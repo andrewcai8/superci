@@ -6800,3 +6800,38 @@ mod run_tests {
         assert_eq!((worker_message(b"no message here"), worker_message(b"Job message: none"), worker_message(b"Job message: {not json")), (None, None, None));
     }
 }
+
+#[cfg(test)]
+mod wait_tests {
+    use super::*;
+
+    fn median(h: &Hour) -> u64 { let mut w = h.waits.clone(); w.sort_unstable(); w[w.len() / 2] }
+
+    /// Each job's end adds its wait to its hour, one at a time, and a day's parts and its hours are added up when read:
+    /// what an hour keeps of its waits has the median of all of them (a thousand waits of 1 to 1,000 seconds, in an
+    /// order no sorting favours), however it was added up.
+    #[test]
+    fn an_hours_waits_kept_one_job_at_a_time_have_the_median_of_all_of_them() {
+        let wait = |i: u64| (i * 7_919 % 1_000 + 1) * 1_000;
+        let one = |w: u64| Hour { jobs: 1, ran: 1, waits: vec![w], ..Default::default() };
+        let mut hour = Hour::default();
+        for i in 0..1_000 { hour.add(&one(wait(i))) }
+        assert!(hour.waits.len() <= WAITS_KEPT && hour.ran == 1_000);
+        assert!((300_000..=700_000).contains(&median(&hour)), "median {} s of 500 s: {:?}", median(&hour) / 1_000, hour.waits);
+        // Eight parts of a day, each its own jobs one at a time, added up as a reader adds them.
+        let mut parts = vec![Hour::default(); 8];
+        for i in 0..1_000u64 { parts[(i % 8) as usize].add(&one(wait(i))) }
+        let mut all = Hour::default();
+        for p in &parts { all.add(p) }
+        assert!(all.waits.len() <= WAITS_KEPT && all.ran == 1_000);
+        assert!((300_000..=700_000).contains(&median(&all)), "median {} s of 500 s: {:?}", median(&all) / 1_000, all.waits);
+        // A part of few jobs beside one of many weighs as few: 999 waits of 1 s and one of 1,000 s, the median 1 s.
+        let (mut many, mut few) = (Hour::default(), Hour::default());
+        for _ in 0..999 { many.add(&one(1_000)) }
+        few.add(&one(1_000_000));
+        let mut both = Hour::default();
+        both.add(&few);
+        both.add(&many);
+        assert_eq!(median(&both), 1_000, "{:?}", both.waits);
+    }
+}
