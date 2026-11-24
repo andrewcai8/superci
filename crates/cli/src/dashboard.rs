@@ -93,6 +93,9 @@ pub struct Dashboard {
     /// The other AWS accounts signed in to. `aws` is the one in hand: the account of the control plane a page or a
     /// command acts on (see `hold_account`), so everything that writes to AWS writes with the right one.
     aws_others: Vec<aws::Session>,
+    /// The kept sign-ins an AWS sign-in given by name for this run stands in for (to its account): not used, and
+    /// kept as they are.
+    aws_set_aside: Vec<aws::Session>,
     /// The dashboard opened by a command for the one thing a person must do in a browser (see `Task`): once it is
     /// done, the page says so and the program ends.
     task: Option<Task>,
@@ -1234,7 +1237,7 @@ impl Dashboard {
         let cf = std::env::var("SUPERCI_CLOUDFLARE_TOKEN").ok().filter(|t| !t.trim().is_empty()).map(|t| cloudflare::Session::from_token(&t));
         let modal = modal::Session::from_env();
         Dashboard { key: random_token(24), base: format!("http://localhost:{}", oauth_port()), planes: vec![], selected: 0, looked_cf: false, looked_aws: false, looked_modal: false,
-            status_key: folder_key(), status_secret: format!("DEVICE_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), modal_others: vec![], modal_came: false, store: None, named: String::new(), about: Default::default(), picture_asked_ms: 0, picture_owner: String::new(), kept_as: String::new(), kept_plane: None, found: vec![], found_about: HashMap::new(), owners_written: HashMap::new(), hello_sent: HashSet::new(), keep_failed: false, aws_ended: false, cf_ended: false, modal_ended: false, aws_ended_in: vec![], modal_ended_in: vec![], unanswered: vec![], aws_came: false, adding: false, aws_others: vec![], task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), job_shown: Default::default(), run_shown: Default::default(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
+            status_key: folder_key(), status_secret: format!("DEVICE_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), modal_others: vec![], modal_came: false, store: None, named: String::new(), about: Default::default(), picture_asked_ms: 0, picture_owner: String::new(), kept_as: String::new(), kept_plane: None, found: vec![], found_about: HashMap::new(), owners_written: HashMap::new(), hello_sent: HashSet::new(), keep_failed: false, aws_ended: false, cf_ended: false, modal_ended: false, aws_ended_in: vec![], modal_ended_in: vec![], unanswered: vec![], aws_came: false, adding: false, aws_others: vec![], aws_set_aside: vec![], task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), job_shown: Default::default(), run_shown: Default::default(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
             manifest_state: None, github_for: None, github_expected: None, deploying: Arc::new(Mutex::new(None)), deployed: Arc::new(Mutex::new(false)), deployed_to: Arc::new(Mutex::new(None)), moving: Arc::new(Mutex::new(None)), updating: Arc::new(Mutex::new(None)), quotas: HashMap::new(), quotas_for: None, aws_looks: HashMap::new(), aws_copying: HashMap::new(), aws_looking: Default::default(), aws_behind: HashMap::new(), budget_lifted: HashMap::new(), seen: HashMap::new(), flash: None, views: None, refreshing: false, measured_at: 0, measuring: false, cf_month: None, modal_months: HashMap::new(), aws_missing: Arc::new(Mutex::new(HashMap::new())), answered: HashSet::new(), first_asked: HashMap::new(), last_good: HashMap::new() }
     }
 
@@ -1249,10 +1252,10 @@ impl Dashboard {
         if d.cf.is_none() { d.cf = kept.cloudflare }
         // Every AWS account kept; in hand, the kept control plane's own (else the first).
         let mut accounts: Vec<aws::Session> = kept.aws.into_iter().chain(kept.aws_more).collect();
-        if let Some(g) = given { accounts.retain(|a| a.account_id != g.account_id); accounts.insert(0, g) }
         let its = match &kept.plane { Some(Plane::Aws { account_id, .. }) => accounts.iter().position(|a| &a.account_id == account_id), _ => None };
         if !accounts.is_empty() { d.aws = Some(accounts.remove(its.unwrap_or(0))) }
         d.aws_others = accounts;
+        if let Some(g) = given { let hold = d.aws.as_ref().is_none_or(|a| a.account_id == g.account_id); d.take_given(g, hold) }
         // Every Modal workspace kept; in hand, the kept control plane's own (else the first).
         let mut workspaces: Vec<modal::Session> = kept.modal.into_iter().chain(kept.modal_more).collect();
         let its = match &kept.plane { Some(Plane::Modal { workspace, .. }) => workspaces.iter().position(|m| &m.workspace == workspace), _ => None };
@@ -1811,8 +1814,8 @@ impl Dashboard {
         let used = view::named().and(self.kept_plane.as_ref()).and_then(|k| self.planes.iter().position(|p| p.plane_id() == k.plane_id())).unwrap_or(self.selected);
         Kept {
             cloudflare: if self.cf_given { None } else { self.cf.clone() },
-            aws: self.aws_accounts().into_iter().find(|a| !a.given_by_name()),
-            aws_more: self.aws_accounts().into_iter().filter(|a| !a.given_by_name()).skip(1).collect(),
+            aws: self.aws_kept().into_iter().next(),
+            aws_more: self.aws_kept().into_iter().skip(1).collect(),
             modal: if self.modal_given { None } else { self.modal.clone() },
             modal_more: self.modal_others.clone(),
             key: Some(Key { name: self.status_secret.clone(), value: self.status_key.clone(), planes }),
@@ -2148,6 +2151,24 @@ impl Dashboard {
         all
     }
 
+    /// The AWS sign-ins to keep: those made here, and those a sign-in given by name stands in for, as they were.
+    fn aws_kept(&self) -> Vec<aws::Session> {
+        let mut all: Vec<aws::Session> = self.aws_accounts().into_iter().filter(|a| !a.given_by_name()).chain(self.aws_set_aside.iter().cloned()).collect();
+        all.sort_by(|a, b| a.account_id.cmp(&b.account_id));
+        all
+    }
+
+    /// An AWS sign-in given by name for this run, in place of any kept to its account (set aside, kept as it is); in
+    /// hand when `hold`.
+    fn take_given(&mut self, g: aws::Session, hold: bool) {
+        let all: Vec<aws::Session> = self.aws.take().into_iter().chain(std::mem::take(&mut self.aws_others)).collect();
+        let (aside, mut rest): (Vec<_>, Vec<_>) = all.into_iter().partition(|a| a.account_id == g.account_id);
+        self.aws_set_aside = aside;
+        if hold { rest.insert(0, g) } else { rest.push(g) }
+        self.aws = Some(rest.remove(0));
+        self.aws_others = rest;
+    }
+
     /// Takes the sign-in to an AWS account in hand, when it is kept: what is done next for a control plane in that
     /// account, or for its runners there, is done with that account's sign-in and no other. Whether it is in hand.
     /// Whether this session is signed in where a control plane runs (what changing it, or updating it, needs).
@@ -2238,10 +2259,14 @@ impl Dashboard {
         let accounts = |v: &serde_json::Value| (v["aws"].clone(), v["aws_more"].clone());
         if (accounts(&mine) == accounts(&last) && accounts(&disk) != accounts(&last)) || (theirs("aws_ended") && self.aws_accounts().is_empty()) {
             let held = self.aws.as_ref().map(|a| a.account_id.clone());
+            // (A sign-in given by name for this run stays in place of the one the file keeps to its account.)
+            let given = self.aws_accounts().into_iter().find(|a| a.given_by_name());
+            let held_given = self.aws.as_ref().is_some_and(|a| a.given_by_name());
             let mut all: Vec<aws::Session> = on_disk.aws.into_iter().chain(on_disk.aws_more).collect();
             let at = held.and_then(|h| all.iter().position(|a| a.account_id == h)).unwrap_or(0);
             self.aws = if all.is_empty() { None } else { Some(all.remove(at)) };
             (self.aws_others, self.aws_ended, self.looked_aws, took) = (all, on_disk.aws_ended, false, true);
+            if let Some(g) = given { self.take_given(g, held_given) }
         }
         if theirs("cloudflare") && !self.cf_given { (self.cf, self.cf_ended, self.looked_cf, took) = (on_disk.cloudflare, on_disk.cloudflare_ended, false, true); self.cf_accounts.clear(); }
         if (theirs("modal") || theirs("modal_more")) && !self.modal_given {
@@ -8297,6 +8322,30 @@ mod tests {
         assert_eq!((kept.aws.map(|a| a.account_id), kept.aws_more.len()), (Some("111111111111".to_string()), 0));
         d.aws_others.clear();
         assert!(d.kept().aws.is_none());
+    }
+
+    /// The kept sign-in a given one stands in for stays kept as it was, and the given one stays in hand when the
+    /// sign-ins are kept, also when another SuperCI changed them meanwhile.
+    #[test]
+    fn a_kept_aws_sign_in_a_given_one_stands_in_for_is_kept_and_the_given_one_stays_in_hand() {
+        let root = std::env::temp_dir().join(format!("superci-given-{}-{}", std::process::id(), superci_core::crypto::random_id(6)));
+        let store = Store::under(&root, "default");
+        let oauth = aws::Session::for_test_until("243891825325", 1);
+        store.write(&Kept { aws: Some(oauth.clone()), aws_more: vec![aws::Session::for_test("111111111111")], ..Default::default() }).unwrap();
+        let mut d = Dashboard::signed_in(Some(store.clone()));
+        d.take_given(aws::Session::given_for_test("243891825325"), true);
+        d.kept_as = serde_json::to_string(&d.kept()).unwrap_or_default();
+        let kept_oauth = |k: &Kept| k.aws.iter().chain(&k.aws_more).find(|a| a.account_id == "243891825325").map(|a| serde_json::to_string(a).unwrap());
+        d.keep();
+        assert!(d.aws.as_ref().unwrap().given_by_name());
+        assert_eq!(kept_oauth(&store.read()), Some(serde_json::to_string(&oauth).unwrap()));
+        // Another SuperCI adds an account: taken in, the given sign-in still in hand and the kept one still kept.
+        store.write(&Kept { aws: Some(oauth.clone()), aws_more: vec![aws::Session::for_test("111111111111"), aws::Session::for_test("222222222222")], ..Default::default() }).unwrap();
+        d.keep();
+        assert!(d.aws.as_ref().unwrap().given_by_name());
+        assert_eq!(d.aws_others.len(), 2);
+        assert_eq!(kept_oauth(&store.read()), Some(serde_json::to_string(&oauth).unwrap()));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// One dashboard as the only workspace's, with no folder (as on a machine that keeps nothing).
