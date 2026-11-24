@@ -1,0 +1,36 @@
+name: Probe
+# Throwaway branches only: compiles and runs round 2's tests, printing what the capacity harness measures.
+on:
+  push:
+    branches: ['probe/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      CORE: a_warm_runner_is_ended_only_on_proof a_machine_kept_for_its_images_is_the_one_ended_later a_start_that_cannot_read_what_it_weighs a_count_of_its_own_machines_not_read what_follows_a_jobs_written_record_failing a_machine_started_for_a_job_that_ended_meanwhile
+      AWS: an_event_costs_dynamodb a_sweep_with_two_thousand_jobs_going a_burst_of_jobs_queued_at_once a_record_moved_while_it_is_deleted a_sweep_that_ends_after_another
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Compile
+        run: |
+          cargo test -p superci-core --lib --test plane --no-run
+          cargo test -p superci-plane-aws --bin bootstrap --no-run
+      - name: Round 2's tests
+        run: |
+          status=0
+          cargo test -p superci-core --lib wait_tests -- --nocapture 2>&1 | tee lib.txt || status=1
+          cargo test -p superci-core --test plane -- $CORE --nocapture 2>&1 | tee core.txt || status=1
+          cargo test -p superci-plane-aws --bin bootstrap -- $AWS --nocapture --test-threads=1 2>&1 | tee aws.txt || status=1
+          echo "=== summary"
+          grep -h "^test \|panicked at\|capacity:" lib.txt core.txt aws.txt || true
+          exit $status
+      - name: Every test of the core and the AWS plane
+        if: ${{ !startsWith(github.ref_name, 'probe/r2-red') }}
+        run: |
+          cargo test -p superci-core 2>&1 | tail -40
+          cargo test -p superci-plane-aws --bin bootstrap 2>&1 | tail -40
