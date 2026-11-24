@@ -104,6 +104,10 @@ pub struct Session {
     creds: Credentials,
     refresh_token: String,
     dpop: SigningKeyStore,
+    /// A sign-in given by name (`SUPERCI_AWS_CREDENTIALS_COMMAND`): the command run again for each renewal instead of
+    /// AWS's sign-in, so it ends only when the command stops giving credentials. Used for this run, never kept.
+    #[serde(skip)]
+    command: Option<String>,
 }
 
 /// AWS's sign-in page for this dashboard; it redirects back to `redirect` (http://127.0.0.1:<port>/oauth/callback).
@@ -168,7 +172,7 @@ fn session_from(region: &str, key: SigningKeyStore, v: &serde_json::Value, previ
         (None, None) => String::new(),
     };
     let account_id = who.split(':').nth(4).map(str::to_string).filter(|a| a.len() == 12).or_else(|| previous.map(|p| p.account_id.clone())).unwrap_or_default();
-    Ok(Session { region: region.into(), account_id, who, creds, refresh_token: s(v, "refreshToken").or_else(|_| previous.map(|p| p.refresh_token.clone()).ok_or("no refresh token"))?, dpop: key })
+    Ok(Session { region: region.into(), account_id, who, creds, refresh_token: s(v, "refreshToken").or_else(|_| previous.map(|p| p.refresh_token.clone()).ok_or("no refresh token"))?, dpop: key, command: None })
 }
 
 /// The redirect's code becomes a session.
@@ -194,6 +198,10 @@ impl Session {
     /// Credentials good for at least two more minutes, renewing them when needed.
     pub fn credentials(&mut self) -> Result<Credentials> {
         if self.due() {
+            if let Some(command) = &self.command {
+                self.creds = credentials_from_command(command)?;
+                return Ok(self.creds.clone());
+            }
             let v = token_call(&self.region, &self.dpop, serde_json::json!({ "clientId": CLIENT_ID, "grantType": "refresh_token", "refreshToken": self.refresh_token }))
                 // AWS answering that the sign-in is over (its refresh token lasts as long as the console session, twelve
                 // hours at most) is said as that; AWS not answering leaves the sign-in as it is.
@@ -202,6 +210,67 @@ impl Session {
         }
         Ok(self.creds.clone())
     }
+}
+
+/// The variable a sign-in to AWS can be given by on a machine with no browser: a command that prints credentials as
+/// AWS's `credential_process` does (`aws configure export-credentials --profile NAME --format process`, say).
+pub const GIVEN: &str = "SUPERCI_AWS_CREDENTIALS_COMMAND";
+
+impl Session {
+    /// The sign-in given by name for this run (`GIVEN`), when there is one and its command gives credentials AWS takes.
+    pub fn given() -> Option<Session> {
+        let command = std::env::var(GIVEN).ok().filter(|c| !c.trim().is_empty())?;
+        match Session::from_command(&command, "us-east-1") {
+            Ok(s) => Some(s),
+            Err(e) => { eprintln!("{GIVEN} was not used: {e}"); None }
+        }
+    }
+
+    /// A sign-in from a command's credentials: whose they are, as STS says.
+    pub fn from_command(command: &str, region: &str) -> Result<Session> {
+        let creds = credentials_from_command(command)?;
+        let xml = futures::executor::block_on(aws::query(&Blocking::new(), &format!("https://sts.{region}.amazonaws.com/"), region, "sts", "2011-06-15", &creds, "GetCallerIdentity", serde_json::json!({}), now_ms()))?;
+        let account_id = aws::xml_tag(&xml, "Account").ok_or("STS answered GetCallerIdentity without an account")?.to_string();
+        let who = aws::xml_tag(&xml, "Arn").unwrap_or_default().to_string();
+        Ok(Session { region: region.into(), account_id, who, creds, refresh_token: String::new(), dpop: SigningKeyStore::generate(), command: Some(command.into()) })
+    }
+
+    /// Given by name for this run (`GIVEN`): not to be kept.
+    pub fn given_by_name(&self) -> bool { self.command.is_some() }
+}
+
+fn credentials_from_command(command: &str) -> Result<Credentials> {
+    let out = std::process::Command::new("sh").arg("-c").arg(command).stderr(std::process::Stdio::inherit()).output().map_err(|e| format!("{GIVEN}: {e}"))?;
+    if !out.status.success() { return Err(format!("{GIVEN} failed ({})", out.status)) }
+    process_credentials(&out.stdout, now_ms())
+}
+
+/// Credentials as a `credential_process` prints them. Without an `Expiration` (long-lived keys), asked for again in
+/// fifteen minutes.
+fn process_credentials(out: &[u8], now: u64) -> Result<Credentials> {
+    let v: serde_json::Value = serde_json::from_slice(out).map_err(|e| format!("{GIVEN} printed no JSON: {e}"))?;
+    let s = |k: &str| v[k].as_str().filter(|x| !x.is_empty()).map(str::to_string).ok_or_else(|| format!("{GIVEN} printed no {k}"));
+    let expires_at_ms = v["Expiration"].as_str().and_then(rfc3339_ms).unwrap_or(now + 900_000);
+    Ok(Credentials { access_key_id: s("AccessKeyId")?, secret_access_key: s("SecretAccessKey")?, session_token: v["SessionToken"].as_str().map(str::to_string), expires_at_ms })
+}
+
+/// Milliseconds since 1970 of an RFC 3339 time (`2026-11-24T09:00:00Z`, `…+01:00`, with or without a fraction).
+fn rfc3339_ms(t: &str) -> Option<u64> {
+    let n = |a: usize, b: usize| t.get(a..b)?.parse::<i64>().ok();
+    let (y, mo, d, h, mi, sec) = (n(0, 4)?, n(5, 7)?, n(8, 10)?, n(11, 13)?, n(14, 16)?, n(17, 19)?);
+    let rest = t.get(19..)?.trim_start_matches(|c: char| c == '.' || c.is_ascii_digit());
+    let offset = match rest {
+        "Z" | "z" => 0,
+        o if o.len() == 6 && (o.starts_with('+') || o.starts_with('-')) => (if o.starts_with('-') { -1 } else { 1 }) * (o.get(1..3)?.parse::<i64>().ok()? * 3600 + o.get(4..6)?.parse::<i64>().ok()? * 60),
+        _ => return None,
+    };
+    // Days since 1970 of a civil date (Howard Hinnant's days_from_civil).
+    let (y, m) = if mo <= 2 { (y - 1, mo + 9) } else { (y, mo - 3) };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + (153 * m + 2) / 5 + d - 1;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from((days * 86_400 + h * 3600 + mi * 60 + sec - offset) * 1000).ok()
 }
 
 /// What a Cloudflare-hosted control plane needs in AWS: its identity provider, the role that trusts only it, the role's
@@ -690,8 +759,11 @@ impl Session {
     /// The same, its credentials good until `expires_at_ms` (renewed, say, by another SuperCI).
     pub fn for_test_until(account_id: &str, expires_at_ms: u64) -> Self { let mut s = Self::for_test(account_id); s.creds.expires_at_ms = expires_at_ms; s.refresh_token = format!("renewed-{expires_at_ms}"); s }
 
+    /// A sign-in given by name for this run (`GIVEN`).
+    pub fn given_for_test(account_id: &str) -> Self { let mut s = Self::for_test(account_id); s.command = Some("true".into()); s }
+
     pub fn for_test(account_id: &str) -> Self {
-        Session { region: "us-east-1".into(), account_id: account_id.into(), who: String::new(), refresh_token: String::new(), dpop: SigningKeyStore::generate(),
+        Session { region: "us-east-1".into(), account_id: account_id.into(), who: String::new(), refresh_token: String::new(), dpop: SigningKeyStore::generate(), command: None,
             creds: Credentials { access_key_id: String::new(), secret_access_key: String::new(), session_token: None, expires_at_ms: 0 } }
     }
 }
@@ -963,10 +1035,54 @@ mod answers {
         assert_eq!(from(&v, Some(&first)).unwrap().refresh_token, "r");
     }
 
+    /// A sign-in given by a command: whose it is as STS says, and each renewal the command run again, never AWS's sign-in.
+    #[test]
+    fn a_sign_in_given_by_a_command_is_whose_sts_says_and_renews_by_running_it_again() {
+        let dir = std::env::temp_dir().join(format!("superci-given-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let runs = dir.join("runs");
+        // (An Expiration long past: every use renews.)
+        let command = format!(r#"echo x >> '{}'; printf '{{"Version":1,"AccessKeyId":"ASIA%s","SecretAccessKey":"s","SessionToken":"t","Expiration":"2000-01-01T00:00:00Z"}}' "$(wc -l < '{}' | tr -d ' ')""#, runs.display(), runs.display());
+        let sts = clouds::serve(|_, url, body| if url.contains("sts.us-east-1.amazonaws.com") && String::from_utf8_lossy(body).contains("Action=GetCallerIdentity") {
+            answer(200, "<GetCallerIdentityResponse><GetCallerIdentityResult><Arn>arn:aws:sts::243891825325:assumed-role/ci-admin/s</Arn><Account>243891825325</Account></GetCallerIdentityResult></GetCallerIdentityResponse>")
+        } else { answer(500, "only STS here") });
+        with(&sts, || {
+            let mut s = Session::from_command(&command, "us-east-1").unwrap();
+            assert_eq!((s.account_id.as_str(), s.who.as_str(), s.given_by_name()), ("243891825325", "arn:aws:sts::243891825325:assumed-role/ci-admin/s", true));
+            assert_eq!(s.credentials().unwrap().access_key_id, "ASIA2");
+            assert_eq!(s.credentials().unwrap().access_key_id, "ASIA3");
+            // (Not kept: what is written of it holds no command, and the dashboard keeps none given by name.)
+            assert!(!serde_json::to_string(&s).unwrap().contains("wc -l"));
+        });
+        with(&clouds::closed(), || assert_eq!(Session::from_command("exit 3", "us-east-1").err().unwrap(), format!("{GIVEN} failed (exit status: 3)")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn process_credentials_are_read_as_a_credential_process_prints_them() {
+        let c = process_credentials(br#"{"Version":1,"AccessKeyId":"ASIA1","SecretAccessKey":"s","SessionToken":"t","Expiration":"2026-11-24T09:00:00Z"}"#, 0).unwrap();
+        assert_eq!((c.access_key_id.as_str(), c.session_token.as_deref(), c.expires_at_ms), ("ASIA1", Some("t"), 1_795_510_800_000));
+        // Long-lived keys: no token, asked for again in fifteen minutes.
+        let c = process_credentials(br#"{"AccessKeyId":"AKIA1","SecretAccessKey":"s"}"#, 1000).unwrap();
+        assert_eq!((c.session_token, c.expires_at_ms), (None, 901_000));
+        assert_eq!(process_credentials(br#"{"AccessKeyId":"AKIA1"}"#, 0).err().unwrap(), format!("{GIVEN} printed no SecretAccessKey"));
+        assert!(process_credentials(b"not json", 0).err().unwrap().starts_with(&format!("{GIVEN} printed no JSON")));
+    }
+
+    #[test]
+    fn rfc3339_times_are_read_with_their_offsets_and_fractions() {
+        assert_eq!(rfc3339_ms("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(rfc3339_ms("2000-03-01T00:00:00Z"), Some(951_868_800_000));
+        assert_eq!(rfc3339_ms("2026-11-24T10:00:00.123+01:00"), Some(1_795_510_800_000));
+        assert_eq!(rfc3339_ms("2026-11-24T04:00:00-05:00"), Some(1_795_510_800_000));
+        assert_eq!(rfc3339_ms("2026-11-24"), None);
+        assert_eq!(rfc3339_ms("2026-11-24T09:00:00"), None);
+    }
+
     /// A renewal AWS does not answer, or answers without credentials: an error, and the sign-in not taken as ended.
     #[test]
     fn a_renewal_aws_does_not_answer_or_answers_without_credentials_is_an_error() {
-        let session = || Session { region: "us-east-1".into(), account_id: "111111111111".into(), who: String::new(), creds: creds(), refresh_token: "r".into(), dpop: SigningKeyStore::generate() };
+        let session = || Session { region: "us-east-1".into(), account_id: "111111111111".into(), who: String::new(), creds: creds(), refresh_token: "r".into(), dpop: SigningKeyStore::generate(), command: None };
         with(&clouds::closed(), || assert!(!session().credentials().unwrap_err().starts_with(ENDED)));
         with(&clouds::serve(|_, _, _| answer(200, "{}")), || assert_eq!(session().credentials().unwrap_err(), "AWS sign-in answer without accessKeyId"));
     }
