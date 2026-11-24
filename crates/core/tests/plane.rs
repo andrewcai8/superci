@@ -7556,6 +7556,173 @@ fn a_failing_runner_that_takes_a_job_waiting_for_room_fails_it_and_its_own_job_g
     assert_eq!((job(&store, 2)["state"].as_str(), job(&store, 1)["fail_pending"].as_str()), (Some("failed"), Some("nowhere to run it")));
 }
 
+/// GitHub as it answers a runner taken back: refused while `busy` (it runs a job), else done.
+fn taking_back(busy: &std::cell::Cell<bool>) -> impl Fn(&Request, &str) -> Option<Response> + '_ {
+    move |r: &Request, _: &str| (r.method == "DELETE" && r.url.contains("/actions/runners/"))
+        .then(|| if busy.get() { Response::new(422, "application/json", r#"{"message":"Runner is still running a job"}"#.to_string()) } else { Response::new(204, "application/json", String::new()) })
+}
+
+/// The warm runners' stand-ins kept, by id.
+fn stand_ins(store: &Mem) -> Vec<serde_json::Value> {
+    let mut all: Vec<serde_json::Value> = store.0.borrow().iter().filter(|(k, _)| k.starts_with("job:")).filter_map(|(_, v)| serde_json::from_str::<serde_json::Value>(v).ok()).filter(|j| j["warm"] == true).collect();
+    all.sort_by_key(|j| j["job_id"].as_u64());
+    all
+}
+
+fn kept_warm(label: &str, count: u32) -> superci_core::plane::Warm { superci_core::plane::Warm { label: label.into(), count, idle_minutes: 30 } }
+
+#[test]
+fn a_label_kept_warm_has_its_count_of_idle_runners_and_a_job_one_takes_leaves_its_own_machine_in_its_place() {
+    let busy = std::cell::Cell::new(false);
+    let clouds = With(FakeClouds::default(), taking_back(&busy));
+    let (store, wakes, cache, own) = (Mem::default(), Wakes::default(), Cache::default(), OwnContainers::default());
+    let clock = MovingClock(std::cell::Cell::new(1_790_000_000_000));
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.containers = true;
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    config.routing.warm = vec![kept_warm("superci", 2)];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
+    let run = |r: Request| block_on(plane.handle(r));
+    let starts = || own.0.borrow().iter().filter(|c| c.starts_with("start")).count();
+    let runner = |id: u64| format!("superci-{PLANE_ID}-{id}");
+    // No job with the label has run here yet: nothing to register its runners with, so none.
+    block_on(plane.alarm()).unwrap();
+    assert_eq!((starts(), stand_ins(&store).len()), (0, 0));
+    run(job_event("queued", 7, "acme/app", None));
+    run(job_event("in_progress", 7, "acme/app", Some(&runner(7))));
+    run(concluded(7, &runner(7), "success"));
+    // Then two, each registered with GitHub under the label as a job's runner is; a sweep after starts none more.
+    block_on(plane.alarm()).unwrap();
+    let warm = stand_ins(&store);
+    assert_eq!((starts(), warm.len()), (3, 2));
+    for w in &warm { assert!(w["job_id"].as_u64().unwrap() >= superci_core::plane::WARM_IDS && w["state"] == "launched" && w["label"] == "superci" && w["runner_id"].is_u64(), "{w}") }
+    block_on(plane.alarm()).unwrap();
+    assert_eq!((starts(), stand_ins(&store).len()), (3, 2));
+    let (one, two) = (warm[0]["job_id"].as_u64().unwrap(), warm[1]["job_id"].as_u64().unwrap());
+    // A queued job gets a machine of its own as ever, and a warm runner takes the job at once.
+    run(job_event("queued", 8, "acme/app", None));
+    assert_eq!((starts(), job(&store, 8)["state"].as_str()), (4, Some("launched")));
+    run(job_event("in_progress", 8, "acme/app", Some(&runner(one))));
+    let w = job(&store, one);
+    assert_eq!((w["state"].as_str(), w["ran"].as_u64(), job(&store, 8)["for_job"].as_u64()), (Some("running"), Some(8), Some(one)), "{w}");
+    // The job's own machine is the next idle runner: two idle, as asked, and none started for the one that went.
+    clock.0.set(clock.0.get() + 3 * 60_000);
+    block_on(plane.alarm()).unwrap();
+    let status = json(&run(get("/status").with_header("authorization", "Bearer dashboard-session-key-1")));
+    assert_eq!((starts(), status["warm_idle"]["superci"].as_u64(), job(&store, 8)["state"].as_str(), job(&store, two)["state"].as_str()), (4, Some(2), Some("launched"), Some("launched")), "{status}");
+    // Stand-ins are no jobs to list; their machines are among those up.
+    assert!(status["jobs"].as_array().unwrap().iter().all(|j| j["job_id"].as_u64().is_some_and(|id| id < superci_core::plane::WARM_IDS)), "{}", status["jobs"]);
+    assert_eq!(status["active"]["cloudflare"].as_u64(), Some(3), "{}", status["active"]);
+    // The job ends on the warm runner's machine, which ends with it; still two idle, and none started.
+    run(concluded(8, &runner(one), "success"));
+    block_on(plane.alarm()).unwrap();
+    let (w, eight) = (job(&store, one), job(&store, 8));
+    assert_eq!((w["state"].as_str(), w["started_ms"].is_u64(), eight["conclusion"].as_str(), eight["state"].as_str(), starts()), (Some("done"), true, Some("success"), Some("launched"), 4), "{w}");
+    assert!(own.0.borrow().contains(&format!("stop {}", runner(one))), "{:?}", own.0.borrow());
+    // GitHub was never asked of a stand-in's id, nor of the job a machine is for when that is a stand-in.
+    assert!(clouds.0.calls.borrow().iter().all(|c| !c.1.contains(&one.to_string()) && !c.1.contains(&two.to_string())), "{:?}", clouds.0.calls.borrow());
+}
+
+#[test]
+fn an_idle_warm_runner_is_taken_back_after_its_time_and_replaced_but_not_one_github_has_given_a_job() {
+    let busy = std::cell::Cell::new(false);
+    let clouds = With(FakeClouds::default(), taking_back(&busy));
+    let (store, wakes, cache, own) = (Mem::default(), Wakes::default(), Cache::default(), OwnContainers::default());
+    let clock = MovingClock(std::cell::Cell::new(1_790_000_000_000));
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.containers = true;
+    config.routing.warm = vec![kept_warm("superci", 1)];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
+    let run = |r: Request| block_on(plane.handle(r));
+    let starts = || own.0.borrow().iter().filter(|c| c.starts_with("start")).count();
+    let runner = |id: u64| format!("superci-{PLANE_ID}-{id}");
+    let taken_back = |rid: u64| clouds.0.calls.borrow().iter().any(|c| c.0 == "DELETE" && c.1.ends_with(&format!("/actions/runners/{rid}")));
+    run(job_event("queued", 7, "acme/app", None));
+    run(job_event("in_progress", 7, "acme/app", Some(&runner(7))));
+    run(concluded(7, &runner(7), "success"));
+    block_on(plane.alarm()).unwrap();
+    let first = stand_ins(&store)[0].clone();
+    let (id, rid) = (first["job_id"].as_u64().unwrap(), first["runner_id"].as_u64().unwrap());
+    // Twenty minutes idle: kept, past the ten a job's machine may take to begin.
+    clock.0.set(clock.0.get() + 20 * 60_000);
+    block_on(plane.alarm()).unwrap();
+    assert_eq!((job(&store, id)["state"].as_str(), starts(), taken_back(rid)), (Some("launched"), 2, false));
+    // Past its thirty: its runner taken back from GitHub, then its machine ended, and another started in its place.
+    clock.0.set(clock.0.get() + 11 * 60_000);
+    block_on(plane.alarm()).unwrap();
+    let ended = job(&store, id);
+    assert_eq!((ended["state"].as_str(), ended["ended_ms"].as_u64(), taken_back(rid), starts()), (Some("done"), Some(clock.0.get()), true, 3), "{ended}");
+    assert!(own.0.borrow().contains(&format!("stop {}", runner(id))));
+    let next = stand_ins(&store).into_iter().find(|w| w["job_id"].as_u64() != Some(id)).unwrap();
+    let (id, rid) = (next["job_id"].as_u64().unwrap(), next["runner_id"].as_u64().unwrap());
+    // Past its time just as GitHub hands it a job (GitHub will not give back a runner running one): kept, its machine
+    // too, and none started beside it.
+    busy.set(true);
+    clock.0.set(clock.0.get() + 31 * 60_000);
+    block_on(plane.alarm()).unwrap();
+    assert_eq!((job(&store, id)["state"].as_str(), starts()), (Some("launched"), 3));
+    assert!(!own.0.borrow().contains(&format!("stop {}", runner(id))));
+    // Once GitHub gives it back, it goes, and another comes.
+    busy.set(false);
+    block_on(plane.alarm()).unwrap();
+    assert_eq!((job(&store, id)["state"].as_str(), taken_back(rid), starts()), (Some("done"), true, 4));
+}
+
+#[test]
+fn warm_runners_keep_to_the_limits_and_go_with_their_label_each_machine_counted_once() {
+    let busy = std::cell::Cell::new(false);
+    let clouds = With(FakeClouds::default(), taking_back(&busy));
+    let (store, wakes, cache, own) = (Mem::default(), Wakes::default(), Cache::default(), OwnContainers::default());
+    let clock = MovingClock(std::cell::Cell::new(1_790_000_000_000));
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.containers = true;
+    config.routing.order = vec![Pool { regions: vec![], off: false, cloud: "cloudflare".into(), max_jobs: Some(2), monthly_usd: None }];
+    config.routing.warm = vec![kept_warm("superci", 3)];
+    // The same, with room for five jobs at once; with that and the CI's monthly limit spent; with no label kept warm.
+    let mut roomy = config.clone();
+    roomy.routing.order[0].max_jobs = Some(5);
+    let mut capped = roomy.clone();
+    capped.routing.monthly_usd = Some(0.000_001);
+    let mut none = roomy.clone();
+    none.routing.warm.clear();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
+    let starts = || own.0.borrow().iter().filter(|c| c.starts_with("start")).count();
+    let runner = |id: u64| format!("superci-{PLANE_ID}-{id}");
+    block_on(plane.handle(job_event("queued", 7, "acme/app", None)));
+    block_on(plane.handle(job_event("in_progress", 7, "acme/app", Some(&runner(7)))));
+    block_on(plane.handle(concluded(7, &runner(7), "success")));
+    // Two jobs at once on Cloudflare: two of the three, and no record of one that found no room.
+    block_on(plane.alarm()).unwrap();
+    assert_eq!((starts(), stand_ins(&store).len()), (3, 2));
+    // With room for more but the CI's monthly limit spent: none more.
+    clock.0.set(clock.0.get() + 10 * 60_000);
+    block_on(ControlPlane { config: &capped, ..plane }.alarm()).unwrap();
+    assert_eq!((starts(), stand_ins(&store).len()), (3, 2));
+    // Within the limits: the third.
+    block_on(ControlPlane { config: &roomy, ..plane }.alarm()).unwrap();
+    assert_eq!((starts(), stand_ins(&store).len()), (4, 3));
+    // The label no longer kept warm: each of its runners taken back from GitHub and its machine ended.
+    block_on(ControlPlane { config: &none, ..plane }.alarm()).unwrap();
+    let warm = stand_ins(&store);
+    assert!(warm.iter().all(|w| w["state"] == "done" && w["runner_id"].is_null() && own.0.borrow().contains(&format!("stop {}", w["machine_id"].as_str().unwrap_or("?")))), "{warm:?}");
+    assert_eq!(starts(), 4);
+    // Every machine started is on one record alone, and the day's spend is what those records cost: each counted once.
+    let now = clock.0.get();
+    let records: Vec<superci_core::plane::Job> = store.0.borrow().iter().filter(|(k, _)| k.starts_with("job:")).map(|(_, v)| serde_json::from_str(v).unwrap()).collect();
+    let mut machines: Vec<String> = records.iter().filter_map(|j| j.machine_id.clone()).collect();
+    let mut started: Vec<String> = own.0.borrow().iter().filter_map(|c| c.strip_prefix("start ")?.split(' ').next().map(str::to_string)).collect();
+    machines.sort();
+    started.sort();
+    assert_eq!(machines, started);
+    let day: superci_core::plane::Day = serde_json::from_str(&store.0.borrow()[&superci_core::plane::day_key(now / 86_400_000)]).unwrap();
+    let (spent, cost): (f64, f64) = (day.spend.values().sum(), records.iter().map(|j| superci_core::plane::job_usd(j, now)).sum());
+    assert!(records.iter().all(superci_core::plane::over) && cost > 0.0 && (spent - cost).abs() < 1e-9, "{spent} {cost}");
+    assert_eq!((day.hours.iter().map(|h| h.jobs).sum::<u64>(), day.hours.iter().map(|h| h.ran).sum::<u64>()), (1, 1), "job 7 alone: a stand-in is no job");
+}
+
 /// A test of this file run under the sweep: its name, and itself.
 type Swept = (&'static str, fn());
 macro_rules! tests { ($($t:ident),* $(,)?) => { &[$((stringify!($t), $t as fn())),*] } }
@@ -7745,7 +7912,10 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         a_preempted_modal_function_is_run_again_once_further_down_the_order_and_counted,
         a_lost_job_of_a_run_that_passed_without_it_is_not_run_again,
         functions_are_a_row_a_label_and_a_preemption_go_past,
-        a_modal_launcher_in_function_mode_starts_a_function_or_says_to_update_it
+        a_modal_launcher_in_function_mode_starts_a_function_or_says_to_update_it,
+        a_label_kept_warm_has_its_count_of_idle_runners_and_a_job_one_takes_leaves_its_own_machine_in_its_place,
+        an_idle_warm_runner_is_taken_back_after_its_time_and_replaced_but_not_one_github_has_given_a_job,
+        warm_runners_keep_to_the_limits_and_go_with_their_label_each_machine_counted_once
     ];
     // (Each test of this file is in it but those that already step through every point of a flow themselves.)
     let stepping = ["a_job_cancelled_at_any_step_of_its_start_or_of_a_sweep_leaves_no_machine_and_stays_cancelled", "a_job_that_begins_at_any_step_of_a_sweep_keeps_its_machine",

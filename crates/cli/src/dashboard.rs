@@ -4189,6 +4189,21 @@ impl Dashboard {
                         routing.images.insert(name, superci_core::plane::RunnerImage { reference, modal_secret: Some(secret).filter(|s| !s.is_empty()) });
                     }
                     "image_remove" => { routing.images.remove(field("name").trim()); }
+                    // A label kept warm (see `Warm`): how many runners idle for it, and how long one idles before another
+                    // takes its place; or none.
+                    "warm_set" | "warm_remove" => {
+                        if !status.as_ref().is_some_and(|s| s["warm"] == true) { return Ok(message(409, "Update the control plane first", "Warm runners need a newer control plane: update it on the Control plane page (or `superci planes update`), then keep a label warm.")) }
+                        let label = field("label").trim().to_string();
+                        if field("action") == "warm_remove" { routing.warm.retain(|w| w.label != label) } else {
+                            let labels: Vec<String> = status.as_ref().and_then(|s| s["labels"].as_array().cloned()).unwrap_or_default().iter().filter_map(|l| l.as_str().map(str::to_string)).collect();
+                            if !matches!(Spec::parse_among(&label, &labels), Some(Ok(_))) { return Ok(message(400, "No label of this control plane's", &esc(&format!("{label} is not a label this control plane answers to: {}, alone or with a machine's keys after it (superci/cpu=4).", labels.join(", "))))) }
+                            let Some(count) = field("count").parse::<u32>().ok().filter(|n| (1..=100).contains(n)) else { return Ok(message(400, "From 1 to 100 runners", "How many runners are kept idle for the label.")) };
+                            let idle_minutes = match field("idle_minutes").as_str() { "" => superci_core::plane::WARM_IDLE_MINUTES, m => match m.parse::<u32>().ok().filter(|m| (1..=360).contains(m)) {
+                                Some(m) => m, None => return Ok(message(400, "From 1 to 360 minutes", "How long a warm runner idles before another takes its place.")) } };
+                            let warm = superci_core::plane::Warm { label: label.clone(), count, idle_minutes };
+                            match routing.warm.iter_mut().find(|w| w.label == label) { Some(w) => *w = warm, None => routing.warm.push(warm) }
+                        }
+                    }
                     // The cache: on or off, what a repository keeps, how long an entry may go unused.
                     "cache_on" => routing.cache.off = field("on") != "on",
                     "cache_images" => routing.cache.images_off = field("on") != "on",
@@ -8221,13 +8236,14 @@ fn setting_name(path: &[String]) -> String {
     let what = |field: &str| match field {
         "max_jobs" => "jobs at once", "monthly_usd" => "monthly limit", "daily_usd" => "daily limit", "regions" => "regions", "off" => "taken out of the order",
         "max_cpu" => "the largest machine", "max_minutes" => "the longest job", "public_repos" => "public repositories", "aws_budget" => "AWS's budget", "cache" => "the cache", "order" => "the order",
-        "launchers" => "the launchers", other => other,
+        "launchers" => "the launchers", "warm" => "the labels kept warm", other => other,
     }.to_string();
     match path.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         ["routing", "order", cloud, field, ..] => format!("{}'s {}", cloud_name(cloud), what(field)),
         ["routing", "account_usd", account] => format!("{}'s monthly limit", cloud_name(account)),
         ["routing", "account_daily_usd", account] => format!("{}'s daily limit", cloud_name(account)),
         ["routing", "order", cloud] | ["launchers", cloud] => format!("{}'s place", cloud_name(cloud)),
+        ["routing", "warm", label, ..] => format!("{label}'s warm runners"),
         ["routing", field, ..] | [field, ..] => what(field),
         [] => "the settings".into(),
     }

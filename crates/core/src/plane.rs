@@ -421,6 +421,10 @@ pub struct Job {
     /// What of its cost its day's totals (`Day`) hold: none until it is over, then its cost as counted, so a cost
     /// settled later adds only the difference. Written with the job itself, so it is counted once.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub counted_usd: Option<f64>,
+    /// A warm runner's stand-in (see `Warm`): its id (`WARM_IDS` up) is no job's of GitHub's, so nothing asks GitHub of
+    /// it, and it has `began` from the first (GitHub has nothing queued for it). Not among the jobs listed, nor counted
+    /// as a job; its machine and its cost are counted as any job's.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub warm: bool,
 }
 
 fn unwritten(rev: &std::cell::Cell<u64>) -> bool { rev.get() == 0 }
@@ -611,8 +615,9 @@ fn month_and_day(now: u64, by_day: std::collections::BTreeMap<u64, std::collecti
 
 /// What one job adds to its hour (the hour it was queued in, counted from the epoch), as it stands at `now`.
 pub fn hour_of(j: &Job, host_price: f64, now: u64) -> (u64, Hour) {
-    let mut h = Hour { jobs: 1, usd: job_usd(j, now), ..Default::default() };
-    if ["failed", "orphan", "swept"].contains(&j.state.as_str()) && j.started_ms.is_none() { h.not_ran = 1 }
+    // (A warm runner's stand-in is no job: the job it ran is counted by its own record.)
+    let mut h = Hour { jobs: (!j.warm).into(), usd: job_usd(j, now), ..Default::default() };
+    if !j.warm && ["failed", "orphan", "swept"].contains(&j.state.as_str()) && j.started_ms.is_none() { h.not_ran = 1 }
     if let Some(start) = j.started_ms {
         let took = j.ended_ms.unwrap_or(if active(j) { now } else { start }).saturating_sub(start);
         let minutes = took.div_ceil(60_000).max(1);
@@ -921,6 +926,9 @@ pub struct Routing {
     /// in place of GitHub's runner image, with a repository's tools in it already.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub images: std::collections::BTreeMap<String, RunnerImage>,
+    /// Labels kept warm (see `Warm`), each by its label as a workflow says it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warm: Vec<Warm>,
 }
 
 /// An image of a control plane's own, in a container registry (`ghcr.io/acme/ci:2026-10`, or by its digest), that a
@@ -1026,6 +1034,23 @@ pub struct Pool {
 impl Pool {
     pub fn of(cloud: &str) -> Pool { Pool { regions: vec![], off: false, cloud: cloud.to_string(), max_jobs: None, monthly_usd: None } }
 }
+
+/// A label kept warm: `count` runners registered and idle for exactly that label, so that GitHub hands its next job to
+/// one at once rather than waiting for a machine to start. Each is a machine like a job's, started for a stand-in job
+/// (see `Job::warm`) within the same limits; one idle `idle_minutes` is ended and another started in its place, so that
+/// none waits past what its machine may live.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Warm {
+    pub label: String,
+    pub count: u32,
+    #[serde(default = "warm_idle_minutes")] pub idle_minutes: u32,
+}
+
+pub const WARM_IDLE_MINUTES: u32 = 30;
+fn warm_idle_minutes() -> u32 { WARM_IDLE_MINUTES }
+
+/// Where stand-in ids begin: far above any id GitHub gives a job, so that none is ever one of GitHub's.
+pub const WARM_IDS: u64 = 1 << 62;
 
 impl Routing {
     /// A public repository allowed to run jobs here.
@@ -1170,6 +1195,11 @@ fn lost_said(provider: &str) -> (&'static str, &'static str) {
 fn capacity_of(cloud: &str) -> Capacity { if cloud == "cloudflare" { Capacity::cloudflare() } else { Capacity::modal() } }
 
 fn active(j: &Job) -> bool { ["launching", "launched", "running"].contains(&j.state.as_str()) }
+
+/// Whether a record is a warm pool's, and idle (see `Warm`): a stand-in's, or a job's own machine whose job a stand-in's
+/// runner took, that has begun nothing and may still. The pool sees to it (`warm_up`): no job of GitHub's is waiting
+/// for it to ask GitHub of.
+fn pooled(j: &Job) -> bool { !over(j) && !j.seen_in_progress && j.provider.is_empty() && (j.warm || j.for_job.is_some_and(|f| f >= WARM_IDS)) }
 
 /// A run from a computer's jobs a name stands for: the job of that name (each combination of its matrix), or all the
 /// jobs of the workflow a job of that name calls.
@@ -2165,6 +2195,9 @@ impl<'a> ControlPlane<'a> {
             // (And images of its own, `Routing::images`; and Modal's Functions, `MODAL_FUNCTIONS`.)
             "runner_images": true,
             "function_mode": true,
+            // (And labels kept warm, `Routing::warm`: each one's runners idle or starting now.)
+            "warm": true,
+            "warm_idle": live.iter().filter(|j| pooled(j)).fold(HashMap::<String, u32>::new(), |mut m, j| { *m.entry(j.label.clone()).or_default() += 1; m }),
             "spend_today": day_spend,
             // Modal Functions preempted this month (UTC), and jobs run again for it (see `MODAL_FUNCTIONS`).
             "preempted": self.preempted(now).await,
@@ -3092,7 +3125,7 @@ impl<'a> ControlPlane<'a> {
     /// The newest `n` jobs, the newest first.
     async fn newest_jobs(&self, n: usize) -> Result<Vec<Job>> {
         if !self.indexed().await {
-            let mut all: Vec<Job> = self.store.list("job:").await?.into_iter().filter_map(|(_, v)| serde_json::from_str(&v).ok()).collect();
+            let mut all: Vec<Job> = self.store.list("job:").await?.into_iter().filter_map(|(_, v)| serde_json::from_str::<Job>(&v).ok()).filter(|j| !j.warm).collect();
             all.sort_by(|a, b| b.at_ms.cmp(&a.at_ms));
             all.truncate(n);
             return Ok(all)
@@ -3225,7 +3258,8 @@ impl<'a> ControlPlane<'a> {
         let id = key.trim_start_matches("job:");
         if needs_care(j, now) { self.store.put(&format!("live:{id}"), String::new()).await? }
         else { self.store.put_until(&format!("live:{id}"), String::new(), now + LIVE_AFTER_MS).await? }
-        if new {
+        // (A warm runner's stand-in is no job to list, nor a repository's: one is made every few minutes.)
+        if new && !j.warm {
             self.store.put_until(&format!("recent:{:013}:{id}", j.at_ms), String::new(), j.at_ms + JOB_KEPT_MS).await?;
             // (Not put in it, the record goes: the next read makes it again from the index, this job among them.)
             if self.note_newest(j.at_ms, id).await.is_err() { self.store.delete(NEWEST).await? }
@@ -3953,6 +3987,8 @@ impl<'a> ControlPlane<'a> {
     /// fails here alike. It runs where it costs least and starts soonest (Cloudflare, Modal, AWS), for ten minutes at
     /// most. A GitLab job is cancelled instead (GitLab can cancel one job).
     async fn fail_fast(&self, plane_url: &str, job: &mut Job, why: &str) {
+        // (A warm runner's stand-in has no job to fail: a failing runner would take, and fail, a job that could run.)
+        if job.warm { return }
         if job.provider == "gitlab" {
             if let (Some(gl), Some(project)) = (self.gitlab_of(job), job.project_id) { let _ = gitlab::cancel_job(self.http, gl, project, job.job_id).await; }
             return;
@@ -4136,10 +4172,13 @@ impl<'a> ControlPlane<'a> {
                         // A job that is over (cancelled before a runner took it, or failed by another's failing
                         // runner) needs no machine again. Nor does one whose own job began on another job's runner
                         // (`for_job`: its machine was for that other job) once that other job has got this machine.
-                        if j.state == "orphan" || j.failed_fast || j.over || j.for_job == Some(job_id) {
+                        // Nor a warm runner's stand-in: its machine was for whichever job came.
+                        if j.state == "orphan" || j.failed_fast || j.over || j.warm || j.for_job == Some(job_id) {
                             j.state = if j.state == "orphan" { "cancelled" } else if j.failed_fast { "failed" } else { "done" }.into();
                             j.for_job = None;
                             j.ended_ms.get_or_insert(now);
+                            // (The machine it had is the other job's now, and its cost with it: counted there alone.)
+                            j.usd_per_hour = None;
                             // The machine that ended with another job's work stays in the books, here.
                             if let Some(e) = ended.filter(|_| j.state == "done") {
                                 (j.cloud, j.machine_id, j.machine_type, j.region, j.zone, j.disk_gb, j.cpu) = (e.cloud, e.machine_id, e.machine_type, e.region, e.zone, e.disk_gb, e.cpu);
@@ -4171,7 +4210,12 @@ impl<'a> ControlPlane<'a> {
                         other.began = true;
                         self.keep(&format!("job:{job_id}"), &other).await?;
                     }
+                    // A warm runner waited for no job of its own: the wait counted is the job's, and what the cache lets
+                    // its machine read and write is the job's branch's.
+                    if j.warm { (j.queued_ms, j.repo_id, j.branch, j.default_branch) = (Some(other.queued_ms.unwrap_or(other.at_ms)), other.repo_id, other.branch.clone(), other.default_branch.clone()) }
                 }
+                // (A job not heard of yet, its queued event still on its way: taken at once.)
+                if j.warm { j.queued_ms.get_or_insert(self.clock.now_ms()); }
                 j.ran = Some(job_id);
             } else {
                 j.began = true;
@@ -4207,6 +4251,96 @@ impl<'a> ControlPlane<'a> {
         j.ended_ms.get_or_insert(self.clock.now_ms());
         self.settle(plane_url, j).await;
         true
+    }
+
+    /// Each warm label's runners (see `Warm`), once the sweep has seen to every other machine. One idle past its time,
+    /// or beyond its label's count (a label no longer kept warm counts none), is taken back as a cancelled job's
+    /// machine is; then as many are started as the count lacks, while the limits every job keeps to let one start.
+    /// How many machines it keeps up.
+    async fn warm_up(&self, plane_url: &str, now: u64) -> Result<usize> {
+        let warm = &self.config.routing.warm;
+        let live = self.live_jobs().await?;
+        // Each label's idle runners: the pool's own, and machines kept for another job still queued (the sweep asks
+        // GitHub of that job; they count all the same).
+        let mut idle: std::collections::BTreeMap<String, Vec<(String, Job)>> = warm.iter().map(|w| (w.label.clone(), vec![])).collect();
+        // (A label whose runner failed to start lately starts none for a while: what failed would fail again.)
+        let mut failing = std::collections::BTreeSet::new();
+        for (key, j) in live {
+            if j.warm && j.state == "failed" && j.ended_ms.is_some_and(|e| now.saturating_sub(e) < 10 * 60_000) { failing.insert(j.label.clone()); }
+            if pooled(&j) || (active(&j) && !j.seen_in_progress && j.for_job.is_some() && j.provider.is_empty()) { idle.entry(j.label.clone()).or_default().push((key, j)) }
+        }
+        let mut up = 0;
+        for (label, mut runners) in idle {
+            let want = warm.iter().find(|w| w.label == label);
+            let count = want.map_or(0, |w| w.count) as usize;
+            // (The newest first: the oldest go first.)
+            runners.sort_by_key(|(_, j)| std::cmp::Reverse(j.launched_ms.unwrap_or(j.at_ms)));
+            let mut kept = 0;
+            for (key, mut j) in runners {
+                if !pooled(&j) { kept += 1; continue }
+                let age = now.saturating_sub(j.launched_ms.unwrap_or(j.at_ms));
+                // (Never longer than its machine may live: it ends by itself then.)
+                let idle_ms = want.map_or(0, |w| w.idle_minutes).min(self.machine_minutes(&j.cloud)) as u64 * 60_000;
+                match j.state.clone().as_str() {
+                    // Its start left it no machine: a warm runner does not wait for room, the next sweep asks again.
+                    "waiting" => { self.unpool(&key, &mut j, now).await?; continue }
+                    // Its start cut off midway (as the sweep says of a job's).
+                    "launching" if age > 120_000 => {
+                        self.stop_machine(plane_url, &j).await;
+                        self.withdraw_runner(&j).await;
+                        self.unpool(&key, &mut j, now).await?;
+                        continue
+                    }
+                    "launching" => {}
+                    // (A spot machine AWS took back is gone already. One GitHub will not take back was just given a job: kept.)
+                    _ => if (kept >= count || age > idle_ms || j.interrupted) && self.retire(plane_url, &key, &mut j).await? { continue },
+                }
+                kept += 1;
+                up += 1;
+            }
+            let Some(want) = want.filter(|_| kept < count && !failing.contains(&label)) else { continue };
+            // What its runners register with: the newest job with the label that was given a machine (one that passed
+            // what a public repository's jobs are held to). None yet: none is started.
+            let Some(from) = self.newest_jobs(NEWEST_KEPT).await?.into_iter().find(|j| j.label == label && j.provider.is_empty() && j.launched_ms.is_some()) else { continue };
+            let Some(Ok(spec)) = self.config.parse(&label) else { continue };
+            let spec = spec.or(&self.config.machine);
+            for n in kept..want.count as usize {
+                if !matches!(self.place(&spec, false, false, false, &[]).await?, Placement::Run(_)) { break }
+                let mut w = Job { job_id: WARM_IDS | (now << 8) | (n as u64 & 0xff), repo: from.repo.clone(), state: "launching".into(), at_ms: now, installation_id: from.installation_id,
+                    label: label.clone(), app_id: from.app_id, warm: true, began: true, ..Default::default() };
+                let key = job_key(&w);
+                if !self.store.put_if_absent(&key, crate::io::json(&w)).await? { break }
+                self.index_claim(&key, &w).await?;
+                self.start_soon(plane_url, &mut w).await?;
+                // (No room after all: nothing to keep. A start that failed is kept, and holds the label's next ones back.)
+                if w.state == "waiting" { self.unpool(&key, &mut w, now).await?; break }
+                if w.state == "failed" { break }
+                up += 1;
+            }
+        }
+        Ok(up)
+    }
+
+    /// A warm pool's idle runner ended (see `warm_up`): taken back from GitHub first, which refuses while it runs a job
+    /// it was given a moment ago, then its machine. Over as done: its job, if it had one, ran on another runner.
+    /// Whether it was.
+    async fn retire(&self, plane_url: &str, key: &str, j: &mut Job) -> Result<bool> {
+        if !self.take_back(plane_url, j).await { return Ok(false) }
+        (j.state, j.for_job) = ("done".into(), None);
+        self.keep(key, j).await?;
+        Ok(true)
+    }
+
+    /// A warm pool's record left with no machine: a stand-in that holds nothing (no machine, no cost) goes, unlisted
+    /// as it was; any other is over, as done.
+    async fn unpool(&self, key: &str, j: &mut Job, now: u64) -> Result<()> {
+        if j.warm && j.machine_id.is_none() && job_usd(j, now) == 0.0 {
+            self.store.delete(key).await?;
+            return self.store.delete(&format!("live:{}", key.trim_start_matches("job:"))).await
+        }
+        (j.state, j.for_job) = ("done".into(), None);
+        j.ended_ms.get_or_insert(now);
+        self.keep(key, j).await
     }
 
     /// A part of the working tree a run from a computer is started with (a gzipped tar, cut in parts of a few MB),
@@ -5297,6 +5431,8 @@ impl<'a> ControlPlane<'a> {
         // GitHub's jobs that still wait as far as it has said (with the runners that can take them), and the jobs
         // that machines still coming are for.
         let (mut queued, mut aimed): (Vec<(String, u64, String)>, Vec<u64>) = (vec![], vec![]);
+        // (Whether a warm pool's runner is among them: its label may no longer be kept warm.)
+        let mut pool = !self.config.routing.warm.is_empty();
         for (_, j) in &kept {
             if !j.provider.is_empty() { continue }
             if ["launching", "launched"].contains(&j.state.as_str()) && !j.seen_in_progress { aimed.push(j.for_job.unwrap_or(j.job_id)) }
@@ -5306,6 +5442,9 @@ impl<'a> ControlPlane<'a> {
         for (key, mut j) in kept {
             // Nothing more to do for it (time has passed since it was written): no longer among the live ones.
             if self.indexed().await && !needs_care(&j, now) { self.store.delete(&format!("live:{}", key.trim_start_matches("job:"))).await?; continue }
+            // A warm pool's idle runner is the pool's to see to, below: what follows asks GitHub of the job a machine is
+            // for, and these are for none.
+            if pooled(&j) { pool = true; continue }
             // Waiting for room: try again (GitHub keeps a job queued for up to a day). As it stands now, not as it
             // was listed a moment ago: it may have been cancelled, or started by another request, since.
             if j.state == "waiting" {
@@ -5511,6 +5650,8 @@ impl<'a> ControlPlane<'a> {
             self.settle(&plane_url, &mut j).await;
             self.keep(&key, &j).await?;
         }
+        // (After the machines above: one ended there is room for a warm runner.)
+        if pool { active += self.warm_up(&plane_url, now).await? }
         self.sweep_gitlab_runners(now).await?;
         // Notes that only matter for a while: spot interruptions (counted for the pause), jobs asked to run again and
         // not arrived.

@@ -46,6 +46,8 @@ const HELP: &[(&str, &str, &str)] = &[
         "Public repositories allowed to run here. Jobs from public repositories are refused unless the repository is allowed.\nEven then, a fork's pull request and `pull_request_target` runs are refused."),
     ("runner_images", "  superci runner_images list\n  superci runner_images create NAME --reference=REGISTRY/IMAGE:TAG [--modal-secret=SECRET]\n  superci runner_images update NAME [--reference=REGISTRY/IMAGE:TAG] [--modal-secret=SECRET|--modal-secret=]\n  superci runner_images delete NAME",
         "Images of your own for jobs on Modal, with a repository's tools in them already: a job names one by its name in its\nlabel (`runs-on: superci/image=NAME`) and its sandbox starts from it in place of GitHub's runner image. Other providers\nrefuse such a job, saying why. A label is split at each /, so it says the name; the control plane keeps the address.\n\ncreate    NAME: 2 to 32 lowercase letters, digits and dashes (not beginning with ubuntu). --reference: where the image\n          is, as `docker pull` takes it. Make it FROM ghcr.io/actions/actions-runner: GitHub's runner\n          (/home/runner/run.sh) starts the job, and a job whose image has none fails, saying so. Modal keeps an\n          image by its address and does not fetch a tag pushed again: give each build a tag of its own, or its\n          digest (…@sha256:…). A public image needs nothing more. For a private registry, --modal-secret names a\n          Secret with REGISTRY_USERNAME and REGISTRY_PASSWORD (for ghcr.io, a token that reads packages), in each\n          Modal workspace that runs jobs (each reads its own); only its name is kept here.\nupdate    The same name, a new --reference (a new build's tag) or --modal-secret (empty: none), in one change:\n          a job that names it starts from the new image, and none finds the name missing meanwhile. What it does\n          not say stays as it is. A name there is not is refused.\ndelete    Jobs that still name it fail, saying so."),
+    ("warm", "  superci warm list\n  superci warm set LABEL --count=N [--idle-minutes=M]\n  superci warm delete LABEL",
+        "Runners kept registered and idle for a label, so that a job with exactly that label (`runs-on: superci/cpu=4`) starts\nat once instead of waiting for its machine. Each is a machine like a job's: it counts toward the jobs at once and the\nlimits, and what it costs is in the spend. A label is kept warm once a job with it has run here.\n\nlist      Each label kept warm, and how many of its runners are idle or starting now.\nset       LABEL: as a workflow's runs-on says it. --count: how many to keep (1 to 100). --idle-minutes: one idle\n          this long is ended and another started in its place (30 unless set, 1 to 360).\ndelete    Its warm runners are ended at the next sweep (one that has just been given a job runs it first)."),
     ("connections", "  superci connections list\n  superci connections create github OWNER [--host=https://github.example.com]\n  superci connections create gitlab --url=https://gitlab.com [--gitlab=ID|new]\n  superci connections delete github OWNER --confirm\n  superci connections delete gitlab [ID] --confirm",
         "Where jobs come from: the GitHub accounts and the GitLabs connected.\n\nlist      Each GitHub account with where its App is installed, and each GitLab.\ncreate    github: opens GitHub in the browser, where a person creates the App for OWNER (an organization, or your\n          own name) and chooses its repositories. GitHub offers that nowhere else. It ends when the App is\n          installed. --host: a GitHub Enterprise Server, or GitHub Enterprise Cloud with data residency.\n          gitlab: the token is read from SUPERCI_GITLAB_TOKEN (--token-env=NAME for another variable): a project,\n          group or personal access token with the scopes api, create_runner and manage_runner. It goes to your\n          control plane and is not kept on this machine. --gitlab=new: a further connection beside the first.\ndelete    github: a further organization; its App is uninstalled and forgotten (the first one goes with\n          `superci leave`). gitlab: its projects stop sending jobs here, and its token is forgotten."),
     ("deliveries", "  superci deliveries list\n  superci deliveries retrieve ID",
@@ -117,7 +119,7 @@ Workspaces:
 {FLAGS}
 SuperCI keeps its own sign-ins in ~/.superci (SUPERCI_HOME to put it elsewhere), by workspace, and reads no other
 tool's. On a machine with no browser, a sign-in can be given by name: SUPERCI_CLOUDFLARE_TOKEN, SUPERCI_MODAL_TOKEN_ID and
-SUPERCI_MODAL_TOKEN_SECRET.", group(&["dashboard", "login", "logout", "status"]), group(&["jobs", "runs", "secrets", "artifacts", "usage"]), group(&["planes"]), group(&["runners", "accounts", "images", "runner_images", "labels", "name", "machine", "limits", "caches"]),
+SUPERCI_MODAL_TOKEN_SECRET.", group(&["dashboard", "login", "logout", "status"]), group(&["jobs", "runs", "secrets", "artifacts", "usage"]), group(&["planes"]), group(&["runners", "accounts", "images", "runner_images", "warm", "labels", "name", "machine", "limits", "caches"]),
                 group(&["connections", "deliveries", "projects", "public_repos"]), group(&["keys"]), group(&["workspaces"]), group(&["leave"]))
         }
     }
@@ -1455,6 +1457,32 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             apply!(d, args, format!("forget the image {}: jobs that name it fail", w(2)), "/routing", &[field("action", "image_remove"), field("name", w(2))]);
             Ok(Done::said(format!("{} is no longer an image here.", w(2))))
         }
+        ("warm", "list") => {
+            let v = view(&mut signed_in())?;
+            let warm = v.routing().warm;
+            let idle = |label: &str| v.status.as_ref().and_then(|s| s["warm_idle"][label].as_u64()).unwrap_or(0);
+            let said = if warm.is_empty() { vec![format!("No label is kept warm. Keep one: `superci warm set {}/cpu=4 --count=2`.", v.label())] }
+                else { warm.iter().map(|w| format!("{}  {} kept idle, {} idle or starting now; one idle {} minutes is replaced", w.label, w.count, idle(&w.label), w.idle_minutes)).collect() };
+            Ok(Done { said, data: json!({ "warm": warm.iter().map(|w| json!({ "label": w.label, "count": w.count, "idle_minutes": w.idle_minutes, "idle": idle(&w.label) })).collect::<Vec<_>>() }) })
+        }
+        ("warm", "set") => {
+            let Some(count) = args.get("count").filter(|_| !w(2).is_empty()) else { return usage("Say which and how many: `superci warm set LABEL --count=N`.") };
+            if !count.parse::<u32>().is_ok_and(|n| (1..=100).contains(&n)) { return usage("--count is how many runners to keep idle: 1 to 100.") }
+            let idle = args.get("idle-minutes").unwrap_or_default();
+            if !idle.is_empty() && !idle.parse::<u32>().is_ok_and(|m| (1..=360).contains(&m)) { return usage("--idle-minutes is how long a warm runner idles before another takes its place: 1 to 360.") }
+            let minutes = if idle.is_empty() { superci_core::plane::WARM_IDLE_MINUTES.to_string() } else { idle.to_string() };
+            let mut d = ready_to_set()?;
+            in_use(&d)?;
+            apply!(d, args, format!("keep {count} runners idle for {}, each replaced after {minutes} idle minutes", w(2)), "/routing", &[field("action", "warm_set"), field("label", w(2)), field("count", count), field("idle_minutes", idle)]);
+            Ok(Done::said(format!("{count} runners are kept idle for `runs-on: {}`; one idle {minutes} minutes is replaced.", w(2))))
+        }
+        ("warm", "delete") => {
+            if w(2).is_empty() { return usage("Say which: `superci warm delete LABEL`.") }
+            let mut d = ready_to_set()?;
+            in_use(&d)?;
+            apply!(d, args, format!("keep no runners idle for {}: those there are ended", w(2)), "/routing", &[field("action", "warm_remove"), field("label", w(2))]);
+            Ok(Done::said(format!("No runner is kept idle for {} now: those there are ended at the next sweep.", w(2))))
+        }
         ("public_repos", operation @ ("create" | "delete")) => {
             let action = if operation == "create" { "add" } else { "remove" };
             if w(2).is_empty() { return usage(format!("Say which: `superci public_repos {operation} OWNER/REPO`.")) }
@@ -1975,7 +2003,7 @@ mod tests {
             "superci runners list", "superci runners create", "superci runners update CLOUD", "superci runners order", "superci runners delete CLOUD", "superci labels list", "superci labels create NAME", "superci labels delete NAME", "superci machine retrieve", "superci machine update", "superci limits retrieve", "superci limits update",
             "superci planes list", "superci planes create", "superci planes update", "superci planes move ID", "superci planes allow", "superci planes delete ID", "superci leave --confirm", "superci connections list", "superci connections create github OWNER", 
             "superci deliveries list", "superci deliveries retrieve ID", "superci connections create gitlab", "superci connections delete github OWNER", "superci connections delete gitlab", "superci projects list", "superci projects update", "superci public_repos list", "superci public_repos create", "superci public_repos delete",
-            "superci runner_images list", "superci runner_images create NAME", "superci runner_images update NAME", "superci runner_images delete NAME", "superci accounts list", "superci accounts retrieve aws", "superci deliveries list", "superci projects update PROJECT_ID",
+            "superci runner_images list", "superci runner_images create NAME", "superci runner_images update NAME", "superci runner_images delete NAME", "superci warm list", "superci warm set LABEL --count=N", "superci warm delete LABEL", "superci accounts list", "superci accounts retrieve aws", "superci deliveries list", "superci projects update PROJECT_ID",
             "superci workspaces list", "superci workspaces create NAME", "superci workspaces update ID --id=NEW", "superci workspaces delete ID --confirm"] {
             assert!(all.contains(command), "{command}");
         }
@@ -2004,7 +2032,7 @@ mod tests {
         for line in ["status", "jobs list", "jobs retrieve 7", "runs list", "runs retrieve 7", "deliveries list", "deliveries retrieve 7", "keys list", "keys create agent", "keys delete agent", "runners list", "labels list", "labels create acmeci", "name retrieve", "name update AcmeCI", "connections list", "planes list", "public_repos list", "machine retrieve", "machine update --cpu=8",
             "planes update", "planes create modal", "planes create aws --region=us-east-1", "runners create aws", "runners order aws", "runners update aws --max-jobs=3", "limits retrieve", "limits update --max-cpu=8", "limits update --max-hours 12",
             "public_repos create acme/site", "public_repos delete acme/site", "projects list", "projects update 7 --enabled=true", "projects update --all --enabled=true", "planes allow", "planes move abcdef123456",
-            "planes update --dry-run", "runners create cloudflare --dry-run", "runner_images list", "runner_images create rust-ci --reference=ghcr.io/acme/ci:1", "runner_images update rust-ci --reference=ghcr.io/acme/ci:2", "runner_images update rust-ci --modal-secret=", "runner_images delete rust-ci"] {
+            "planes update --dry-run", "runners create cloudflare --dry-run", "runner_images list", "runner_images create rust-ci --reference=ghcr.io/acme/ci:1", "runner_images update rust-ci --reference=ghcr.io/acme/ci:2", "runner_images update rust-ci --modal-secret=", "runner_images delete rust-ci", "warm list", "warm set superci/cpu=4 --count=2", "warm set superci --count=1 --idle-minutes=10", "warm delete superci/cpu=4"] {
             assert_eq!(run(line), signed_out, "{line}");
         }
         for line in ["planes delete abcdef123456", "leave", "runners delete aws", "labels delete superci", "connections delete github acme", "connections delete gitlab"] {
@@ -2013,7 +2041,7 @@ mod tests {
             assert_eq!(run(&format!("{line} --dry-run")), signed_out, "{line}: a dry run checks the sign-in too");
         }
         for (line, says) in [("runners create gcp", "Say which: `superci runners create aws`"), ("planes create", "Say where: `superci planes create aws"), ("planes create aws", "Say where: --region"), ("planes move", "Say where to:"), ("planes delete", "Say which:"),
-            ("runners order", "Say the order:"), ("public_repos create", "Say which:"), ("runner_images create rust-ci", "Say which and where:"), ("runner_images create --reference=ghcr.io/acme/ci:1", "Say which and where:"), ("runner_images delete", "Say which:"), ("runner_images update rust-ci", "Say which and what:"), ("runner_images update --reference=ghcr.io/acme/ci:2", "Say which and what:"),
+            ("runners order", "Say the order:"), ("public_repos create", "Say which:"), ("runner_images create rust-ci", "Say which and where:"), ("runner_images create --reference=ghcr.io/acme/ci:1", "Say which and where:"), ("runner_images delete", "Say which:"), ("warm set superci", "Say which and how many:"), ("warm set --count=2", "Say which and how many:"), ("warm set superci --count=0", "--count is how many"), ("warm set superci --count=2 --idle-minutes=0", "--idle-minutes is how long"), ("warm delete", "Say which:"), ("warm frob", "`frob` is not an operation of `superci warm`."), ("runner_images update rust-ci", "Say which and what:"), ("runner_images update --reference=ghcr.io/acme/ci:2", "Say which and what:"),
             ("runner_images update rust-ci --reference=https://ghcr.io/acme/ci", "Check the image's address:"), ("runner_images update rust-ci --modal-secret=a!secret", "Check the Modal Secret's name:"), ("connections create gitlab", "Give the GitLab token by name: SUPERCI_GITLAB_TOKEN"), ("connections create gitlab --token-env MY_TOKEN", "Give the GitLab token by name: MY_TOKEN"),
             ("jobs retrieve", "Say which: `superci jobs retrieve ID`"), ("runs retrieve", "Say which: `superci runs retrieve ID`"), ("jobs retrieve seven", "Say which: `superci jobs retrieve ID`"), ("keys create", "Give it a name:"), ("keys delete", "Say which:"), ("name update", "Say what to call it:"), ("keys create agent --days soon", "--days is a number"),
             ("projects update 7", "Say which way:"), ("projects update --all --enabled=false", "Projects are switched off one at a time"),
