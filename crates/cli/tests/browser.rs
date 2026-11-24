@@ -8646,8 +8646,8 @@ fn aws_connected_by_the_stacks_report_only_once_its_role_sees_the_image_and_neve
 /// The upkeep, for jobs left midway: a start cut off before any machine is placed again; a job that waits with what
 /// an earlier machine left on its record gets a runner of its own name again. Machines left by jobs over are ended
 /// and their runners withdrawn where that can be: a GitLab one whose connection is gone, or that GitLab would not
-/// remove (kept, for the next sweep), a GitHub one of an App not here any more, of an installation GitHub gives no
-/// token for, or with no runner's name kept: each forgotten here all the same.
+/// remove (kept, for the next sweep), or a GitHub one GitHub took back. One of an App not here any more, or of an
+/// installation GitHub gives no token for, is not known to run nothing: left until its time is up.
 #[test]
 fn the_upkeep_places_again_what_was_cut_off_and_forgets_machines_left_whatever_their_runners_say() {
     let served = serve(|_| {});
@@ -8683,7 +8683,8 @@ fn the_upkeep_places_again_what_was_cut_off_and_forgets_machines_left_whatever_t
     let job = |key: &str| served.store.under(key).into_iter().find(|(k, _)| k == key).map(|(_, j)| j).unwrap_or_default();
     assert!(job("job:88")["state"] == "launched" && job("job:88")["retries"] == 1, "{}", job("job:88"));
     assert!(job("job:89")["state"] == "launched" && job("job:89")["runner_id"] != 12345 && job("job:89")["machine_id"] != "m-before", "{}", job("job:89"));
-    for key in ["job:glggone-1", "job:gl3", "job:4", "job:5", "job:6"] { assert_eq!(job(key)["state"], "swept", "{key}: {}", job(key)) }
+    for key in ["job:glggone-1", "job:gl3", "job:6"] { assert_eq!(job(key)["state"], "swept", "{key}: {}", job(key)) }
+    for key in ["job:4", "job:5"] { assert_eq!(job(key)["state"], "orphan", "{key}: {}", job(key)) }
     assert!(!served.store.under("glrunner:66").is_empty(), "GitLab would not remove it: kept");
 }
 
@@ -16809,13 +16810,13 @@ fn a_jobs_end_is_settled_for_each_way_its_record_stands_and_said_on_its_page() {
     edit(w2, &|j| { j["state"] = "waiting".into(); for k in ["machine_id", "runner", "runner_id"] { j.as_object_mut().unwrap().remove(k); } });
     edit(l2, &|j| { j["state"] = "launching".into(); });
     for id in [w2, l2] { let _ = served.github.start_on(id, &host_runner); assert!(served.webhook(served.github.finish(id, "success", "ok", now)) < 300); }
-    // Seen running, then cancelled with no runner; its runner kept by GitHub (taken back refused): left idle.
+    // Seen running, then cancelled with no runner; its runner kept by GitHub (taken back refused: it runs a job): running.
     let (seen, kept_runner) = (job("seen, cancelled"), job("runner kept"));
     edit(seen, &|j| { j["seen_in_progress"] = true.into(); });
     served.github.fail("DELETE", &format!("/runners/{}", state(kept_runner)["runner_id"]), 422, "Runner is still running a job");
     for id in [seen, kept_runner] { assert!(served.webhook(served.github.cancel(id, now)) < 300) }
     served.github.fail_none();
-    assert_eq!(state(kept_runner)["state"], "orphan", "{}", state(kept_runner));
+    assert_eq!(state(kept_runner)["state"], "running", "{}", state(kept_runner));
     // The same end said twice: nothing more.
     assert!(served.webhook(served.github.cancel(again, now)) < 300);
     // A job not known here ended on a runner of ours.

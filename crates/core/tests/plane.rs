@@ -3257,6 +3257,84 @@ fn a_machine_running_another_jobs_work_is_not_ended_when_its_own_job_ends_first(
     assert_eq!((job(&store, 9)["state"].as_str(), stopped(9)), (Some("done"), 1));
 }
 
+/// Two jobs of one label, each run on the other's runner (GitHub gives a waiting job to any idle runner with its label),
+/// their events delivered in every order, each one twice at every later point, and each start's event never, a sweep
+/// after each, minutes apart. GitHub answers as things are: a runner busy until its job's end has been sent, then gone.
+/// Whatever the order: no machine is ended while its runner runs a job, every machine started is ended by the last
+/// sweep, and both jobs end done.
+#[test]
+fn two_jobs_on_each_others_runners_end_right_whatever_order_their_events_come_in() {
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Ev { Queued(u64), Began(u64), Ended(u64) }
+    fn orders<T: Clone>(items: &[T]) -> Vec<Vec<T>> {
+        if items.is_empty() { return vec![vec![]] }
+        (0..items.len()).flat_map(|i| { let mut rest = items.to_vec(); let first = rest.remove(i); orders(&rest).into_iter().map(move |mut o| { o.insert(0, first.clone()); o }) }).collect()
+    }
+    let runner = |id: u64| format!("superci-{PLANE_ID}-{id}");
+    let ran_on = |job: u64| runner(if job == 7 { 8 } else { 7 });
+    let mut all: Vec<Vec<Ev>> = vec![];
+    for order in orders(&[Ev::Began(7), Ev::Began(8), Ev::Ended(7), Ev::Ended(8)]) {
+        all.push(order.clone());
+        for (i, e) in order.iter().enumerate() { for at in i + 1..=order.len() { let mut again = order.clone(); again.insert(at, *e); all.push(again) } }
+        for e in [Ev::Queued(7), Ev::Queued(8)] { for at in 0..=order.len() { let mut again = order.clone(); again.insert(at, e); all.push(again) } }
+        for lost in [Ev::Began(7), Ev::Began(8)] { all.push(order.iter().copied().filter(|e| *e != lost).collect()) }
+    }
+    let the_app = app();
+    for order in &all {
+        let (ended, removed) = (RefCell::new(std::collections::BTreeSet::<u64>::new()), RefCell::new(std::collections::BTreeSet::<u64>::new()));
+        // Job 7's runner (registered first: 5) runs job 8 until job 8's end is sent; job 8's (101) runs job 7. Any other is idle.
+        let busy = |id: u64| match id { 5 => !ended.borrow().contains(&8), 101 => !ended.borrow().contains(&7), _ => false };
+        let clouds = With(FakeClouds::default(), |r: &Request, _: &str| {
+            if let Some(job) = r.url.strip_prefix("https://api.github.com/repos/acme/app/actions/jobs/").and_then(|j| j.parse::<u64>().ok()) {
+                let said = if ended.borrow().contains(&job) { serde_json::json!({ "status": "completed", "conclusion": "success", "runner_name": ran_on(job) }) } else { serde_json::json!({ "status": "in_progress", "runner_name": ran_on(job) }) };
+                return Some(Response::new(200, "application/json", said.to_string()))
+            }
+            let id = r.url.strip_prefix("https://api.github.com/orgs/acme/actions/runners/")?.parse::<u64>().ok()?;
+            let known = !removed.borrow().contains(&id) && match id { 5 => !ended.borrow().contains(&8), 101 => !ended.borrow().contains(&7), _ => true };
+            Some(match r.method.as_str() {
+                _ if !known => Response::new(404, "application/json", r#"{"message":"Not Found"}"#.to_string()),
+                "GET" => Response::new(200, "application/json", serde_json::json!({ "id": id, "status": "online", "busy": busy(id) }).to_string()),
+                _ if busy(id) => Response::new(422, "application/json", r#"{"message":"Runner is still running a job"}"#.to_string()),
+                _ => { removed.borrow_mut().insert(id); Response::new(204, "application/json", String::new()) }
+            })
+        });
+        let (store, wakes, cache, own) = (Mem::default(), Wakes::default(), Cache::default(), OwnContainers::default());
+        let clock = MovingClock(std::cell::Cell::new(1_790_000_000_000));
+        let mut config = Config::new(PLANE_ID.into());
+        config.app = Some(the_app.clone());
+        config.containers = true;
+        let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
+        let run = |r: Request| { block_on(plane.handle(r)); };
+        let deliver = |e: Ev| match e {
+            Ev::Queued(j) => run(job_event("queued", j, "acme/app", None)),
+            Ev::Began(j) => run(job_event("in_progress", j, "acme/app", Some(&ran_on(j)))),
+            Ev::Ended(j) => { ended.borrow_mut().insert(j); run(concluded(j, &ran_on(j), "success")) }
+        };
+        let mut seen = 0;
+        let mut check = |at: &str| {
+            let calls = own.0.borrow();
+            for stop in calls[seen..].iter().filter_map(|c| c.strip_prefix("stop ")) {
+                let id = if stop == runner(7) { 5 } else if stop == runner(8) { 101 } else { 0 };
+                assert!(!busy(id), "{order:?}, {at}: {stop} ended while its runner runs a job");
+            }
+            seen = calls.len();
+        };
+        for e in [Ev::Queued(7), Ev::Queued(8)].iter().chain(order) {
+            deliver(*e);
+            check(&format!("{e:?}"));
+            clock.0.set(clock.0.get() + 4 * 60_000);
+            block_on(plane.alarm()).unwrap();
+            check(&format!("the sweep after {e:?}"));
+        }
+        for _ in 0..2 { clock.0.set(clock.0.get() + 4 * 60_000); block_on(plane.alarm()).unwrap(); check("a last sweep") }
+        let calls = own.0.borrow();
+        let started: std::collections::BTreeSet<&str> = calls.iter().filter_map(|c| c.strip_prefix("start ")?.split(' ').next()).collect();
+        let stopped: std::collections::BTreeSet<&str> = calls.iter().filter_map(|c| c.strip_prefix("stop ")).collect();
+        assert!(started.is_subset(&stopped), "{order:?}: left up {:?}", started.difference(&stopped).collect::<Vec<_>>());
+        for id in [7, 8] { assert_eq!((job(&store, id)["state"].as_str(), job(&store, id)["conclusion"].as_str()), (Some("done"), Some("success")), "{order:?}: {}", job(&store, id)) }
+    }
+}
+
 /// The sweep's other ends of a machine nobody seems to wait for: none while its runner runs a job. Job 12's record went
 /// on to another machine (written over by a request that read it before) while the index of the runner it had still
 /// names it: that runner's end is no end of the record's machine. Job 11's machine took a job whose events never came,
@@ -5304,7 +5382,9 @@ fn jobs_kept_before_their_indexes_are_indexed_once_and_each_job_is_counted_in_it
     assert_eq!(after["usage"]["day"]["jobs"], before["usage"]["day"]["jobs"]);
     assert_eq!(after["usage"]["week"]["billed_minutes"], before["usage"]["week"]["billed_minutes"]);
     assert_eq!(after["jobs"].as_array().unwrap().iter().map(|j| j["job_id"].as_u64().unwrap()).collect::<Vec<_>>(), [4, 2, 1, 3], "the newest first");
-    let today = |k: &str| serde_json::from_str::<serde_json::Value>(&store.0.borrow()[&format!("day:{:06}", t / 86_400_000)]).unwrap()["spend"][k].as_f64();
+    // (A day's totals are kept in a few records, added up.)
+    let today = |k: &str| superci_core::plane::day_keys(t / 86_400_000).iter().filter_map(|d| store.0.borrow().get(d).cloned())
+        .map(|v| serde_json::from_str::<serde_json::Value>(&v).unwrap()["spend"][k].as_f64()).reduce(|a, b| Some(a.unwrap_or(0.0) + b.unwrap_or(0.0))).flatten();
     assert!((today("aws").unwrap() - 0.15).abs() < 1e-9, "the two over today, counted once: {:?}", today("aws"));
     block_on(plane.alarm()).unwrap();
     assert!((today("aws").unwrap() - 0.15).abs() < 1e-9, "not again at the next sweep");
@@ -7807,10 +7887,12 @@ fn warm_runners_keep_to_the_limits_and_go_with_their_label_each_machine_counted_
     machines.sort();
     started.sort();
     assert_eq!(machines, started);
-    let day: superci_core::plane::Day = serde_json::from_str(&store.0.borrow()[&superci_core::plane::day_key(now / 86_400_000)]).unwrap();
-    let (spent, cost): (f64, f64) = (day.spend.values().sum(), records.iter().map(|j| superci_core::plane::job_usd(j, now)).sum());
+    // (A day's totals are kept in a few records, added up.)
+    let days: Vec<superci_core::plane::Day> = superci_core::plane::day_keys(now / 86_400_000).iter().filter_map(|k| store.0.borrow().get(k).map(|v| serde_json::from_str(v).unwrap())).collect();
+    let (spent, cost): (f64, f64) = (days.iter().flat_map(|d| d.spend.values()).sum(), records.iter().map(|j| superci_core::plane::job_usd(j, now)).sum());
     assert!(records.iter().all(superci_core::plane::over) && cost > 0.0 && (spent - cost).abs() < 1e-9, "{spent} {cost}");
-    assert_eq!((day.hours.iter().map(|h| h.jobs).sum::<u64>(), day.hours.iter().map(|h| h.ran).sum::<u64>()), (1, 1), "job 7 alone: a stand-in is no job");
+    let hours = || days.iter().flat_map(|d| d.hours.iter());
+    assert_eq!((hours().map(|h| h.jobs).sum::<u64>(), hours().map(|h| h.ran).sum::<u64>()), (1, 1), "job 7 alone: a stand-in is no job");
 }
 
 #[test]
@@ -8210,6 +8292,8 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
     // (Each test of this file is in it but those that already step through every point of a flow themselves.)
     let stepping = ["a_job_cancelled_at_any_step_of_its_start_or_of_a_sweep_leaves_no_machine_and_stays_cancelled", "a_job_that_begins_at_any_step_of_a_sweep_keeps_its_machine",
         "a_job_that_runs_and_ends_at_any_step_of_a_sweep_stays_done", "a_gitlab_job_cancelled_at_any_step_of_its_start_leaves_no_machine_and_no_runner", "every_test_here_holds_with_each_call_and_store_operation_failing",
+        // (And one that steps through every order of its events.)
+        "two_jobs_on_each_others_runners_end_right_whatever_order_their_events_come_in",
         // (And one that measures, over a thousand jobs: a fault would only make it slower.)
         "a_busy_request_costs_the_same_however_many_jobs_are_kept_and_fits_what_waits_for_it"];
     let all: Vec<&str> = include_str!("plane.rs").split("#[test]\nfn ").skip(1).filter_map(|t| t.split('(').next()).collect();

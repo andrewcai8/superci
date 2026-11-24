@@ -50,22 +50,58 @@ fn own_credentials() -> Credentials {
 /// What DynamoDB says when a call may be made again: too much at once, or a passing fault of its own.
 const AGAIN: [&str; 6] = ["ThrottlingException", "ProvisionedThroughputExceededException", "RequestLimitExceeded", "InternalServerError", "ServiceUnavailable", "HTTP 5"];
 
-/// State in one DynamoDB table: each kind of record in a partition of its own (`p`: the key up to its first colon,
-/// `job` for `job:1717`), the key itself as the sort key (`k`), the record as text (`v`), and its end in seconds (`x`,
-/// the table's time to live) when it has one. Before 0.19.0 every record was in the one partition `s`: until those
-/// are moved (`migrate`, a little at each sweep; then `layout` says so), what is not found in its own is looked for
-/// there too.
-struct Dynamo<'a> { http: &'a dyn Http, table: String, region: String, old: std::cell::Cell<Option<bool>> }
+/// State in one DynamoDB table: the record as text (`v`) under its key (`k`, the sort key) in a partition (`p`), and its
+/// end in seconds (`x`, the table's time to live) when it has one. A partition is its kind's, the key up to its first
+/// colon (`settings`, `day`); but one partition takes some 3,000 reads and 1,000 writes a second, so each kind every job
+/// reads and writes (`SPREAD`) is spread over `BUCKETS` of them by the key's second part (`job#07` for `job:1717`; one
+/// job's log marks, `glive:<id>:…`, in one). The layouts before are read where they kept a record until `migrate` has
+/// moved what is left, a little at each sweep (then `layout` says so): every record in the one partition `s` (before
+/// 0.19.0), then each kind whole in its own.
+struct Dynamo<'a> { http: &'a dyn Http, table: String, region: String, layout: std::cell::Cell<Option<u8>> }
 
-/// The partition a key is kept in: its kind.
-fn part(key: &str) -> &str { key.split(':').next().unwrap_or(key) }
+/// The kinds read and written for every job and every event, each spread over `BUCKETS` partitions.
+const SPREAD: [&str; 8] = ["job", "live", "recent", "runner", "hello", "shape", "glive", "cachem"];
+const BUCKETS: u32 = 16;
 
-/// Where the layout is said to be this one (once nothing is left in the old partition).
+fn kind(key: &str) -> &str { key.split(':').next().unwrap_or(key) }
+
+/// The partition a key is kept in: its kind's, or for a kind spread, the one its second part falls in (FNV-1a, folded;
+/// never to change, as a record is looked for where its key says).
+fn part(key: &str) -> String {
+    let kind = kind(key);
+    if !SPREAD.contains(&kind) { return kind.to_string() }
+    let hash = key.split(':').nth(1).unwrap_or_default().bytes().fold(0x811c_9dc5u32, |h, b| (h ^ b as u32).wrapping_mul(0x0100_0193));
+    format!("{kind}#{:02}", (hash ^ (hash >> 16)) % BUCKETS)
+}
+
+/// The partitions a prefix's records are in: one when the prefix holds its kind's second part whole (`glive:17:`), else
+/// each of its kind's.
+fn parts(prefix: &str) -> Vec<String> {
+    let kind = kind(prefix);
+    if !SPREAD.contains(&kind) || prefix.splitn(3, ':').count() == 3 { return vec![part(prefix)] }
+    (0..BUCKETS).map(|b| format!("{kind}#{b:02}")).collect()
+}
+
+/// Where a layout before this one kept a key's records (`layout` its number, see `LAYOUTS`), the newest first.
+fn older(key: &str, layout: u8) -> Vec<String> {
+    let mut at = vec![];
+    if layout < 2 && SPREAD.contains(&kind(key)) { at.push(kind(key).to_string()) }
+    if layout < 1 { at.push("s".into()) }
+    at
+}
+
+fn key_in(p: &str, k: &str) -> Value { json!({ "p": { "S": p }, "k": { "S": k } }) }
+
+/// Where the layout is said to be (once nothing is left where one before it kept records).
 const LAYOUT: &str = "layout";
+
+/// What `layout` says of each, in turn: every record in `s` (it said nothing), each kind in one partition, and this one.
+const LAYOUTS: [&str; 3] = ["", "kinds", "spread"];
 
 impl Dynamo<'_> {
     /// One call, asked again when DynamoDB says to (throttled, or a passing error of its own), as AWS's own SDKs do:
-    /// up to ten times, each wait twice the last at most (from 50 ms to 5 s), a random part of it.
+    /// up to ten times, each wait twice the last at most (from 50 ms to 5 s), a random part of it. Then what DynamoDB
+    /// said: an error, never an answer of nothing (what was not read is not known to be absent).
     async fn call(&self, op: &str, body: Value) -> io::Result<Value> {
         let (mut most_ms, mut tries) = (50u64, 0);
         loop {
@@ -84,30 +120,28 @@ impl Dynamo<'_> {
         aws::json_call(self.http, "POST", &format!("https://dynamodb.{}.amazonaws.com/", self.region), &self.region, "dynamodb", Some(&format!("DynamoDB_20120810.{op}")),
             "application/x-amz-json-1.0", Some(&body), &own_credentials(), now_ms()).await
     }
-    fn key(&self, k: &str) -> Value { json!({ "p": { "S": part(k) }, "k": { "S": k } }) }
-    fn old_key(&self, k: &str) -> Value { json!({ "p": { "S": "s" }, "k": { "S": k } }) }
     fn item(&self, k: &str, value: String, until_ms: Option<u64>) -> Value {
         let mut item = json!({ "p": { "S": part(k) }, "k": { "S": k }, "v": { "S": value } });
         if let Some(until) = until_ms { item["x"] = json!({ "N": (until / 1000).to_string() }) }
         item
     }
-    /// Whether records may still be in the old partition (asked once per request).
-    async fn old(&self) -> io::Result<bool> {
-        if let Some(old) = self.old.get() { return Ok(old) }
-        let v = self.call("GetItem", json!({ "TableName": self.table, "Key": self.key(LAYOUT), "ConsistentRead": true })).await?;
-        let old = v["Item"]["v"]["S"].as_str() != Some("kinds");
-        self.old.set(Some(old));
-        Ok(old)
+    /// The layout this table is in (asked once per request), by its number in `LAYOUTS`.
+    async fn layout(&self) -> io::Result<u8> {
+        if let Some(layout) = self.layout.get() { return Ok(layout) }
+        let v = self.call("GetItem", json!({ "TableName": self.table, "Key": key_in(LAYOUT, LAYOUT), "ConsistentRead": true })).await?;
+        let said = v["Item"]["v"]["S"].as_str().unwrap_or_default();
+        let layout = LAYOUTS.iter().position(|l| *l == said).unwrap_or(0) as u8;
+        self.layout.set(Some(layout));
+        Ok(layout)
     }
-    async fn get_old(&self, key: &str) -> io::Result<Option<String>> {
-        if !self.old().await? { return Ok(None) }
-        let v = self.call("GetItem", json!({ "TableName": self.table, "Key": self.old_key(key), "ConsistentRead": true })).await?;
+    async fn get_at(&self, p: &str, k: &str, consistent: bool) -> io::Result<Option<String>> {
+        let v = self.call("GetItem", json!({ "TableName": self.table, "Key": key_in(p, k), "ConsistentRead": consistent })).await?;
         Ok(v["Item"]["v"]["S"].as_str().map(str::to_string))
     }
-    async fn query(&self, partition: &str, prefix: &str, last: Option<usize>) -> io::Result<Vec<(String, String)>> {
+    async fn query(&self, partition: &str, prefix: &str, last: Option<usize>, consistent: bool) -> io::Result<Vec<(String, String)>> {
         let (mut out, mut start) = (vec![], Value::Null);
         loop {
-            let mut q = json!({ "TableName": self.table, "KeyConditionExpression": "p = :p AND begins_with(k, :k)", "ExpressionAttributeValues": { ":p": { "S": partition }, ":k": { "S": prefix } }, "ConsistentRead": true });
+            let mut q = json!({ "TableName": self.table, "KeyConditionExpression": "p = :p AND begins_with(k, :k)", "ExpressionAttributeValues": { ":p": { "S": partition }, ":k": { "S": prefix } }, "ConsistentRead": consistent });
             if let Some(n) = last { q["ScanIndexForward"] = false.into(); q["Limit"] = (n - out.len()).into() }
             if !start.is_null() { q["ExclusiveStartKey"] = start }
             let v = self.call("Query", q).await?;
@@ -124,101 +158,142 @@ impl Dynamo<'_> {
     async fn put_when(&self, put: Value) -> io::Result<bool> {
         match self.call("PutItem", put).await { Ok(_) => Ok(true), Err(e) if e.starts_with("ConditionalCheckFailedException") => Ok(false), Err(e) => Err(e) }
     }
+    /// Every record under a prefix, by key: where a layout before kept them first, the oldest first, then their own
+    /// partitions (one moved between two of these reads is read in its own, and its own copy is the one kept).
+    async fn listed(&self, prefix: &str, consistent: bool) -> io::Result<Vec<(String, String)>> {
+        let layout = self.layout().await?;
+        let mut all = std::collections::BTreeMap::new();
+        for p in older(prefix, layout).into_iter().rev().chain(parts(prefix)) { all.extend(self.query(&p, prefix, None, consistent).await?) }
+        Ok(all.into_iter().collect())
+    }
+    /// Records by key, each looked for in its own partition first and then where a layout before kept it.
+    async fn read_many(&self, keys: &[String], consistent: bool) -> io::Result<Vec<Option<String>>> {
+        let layout = self.layout().await?;
+        let mut found: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut want: Vec<String> = keys.iter().cloned().collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+        for depth in 0.. {
+            let asked: Vec<(String, String)> = want.iter().filter_map(|k| std::iter::once(part(k)).chain(older(k, layout)).nth(depth).map(|p| (p, k.clone()))).collect();
+            if asked.is_empty() { break }
+            found.extend(self.batch(&asked, consistent).await?);
+            want.retain(|k| !found.contains_key(k));
+        }
+        // (Moved from where a layout before kept it after its own partition was read: there now.)
+        if layout < 2 && !want.is_empty() {
+            let asked: Vec<(String, String)> = want.iter().map(|k| (part(k), k.clone())).collect();
+            found.extend(self.batch(&asked, consistent).await?);
+        }
+        Ok(keys.iter().map(|k| found.get(k).cloned()).collect())
+    }
+    /// Records by partition and key, a hundred at a time (DynamoDB's most): what DynamoDB leaves for later is asked
+    /// again, and what it still leaves after eight times read one by one. Not found: absent (a read DynamoDB did not
+    /// make is asked again or is an error, never taken for one).
+    async fn batch(&self, asked: &[(String, String)], consistent: bool) -> io::Result<std::collections::HashMap<String, String>> {
+        let mut found = std::collections::HashMap::new();
+        for chunk in asked.chunks(100) {
+            let mut want: Vec<Value> = chunk.iter().map(|(p, k)| key_in(p, k)).collect();
+            let mut tries = 0;
+            loop {
+                tries += 1;
+                let v = self.call("BatchGetItem", json!({ "RequestItems": { &self.table: { "Keys": want, "ConsistentRead": consistent } } })).await?;
+                for item in v["Responses"][&self.table].as_array().into_iter().flatten() {
+                    if let (Some(k), Some(val)) = (item["k"]["S"].as_str(), item["v"]["S"].as_str()) { found.insert(k.to_string(), val.to_string()); }
+                }
+                want = v["UnprocessedKeys"][&self.table]["Keys"].as_array().cloned().unwrap_or_default();
+                if want.is_empty() || tries == 8 { break }
+            }
+            for left in &want {
+                let (Some(p), Some(k)) = (left["p"]["S"].as_str(), left["k"]["S"].as_str()) else { continue };
+                if let Some(val) = self.get_at(p, k, consistent).await? { found.insert(k.to_string(), val); }
+            }
+        }
+        Ok(found)
+    }
 }
 
 #[async_trait(?Send)]
 impl Store for Dynamo<'_> {
     async fn get(&self, key: &str) -> io::Result<Option<String>> {
-        let v = self.call("GetItem", json!({ "TableName": self.table, "Key": self.key(key), "ConsistentRead": true })).await?;
-        match v["Item"]["v"]["S"].as_str() { Some(s) => Ok(Some(s.to_string())), None => self.get_old(key).await }
+        let layout = self.layout().await?;
+        let older = older(key, layout);
+        if let Some(v) = self.get_at(&part(key), key, true).await? { return Ok(Some(v)) }
+        for p in &older { if let Some(v) = self.get_at(p, key, true).await? { return Ok(Some(v)) } }
+        // (Moved from where a layout before kept it after its own partition was read: there now.)
+        if older.is_empty() { return Ok(None) }
+        self.get_at(&part(key), key, true).await
     }
     async fn put(&self, key: &str, value: String) -> io::Result<()> {
         self.call("PutItem", json!({ "TableName": self.table, "Item": self.item(key, value, None) })).await.map(|_| ())
     }
     /// Requests run in parallel here: DynamoDB's condition makes the claim atomic.
     async fn put_if_absent(&self, key: &str, value: String) -> io::Result<bool> {
-        if self.get_old(key).await?.is_some() { return Ok(false) }
+        for p in older(key, self.layout().await?) { if self.get_at(&p, key, true).await?.is_some() { return Ok(false) } }
         self.put_when(json!({ "TableName": self.table, "Item": self.item(key, value, None), "ConditionExpression": "attribute_not_exists(k)" })).await
     }
     async fn swap(&self, key: &str, was: Option<&str>, value: String) -> io::Result<bool> { self.swap_until(key, was, value, None).await }
     async fn delete(&self, key: &str) -> io::Result<()> {
-        self.call("DeleteItem", json!({ "TableName": self.table, "Key": self.key(key) })).await?;
-        if self.old().await? { self.call("DeleteItem", json!({ "TableName": self.table, "Key": self.old_key(key) })).await?; }
+        for p in std::iter::once(part(key)).chain(older(key, self.layout().await?)) { self.call("DeleteItem", json!({ "TableName": self.table, "Key": key_in(&p, key) })).await?; }
         Ok(())
     }
-    async fn list(&self, prefix: &str) -> io::Result<Vec<(String, String)>> {
-        let mut out = self.query(part(prefix), prefix, None).await?;
-        if self.old().await? {
-            let have: std::collections::HashSet<String> = out.iter().map(|(k, _)| k.clone()).collect();
-            out.extend(self.query("s", prefix, None).await?.into_iter().filter(|(k, _)| !have.contains(k)));
-            out.sort_by(|a, b| a.0.cmp(&b.0));
-        }
-        Ok(out)
-    }
+    async fn list(&self, prefix: &str) -> io::Result<Vec<(String, String)>> { self.listed(prefix, true).await }
+    /// Eventually consistent: half the price of `list`.
+    async fn list_stale(&self, prefix: &str) -> io::Result<Vec<(String, String)>> { self.listed(prefix, false).await }
     async fn put_until(&self, key: &str, value: String, until_ms: u64) -> io::Result<()> {
         self.call("PutItem", json!({ "TableName": self.table, "Item": self.item(key, value, Some(until_ms)) })).await.map(|_| ())
     }
-    /// The same for a write over what was read: only while the value is still that one. (A record still in the old
-    /// partition is written in its own, only while that one is not there yet.)
+    /// The same for a write over what was read: only while the value is still that one. (A record still where a layout
+    /// before kept it is written in its own partition, only while that one is not there yet, and goes from the older.)
     async fn swap_until(&self, key: &str, was: Option<&str>, value: String, until_ms: Option<u64>) -> io::Result<bool> {
+        let older = older(key, self.layout().await?);
+        let mut from = None;
+        if let (Some(was), false) = (was, older.is_empty()) {
+            if self.get_at(&part(key), key, true).await?.is_none() {
+                for p in &older {
+                    if let Some(v) = self.get_at(p, key, true).await? { if v == was { from = Some(p.clone()) } break }
+                }
+            }
+        }
         let mut put = json!({ "TableName": self.table, "Item": self.item(key, value, until_ms) });
-        let in_old = match was { Some(was) if self.old().await? => {
-            let here = self.call("GetItem", json!({ "TableName": self.table, "Key": self.key(key), "ConsistentRead": true })).await?;
-            here["Item"].is_null() && self.get_old(key).await?.as_deref() == Some(was)
-        } _ => false };
-        match was {
-            Some(was) if !in_old => { put["ConditionExpression"] = "v = :was".into(); put["ExpressionAttributeValues"] = json!({ ":was": { "S": was } }) }
+        match (was, &from) {
+            (Some(was), None) => { put["ConditionExpression"] = "v = :was".into(); put["ExpressionAttributeValues"] = json!({ ":was": { "S": was } }) }
             _ => put["ConditionExpression"] = "attribute_not_exists(k)".into(),
         }
         let made = self.put_when(put).await?;
-        if made && in_old { self.call("DeleteItem", json!({ "TableName": self.table, "Key": self.old_key(key) })).await?; }
+        if let (true, Some(p)) = (made, from) { self.call("DeleteItem", json!({ "TableName": self.table, "Key": key_in(&p, key) })).await?; }
         Ok(made)
     }
     async fn list_last(&self, prefix: &str, n: usize) -> io::Result<Vec<(String, String)>> {
         if n == 0 { return Ok(vec![]) }
-        if self.old().await? {
-            let mut all = self.list(prefix).await?;
-            return Ok(all.split_off(all.len().saturating_sub(n)))
-        }
-        self.query(part(prefix), prefix, Some(n)).await
+        let mut all = if older(prefix, self.layout().await?).is_empty() {
+            let mut each = vec![];
+            for p in parts(prefix) { each.extend(self.query(&p, prefix, Some(n), true).await?) }
+            each.sort_by(|a, b| a.0.cmp(&b.0));
+            each
+        } else { self.list(prefix).await? };
+        Ok(all.split_off(all.len().saturating_sub(n)))
     }
-    /// A hundred at a time (DynamoDB's most), asked again for what it leaves for later (what it still leaves after
-    /// eight times, read one by one).
-    async fn get_many(&self, keys: &[String]) -> io::Result<Vec<Option<String>>> {
-        let mut found: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        let mut left: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for chunk in keys.chunks(100) {
-            let mut want: Vec<Value> = chunk.iter().collect::<std::collections::BTreeSet<_>>().into_iter().map(|k| self.key(k)).collect();
-            let mut asked = 0;
-            loop {
-                asked += 1;
-                let v = self.call("BatchGetItem", json!({ "RequestItems": { &self.table: { "Keys": want, "ConsistentRead": true } } })).await?;
-                for item in v["Responses"][&self.table].as_array().into_iter().flatten() {
-                    if let (Some(k), Some(val)) = (item["k"]["S"].as_str(), item["v"]["S"].as_str()) { found.insert(k.to_string(), val.to_string()); }
-                }
-                want = v["UnprocessedKeys"][&self.table]["Keys"].as_array().cloned().unwrap_or_default();
-                if want.is_empty() || asked == 8 { break }
-            }
-            left.extend(want.iter().filter_map(|k| k["k"]["S"].as_str().map(str::to_string)));
-        }
-        let mut out = Vec::with_capacity(keys.len());
-        for k in keys { out.push(match found.get(k) { Some(v) => Some(v.clone()), None if left.contains(k) => self.get(k).await?, None => self.get_old(k).await? }) }
-        Ok(out)
-    }
-    /// Moves what is left in the old partition into each record's own (not over one written there since), then says
-    /// the layout is this one.
+    async fn get_many(&self, keys: &[String]) -> io::Result<Vec<Option<String>>> { self.read_many(keys, true).await }
+    /// Eventually consistent: half the price of `get_many`.
+    async fn get_many_stale(&self, keys: &[String]) -> io::Result<Vec<Option<String>>> { self.read_many(keys, false).await }
+    /// Moves what is left where a layout before kept it into each record's own partition, with its end (not over one
+    /// written there since), the oldest layout first; then says the layout is this one.
     async fn migrate(&self, budget: usize) -> io::Result<bool> {
-        if !self.old().await? { return Ok(true) }
-        let v = self.call("Query", json!({ "TableName": self.table, "KeyConditionExpression": "p = :p", "ExpressionAttributeValues": { ":p": { "S": "s" } }, "Limit": budget.max(1), "ConsistentRead": true })).await?;
-        let items = v["Items"].as_array().cloned().unwrap_or_default();
-        for item in &items {
-            let (Some(k), Some(val)) = (item["k"]["S"].as_str(), item["v"]["S"].as_str()) else { continue };
-            self.put_when(json!({ "TableName": self.table, "Item": self.item(k, val.to_string(), None), "ConditionExpression": "attribute_not_exists(k)" })).await?;
-            self.call("DeleteItem", json!({ "TableName": self.table, "Key": self.old_key(k) })).await?;
+        let layout = self.layout().await?;
+        if layout as usize == LAYOUTS.len() - 1 { return Ok(true) }
+        let from = (if layout < 1 { vec!["s".to_string()] } else { vec![] }).into_iter().chain(SPREAD.iter().map(|k| k.to_string()));
+        for p in from {
+            let v = self.call("Query", json!({ "TableName": self.table, "KeyConditionExpression": "p = :p", "ExpressionAttributeValues": { ":p": { "S": p } }, "Limit": budget.max(1), "ConsistentRead": true })).await?;
+            let items = v["Items"].as_array().cloned().unwrap_or_default();
+            for item in &items {
+                let (Some(k), true) = (item["k"]["S"].as_str(), item["v"]["S"].is_string()) else { continue };
+                let mut moved = item.clone();
+                moved["p"] = json!({ "S": part(k) });
+                self.put_when(json!({ "TableName": self.table, "Item": moved, "ConditionExpression": "attribute_not_exists(k)" })).await?;
+                self.call("DeleteItem", json!({ "TableName": self.table, "Key": key_in(&p, k) })).await?;
+            }
+            if !items.is_empty() || !v["LastEvaluatedKey"].is_null() { return Ok(false) }
         }
-        if !items.is_empty() || !v["LastEvaluatedKey"].is_null() { return Ok(false) }
-        self.put(LAYOUT, "kinds".into()).await?;
-        self.old.set(Some(false));
+        self.put(LAYOUT, LAYOUTS[LAYOUTS.len() - 1].into()).await?;
+        self.layout.set(Some((LAYOUTS.len() - 1) as u8));
         Ok(true)
     }
 }
@@ -364,7 +439,7 @@ fn main() {
         let moving = event["rawPath"].as_str().is_some_and(|p| p.starts_with("/move/"));
         let refreshed = secrets.refresh(&http, &region, &plane_id, unknown || moving);
         let config = config(&secrets, &account_id);
-        let store = Dynamo { http: &http, table: table.clone(), region: region.clone(), old: std::cell::Cell::new(None) };
+        let store = Dynamo { http: &http, table: table.clone(), region: region.clone(), layout: std::cell::Cell::new(None) };
         let later = std::cell::RefCell::new(vec![]);
         let timer = Scheduled { http: &http, store: &store, region: &region, function: &function, later: &later };
         let plane = ControlPlane { store: &store, http: &http, clock: &SystemClock, timer: &timer, config: &config, cache: &cache, containers: None };
@@ -490,7 +565,7 @@ mod tests {
         }
     }
 
-    fn store(fake: &FakeDynamo) -> Dynamo<'_> { Dynamo { http: fake, table: "superci-plane-t".into(), region: "us-east-1".into(), old: std::cell::Cell::new(None) } }
+    fn store(fake: &FakeDynamo) -> Dynamo<'_> { Dynamo { http: fake, table: "superci-plane-t".into(), region: "us-east-1".into(), layout: std::cell::Cell::new(None) } }
 
     /// Lambda taking (or refusing) the function's calls to itself; DynamoDB as above.
     #[derive(Default)]
@@ -546,13 +621,16 @@ mod tests {
     #[test]
     fn it_keeps_each_kind_of_record_in_a_partition_of_its_own_and_does_what_every_store_does() {
         let fake = FakeDynamo::default();
-        fake.items.borrow_mut().insert(("layout".into(), "layout".into()), json!({ "p": { "S": "layout" }, "k": { "S": "layout" }, "v": { "S": "kinds" } }));
+        fake.items.borrow_mut().insert(("layout".into(), "layout".into()), json!({ "p": { "S": "layout" }, "k": { "S": "layout" }, "v": { "S": "spread" } }));
         let s = store(&fake);
         block_on(s.put("job:1", "one".into())).unwrap();
         block_on(s.put("job:2", "two".into())).unwrap();
         block_on(s.put("job:3", "three".into())).unwrap();
         block_on(s.put("live:2", String::new())).unwrap();
-        assert!(fake.items.borrow().contains_key(&("job".to_string(), "job:1".to_string())) && fake.items.borrow().contains_key(&("live".to_string(), "live:2".to_string())));
+        block_on(s.put("settings", "s".into())).unwrap();
+        let held = |p: &str, k: &str| fake.items.borrow().contains_key(&(p.to_string(), k.to_string()));
+        assert!(held(&part("job:1"), "job:1") && held(&part("live:2"), "live:2") && held("settings", "settings"));
+        assert!(part("job:1").starts_with("job#") && part("glive:9:a:0001") == part("glive:9:b:0002") && parts("glive:9:") == [part("glive:9:x")] && parts("job:").len() == BUCKETS as usize);
         assert_eq!(block_on(s.get("job:2")).unwrap().as_deref(), Some("two"));
         assert_eq!(block_on(s.list("job:")).unwrap().len(), 3, "every page of it");
         assert_eq!(block_on(s.list_last("job:", 2)).unwrap().iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(), ["job:2", "job:3"]);
@@ -577,14 +655,55 @@ mod tests {
         assert_eq!(block_on(s.list("job:")).unwrap().len(), 3);
         assert!(!block_on(s.put_if_absent("job:1", "x".into())).unwrap(), "one in the old partition is there");
         assert!(block_on(s.swap("job:3", Some("three"), "tres".into())).unwrap(), "written in its own partition, the old one gone");
-        assert!(fake.items.borrow().contains_key(&("job".to_string(), "job:3".to_string())) && !fake.items.borrow().contains_key(&("s".to_string(), "job:3".to_string())));
+        assert!(fake.items.borrow().contains_key(&(part("job:3"), "job:3".to_string())) && !fake.items.borrow().contains_key(&("s".to_string(), "job:3".to_string())));
         // Moved a few at each sweep, never over what was written since; then the layout says so.
         assert!(!block_on(s.migrate(2)).unwrap());
         while !block_on(s.migrate(2)).unwrap() {}
         assert!(!fake.items.borrow().keys().any(|(p, _)| p == "s"), "nothing left in the old partition");
         assert_eq!(block_on(s.get("job:3")).unwrap().as_deref(), Some("tres"));
         assert_eq!(block_on(s.get("hello:1")).unwrap().as_deref(), Some("h"));
-        assert_eq!(fake.items.borrow()[&("layout".to_string(), "layout".to_string())]["v"]["S"], "kinds");
+        assert_eq!(fake.items.borrow()[&("layout".to_string(), "layout".to_string())]["v"]["S"], "spread");
+    }
+
+    /// A table as 0.20.5 left it, each kind whole in one partition: read where its records are, written in their own
+    /// partitions (one written over is moved), and moved over a little at each sweep with their ends, never over what was
+    /// written since; then the layout says so, and what every job reads and writes is spread over many partitions.
+    #[test]
+    fn a_table_with_each_kind_in_one_partition_is_spread_while_it_is_used() {
+        let fake = FakeDynamo::default();
+        let at = |p: &str, k: &str, v: &str| ((p.to_string(), k.to_string()), json!({ "p": { "S": p }, "k": { "S": k }, "v": { "S": v }, "x": { "N": "1790000000" } }));
+        fake.items.borrow_mut().insert(("layout".into(), "layout".into()), json!({ "p": { "S": "layout" }, "k": { "S": "layout" }, "v": { "S": "kinds" } }));
+        fake.items.borrow_mut().extend((0..40).map(|i| at("job", &format!("job:{i}"), "kept")));
+        fake.items.borrow_mut().extend([at("live", "live:3", ""), at("glive", "glive:3:a:0001", "m1"), at("glive", "glive:3:a:0002", "m2"), at("settings", "settings", "s")]);
+        let s = store(&fake);
+        assert_eq!(block_on(s.get("job:7")).unwrap().as_deref(), Some("kept"));
+        assert_eq!(block_on(s.get("job:99")).unwrap(), None);
+        assert_eq!(block_on(s.get_many(&["job:7".into(), "job:99".into(), "live:3".into()])).unwrap(), [Some("kept".to_string()), None, Some(String::new())]);
+        assert_eq!(block_on(s.list_stale("job:")).unwrap().len(), 40);
+        assert_eq!(block_on(s.list("glive:3:")).unwrap().len(), 2);
+        block_on(s.put("job:100", "new".into())).unwrap();
+        assert!(block_on(s.swap("job:8", Some("kept"), "swapped".into())).unwrap());
+        assert!(!block_on(s.swap("job:9", Some("not what is kept"), "x".into())).unwrap());
+        assert!(!block_on(s.put_if_absent("job:9", "again".into())).unwrap());
+        let held = |p: &str, k: &str| fake.items.borrow().contains_key(&(p.to_string(), k.to_string()));
+        assert!(held(&part("job:100"), "job:100") && held(&part("job:8"), "job:8") && !held("job", "job:8"));
+        assert_eq!(block_on(s.list("job:")).unwrap().len(), 41);
+        assert!(!block_on(s.migrate(10)).unwrap());
+        while !block_on(s.migrate(10)).unwrap() {}
+        {
+            let items = fake.items.borrow();
+            assert!(items.keys().all(|(p, _)| !SPREAD.contains(&p.as_str())), "nothing left where a kind was kept whole");
+            assert_eq!(items[&(part("job:8"), "job:8".to_string())]["v"]["S"], "swapped", "not moved over what was written since");
+            assert_eq!(items[&(part("glive:3:a:0001"), "glive:3:a:0001".to_string())]["x"]["N"], "1790000000", "moved with its end");
+            assert!(items.contains_key(&("settings".to_string(), "settings".to_string())), "a kind not spread stays");
+            let jobs: std::collections::BTreeSet<&String> = items.keys().filter(|(p, _)| p.starts_with("job#")).map(|(p, _)| p).collect();
+            assert!(jobs.len() >= 8, "forty jobs over many partitions: {jobs:?}");
+            assert_eq!(items[&("layout".to_string(), "layout".to_string())]["v"]["S"], "spread");
+        }
+        let s = store(&fake);
+        assert_eq!(block_on(s.list("job:")).unwrap().len(), 41);
+        assert_eq!(block_on(s.list_last("job:", 3)).unwrap().iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(), ["job:7", "job:8", "job:9"]);
+        assert_eq!(block_on(s.get("job:100")).unwrap().as_deref(), Some("new"));
     }
 
     /// What every store's caller does with the old layout and the new, as one scenario: each step's own error kept,

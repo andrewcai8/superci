@@ -579,6 +579,53 @@ pub fn needs_care(j: &Job, now: u64) -> bool {
         || now < ended + LIVE_AFTER_MS
 }
 
+/// How long a job that ended stays among those every start weighs (`live:`): AWS counts its machine against the
+/// account's limits for a little while after (see `spot_ending`, `aws_machines_up`).
+const ENDED_HOT_MS: u64 = 3 * 60_000;
+
+/// Whether every start weighs a job: one going, or one that ended a moment ago.
+fn hot(j: &Job, now: u64) -> bool { !over(j) || now < j.ended_ms.unwrap_or(j.at_ms) + ENDED_HOT_MS }
+
+/// The index of the jobs that ended a while ago and that the sweep still cares for (see `needs_care`), apart from
+/// what every start reads (`live:`).
+const CARE: &str = "care:";
+
+/// What the index of the jobs going (`live:<id>`) holds of each: what every start weighs of them (the machines each
+/// place runs, those that ended a moment ago, what they have cost so far), so that a start reads the index and no job.
+#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
+struct Live {
+    id: u64, state: String, cloud: String, at: u64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")] on_demand: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")] machine: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")] counted: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")] warm: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")] label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")] region: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] launched: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] started: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] ended: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] usd_per_hour: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] waiting_usd_per_hour: Option<f64>,
+    #[serde(default, skip_serializing_if = "is_zero_f64")] earlier_usd: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")] cost_usd: Option<f64>,
+}
+
+impl Live {
+    fn of(j: &Job) -> Live {
+        Live { id: j.job_id, state: j.state.clone(), cloud: j.cloud.clone(), at: j.at_ms, on_demand: j.on_demand, machine: j.machine_id.is_some(), counted: j.counted_usd.is_some(),
+            warm: j.warm, label: j.label.clone(), region: j.region.clone(), launched: j.launched_ms, started: j.started_ms, ended: j.ended_ms, usd_per_hour: j.usd_per_hour,
+            waiting_usd_per_hour: j.waiting_usd_per_hour, earlier_usd: j.earlier_usd, cost_usd: j.cost_usd }
+    }
+
+    /// As a job, for what weighs jobs (`active`, `place_of`, `hour_of`): what the index holds of it, and never written.
+    fn job(self) -> Job {
+        Job { job_id: self.id, state: self.state, cloud: self.cloud, at_ms: self.at, on_demand: self.on_demand, machine_id: self.machine.then(String::new),
+            counted_usd: self.counted.then_some(0.0), warm: self.warm, label: self.label, region: self.region, launched_ms: self.launched, started_ms: self.started,
+            ended_ms: self.ended, usd_per_hour: self.usd_per_hour, waiting_usd_per_hour: self.waiting_usd_per_hour, earlier_usd: self.earlier_usd, cost_usd: self.cost_usd,
+            ..Default::default() }
+    }
+}
+
 /// A day's totals (UTC), from the jobs queued in it: what each place's machines cost (see `place_of`), and its hours.
 #[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
 pub struct Day { #[serde(default)] pub spend: std::collections::BTreeMap<String, f64>, #[serde(default)] pub hours: Vec<Hour> }
@@ -598,11 +645,27 @@ impl Hour {
         (self.runs, self.jobs, self.ran, self.not_ran, self.ms, self.billed) = (self.runs + o.runs, self.jobs + o.jobs, self.ran + o.ran, self.not_ran + o.not_ran, self.ms + o.ms, self.billed + o.billed);
         (self.usd, self.host_usd) = (self.usd + o.usd, self.host_usd + o.host_usd);
         self.waits.extend_from_slice(&o.waits);
+        if self.waits.len() > WAITS_KEPT {
+            self.waits.sort_unstable();
+            let n = self.waits.len();
+            self.waits = (0..WAITS_KEPT).map(|i| self.waits[i * (n - 1) / (WAITS_KEPT - 1)]).collect();
+        }
     }
 }
 
+/// The waits an hour keeps at most: the shortest, the longest and evenly between them, for their median. (Every job's
+/// made a busy day's record larger than a store keeps one, DynamoDB's 400 KB.)
+const WAITS_KEPT: usize = 64;
+
 /// Where a day's totals are kept: by the day's number since the epoch, so they sort by time.
 pub fn day_key(day: u64) -> String { format!("day:{day:06}") }
+
+/// The records a day's totals are kept in, added up when read: one before they were kept apart, and one for each
+/// part of the day's jobs (by id). Every job's end adds to its day's, and a record that every one of them writes over
+/// is written by many requests at once, each losing to the others.
+const DAY_PARTS: u64 = 4;
+pub fn day_keys(day: u64) -> Vec<String> { std::iter::once(day_key(day)).chain((0..DAY_PARTS).map(|p| format!("{}:{p}", day_key(day)))).collect() }
+fn day_part_key(day: u64, job_id: u64) -> String { format!("{}:{}", day_key(day), job_id % DAY_PARTS) }
 
 /// What machines cost this month and today, by place, from each day's spend by place (days before this month left out).
 fn month_and_day(now: u64, by_day: std::collections::BTreeMap<u64, std::collections::BTreeMap<String, f64>>) -> (HashMap<String, f64>, HashMap<String, f64>) {
@@ -2175,9 +2238,8 @@ impl<'a> ControlPlane<'a> {
         // The newest fifty jobs; the ones still going; what this month and today cost.
         let jobs = self.newest_jobs(50).await?;
         // (The jobs still going and the days' totals read once: thirty-one days hold this month's.)
-        let live_kept = self.live_jobs().await?;
-        let (hours, by_day) = self.hours_with(31, &live_kept).await?;
-        let live: Vec<Job> = live_kept.into_iter().map(|(_, j)| j).collect();
+        let live: Vec<Job> = self.live_jobs(false).await?.into_iter().map(|(_, j)| j).collect();
+        let (hours, by_day) = self.hours_with(31, &live).await?;
         let now = self.clock.now_ms();
         let (month_spend, day_spend) = month_and_day(now, by_day);
         // What jobs used over a day, a week and 30 days, beside what the code host's runners would have charged.
@@ -2799,7 +2861,7 @@ impl<'a> ControlPlane<'a> {
 
     /// A job whose spot machine AWS took back, its run finished: run again (GitHub makes a new attempt of that job and
     /// of those that need it), noted so the new attempt is not on a spot machine again. Whether it is settled.
-    async fn run_again(&self, j: &mut Job, mut r: Rerun, now: u64) -> bool {
+    async fn run_again(&self, j: &mut Job, mut r: Rerun, now: u64, pending: &[Rerun]) -> bool {
         let settled = async {
             if now.saturating_sub(r.at_ms) > 6 * 3_600_000 { return Some("not run again: its run was still going six hours later".to_string()) }
             // GitHub not answering now (a token, the run's status): asked again the next minute.
@@ -2818,8 +2880,7 @@ impl<'a> ControlPlane<'a> {
             }
             // The other jobs of this run that wait to be run again: GitHub takes one request per attempt, so they
             // are asked for together (the run's failed jobs). Each is asked for once, whoever gets here first.
-            let others: Vec<Rerun> = self.live_jobs().await.unwrap_or_default().into_iter().filter_map(|(_, o)| o.rerun)
-                .filter(|o| o.state == "pending" && o.repo == r.repo && o.run_id == r.run_id && o.job_id != r.job_id).collect();
+            let others: Vec<Rerun> = pending.iter().filter(|o| o.repo == r.repo && o.run_id == r.run_id && o.job_id != r.job_id).cloned().collect();
             let claim = |id: u64| format!("rerun-asked:{id}");
             match self.store.put_if_absent(&claim(r.job_id), now.to_string()).await { Ok(true) => {} Ok(false) => return Some("asked".into()), Err(_) => return None }
             for o in &others { let _ = self.store.put_if_absent(&claim(o.job_id), now.to_string()).await; }
@@ -2851,13 +2912,13 @@ impl<'a> ControlPlane<'a> {
     /// ago (AWS counts a machine against the account's limits a little longer than it runs).
     async fn aws_machines_up(&self, account: &str, job_id: u64) -> (usize, usize) {
         let now = self.clock.now_ms();
-        let jobs: Vec<Job> = self.live_jobs().await.unwrap_or_default().into_iter().map(|(_, j)| j).collect();
+        let jobs = self.live_index().await.unwrap_or_default();
         let theirs = |j: &&Job| j.job_id != job_id && self.config.records.account_of(&j.cloud) == account && j.machine_id.is_some();
         (jobs.iter().filter(theirs).filter(|j| active(j)).count(), jobs.iter().filter(theirs).filter(|j| !active(j) && j.ended_ms.is_some_and(|e| now.saturating_sub(e) < 120_000)).count())
     }
 
     async fn gpu_machines_up(&self, account: &str, job_id: u64) -> bool {
-        let jobs: Vec<Job> = self.live_jobs().await.unwrap_or_default().into_iter().map(|(_, j)| j).collect();
+        let jobs = self.live_index().await.unwrap_or_default();
         jobs.iter().any(|j| j.job_id != job_id && self.config.records.account_of(&j.cloud) == account && active(j) && self.config.parse(&j.label).and_then(|s| s.ok()).is_some_and(|s| s.gpu.is_some()))
     }
 
@@ -2916,8 +2977,11 @@ impl<'a> ControlPlane<'a> {
             None => order,
         };
         if candidates.is_empty() { return Ok(Placement::Fail(format!("no cloud connected for jobs: connect one in the {} dashboard", self.config.name()))) }
-        let (spend, today) = self.spend().await?;
-        let jobs: Vec<Job> = self.live_jobs().await?.into_iter().map(|(_, j)| j).collect();
+        // (What was spent is read only for a limit on it.)
+        let jobs = self.live_index().await?;
+        let capped = routing.monthly_usd.is_some() || routing.daily_usd.is_some() || !routing.account_usd.is_empty() || !routing.account_daily_usd.is_empty()
+            || routing.order.iter().any(|p| p.monthly_usd.is_some());
+        let (spend, today) = if capped { self.spend(&jobs).await? } else { Default::default() };
         // The whole CI's limit for the month: at it nothing is started, wherever.
         if let Some(cap) = routing.monthly_usd {
             let spent: f64 = spend.values().sum::<f64>() + 0.0;
@@ -3148,18 +3212,46 @@ impl<'a> ControlPlane<'a> {
         let limited: Vec<&str> = said.split("; ").filter(|a| a.contains("MaxSpotInstanceCountExceeded")).filter_map(|a| a.split(':').next()).collect();
         if limited.is_empty() { return false }
         let now = self.clock.now_ms();
-        self.live_jobs().await.unwrap_or_default().iter().any(|(_, j)| j.job_id != job.job_id && self.config.records.account_of(&j.cloud) == self.config.records.account_of(&job.cloud) && !j.on_demand
+        self.live_index().await.unwrap_or_default().iter().any(|j| j.job_id != job.job_id && self.config.records.account_of(&j.cloud) == self.config.records.account_of(&job.cloud) && !j.on_demand
             && j.region.as_deref().is_some_and(|r| limited.contains(&r)) && j.ended_ms.is_some_and(|e| now.saturating_sub(e) < 120_000))
     }
 
-    async fn live_jobs(&self) -> Result<Vec<(String, Job)>> {
+    /// The jobs going and those that ended a moment ago (`live:`, see `hot`), each with its key: as kept now (`fresh`),
+    /// or as read without waiting on writes a moment old, for what only shows them. (Before the indexes, every job the
+    /// sweep cares for.)
+    async fn live_jobs(&self, fresh: bool) -> Result<Vec<(String, Job)>> {
         let now = self.clock.now_ms();
         if !self.indexed().await? {
             return Ok(self.store.list("job:").await?.into_iter().filter_map(|(k, v)| Some((k, serde_json::from_str::<Job>(&v).ok()?))).filter(|(_, j)| needs_care(j, now)).collect())
         }
-        // (The jobs themselves, read at once: an index says only which.)
-        let keys: Vec<String> = self.store.list("live:").await?.into_iter().map(|(k, _)| format!("job:{}", &k["live:".len()..])).collect();
-        Ok(keys.iter().cloned().zip(self.store.get_many(&keys).await?).filter_map(|(k, v)| Some((k, serde_json::from_str::<Job>(&v?).ok()?))).collect())
+        let listed = if fresh { self.store.list("live:").await? } else { self.store.list_stale("live:").await? };
+        let keys: Vec<String> = listed.into_iter().map(|(k, _)| format!("job:{}", &k["live:".len()..])).collect();
+        let read = if fresh { self.store.get_many(&keys).await? } else { self.store.get_many_stale(&keys).await? };
+        Ok(keys.into_iter().zip(read).filter_map(|(k, v)| Some((k, serde_json::from_str::<Job>(&v?).ok()?))).collect())
+    }
+
+    /// What every start weighs of the jobs going and of those that ended a moment ago, from the index alone (see
+    /// `Live`), as read without waiting on writes a moment old. An entry from before the index held it: its job read.
+    async fn live_index(&self) -> Result<Vec<Job>> {
+        if !self.indexed().await? { return Ok(self.live_jobs(true).await?.into_iter().map(|(_, j)| j).collect()) }
+        let (mut jobs, mut unread) = (vec![], vec![]);
+        for (k, v) in self.store.list_stale("live:").await? {
+            match serde_json::from_str::<Live>(&v) { Ok(l) => jobs.push(l.job()), Err(_) => unread.push(format!("job:{}", &k["live:".len()..])) }
+        }
+        if !unread.is_empty() { jobs.extend(self.store.get_many_stale(&unread).await?.into_iter().flatten().filter_map(|v| serde_json::from_str::<Job>(&v).ok())) }
+        Ok(jobs)
+    }
+
+    /// Every job the sweep cares for (see `needs_care`): those of `live:`, with what that index holds of each, and those
+    /// that ended a while ago with something still to do (`care:`); each with its key, as kept now.
+    async fn cared_for(&self) -> Result<Vec<(String, Job, Option<String>, bool)>> {
+        if !self.indexed().await? { return Ok(self.live_jobs(true).await?.into_iter().map(|(k, j)| (k, j, None, false)).collect()) }
+        let mut at: std::collections::BTreeMap<String, (Option<String>, bool)> = Default::default();
+        for (k, v) in self.store.list("live:").await? { at.entry(format!("job:{}", &k["live:".len()..])).or_default().0 = Some(v) }
+        for (k, _) in self.store.list(CARE).await? { at.entry(format!("job:{}", &k[CARE.len()..])).or_default().1 = true }
+        let keys: Vec<String> = at.keys().cloned().collect();
+        let read = self.store.get_many(&keys).await?;
+        Ok(at.into_iter().zip(read).filter_map(|((k, (live, care)), v)| Some((k, serde_json::from_str::<Job>(&v?).ok()?, live, care))).collect())
     }
 
     /// The newest `n` jobs, the newest first.
@@ -3208,15 +3300,10 @@ impl<'a> ControlPlane<'a> {
         }
     }
 
-    /// Each hour's totals over the last `days` days and today, from each day's (jobs still going counted as they
-    /// stand now), by the hour since the epoch; and each day's spend by place.
-    async fn hours(&self, days: u64) -> Result<(std::collections::BTreeMap<u64, Hour>, std::collections::BTreeMap<u64, std::collections::BTreeMap<String, f64>>)> {
-        let live = if self.indexed().await? { self.live_jobs().await? } else { vec![] };
-        self.hours_with(days, &live).await
-    }
-
-    /// The same, with the jobs still going as read already (see `live_jobs`; none needed before the indexes).
-    async fn hours_with(&self, days: u64, live: &[(String, Job)]) -> Result<(std::collections::BTreeMap<u64, Hour>, std::collections::BTreeMap<u64, std::collections::BTreeMap<String, f64>>)> {
+    /// Each hour's totals over the last `days` days and today, from each day's, and the jobs still going counted as they
+    /// stand now (as read already: see `live_jobs`, `live_index`; none needed before the indexes), by the hour since
+    /// the epoch; and each day's spend by place.
+    async fn hours_with(&self, days: u64, live: &[Job]) -> Result<(std::collections::BTreeMap<u64, Hour>, std::collections::BTreeMap<u64, std::collections::BTreeMap<String, f64>>)> {
         let now = self.clock.now_ms();
         let today = now / 86_400_000;
         let (mut hours, mut spend) = (std::collections::BTreeMap::new(), std::collections::BTreeMap::<u64, std::collections::BTreeMap<String, f64>>::new());
@@ -3230,21 +3317,22 @@ impl<'a> ControlPlane<'a> {
             for (_, v) in self.store.list("job:").await? { if let Ok(j) = serde_json::from_str::<Job>(&v) { if j.at_ms >= since { add(&j, &mut hours, &mut spend) } } }
             return Ok((hours, spend))
         }
-        let keys: Vec<String> = (today - days..=today).map(day_key).collect();
-        let kept = (today - days..=today).zip(self.store.get_many(&keys).await?).filter_map(|(day, v)| v.and_then(|v| serde_json::from_str::<Day>(&v).ok()).map(|d| (day, d)));
+        let keys: Vec<String> = (today - days..=today).flat_map(day_keys).collect();
+        let parts = day_keys(today).len();
+        let kept = self.store.get_many(&keys).await?.into_iter().enumerate().filter_map(|(i, v)| v.and_then(|v| serde_json::from_str::<Day>(&v).ok()).map(|d| (today - days + (i / parts) as u64, d)));
         for (day, d) in kept {
             for (i, h) in d.hours.iter().enumerate() { if h.jobs > 0 || h.usd != 0.0 { hours.entry(day * 24 + i as u64).or_insert_with(Hour::default).add(h) } }
             let s = spend.entry(day).or_default();
             for (place, usd) in d.spend { *s.entry(place).or_insert(0.0) += usd }
         }
-        for (_, j) in live { if j.counted_usd.is_none() && j.at_ms >= (today - days) * 86_400_000 { add(j, &mut hours, &mut spend) } }
+        for j in live { if j.counted_usd.is_none() && j.at_ms >= (today - days) * 86_400_000 { add(j, &mut hours, &mut spend) } }
         Ok((hours, spend))
     }
 
-    /// What machines cost this month and today, by place (see `place_of`).
-    async fn spend(&self) -> Result<(HashMap<String, f64>, HashMap<String, f64>)> {
+    /// What machines cost this month and today, by place (see `place_of`), with the jobs going as read already.
+    async fn spend(&self, live: &[Job]) -> Result<(HashMap<String, f64>, HashMap<String, f64>)> {
         let now = self.clock.now_ms();
-        let (_, spend) = self.hours((now - month_start_ms(now)) / 86_400_000).await?;
+        let (_, spend) = self.hours_with((now - month_start_ms(now)) / 86_400_000, live).await?;
         Ok(month_and_day(now, spend))
     }
 
@@ -3259,7 +3347,7 @@ impl<'a> ControlPlane<'a> {
     /// Adds what a job's cost changed by (all of it when it is first counted) to its day's totals.
     async fn count(&self, j: &Job, h: &Hour) -> Result<()> {
         let (day, hour) = (j.at_ms / 86_400_000, (j.at_ms % 86_400_000 / 3_600_000) as usize);
-        let key = day_key(day);
+        let key = day_part_key(day, j.job_id);
         let mut tries = 0;
         loop {
             if tries == 8 { return Err(format!("{key} kept changing while it was written")) }
@@ -3296,8 +3384,14 @@ impl<'a> ControlPlane<'a> {
     async fn indexes(&self, key: &str, j: &Job, new: bool, add: Option<Hour>) -> Result<()> {
         let now = self.clock.now_ms();
         let id = key.trim_start_matches("job:");
-        if needs_care(j, now) { self.store.put(&format!("live:{id}"), String::new()).await? }
-        else { self.store.put_until(&format!("live:{id}"), String::new(), now + LIVE_AFTER_MS).await? }
+        // What every start weighs (see `Live`); a job that ended a while ago, left to the sweep (`care:`). (That one first,
+        // so that a sweep listing both meanwhile finds it in one.)
+        if hot(j, now) { self.store.put(&format!("live:{id}"), crate::io::json(&Live::of(j))).await? }
+        else {
+            let care = format!("{CARE}{id}");
+            if needs_care(j, now) { self.store.put(&care, String::new()).await? } else { self.store.put_until(&care, String::new(), now + LIVE_AFTER_MS).await? }
+            self.store.delete(&format!("live:{id}")).await?
+        }
         // (A warm runner's stand-in is no job to list, nor a repository's: one is made every few minutes.)
         if new && !j.warm {
             self.store.put_until(&format!("recent:{:013}:{id}", j.at_ms), String::new(), j.at_ms + JOB_KEPT_MS).await?;
@@ -3389,7 +3483,7 @@ impl<'a> ControlPlane<'a> {
                 Some(kept) if kept.ended_ms.is_some() => {
                     if job.machine_id.is_some() && job.machine_id != kept.machine_id {
                         let plane_url = get_json::<String>(self.store, "plane_url").await?.unwrap_or_default();
-                        self.release(&plane_url, job).await;
+                        self.release(&plane_url, job, false).await;
                     } else if job.runner != kept.runner || job.runner_id != kept.runner_id { self.withdraw_runner(job).await }
                     return Ok(())
                 }
@@ -3400,6 +3494,9 @@ impl<'a> ControlPlane<'a> {
                     merged.interrupted |= kept.interrupted;
                     merged.started_ms = merged.started_ms.or(kept.started_ms);
                     merged.conclusion = merged.conclusion.take().or(kept.conclusion);
+                    // A machine seen running a job is not taken for an idle one again by a copy read before: on one runner
+                    // that state moves one way.
+                    if merged.runner == kept.runner && kept.state == "running" && ["launched", "orphan"].contains(&merged.state.as_str()) { merged.state = kept.state.clone() }
                     merged.rev.set(kept.rev.get() + 1);
                     merged
                 }
@@ -3413,6 +3510,20 @@ impl<'a> ControlPlane<'a> {
                 return Ok(())
             }
         }
+    }
+
+    /// Writes a job's record over exactly the copy read (its `rev`), one more, or not at all: whether it did. Done before
+    /// ending the machine the copy says the job holds, as a fencing token: a request that read the record before another
+    /// wrote it loses here and decides again from the record as it is, never ending a machine on what it read before.
+    /// (Not read: not written, as lost.)
+    async fn fence(&self, key: &str, j: &Job) -> Result<bool> {
+        let Some(was) = self.store.get(key).await? else { return Ok(false) };
+        if serde_json::from_str::<Job>(&was).map_or(true, |kept| kept.rev != j.rev) { return Ok(false) }
+        let next = j.clone();
+        next.rev.set(j.rev.get() + 1);
+        if !self.store.swap_until(key, Some(&was), crate::io::json(&next), Self::job_end(&next, self.clock.now_ms())).await? { return Ok(false) }
+        j.rev.set(next.rev.get());
+        Ok(true)
     }
 
     /// Whether a job's record ended since this copy of it was read (cancelled at its code host, in another request).
@@ -3933,8 +4044,7 @@ impl<'a> ControlPlane<'a> {
             // Its job ended at its code host while the machine was being asked for (cancelled before any runner took
             // it): the machine it has just been given is ended at once, not left for a sweep to find idle.
             if self.store.get(&gone_key(job)).await.ok().flatten().is_some() {
-                self.stop_machine(plane_url, job).await;
-                self.withdraw_runner(job).await;
+                self.release(plane_url, job, true).await;
                 let _ = self.store.delete(&gone_key(job)).await;
                 (job.state, job.began, job.runner_id) = ("cancelled".into(), true, None);
                 job.ended_ms = Some(self.clock.now_ms());
@@ -4296,6 +4406,7 @@ impl<'a> ControlPlane<'a> {
             Back::Unknown => Back::Taken,
             back => back,
         };
+        if !self.fence(&job_key(j), j).await.unwrap_or(false) { return Back::Unknown }
         if let Some(name) = &j.runner { let _ = self.store.delete(&format!("runner:{name}")).await; }
         self.stop_machine(plane_url, j).await;
         (j.state, j.runner_id) = ("cancelled".into(), None);
@@ -4304,8 +4415,10 @@ impl<'a> ControlPlane<'a> {
         back
     }
 
-    /// Asks GitHub to remove a job's runner, so that it can take no job: what GitHub said (see `Back`).
+    /// Asks GitHub to remove a job's runner, so that it can take no job: what GitHub said (see `Back`). A machine its
+    /// record says no runner was registered for takes no job: `Gone`.
     async fn ask_back(&self, j: &Job) -> Back {
+        if j.runner.is_none() && j.runner_id.is_none() { return Back::Gone }
         let (Some(app), Some(runner_id)) = (self.app_of(j), j.runner_id) else { return Back::Unknown };
         let Ok(token) = self.installation_token(app, j.installation_id).await else { return Back::Unknown };
         match github::delete_runner(self.http, &app.api(), &token, &Self::owner_of(app), &j.repo, runner_id).await {
@@ -4318,19 +4431,17 @@ impl<'a> ControlPlane<'a> {
 
     /// Ends the machine of a job nobody waits for any more, only once its runner can take no job: GitHub removes the
     /// runner first, and refuses while the runner runs a job (GitHub gives a waiting job to any idle runner with its
-    /// label, and that job's event may not have come yet, or may have been lost). What GitHub said: the machine was
-    /// ended for `Taken` and `Gone` alone. A GitLab job's machine and a run from a computer's are ended at once.
-    async fn release(&self, plane_url: &str, j: &Job) -> Back {
-        if !j.provider.is_empty() {
-            self.stop_machine(plane_url, j).await;
-            self.withdraw_runner(j).await;
-            return Back::Taken
-        }
-        let back = self.ask_back(j).await;
-        if back.ended() {
-            if let Some(name) = &j.runner { let _ = self.store.delete(&format!("runner:{name}")).await; }
-            self.stop_machine(plane_url, j).await;
-        }
+    /// label, and that job's event may not have come yet, or may have been lost). Then, `fenced`, only once the job's
+    /// record is written over the very copy read (see `fence`; lost: `Unknown`, decided again from the record as it is).
+    /// What GitHub said: the machine was ended for `Taken` and `Gone` alone. A GitLab job's runner and a run from a
+    /// computer's are not asked of GitHub.
+    async fn release(&self, plane_url: &str, j: &Job, fenced: bool) -> Back {
+        let back = if j.provider.is_empty() { self.ask_back(j).await } else { Back::Taken };
+        if !back.ended() { return back }
+        if fenced && !self.fence(&job_key(j), j).await.unwrap_or(false) { return Back::Unknown }
+        if !j.provider.is_empty() { self.withdraw_runner(j).await }
+        else if let Some(name) = &j.runner { let _ = self.store.delete(&format!("runner:{name}")).await; }
+        self.stop_machine(plane_url, j).await;
         back
     }
 
@@ -4340,7 +4451,7 @@ impl<'a> ControlPlane<'a> {
     /// every job keeps to let one start. How many machines it keeps up.
     async fn warm_up(&self, plane_url: &str, now: u64) -> Result<usize> {
         let warm = &self.config.routing.warm;
-        let live = self.live_jobs().await?;
+        let live = self.live_jobs(true).await?;
         // Each label's idle runners: the pool's own, and machines kept for another job still queued (the sweep asks
         // GitHub of that job; they count all the same).
         let mut idle: std::collections::BTreeMap<String, Vec<(String, Job)>> = warm.iter().map(|w| (w.label.clone(), vec![])).collect();
@@ -4361,12 +4472,12 @@ impl<'a> ControlPlane<'a> {
                 let age = now.saturating_sub(j.launched_ms.unwrap_or(j.at_ms));
                 // (Never longer than its machine may live: it ends by itself then.)
                 let idle_ms = want.map_or(0, |w| w.idle_minutes).min(self.machine_minutes(&j.cloud)) as u64 * 60_000;
+                // Its start cut off midway (as the sweep says of a job's): its machine, if it has one, taken back first.
+                let cut_off = j.state == "launching" && age > 120_000 && (j.machine_id.is_none() || self.release(plane_url, &j, true).await.ended());
                 match j.state.clone().as_str() {
                     // Its start left it no machine: a warm runner does not wait for room, the next sweep asks again.
                     "waiting" => { self.unpool(&key, &mut j, now).await?; continue }
-                    // Its start cut off midway (as the sweep says of a job's).
-                    "launching" if age > 120_000 => {
-                        self.stop_machine(plane_url, &j).await;
+                    "launching" if cut_off => {
                         self.withdraw_runner(&j).await;
                         self.unpool(&key, &mut j, now).await?;
                         continue
@@ -5205,7 +5316,7 @@ impl<'a> ControlPlane<'a> {
         // key: a run key cancels the runs it may start, from a computer, and no GitHub run.
         if self.store.get(&key).await?.is_none() {
             if !github_too { return Ok(nothing_here()) }
-            let mut known = self.live_jobs().await?.into_iter().map(|(_, j)| j).collect::<Vec<_>>();
+            let mut known = self.live_jobs(true).await?.into_iter().map(|(_, j)| j).collect::<Vec<_>>();
             known.extend(self.newest_jobs(200).await?);
             let Some(j) = known.into_iter().find(|j| j.run_id == id && j.provider.is_empty()) else { return Ok(nothing_here()) };
             let said = match self.github_for(&j).await {
@@ -5450,7 +5561,15 @@ impl<'a> ControlPlane<'a> {
         if let Some(name) = runner.filter(|r| failing_runner(r)) { return self.failed_by_runner(name, job_id).await }
         // (Only with a runner of this control plane's: with none, it is none below.)
         let mut on_anothers = None;
-        if let (Some(name), Some(mut j)) = (runner, self.by_runner(runner).await?) {
+        // The record that holds that runner's machine, as it is now: its machine is ended only once that very copy is
+        // written over (see `fence`); one written meanwhile is read again.
+        let mut holder = None;
+        for tries in 1..=4 {
+            let Some(j) = self.by_runner(runner).await? else { break };
+            if self.fence(&format!("job:{}", j.job_id), &j).await? { holder = Some(j); break }
+            if tries == 4 { return Err(format!("the record holding runner {} kept changing", runner.unwrap_or_default())) }
+        }
+        if let (Some(name), Some(mut j)) = (runner, holder) {
             if j.job_id != job_id { on_anothers = Some(j.for_job.unwrap_or(j.job_id)) }
             // (One that keeps its job's images goes off by itself once it has: ended later only if it has not.)
             if j.keeps && self.config.records.provider_of(&j.cloud) == "aws" {
@@ -5557,21 +5676,37 @@ impl<'a> ControlPlane<'a> {
         // (And the runs of jobs counted before runs were, once the indexes are there.)
         let indexed = self.indexed().await?;
         if indexed { let _ = self.recount_runs(150).await; }
-        let kept = self.live_jobs().await?;
+        let kept = self.cared_for().await?;
+        // (The jobs to be run again once their runs have finished: those of one run are asked for together.)
+        let reruns: Vec<Rerun> = kept.iter().filter_map(|(_, j, _, _)| j.rerun.clone()).filter(|r| r.state == "pending").collect();
         // GitHub's jobs that still wait as far as it has said (with the runners that can take them), and the jobs
         // that machines still coming are for.
         let (mut queued, mut aimed): (Vec<(String, u64, String)>, Vec<u64>) = (vec![], vec![]);
         // (Whether a warm pool's runner is among them: its label may no longer be kept warm.)
         let mut pool = !self.config.routing.warm.is_empty();
-        for (_, j) in &kept {
+        for (_, j, _, _) in &kept {
             if !j.provider.is_empty() { continue }
             if ["launching", "launched"].contains(&j.state.as_str()) && !j.seen_in_progress { aimed.push(j.for_job.unwrap_or(j.job_id)) }
             let waits = !(j.began || j.over || j.failed_fast) && j.fail_pending.is_none() && j.rerun.is_none() && now.saturating_sub(j.at_ms) < 86_400_000;
             if waits && ["launching", "launched", "running", "done"].contains(&j.state.as_str()) { queued.push((self.runners_of(j), j.job_id, j.repo.clone())) }
         }
-        for (key, mut j) in kept {
-            // Nothing more to do for it (time has passed since it was written): no longer among the live ones.
-            if indexed && !needs_care(&j, now) { self.store.delete(&format!("live:{}", key.trim_start_matches("job:"))).await?; continue }
+        for (key, mut j, live, care) in kept {
+            let id = key.trim_start_matches("job:");
+            // Nothing more to do for it (time has passed since it was written): in neither index.
+            if indexed && !needs_care(&j, now) {
+                if live.is_some() { self.store.delete(&format!("live:{id}")).await? }
+                if care { self.store.delete(&format!("{CARE}{id}")).await? }
+                continue
+            }
+            // What every start reads of it kept to it as it is (a request that read it before may have written its entry
+            // last, or one from before the index held what it holds); one that ended a while ago, out of it.
+            if indexed && hot(&j, now) {
+                let held = crate::io::json(&Live::of(&j));
+                if live.as_deref() != Some(held.as_str()) { self.store.put(&format!("live:{id}"), held).await? }
+            } else if indexed && live.is_some() {
+                if !care { self.store.put(&format!("{CARE}{id}"), String::new()).await? }
+                self.store.delete(&format!("live:{id}")).await?
+            }
             // A warm pool's idle runner is the pool's to see to, below: what follows asks GitHub of the job a machine is
             // for, and these are for none.
             if pooled(&j) { pool = true; continue }
@@ -5590,7 +5725,7 @@ impl<'a> ControlPlane<'a> {
             // A start cut off midway (the runtime stopped while it waited on a cloud): placed again, twice at most.
             if j.state == "launching" {
                 if now.saturating_sub(j.launched_ms.unwrap_or(j.at_ms)) < 120_000 { active += 1; continue }
-                self.stop_machine(&plane_url, &j).await;
+                if j.machine_id.is_some() && !self.release(&plane_url, &j, true).await.ended() { active += 1; continue }
                 if j.retries >= 2 {
                     j.state = "failed".into();
                     j.error = Some("its machine's start was cut off, three times".into());
@@ -5606,7 +5741,7 @@ impl<'a> ControlPlane<'a> {
             }
             // A job whose spot machine AWS took back: run again once its run has finished.
             if let Some(r) = j.rerun.clone().filter(|r| r.state == "pending") {
-                if self.run_again(&mut j, r, now).await { self.keep(&key, &j).await? } else { active += 1 }
+                if self.run_again(&mut j, r, now, &reruns).await { self.keep(&key, &j).await? } else { active += 1 }
                 continue;
             }
             // A failed job GitHub still has queued, its failing runner not started yet: tried again, for half an hour.
@@ -5724,7 +5859,7 @@ impl<'a> ControlPlane<'a> {
                     let held = late && !gone && waits_there && j.provider.is_empty() && j.for_job.is_none() && self.runner_waits(&j, &github).await;
                     // Its runner taken back first: one that took a job since GitHub was asked above is running it.
                     if gone || late {
-                        match self.release(&plane_url, &j).await {
+                        match self.release(&plane_url, &j, true).await {
                             Back::Taken | Back::Gone => {}
                             Back::Busy => { busy(&mut j, now); self.keep(&key, &j).await?; active += 1; continue }
                             // (GitHub not answering: asked again at the next sweep. Its machine ends by itself at its time.)
@@ -5777,10 +5912,11 @@ impl<'a> ControlPlane<'a> {
             // Past its longest time it is ended whatever it runs (it powers itself off then too); before, only once its
             // runner is taken back (an orphan's may have been given a job whose event has not come).
             if past {
+                if !self.fence(&key, &j).await? { active += 1; continue }
                 self.stop_machine(&plane_url, &j).await;
                 self.withdraw_runner(&j).await;
             } else {
-                match self.release(&plane_url, &j).await {
+                match self.release(&plane_url, &j, true).await {
                     Back::Taken | Back::Gone => {}
                     Back::Busy => { busy(&mut j, now); self.keep(&key, &j).await?; active += 1; continue }
                     Back::Unknown => { active += 1; continue }
@@ -5866,7 +6002,13 @@ impl<'a> ControlPlane<'a> {
         // Machines that kept their jobs' images and are still there a while after: ended now.
         for (k, v) in self.store.list("keeping:").await.unwrap_or_default() {
             if v.parse::<u64>().is_ok_and(|due| due > now) { continue }
-            if let Some(j) = get_json::<Job>(self.store, &format!("job:{}", k.trim_start_matches("keeping:"))).await.ok().flatten() { self.stop_machine(&plane_url, &j).await; }
+            let key = format!("job:{}", k.trim_start_matches("keeping:"));
+            // (Not read, or written meanwhile: the next sweep.)
+            let Ok(held) = get_json::<Job>(self.store, &key).await else { continue };
+            if let Some(j) = held {
+                if !self.fence(&key, &j).await.unwrap_or(false) { continue }
+                self.stop_machine(&plane_url, &j).await;
+            }
             let _ = self.store.delete(&k).await;
         }
         self.redeliver_failed().await;
@@ -5941,7 +6083,7 @@ impl<'a> ControlPlane<'a> {
                 }
             };
             // The jobs it has machines for, as GitLab has them now (their events may not have come either).
-            for (key, mut j) in self.live_jobs().await.unwrap_or_default() {
+            for (key, mut j) in self.live_jobs(true).await.unwrap_or_default() {
                 if j.provider != "gitlab" || j.gitlab != gl.id || !active(&j) { continue }
                 let _ = self.gitlab_settle(&key, &mut j, now).await;
             }
