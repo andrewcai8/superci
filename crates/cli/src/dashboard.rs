@@ -1242,11 +1242,14 @@ impl Dashboard {
     /// sign-in given by name for this run comes first.
     pub fn signed_in(store: Option<Store>) -> Self {
         let mut d = Dashboard::new();
-        let Some(store) = store else { return d };
+        // (An AWS sign-in given by name for this run stands in for any kept to the same account.)
+        let given = aws::Session::given();
+        let Some(store) = store else { d.aws = given; return d };
         let kept = store.read();
         if d.cf.is_none() { d.cf = kept.cloudflare }
         // Every AWS account kept; in hand, the kept control plane's own (else the first).
         let mut accounts: Vec<aws::Session> = kept.aws.into_iter().chain(kept.aws_more).collect();
+        if let Some(g) = given { accounts.retain(|a| a.account_id != g.account_id); accounts.insert(0, g) }
         let its = match &kept.plane { Some(Plane::Aws { account_id, .. }) => accounts.iter().position(|a| &a.account_id == account_id), _ => None };
         if !accounts.is_empty() { d.aws = Some(accounts.remove(its.unwrap_or(0))) }
         d.aws_others = accounts;
@@ -1808,8 +1811,8 @@ impl Dashboard {
         let used = view::named().and(self.kept_plane.as_ref()).and_then(|k| self.planes.iter().position(|p| p.plane_id() == k.plane_id())).unwrap_or(self.selected);
         Kept {
             cloudflare: if self.cf_given { None } else { self.cf.clone() },
-            aws: self.aws_accounts().into_iter().next(),
-            aws_more: self.aws_accounts().into_iter().skip(1).collect(),
+            aws: self.aws_accounts().into_iter().find(|a| !a.given_by_name()),
+            aws_more: self.aws_accounts().into_iter().filter(|a| !a.given_by_name()).skip(1).collect(),
             modal: if self.modal_given { None } else { self.modal.clone() },
             modal_more: self.modal_others.clone(),
             key: Some(Key { name: self.status_secret.clone(), value: self.status_key.clone(), planes }),
@@ -8282,6 +8285,18 @@ mod tests {
         d.cf = Some(cloudflare::Session::from_token("test"));
         d.cf_accounts = accounts.iter().map(|(id, n)| (id.to_string(), n.to_string())).collect();
         d
+    }
+
+    /// An AWS sign-in given by name for this run is used, never kept: what is kept is the sign-ins made here.
+    #[test]
+    fn an_aws_sign_in_given_by_name_is_not_kept() {
+        let mut d = Dashboard::new();
+        d.aws = Some(aws::Session::given_for_test("243891825325"));
+        d.aws_others = vec![aws::Session::for_test("111111111111")];
+        let kept = d.kept();
+        assert_eq!((kept.aws.map(|a| a.account_id), kept.aws_more.len()), (Some("111111111111".to_string()), 0));
+        d.aws_others.clear();
+        assert!(d.kept().aws.is_none());
     }
 
     /// One dashboard as the only workspace's, with no folder (as on a machine that keeps nothing).
