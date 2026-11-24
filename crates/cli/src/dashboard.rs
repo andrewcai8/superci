@@ -2302,8 +2302,9 @@ impl Dashboard {
         let kept = self.kept();
         let text = serde_json::to_string(&kept).unwrap_or_default();
         if text == self.kept_as { return }
-        // (Signed in only by name for this run, nothing of the sign-in is kept, but the control plane in use and its key are.)
-        let by_name = self.cf_given || self.modal_given || self.aws_accounts().iter().any(|a| a.given_by_name());
+        // (Signed in to AWS by a command, which gives a sign-in again on every run: nothing of the sign-in is kept, but
+        // the control plane in use and its key are, as for one signed in to.)
+        let by_name = self.aws_accounts().iter().any(|a| a.given_by_name());
         let done = if kept.worth_keeping() || (by_name && kept.plane.is_some()) { store.write(&kept) } else { store.remove().map(|_| ()) };
         match done {
             Ok(()) => self.kept_as = text,
@@ -8350,7 +8351,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Signed in only by a sign-in given by name, the control plane in use is kept (with its key), the sign-in not.
+    /// Signed in only by an AWS sign-in given by a command, the control plane in use is kept (with its key), the sign-in not.
     #[test]
     fn signed_in_only_by_name_the_control_plane_in_use_is_kept() {
         let root = std::env::temp_dir().join(format!("superci-given-plane-{}-{}", std::process::id(), superci_core::crypto::random_id(6)));
