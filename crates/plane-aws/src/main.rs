@@ -319,6 +319,25 @@ const SWEEPING: &str = "aws:sweeping";
 /// Where a sweep that is on its way is noted (when it is for, ms). One still there well after its time never came.
 const WAKING: &str = "aws:waking";
 
+/// Claims the sweep for this request (see `SWEEPING`): the claim, to give back once done, or none while another sweep is
+/// going. A claim older than a minute and a half is of a sweep that was cut off, taken over by one alone. (The claim not
+/// read, as when DynamoDB is throttled: an error, and no sweep. Two at once would each act on the jobs.)
+fn sweep_claim(store: &Dynamo, now: u64) -> io::Result<Option<String>> {
+    let token = now.to_string();
+    if !block_on(store.put_if_absent(SWEEPING, token.clone()))? {
+        let held = block_on(store.get(SWEEPING))?;
+        let since = held.as_deref().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        if now.saturating_sub(since) < 90_000 || !block_on(store.swap(SWEEPING, held.as_deref(), token.clone()))? { return Ok(None) }
+    }
+    Ok(Some(token))
+}
+
+/// A sweep's claim given back once it is done.
+fn sweep_done(store: &Dynamo, token: &str) {
+    let _ = token;
+    let _ = block_on(store.delete(SWEEPING));
+}
+
 #[async_trait(?Send)]
 impl Timer for Scheduled<'_> {
     async fn wake_in(&self, ms: u64) -> io::Result<()> {
@@ -450,14 +469,9 @@ fn main() {
             // itself); a note older than a minute and a half is of a sweep that was cut off, taken over by one alone.
             // (The note not read, as when DynamoDB is throttled: no sweep. Two at once would each act on the jobs.)
             let sweep = || -> io::Result<Value> {
-                let now = now_ms();
-                if !block_on(store.put_if_absent(SWEEPING, now.to_string()))? {
-                    let held = block_on(store.get(SWEEPING))?;
-                    let since = held.as_deref().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
-                    if now.saturating_sub(since) < 90_000 || !block_on(store.swap(SWEEPING, held.as_deref(), now.to_string()))? { return Ok(json!({ "swept": false })) }
-                }
+                let Some(token) = sweep_claim(&store, now_ms())? else { return Ok(json!({ "swept": false })) };
                 let done = block_on(plane.alarm()).map(|_| json!({ "swept": true }));
-                let _ = block_on(store.delete(SWEEPING));
+                sweep_done(&store, &token);
                 done
             };
             if event["superci"] == "sweep" { return sweep() }
@@ -514,7 +528,38 @@ mod tests {
         throttle_ops: RefCell<Vec<&'static str>>,
         /// What the calls consumed, as DynamoDB counts it, by partition: read units (4 KB, half for an eventually
         /// consistent read) and write units (1 KB).
-        units: RefCell<BTreeMap<String, (f64, f64)>> }
+        units: RefCell<BTreeMap<String, (f64, f64)>>,
+        /// What another request does just before a call is made (its kind, what it asks, the items), as a test sets it.
+        meddle: RefCell<Option<Meddler>>,
+        /// Each call waits its turn among the requests going at once (see `Turn`), as the calls of requests that run at
+        /// once interleave.
+        interleaved: RefCell<bool>,
+        /// How long the calls took, one after another (µs, see `LATENCY_US`); how many of each kind; the conditional
+        /// writes refused, by partition.
+        took_us: RefCell<u64>,
+        ops: RefCell<BTreeMap<String, u64>>,
+        lost: RefCell<BTreeMap<String, u64>> }
+
+    type Meddler = Box<dyn FnMut(&str, &Value, &mut BTreeMap<(String, String), Value>)>;
+
+    /// How long each of DynamoDB's calls takes from a function in its region (µs): an assumption, of the order AWS says
+    /// for single-digit-millisecond reads and writes, not a measurement.
+    const LATENCY_US: [(&str, u64); 5] = [("GetItem", 4_000), ("PutItem", 6_000), ("DeleteItem", 6_000), ("Query", 8_000), ("BatchGetItem", 12_000)];
+
+    /// How long each call to GitHub or to CloudWatch takes (µs): likewise an assumption.
+    const HTTP_US: u64 = 60_000;
+
+    /// A call's turn: once every other request going has had one (it is woken again at once, behind them).
+    struct Turn(bool);
+    impl std::future::Future for Turn {
+        type Output = ();
+        fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+            if self.0 { return std::task::Poll::Ready(()) }
+            self.0 = true;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    }
 
     /// An item's size as DynamoDB counts it: its attributes' names and values.
     fn size(item: &Value) -> usize { item.as_object().map_or(0, |o| o.iter().map(|(k, v)| k.len() + v.as_object().and_then(|t| t.values().next()).and_then(Value::as_str).map_or(0, str::len)).sum()) }
@@ -522,16 +567,22 @@ mod tests {
     #[async_trait(?Send)]
     impl Http for FakeDynamo {
         async fn send(&self, r: Request) -> io::Result<Response> {
+            if *self.interleaved.borrow() { Turn(false).await }
             let n = { let mut c = self.calls.borrow_mut(); *c += 1; *c };
             let op = r.header("x-amz-target").unwrap_or_default().trim_start_matches("DynamoDB_20120810.").to_string();
+            *self.ops.borrow_mut().entry(op.clone()).or_default() += 1;
+            *self.took_us.borrow_mut() += LATENCY_US.iter().find(|(o, _)| *o == op).map_or(0, |(_, us)| *us);
             let fail = |kind: &str| Ok(Response::new(400, "application/x-amz-json-1.0", json!({ "__type": format!("com.amazonaws.dynamodb.v20120810#{kind}"), "message": kind }).to_string()));
             if (n % 13 == 0 && !*self.calm.borrow()) || *self.throttled.borrow() || self.throttle_ops.borrow().contains(&op.as_str()) { return fail("ThrottlingException") }
             if *self.fail_at.borrow() == Some(n) { return fail("ValidationException") }
             let b: Value = serde_json::from_slice(&r.body).unwrap_or_default();
+            if let Some(meddle) = self.meddle.borrow_mut().as_mut() { meddle(&op, &b, &mut self.items.borrow_mut()) }
             let key = |k: &Value| (k["p"]["S"].as_str().unwrap_or_default().to_string(), k["k"]["S"].as_str().unwrap_or_default().to_string());
             let ok = |v: Value| Ok(Response::new(200, "application/x-amz-json-1.0", v.to_string()));
             let mut items = self.items.borrow_mut();
-            let factor = if b["ConsistentRead"] == true { 1.0 } else { 0.5 };
+            // (A batch says it in each table's part of what it asks.)
+            let consistent = b["ConsistentRead"] == true || b["RequestItems"].as_object().is_some_and(|t| t.values().any(|asked| asked["ConsistentRead"] == true));
+            let factor = if consistent { 1.0 } else { 0.5 };
             let read = |p: &str, bytes: usize| self.units.borrow_mut().entry(p.to_string()).or_default().0 += (bytes.div_ceil(4096).max(1)) as f64 * factor;
             let wrote = |p: &str, bytes: usize| self.units.borrow_mut().entry(p.to_string()).or_default().1 += bytes.div_ceil(1024).max(1) as f64;
             match op.as_str() {
@@ -545,11 +596,17 @@ mod tests {
                         Some("v = :was") => held.is_some_and(|h| h["v"] == b["ExpressionAttributeValues"][":was"]),
                         _ => true,
                     };
-                    if !allowed { return fail("ConditionalCheckFailedException") }
+                    if !allowed { *self.lost.borrow_mut().entry(at.0.clone()).or_default() += 1; return fail("ConditionalCheckFailedException") }
                     items.insert(at, b["Item"].clone());
                     ok(json!({}))
                 }
-                "DeleteItem" => { let at = key(&b["Key"]); wrote(&at.0, items.get(&at).map_or(0, size)); items.remove(&at); ok(json!({})) }
+                "DeleteItem" => {
+                    let at = key(&b["Key"]);
+                    wrote(&at.0, items.get(&at).map_or(0, size));
+                    if b["ConditionExpression"] == "v = :was" && items.get(&at).is_none_or(|h| h["v"] != b["ExpressionAttributeValues"][":was"]) { return fail("ConditionalCheckFailedException") }
+                    items.remove(&at);
+                    ok(json!({}))
+                }
                 "Query" => {
                     let vals = &b["ExpressionAttributeValues"];
                     let (p, prefix) = (vals[":p"]["S"].as_str().unwrap_or_default(), vals[":k"]["S"].as_str().unwrap_or(""));
@@ -887,37 +944,89 @@ mod tests {
 
     fn runner_of(id: u64) -> String { format!("superci-{}-{id}", superci_testkit::PLANE) }
 
+    /// The jobs going: one by GitHub's events, and copies of its records (their ids apart) to make `going`, which the
+    /// sweep that follows sets right.
+    fn going(fake: &FakeDynamo, plane: &ControlPlane<'_>, github: &superci_testkit::GitHub, now: u64, going: u64) {
+        let (first, queued) = github.queue("first", "superci", now);
+        assert!(webhook(plane, queued) < 300 && webhook(plane, github.start(first)) < 300);
+        let one = first.to_string();
+        let copies: Vec<((String, String), Value)> = fake.items.borrow().iter()
+            .filter(|((_, k), _)| k.contains(&one) && ["job:", "live:", "runner:", "recent:"].iter().any(|p| k.starts_with(p)))
+            .flat_map(|((_, k), item)| { let one = &one; (1..going).map(move |n| {
+                let id = (80_000_000_000 + n).to_string();
+                let k = k.replace(one, &id);
+                let mut item: Value = serde_json::from_str(&item.to_string().replace(one, &id)).unwrap();
+                item["p"] = json!({ "S": part(&k) });
+                ((part(&k), k), item)
+            }) }).collect();
+        fake.items.borrow_mut().extend(copies);
+    }
+
+    /// This month's day totals as a busy month leaves them, late in the day: every record of every day so far with every
+    /// hour's waits kept in full (some 12 KB each), and a little spent on each (under the limit on the day's spending).
+    fn busy_month(s: &Dynamo<'_>, now: u64) {
+        let hour = superci_core::plane::Hour { runs: 120, jobs: 800, ran: 800, not_ran: 3, ms: 96_000_000, billed: 1_700, usd: 31.7, host_usd: 74.4, waits: (0..64u64).map(|i| 4_000 + i * 977 % 90_000).collect() };
+        let day = superci_core::plane::Day { spend: [("aws".to_string(), 20.0), ("aws-on-demand".to_string(), 1.0)].into_iter().collect(), hours: vec![hour; 24] };
+        let text = serde_json::to_string(&day).unwrap();
+        for d in superci_core::plane::month_start_ms(now) / 86_400_000..=now / 86_400_000 {
+            for k in superci_core::plane::day_keys(d) { block_on(s.put(&k, text.clone())).unwrap() }
+        }
+    }
+
+    /// Jobs that ended a while ago that the sweep still cares for, as many as a busy hour leaves: AWS machines whose sent
+    /// data CloudWatch counts twelve minutes after they ended, `waiting` of them ended 3 to 12 minutes ago, `due` 12 to 13
+    /// minutes ago. Each its record and its entry in `care:`, saying when it is next to be seen to.
+    fn care_for(fake: &FakeDynamo, waiting: u64, due: u64, now: u64) {
+        let mut items = fake.items.borrow_mut();
+        for n in 0..waiting + due {
+            let id = 70_000_000_000 + n;
+            let ended = if n < waiting { now - 3 * 60_000 - n * 9 * 60_000 / waiting.max(1) } else { now - 12 * 60_000 - 1 - (n - waiting) * 60_000 / due.max(1) };
+            let job = json!({ "job_id": id, "run_id": 3, "repo": "acme/app", "state": "done", "at_ms": ended - 600_000, "installation_id": 42, "runner": runner_of(id), "runner_id": 5,
+                "cloud": "aws", "machine_id": format!("i-{id:x}"), "machine_type": "m8a.xlarge", "error": null, "seen_in_progress": true, "label": "superci", "usd_per_hour": 0.0712,
+                "started_ms": ended - 540_000, "ended_ms": ended, "launched_ms": ended - 600_000, "cpu": 4, "region": "us-east-1", "zone": "us-east-1b", "disk_gb": 60, "began": true,
+                "conclusion": "success", "cost_usd": 0.0119, "cost_from": "prices", "counted_usd": 0.0119, "app_id": 99, "rev": 6, "name": "unit (3)", "workflow": "Lint & Test",
+                "queued_ms": ended - 610_000, "branch": "main", "default_branch": "main", "repo_id": 77 });
+            for (k, v) in [(format!("job:{id}"), job.to_string()), (format!("care:{id}"), (ended + 12 * 60_000).to_string())] {
+                items.insert((part(&k), k.clone()), json!({ "p": { "S": part(&k) }, "k": { "S": k }, "v": { "S": v } }));
+            }
+        }
+    }
+
+    /// The busiest partition of what `units` took, by reads and by writes, as a share of what DynamoDB lets one take
+    /// a second (3,000 read units, 1,000 write units) at `per_second` of what `units` is one of.
+    fn busiest(units: &BTreeMap<String, (f64, f64)>, per_second: f64) -> String {
+        let most = |w: bool| units.iter().map(|(p, (r, wr))| (p.clone(), if w { *wr } else { *r })).fold((String::new(), 0.0), |a, b| if b.1 > a.1 { b } else { a });
+        let ((rp, r), (wp, w)) = (most(false), most(true));
+        format!("reads {rp} {:.0} RCU/s ({:.1}% of 3,000), writes {wp} {:.0} WCU/s ({:.1}% of 1,000)", r * per_second, r * per_second / 30.0, w * per_second, w * per_second / 10.0)
+    }
+
     /// What GitHub's events cost DynamoDB, as DynamoDB counts it (read units of 4 KB, half for an eventually consistent
     /// read; write units of 1 KB), with 50 jobs going and with 2,000: about the same, as an event reads and writes its own
-    /// job's records and none that grow with the jobs going. And no partition takes a large part of a busy minute's: at
-    /// 50 events a second (a job's three), each partition's share stays under a quarter of what DynamoDB lets one take
-    /// (3,000 read units, 1,000 write units a second).
+    /// job's records and none that grow with the jobs going. As production runs: a start weighs two places (as AWS's
+    /// spot and on-demand machines), a limit on the day's spending is set, this month's day totals are as a busy month
+    /// leaves them, and the sweep cares for as many ended jobs as a busy hour leaves. And no partition takes a large part
+    /// of a busy minute's: at 50 events a second (a job's three), each partition's share stays under a quarter of what
+    /// DynamoDB lets one take (3,000 read units, 1,000 write units a second).
     #[test]
     fn an_event_costs_dynamodb_the_same_with_fifty_jobs_going_or_two_thousand() {
         let mut costs: Vec<Vec<(f64, f64)>> = vec![];
-        for going in [50u64, 2_000] {
+        let mut said = vec![];
+        for going_now in [50u64, 2_000] {
             let fake = FakeDynamo { calm: RefCell::new(true), ..Default::default() };
             fake.items.borrow_mut().insert(("layout".into(), "layout".into()), json!({ "p": { "S": "layout" }, "k": { "S": "layout" }, "v": { "S": "spread" } }));
-            let (s, github, own, cache, config) = (store(&fake), superci_testkit::GitHub::default(), Own::default(), Cache::default(), github_plane());
+            let (s, github, own, cache) = (store(&fake), superci_testkit::GitHub::default(), Own::default(), Cache::default());
+            let mut config = github_plane();
+            // (AWS's place is not connected here: it is passed over, and what runs on it read all the same.)
+            config.routing.order.insert(0, superci_core::plane::Pool::of("aws"));
+            config.routing.daily_usd = Some(1_500.0);
             let clock = At(std::cell::Cell::new(1_790_000_000_000));
             let plane = ControlPlane { store: &s, http: &github, clock: &clock, timer: &Later, config: &config, cache: &cache, containers: Some(&own) };
             block_on(plane.alarm()).unwrap();
-            // One job going by GitHub's events; the others copies of its records (their ids apart), set right by a sweep.
-            let (first, queued) = github.queue("first", "superci", clock.now_ms());
-            assert!(webhook(&plane, queued) < 300 && webhook(&plane, github.start(first)) < 300);
-            let one = first.to_string();
-            let copies: Vec<((String, String), Value)> = fake.items.borrow().iter()
-                .filter(|((_, k), _)| k.contains(&one) && ["job:", "live:", "runner:", "recent:"].iter().any(|p| k.starts_with(p)))
-                .flat_map(|((_, k), item)| { let one = &one; (1..going).map(move |n| {
-                    let id = (80_000_000_000 + n).to_string();
-                    let k = k.replace(one, &id);
-                    let mut item: Value = serde_json::from_str(&item.to_string().replace(one, &id)).unwrap();
-                    item["p"] = json!({ "S": part(&k) });
-                    ((part(&k), k), item)
-                }) }).collect();
-            fake.items.borrow_mut().extend(copies);
+            going(&fake, &plane, &github, clock.now_ms(), going_now);
+            busy_month(&s, clock.now_ms());
+            care_for(&fake, 9_000, 1_000, clock.now_ms());
             block_on(plane.alarm()).unwrap();
-            assert_eq!(block_on(s.list("live:")).unwrap().len() as u64, going);
+            assert_eq!(block_on(s.list("live:")).unwrap().len() as u64, going_now);
             let take = || std::mem::take(&mut *fake.units.borrow_mut());
             let total = |u: &BTreeMap<String, (f64, f64)>| (u.values().map(|(r, _)| r).sum::<f64>(), u.values().map(|(_, w)| w).sum::<f64>());
             // Jobs beside them, each queued (and given its machine), begun and ended: what each event cost, and over them all,
@@ -936,7 +1045,11 @@ mod tests {
                 }
             }
             let per_second = 50.0 / 3.0;
-            for (p, (r, w)) in &by_part { assert!(r * per_second < 750.0 && w * per_second < 250.0, "{going} going: partition {p} takes {r:.1} read and {w:.1} write units a job: {by_part:?}") }
+            let (r, w) = (each.iter().map(|e| e.0).sum::<f64>() * per_second, each.iter().map(|e| e.1).sum::<f64>() * per_second);
+            said.push(format!("capacity: {going_now} going: queued {:.1} R / {:.1} W, in_progress {:.1} R / {:.1} W, completed {:.1} R / {:.1} W a job; at 50 events/s the table {r:.0} RCU/s and {w:.0} WCU/s, busiest {}",
+                each[0].0, each[0].1, each[1].0, each[1].1, each[2].0, each[2].1, busiest(&by_part, per_second)));
+            eprintln!("{}", said.last().unwrap());
+            for (p, (r, w)) in &by_part { assert!(r * per_second < 750.0 && w * per_second < 250.0, "{going_now} going: partition {p} takes {r:.1} read and {w:.1} write units a job: {by_part:?}") }
             costs.push(each);
         }
         for (i, event) in ["queued and started", "in progress", "completed"].iter().enumerate() {
@@ -986,5 +1099,158 @@ mod tests {
         github.fail_none();
         assert!(webhook(&plane, github.finish(two, "success", "ok", clock.now_ms())) < 300);
         assert!(own.stopped(&runner_of(one)), "{:?}", own.0.borrow());
+    }
+
+    /// GitHub as the test kit has it, and CloudWatch saying what each machine sent; each call the time it takes (see
+    /// `HTTP_US`), and the calls to CloudWatch counted.
+    struct Modeled<'a> { github: &'a superci_testkit::GitHub, took_us: RefCell<u64>, sent: RefCell<u64> }
+    #[async_trait(?Send)]
+    impl Http for Modeled<'_> {
+        async fn send(&self, r: Request) -> io::Result<Response> {
+            *self.took_us.borrow_mut() += HTTP_US;
+            if r.url.starts_with("https://monitoring.") {
+                *self.sent.borrow_mut() += 1;
+                return Ok(Response::new(200, "text/xml", "<GetMetricStatisticsResponse><GetMetricStatisticsResult><Datapoints><member><Sum>52000000</Sum></member></Datapoints></GetMetricStatisticsResult></GetMetricStatisticsResponse>"));
+            }
+            self.github.send(r).await
+        }
+    }
+
+    /// The time as the calls made so far took it, one after another as a request makes them: DynamoDB's and the others'.
+    struct Lapse<'a> { at: u64, fake: &'a FakeDynamo, http: &'a Modeled<'a> }
+    impl Clock for Lapse<'_> { fn now_ms(&self) -> u64 { self.at + (*self.fake.took_us.borrow() + *self.http.took_us.borrow()) / 1_000 } }
+
+    /// The sweep with 2,000 jobs going and as many ended a while ago as a busy hour leaves it to care for (9,000 AWS
+    /// machines whose sent data CloudWatch has not counted yet, 1,000 whose it has): what one sweep reads and writes,
+    /// and how long it takes at the time each call takes (DynamoDB's and CloudWatch's, see `LATENCY_US`, `HTTP_US`). It
+    /// reads what is due and no more, and ends well within the minute and a half its claim holds (and the minute the
+    /// function may run): what is left of the sent data to add is added at the sweeps after.
+    #[test]
+    fn a_sweep_with_two_thousand_jobs_going_and_a_full_care_set_reads_what_is_due_and_ends_in_time() {
+        let fake = FakeDynamo { calm: RefCell::new(true), ..Default::default() };
+        fake.items.borrow_mut().insert(("layout".into(), "layout".into()), json!({ "p": { "S": "layout" }, "k": { "S": "layout" }, "v": { "S": "spread" } }));
+        let (s, github, own, cache) = (store(&fake), superci_testkit::GitHub::default(), Own::default(), Cache::default());
+        let clouds = Modeled { github: &github, took_us: RefCell::new(0), sent: RefCell::new(0) };
+        let mut config = github_plane();
+        (config.aws_own, config.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+        // (AWS's places off: its jobs here are those that ended; the jobs going run in containers of the plane's own.)
+        config.routing.order = vec![superci_core::plane::Pool { off: true, ..superci_core::plane::Pool::of("aws") }, superci_core::plane::Pool { off: true, ..superci_core::plane::Pool::of(superci_core::plane::AWS_ON_DEMAND) },
+            superci_core::plane::Pool { max_jobs: Some(100_000), ..superci_core::plane::Pool::of("cloudflare") }];
+        let clock = Lapse { at: 1_790_000_000_000, fake: &fake, http: &clouds };
+        let plane = ControlPlane { store: &s, http: &clouds, clock: &clock, timer: &Later, config: &config, cache: &cache, containers: Some(&own) };
+        block_on(plane.alarm()).unwrap();
+        going(&fake, &plane, &github, clock.now_ms(), 2_000);
+        block_on(plane.alarm()).unwrap();
+        care_for(&fake, 9_000, 1_000, clock.now_ms());
+        fake.units.borrow_mut().clear();
+        fake.ops.borrow_mut().clear();
+        let (began, real, sent) = (clock.now_ms(), Instant::now(), *clouds.sent.borrow());
+        block_on(plane.alarm()).unwrap();
+        let (took, cpu, sent) = (clock.now_ms() - began, real.elapsed(), *clouds.sent.borrow() - sent);
+        let units = std::mem::take(&mut *fake.units.borrow_mut());
+        let (r, w) = (units.values().map(|(r, _)| r).sum::<f64>(), units.values().map(|(_, w)| w).sum::<f64>());
+        let jobs_read = units.iter().filter(|(p, _)| p.starts_with("job")).map(|(_, (r, _))| r).sum::<f64>();
+        let mut by_kind = BTreeMap::<String, (f64, f64)>::new();
+        for (p, (r, w)) in &units { let t = by_kind.entry(p.split('#').next().unwrap_or(p).to_string()).or_default(); (t.0, t.1) = (t.0 + r, t.1 + w) }
+        let by_kind: Vec<String> = by_kind.iter().map(|(k, (r, w))| format!("{k} {r:.0} R / {w:.0} W")).collect();
+        eprintln!("capacity: the sweep, 2,000 going and 10,000 cared for (1,000 due): {r:.0} RCU ({jobs_read:.0} of them job records) and {w:.0} WCU, {sent} sent data added, {:.1} s as the calls take ({:?} here), calls {:?}; by kind {}; over the sweep {}",
+            took as f64 / 1_000.0, cpu, fake.ops.borrow(), by_kind.join(", "), busiest(&units, 1_000.0 / took.max(1) as f64));
+        assert!(took < 45_000, "the sweep takes {:.1} s at the time its calls take, past the minute the function may run", took as f64 / 1_000.0);
+        assert!(jobs_read < 4_000.0, "{jobs_read:.0} read units of job records: more than the jobs going and those due");
+        assert!(sent > 0, "some of the sent data due added");
+    }
+
+    /// Each request's own wake-ups: none (the test sweeps itself). A pause: as many turns of the requests going at once
+    /// as it is long, one for each ten milliseconds.
+    struct Turns;
+    #[async_trait(?Send)]
+    impl Timer for Turns {
+        async fn wake_in(&self, _ms: u64) -> io::Result<()> { Ok(()) }
+        async fn pause(&self, ms: u64) { for _ in 0..ms / 10 + 1 { Turn(false).await } }
+    }
+
+    /// A matrix's hundreds of jobs queued in one burst, each event in a request of its own and the requests' calls
+    /// interleaved, as requests running at once interleave theirs: hundreds of writers on each place's records of what runs.
+    /// Every job gets its machine and each machine is in its job's record; once a sweep has been, the records of what
+    /// runs hold exactly the jobs going. What those records' writes lost to one another is said.
+    #[test]
+    fn a_burst_of_jobs_queued_at_once_gets_each_its_machine_in_its_record() {
+        let fake = FakeDynamo { calm: RefCell::new(true), ..Default::default() };
+        fake.items.borrow_mut().insert(("layout".into(), "layout".into()), json!({ "p": { "S": "layout" }, "k": { "S": "layout" }, "v": { "S": "spread" } }));
+        let (s, github, own, cache, config) = (store(&fake), superci_testkit::GitHub::default(), Own::default(), Cache::default(), github_plane());
+        let clock = At(std::cell::Cell::new(1_790_000_000_000));
+        let plane = ControlPlane { store: &s, http: &github, clock: &clock, timer: &Later, config: &config, cache: &cache, containers: Some(&own) };
+        block_on(plane.alarm()).unwrap();
+        let n = 300;
+        let events: Vec<(u64, (Vec<u8>, String))> = (0..n).map(|i| github.queue(&format!("matrix ({i})"), "superci", clock.now_ms())).collect();
+        let ids: Vec<u64> = events.iter().map(|(id, _)| *id).collect();
+        let (stores, caches): (Vec<Dynamo<'_>>, Vec<Cache>) = ((0..n).map(|_| store(&fake)).collect(), (0..n).map(|_| Cache::default()).collect());
+        *fake.interleaved.borrow_mut() = true;
+        fake.lost.borrow_mut().clear();
+        let answers = block_on(futures::future::join_all(events.into_iter().zip(&stores).zip(&caches).map(|(((_, (body, signature)), s), cache)| {
+            let plane = ControlPlane { store: s, http: &github, clock: &clock, timer: &Turns, config: &config, cache, containers: Some(&own) };
+            async move { plane.handle(Request::new("POST", "https://plane.example/webhook").with_header("x-github-event", "workflow_job").with_header("x-hub-signature-256", &signature).with_body(body)).await.status }
+        })));
+        *fake.interleaved.borrow_mut() = false;
+        let lost = std::mem::take(&mut *fake.lost.borrow_mut());
+        eprintln!("capacity: a burst of {n} queued at once: conditional writes lost to another, by partition: {lost:?}");
+        assert!(answers.iter().all(|a| *a < 300), "{answers:?}");
+        let jobs: Vec<Value> = ids.iter().map(|id| serde_json::from_str(&block_on(s.get(&format!("job:{id}"))).unwrap().unwrap()).unwrap()).collect();
+        let unplaced: Vec<&Value> = jobs.iter().filter(|j| j["state"] != "launched" || j["machine_id"].as_str() != Some(runner_of(j["job_id"].as_u64().unwrap()).as_str())).collect();
+        assert!(unplaced.is_empty(), "{} of {n} jobs have not their machine in their record, the first: {}", unplaced.len(), unplaced[0]);
+        let held: std::collections::BTreeSet<String> = block_on(s.list("job:")).unwrap().into_iter().filter_map(|(_, v)| serde_json::from_str::<Value>(&v).ok()?["machine_id"].as_str().map(str::to_string)).collect();
+        let started: Vec<String> = own.0.borrow().iter().filter_map(|c| c.strip_prefix("start ").map(str::to_string)).collect();
+        assert!(started.iter().all(|m| held.contains(m)), "machines no record holds: {:?}", started.iter().filter(|m| !held.contains(*m)).collect::<Vec<_>>());
+        block_on(plane.alarm()).unwrap();
+        let running: std::collections::BTreeSet<u64> = block_on(s.list("active:")).unwrap().into_iter()
+            .flat_map(|(_, v)| serde_json::from_str::<BTreeMap<String, u64>>(&v).unwrap().into_keys().filter_map(|id| id.parse().ok()).collect::<Vec<u64>>()).collect();
+        assert_eq!(running, ids.iter().copied().collect::<std::collections::BTreeSet<u64>>(), "what runs, once the sweep has been");
+    }
+
+    /// Moving a record from where a layout before kept it races what requests do meanwhile. One deleted between the
+    /// move's read of it and its write (by a request of this version, which deletes it wherever it is) is not brought
+    /// back; one written meanwhile by a request of the version before (which writes where that one kept it) keeps what
+    /// that request wrote.
+    #[test]
+    fn a_record_moved_while_it_is_deleted_or_written_stays_deleted_or_as_written() {
+        let fake = FakeDynamo::default();
+        let at = |k: &str| (("job".to_string(), k.to_string()), json!({ "p": { "S": "job" }, "k": { "S": k }, "v": { "S": "kept" }, "x": { "N": "1790000000" } }));
+        fake.items.borrow_mut().insert(("layout".into(), "layout".into()), json!({ "p": { "S": "layout" }, "k": { "S": "layout" }, "v": { "S": "kinds" } }));
+        fake.items.borrow_mut().extend([at("job:7"), at("job:8"), at("job:9")]);
+        let (mut deleted, mut written) = (false, false);
+        *fake.meddle.borrow_mut() = Some(Box::new(move |op: &str, b: &Value, items: &mut BTreeMap<(String, String), Value>| {
+            if op == "PutItem" && b["Item"]["k"]["S"] == "job:7" && b["ConditionExpression"] == "attribute_not_exists(k)" && !deleted {
+                deleted = true;
+                items.remove(&("job".to_string(), "job:7".to_string()));
+            }
+            if op == "DeleteItem" && b["Key"]["k"]["S"] == "job:8" && b["Key"]["p"]["S"] == "job" && !written {
+                written = true;
+                if let Some(old) = items.get_mut(&("job".to_string(), "job:8".to_string())) { old["v"] = json!({ "S": "newer" }) }
+            }
+        }));
+        let s = store(&fake);
+        while !block_on(s.migrate(10)).unwrap() {}
+        assert_eq!(block_on(s.get("job:7")).unwrap(), None, "deleted, and not brought back by the move");
+        assert_eq!(block_on(s.get("job:8")).unwrap().as_deref(), Some("newer"), "as the request of the version before wrote it");
+        assert_eq!(block_on(s.get("job:9")).unwrap().as_deref(), Some("kept"));
+        assert!(fake.items.borrow().keys().all(|(p, _)| p != "job"), "nothing left where a kind was kept whole");
+    }
+
+    /// The sweep's claim: one sweep at a time, a claim of one cut off taken over after a minute and a half. A sweep that
+    /// ends after another took its claim over gives back only its own: the other's stays, and no third starts beside it.
+    #[test]
+    fn a_sweep_that_ends_after_another_took_its_claim_over_leaves_that_ones_claim() {
+        let fake = FakeDynamo::default();
+        fake.items.borrow_mut().insert(("layout".into(), "layout".into()), json!({ "p": { "S": "layout" }, "k": { "S": "layout" }, "v": { "S": "spread" } }));
+        let s = store(&fake);
+        let t = 1_790_000_000_000;
+        let first = sweep_claim(&s, t).unwrap().expect("none going");
+        assert!(sweep_claim(&s, t + 30_000).unwrap().is_none(), "one going");
+        let second = sweep_claim(&s, t + 91_000).unwrap().expect("the first cut off, as far as can be told");
+        sweep_done(&s, &first);
+        assert_eq!(block_on(s.get(SWEEPING)).unwrap(), Some(second.clone()), "the second's claim kept");
+        assert!(sweep_claim(&s, t + 92_000).unwrap().is_none(), "no third beside the second");
+        sweep_done(&s, &second);
+        assert!(sweep_claim(&s, t + 93_000).unwrap().is_some(), "free once the second is done");
     }
 }
