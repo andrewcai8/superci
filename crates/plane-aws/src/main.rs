@@ -52,15 +52,16 @@ const AGAIN: [&str; 6] = ["ThrottlingException", "ProvisionedThroughputExceededE
 
 /// State in one DynamoDB table: the record as text (`v`) under its key (`k`, the sort key) in a partition (`p`), and its
 /// end in seconds (`x`, the table's time to live) when it has one. A partition is its kind's, the key up to its first
-/// colon (`settings`, `day`); but one partition takes some 3,000 reads and 1,000 writes a second, so each kind every job
+/// colon (`settings`, `care`); but one partition takes some 3,000 reads and 1,000 writes a second, so each kind every job
 /// reads and writes (`SPREAD`) is spread over `BUCKETS` of them by the key's second part (`job#07` for `job:1717`; one
-/// job's log marks, `glive:<id>:…`, in one). The layouts before are read where they kept a record until `migrate` has
+/// job's log marks, `glive:<id>:…`, in one), or for a day's totals by all of the key after its kind (each part of a
+/// day's in a partition of its own, as every job's end writes one). The layouts before are read where they kept a record until `migrate` has
 /// moved what is left, a little at each sweep (then `layout` says so): every record in the one partition `s` (before
 /// 0.19.0), then each kind whole in its own.
 struct Dynamo<'a> { http: &'a dyn Http, table: String, region: String, layout: std::cell::Cell<Option<u8>> }
 
 /// The kinds read and written for every job and every event, each spread over `BUCKETS` partitions.
-const SPREAD: [&str; 9] = ["job", "live", "recent", "runner", "hello", "shape", "glive", "cachem", "active"];
+const SPREAD: [&str; 10] = ["job", "live", "recent", "runner", "hello", "shape", "glive", "cachem", "active", "day"];
 const BUCKETS: u32 = 16;
 
 fn kind(key: &str) -> &str { key.split(':').next().unwrap_or(key) }
@@ -70,15 +71,19 @@ fn kind(key: &str) -> &str { key.split(':').next().unwrap_or(key) }
 fn part(key: &str) -> String {
     let kind = kind(key);
     if !SPREAD.contains(&kind) { return kind.to_string() }
-    let hash = key.split(':').nth(1).unwrap_or_default().bytes().fold(0x811c_9dc5u32, |h, b| (h ^ b as u32).wrapping_mul(0x0100_0193));
+    let by = if kind == DAY { key.split_once(':').map_or("", |(_, rest)| rest) } else { key.split(':').nth(1).unwrap_or_default() };
+    let hash = by.bytes().fold(0x811c_9dc5u32, |h, b| (h ^ b as u32).wrapping_mul(0x0100_0193));
     format!("{kind}#{:02}", (hash ^ (hash >> 16)) % BUCKETS)
 }
+
+/// The kind spread by all of its key (see `part`).
+const DAY: &str = "day";
 
 /// The partitions a prefix's records are in: one when the prefix holds its kind's second part whole (`glive:17:`), else
 /// each of its kind's.
 fn parts(prefix: &str) -> Vec<String> {
     let kind = kind(prefix);
-    if !SPREAD.contains(&kind) || prefix.splitn(3, ':').count() == 3 { return vec![part(prefix)] }
+    if !SPREAD.contains(&kind) || (kind != DAY && prefix.splitn(3, ':').count() == 3) { return vec![part(prefix)] }
     (0..BUCKETS).map(|b| format!("{kind}#{b:02}")).collect()
 }
 
@@ -157,6 +162,39 @@ impl Dynamo<'_> {
     /// A conditional write: whether it was made.
     async fn put_when(&self, put: Value) -> io::Result<bool> {
         match self.call("PutItem", put).await { Ok(_) => Ok(true), Err(e) if e.starts_with("ConditionalCheckFailedException") => Ok(false), Err(e) => Err(e) }
+    }
+    /// A record in a partition deleted only while its value is `was` (DynamoDB's form of it): whether it was.
+    async fn delete_at_when(&self, p: &str, k: &str, was: &Value) -> io::Result<bool> {
+        let delete = json!({ "TableName": self.table, "Key": key_in(p, k), "ConditionExpression": "v = :was", "ExpressionAttributeValues": { ":was": was } });
+        match self.call("DeleteItem", delete).await { Ok(_) => Ok(true), Err(e) if e.starts_with("ConditionalCheckFailedException") => Ok(false), Err(e) => Err(e) }
+    }
+    /// A record deleted only while it is `was` (in its own partition, where this version writes it): whether it was.
+    async fn delete_when(&self, key: &str, was: &str) -> io::Result<bool> { self.delete_at_when(&part(key), key, &json!({ "S": was })).await }
+    /// One record moved from where a layout before kept it (`from`) into its own partition, as it is when it moves (read
+    /// again just before), never over one written there since (that one is the record). Its old copy is deleted only
+    /// while it is still what was moved: changed meanwhile (a request of the version before wrote it), what it is now is
+    /// carried over what was moved, while that is still there; gone meanwhile (a delete), what was moved goes too.
+    async fn move_one(&self, from: &str, k: &str) -> io::Result<()> {
+        let own = part(k);
+        // (What this move wrote in its own partition, while it is what is there.)
+        let mut made: Option<Value> = None;
+        for _ in 0..8 {
+            let read = self.call("GetItem", json!({ "TableName": self.table, "Key": key_in(from, k), "ConsistentRead": true })).await?;
+            let Some(item) = read.get("Item").filter(|i| i["v"]["S"].is_string()).cloned() else {
+                if let Some(v) = &made { self.delete_at_when(&own, k, v).await?; }
+                return Ok(())
+            };
+            let mut moved = item.clone();
+            moved["p"] = json!({ "S": own });
+            let wrote = match &made {
+                None => self.put_when(json!({ "TableName": self.table, "Item": moved, "ConditionExpression": "attribute_not_exists(k)" })).await?,
+                Some(v) if *v == item["v"] => true,
+                Some(v) => self.put_when(json!({ "TableName": self.table, "Item": moved, "ConditionExpression": "v = :was", "ExpressionAttributeValues": { ":was": v } })).await?,
+            };
+            made = wrote.then(|| item["v"].clone());
+            if self.delete_at_when(from, k, &item["v"]).await? { return Ok(()) }
+        }
+        Err(format!("{k} kept changing while it was moved"))
     }
     /// Every record under a prefix, by key: where a layout before kept them first, the oldest first, then their own
     /// partitions (one moved between two of these reads is read in its own, and its own copy is the one kept).
@@ -275,7 +313,8 @@ impl Store for Dynamo<'_> {
     /// Eventually consistent: half the price of `get_many`.
     async fn get_many_stale(&self, keys: &[String]) -> io::Result<Vec<Option<String>>> { self.read_many(keys, false).await }
     /// Moves what is left where a layout before kept it into each record's own partition, with its end (not over one
-    /// written there since), the oldest layout first; then says the layout is this one.
+    /// written there since, and as each is when it moves: see `move_one`), the oldest layout first; then says the layout
+    /// is this one.
     async fn migrate(&self, budget: usize) -> io::Result<bool> {
         let layout = self.layout().await?;
         if layout as usize == LAYOUTS.len() - 1 { return Ok(true) }
@@ -285,10 +324,7 @@ impl Store for Dynamo<'_> {
             let items = v["Items"].as_array().cloned().unwrap_or_default();
             for item in &items {
                 let (Some(k), true) = (item["k"]["S"].as_str(), item["v"]["S"].is_string()) else { continue };
-                let mut moved = item.clone();
-                moved["p"] = json!({ "S": part(k) });
-                self.put_when(json!({ "TableName": self.table, "Item": moved, "ConditionExpression": "attribute_not_exists(k)" })).await?;
-                self.call("DeleteItem", json!({ "TableName": self.table, "Key": key_in(&p, k) })).await?;
+                self.move_one(&p, k).await?;
             }
             if !items.is_empty() || !v["LastEvaluatedKey"].is_null() { return Ok(false) }
         }
@@ -332,11 +368,9 @@ fn sweep_claim(store: &Dynamo, now: u64) -> io::Result<Option<String>> {
     Ok(Some(token))
 }
 
-/// A sweep's claim given back once it is done.
-fn sweep_done(store: &Dynamo, token: &str) {
-    let _ = token;
-    let _ = block_on(store.delete(SWEEPING));
-}
+/// A sweep's claim given back once it is done: only while it is still its own (one cut off, as far as another could tell,
+/// may end after that one took its claim over; the claim is that one's then).
+fn sweep_done(store: &Dynamo, token: &str) { let _ = block_on(store.delete_when(SWEEPING, token)); }
 
 #[async_trait(?Send)]
 impl Timer for Scheduled<'_> {

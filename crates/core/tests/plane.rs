@@ -5439,7 +5439,10 @@ fn a_machine_that_keeps_its_jobs_images_is_not_ended_with_its_job_but_goes_off_b
     let k = store.0.borrow().keys().find(|k| k.starts_with("keeping:")).cloned().expect("noted");
     block_on(plane.alarm()).unwrap();
     assert_eq!(ended(), 1, "not yet");
-    store.0.borrow_mut().insert(k.clone(), "0".into());
+    let mut kept: serde_json::Value = serde_json::from_str(&store.0.borrow()[&k]).unwrap();
+    assert_eq!((k.as_str(), kept["machine"]["machine_id"].as_str()), ("keeping:1:i-0abc", Some("i-0abc")), "the machine noted with its job");
+    kept["due_ms"] = 0.into();
+    store.0.borrow_mut().insert(k.clone(), kept.to_string());
     block_on(plane.alarm()).unwrap();
     assert_eq!(ended(), 2);
     assert!(!store.0.borrow().contains_key(&k));
@@ -7828,16 +7831,18 @@ fn an_idle_warm_runner_is_taken_back_after_its_time_and_replaced_but_not_one_git
     let next = stand_ins(&store).into_iter().find(|w| w["job_id"].as_u64() != Some(id)).unwrap();
     let (id, rid) = (next["job_id"].as_u64().unwrap(), next["runner_id"].as_u64().unwrap());
     // Past its time just as GitHub hands it a job (GitHub will not give back a runner running one): kept, its machine
-    // too, and none started beside it.
+    // too, as running; another idle one in its place.
     busy.set(true);
     clock.0.set(clock.0.get() + 31 * 60_000);
     block_on(plane.alarm()).unwrap();
-    assert_eq!((job(&store, id)["state"].as_str(), starts()), (Some("launched"), 3));
+    assert_eq!((job(&store, id)["state"].as_str(), starts()), (Some("running"), 4), "{}", job(&store, id));
     assert!(!own.0.borrow().contains(&format!("stop {}", runner(id))));
-    // Once GitHub gives it back, it goes, and another comes.
+    // The job it was given ends on its runner: it goes with it, and none more is started (one idle is there).
     busy.set(false);
+    block_on(plane.handle(concluded(99, &runner(id), "success")));
     block_on(plane.alarm()).unwrap();
-    assert_eq!((job(&store, id)["state"].as_str(), taken_back(rid), starts()), (Some("done"), true, 4));
+    assert_eq!((job(&store, id)["state"].as_str(), taken_back(rid), starts()), (Some("done"), true, 4), "{}", job(&store, id));
+    assert!(own.0.borrow().contains(&format!("stop {}", runner(id))));
 }
 
 #[test]
@@ -7896,7 +7901,7 @@ fn warm_runners_keep_to_the_limits_and_go_with_their_label_each_machine_counted_
 }
 
 #[test]
-fn a_warm_runner_github_cannot_give_back_is_ended_past_its_time_and_a_grace_but_never_one_running_a_job() {
+fn a_warm_runner_github_cannot_give_back_is_kept_and_one_it_no_longer_knows_is_ended_at_once() {
     // GitHub's answer to a runner taken back: 204, 404 (it knows no such runner), 422 (it runs a job) or 500.
     let said = std::cell::Cell::new(500u16);
     let clouds = With(FakeClouds::default(), |r: &Request, _: &str| (r.url.contains("/actions/runners/") && ["DELETE", "GET"].contains(&r.method.as_str())).then(|| match r.method.as_str() {
@@ -7918,24 +7923,25 @@ fn a_warm_runner_github_cannot_give_back_is_ended_past_its_time_and_a_grace_but_
     block_on(plane.handle(concluded(7, &runner(7), "success")));
     block_on(plane.alarm()).unwrap();
     let id = stand_ins(&store)[0]["job_id"].as_u64().unwrap();
-    // Past its thirty idle minutes, GitHub failing each time: kept for the grace, then its machine ended all the same
-    // and another started in its place.
+    // Past its thirty idle minutes, GitHub failing each time: kept, its machine too (no answer is no proof its runner
+    // takes no job).
     clock.0.set(clock.0.get() + 31 * 60_000);
     block_on(plane.alarm()).unwrap();
     assert_eq!((job(&store, id)["state"].as_str(), stopped(id), starts()), (Some("launched"), false, 2));
     clock.0.set(clock.0.get() + 10 * 60_000);
     block_on(plane.alarm()).unwrap();
+    assert_eq!((job(&store, id)["state"].as_str(), stopped(id), starts()), (Some("launched"), false, 2));
+    // One GitHub no longer knows (its job's events lost, or removed at GitHub) is taken back already: ended at once, and
+    // another started in its place.
+    said.set(404);
+    block_on(plane.alarm()).unwrap();
     assert_eq!((job(&store, id)["state"].as_str(), stopped(id), starts()), (Some("done"), true, 3));
     let next = stand_ins(&store).into_iter().find(|w| w["job_id"].as_u64() != Some(id)).unwrap()["job_id"].as_u64().unwrap();
-    // One GitHub says runs a job is never ended, however long past its time.
+    // One GitHub says runs a job is never ended, however long past its idle time: running, and another idle in its place.
     said.set(422);
     clock.0.set(clock.0.get() + 60 * 60_000);
     block_on(plane.alarm()).unwrap();
-    assert_eq!((job(&store, next)["state"].as_str(), stopped(next), starts()), (Some("launched"), false, 3));
-    // One GitHub no longer knows (its job's events lost, or removed at GitHub) is taken back already: ended at once.
-    said.set(404);
-    block_on(plane.alarm()).unwrap();
-    assert_eq!((job(&store, next)["state"].as_str(), stopped(next), starts()), (Some("done"), true, 4));
+    assert_eq!((job(&store, next)["state"].as_str(), stopped(next), starts()), (Some("running"), false, 4));
 }
 
 /// Containers that will not start while `refusing`, each try counted.
@@ -8281,7 +8287,7 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         a_label_kept_warm_has_its_count_of_idle_runners_and_a_job_one_takes_leaves_its_own_machine_in_its_place,
         an_idle_warm_runner_is_taken_back_after_its_time_and_replaced_but_not_one_github_has_given_a_job,
         warm_runners_keep_to_the_limits_and_go_with_their_label_each_machine_counted_once,
-        a_warm_runner_github_cannot_give_back_is_ended_past_its_time_and_a_grace_but_never_one_running_a_job,
+        a_warm_runner_github_cannot_give_back_is_kept_and_one_it_no_longer_knows_is_ended_at_once,
         a_label_whose_warm_runners_fail_to_start_waits_longer_after_each_and_starts_again_once_one_does,
         a_warm_runner_spot_reclaimed_while_running_a_job_holds_its_label_back_not,
         a_warm_machine_that_never_comes_up_is_replaced_once_a_jobs_would_have_and_one_that_did_is_asked_of_once,
