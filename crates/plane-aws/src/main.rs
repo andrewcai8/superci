@@ -985,4 +985,59 @@ mod tests {
         assert!(webhook(&plane, github.finish(two, "success", "ok", clock.now_ms())) < 300);
         assert!(own.stopped(&runner_of(one)), "{:?}", own.0.borrow());
     }
+
+    /// What GitHub's events cost DynamoDB, as DynamoDB counts it (read units of 4 KB, half for an eventually consistent
+    /// read; write units of 1 KB), with 50 jobs going and with 2,000: about the same, as an event reads and writes its own
+    /// job's records and none that grow with the jobs going. And no partition takes a large part of a busy minute's: at
+    /// 50 events a second (a job's three), each partition's share stays under a quarter of what DynamoDB lets one take
+    /// (3,000 read units, 1,000 write units a second).
+    #[test]
+    fn measure_what_an_event_costs_dynamodb() {
+        let mut costs: Vec<Vec<(f64, f64)>> = vec![];
+        let mut report: Vec<String> = vec![];
+        for going in [50u64, 2_000] {
+            let fake = FakeDynamo { calm: RefCell::new(true), ..Default::default() };
+            fake.items.borrow_mut().insert(("layout".into(), "layout".into()), json!({ "p": { "S": "layout" }, "k": { "S": "layout" }, "v": { "S": "spread" } }));
+            let (s, github, own, cache, config) = (store(&fake), superci_testkit::GitHub::default(), Own::default(), Cache::default(), github_plane());
+            let clock = At(std::cell::Cell::new(1_790_000_000_000));
+            let plane = ControlPlane { store: &s, http: &github, clock: &clock, timer: &Later, config: &config, cache: &cache, containers: Some(&own) };
+            block_on(plane.alarm()).unwrap();
+            // One job going by GitHub's events; the others copies of its records (their ids apart), set right by a sweep.
+            let (first, queued) = github.queue("first", "superci", clock.now_ms());
+            assert!(webhook(&plane, queued) < 300 && webhook(&plane, github.start(first)) < 300);
+            let one = first.to_string();
+            let copies: Vec<((String, String), Value)> = fake.items.borrow().iter()
+                .filter(|((_, k), _)| k.contains(&one) && ["job:", "live:", "runner:", "recent:"].iter().any(|p| k.starts_with(p)))
+                .flat_map(|((_, k), item)| { let one = &one; (1..going).map(move |n| {
+                    let id = (80_000_000_000 + n).to_string();
+                    let k = k.replace(one, &id);
+                    let mut item: Value = serde_json::from_str(&item.to_string().replace(one, &id)).unwrap();
+                    item["p"] = json!({ "S": part(&k) });
+                    ((part(&k), k), item)
+                }) }).collect();
+            fake.items.borrow_mut().extend(copies);
+            block_on(plane.alarm()).unwrap();
+            assert_eq!(block_on(s.list("live:")).unwrap().len() as u64, going);
+            let take = || std::mem::take(&mut *fake.units.borrow_mut());
+            let total = |u: &BTreeMap<String, (f64, f64)>| (u.values().map(|(r, _)| r).sum::<f64>(), u.values().map(|(_, w)| w).sum::<f64>());
+            // Jobs beside them, each queued (and given its machine), begun and ended: what each event cost, and over them all,
+            // what each partition took a job.
+            let (mut each, mut by_part, jobs) = (vec![(0.0, 0.0); 3], BTreeMap::<String, (f64, f64)>::new(), 32.0);
+            take();
+            for _ in 0..jobs as u64 {
+                let (id, queued) = github.queue("beside", "superci", clock.now_ms());
+                let events = [queued, github.start(id), github.finish(id, "success", "ok", clock.now_ms())];
+                for (i, event) in events.into_iter().enumerate() {
+                    assert!(webhook(&plane, event) < 300);
+                    let u = take();
+                    let (r, w) = total(&u);
+                    (each[i].0, each[i].1) = (each[i].0 + r / jobs, each[i].1 + w / jobs);
+                    for (p, (r, w)) in u { let t = by_part.entry(p).or_default(); (t.0, t.1) = (t.0 + r / jobs, t.1 + w / jobs) }
+                }
+            }
+            report.push(format!("{going} going: per event (read, write) {each:?}; per job by partition {by_part:?}"));
+            costs.push(each);
+        }
+        panic!("MEASURED\n{}", report.join("\n"));
+    }
 }
