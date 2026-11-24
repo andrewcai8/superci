@@ -9042,9 +9042,10 @@ fn jobs_counted_once_indexed_count_their_runs_and_a_job_of_no_run_counts_none() 
         }
     }
     served.upkeep();
-    let day = served.store.under(&superci_core::plane::day_key(at / 86_400_000))[0].1.clone();
-    let hour = &day["hours"][(at % 86_400_000 / 3_600_000) as usize];
-    assert!(hour["jobs"] == 3 && hour["runs"] == 1, "{day}");
+    // (A day's totals are kept in a few records, added up.)
+    let keys = superci_core::plane::day_keys(at / 86_400_000);
+    let hour = |k: &str| served.store.under(&keys[0]).into_iter().filter(|(key, _)| keys.contains(key)).map(|(_, d)| d["hours"][(at % 86_400_000 / 3_600_000) as usize][k].as_u64().unwrap_or(0)).sum::<u64>();
+    assert!(hour("jobs") == 3 && hour("runs") == 1, "{:?}", served.store.under(&keys[0]));
 }
 
 /// A running GitHub job's pages as its machine sent them, read for its log: from the end of each, as much as is

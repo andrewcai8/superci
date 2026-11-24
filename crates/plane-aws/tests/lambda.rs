@@ -111,8 +111,8 @@ fn url_event(method: &str, path: &str, headers: Value, body: &str) -> Value {
 }
 
 fn item(aws: &Aws, key: &str) -> Option<String> {
-    let p = key.split(':').next().unwrap();
-    aws.items.lock().unwrap().get(&(TABLE.to_string(), p.to_string(), key.to_string())).and_then(|i| i["v"]["S"].as_str().map(str::to_string))
+    // (In whichever partition: a kind every job uses is spread over several.)
+    aws.items.lock().unwrap().iter().find(|((t, _, k), _)| t == TABLE && k == key).and_then(|(_, i)| i["v"]["S"].as_str().map(str::to_string))
 }
 
 fn aws() -> Aws {
