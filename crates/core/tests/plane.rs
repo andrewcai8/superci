@@ -7772,9 +7772,9 @@ fn a_warm_runner_github_cannot_give_back_is_ended_past_its_time_and_a_grace_but_
 }
 
 /// Containers that will not start while `refusing`, each try counted.
-struct Refusing<'a> { own: &'a OwnContainers, refusing: std::cell::Cell<bool>, tries: std::cell::Cell<u32> }
+struct RefusingContainers<'a> { own: &'a OwnContainers, refusing: std::cell::Cell<bool>, tries: std::cell::Cell<u32> }
 #[async_trait(?Send)]
-impl<'a> Containers for Refusing<'a> {
+impl<'a> Containers for RefusingContainers<'a> {
     async fn start(&self, name: &str, work: &superci_core::io::Work, max: u32, size: superci_core::spec::Size) -> io::Result<String> {
         self.tries.set(self.tries.get() + 1);
         if self.refusing.get() { return Err("the account may not start containers".into()) }
@@ -7788,7 +7788,7 @@ fn a_label_whose_warm_runners_fail_to_start_waits_longer_after_each_and_starts_a
     let busy = std::cell::Cell::new(false);
     let clouds = With(FakeClouds::default(), taking_back(&busy));
     let (store, wakes, cache, own) = (Mem::default(), Wakes::default(), Cache::default(), OwnContainers::default());
-    let containers = Refusing { own: &own, refusing: Default::default(), tries: Default::default() };
+    let containers = RefusingContainers { own: &own, refusing: Default::default(), tries: Default::default() };
     let clock = MovingClock(std::cell::Cell::new(1_790_000_000_000));
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
