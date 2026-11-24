@@ -787,7 +787,7 @@ mod tests {
                     let k = k.replace(one, &id);
                     let mut item: Value = serde_json::from_str(&item.to_string().replace(one, &id)).unwrap();
                     item["p"] = json!({ "S": part(&k) });
-                    ((part(&k), k), item)
+                    ((part(&k).to_string(), k), item)
                 }) }).collect();
             fake.items.borrow_mut().extend(copies);
             block_on(plane.alarm()).unwrap();
