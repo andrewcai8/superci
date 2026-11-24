@@ -16776,7 +16776,7 @@ fn a_jobs_end_is_settled_for_each_way_its_record_stands_and_said_on_its_page() {
     assert!(served.webhook(served.github.start(keeps)) < 300);
     edit(keeps, &|j| { j["keeps"] = true.into(); });
     assert!(served.webhook(served.github.finish(keeps, "success", "ok", now)) < 300);
-    assert!(served.store.0.lock().unwrap().contains_key(&format!("keeping:{keeps}")), "{}", state(keeps));
+    assert!(served.store.0.lock().unwrap().keys().any(|k| k.starts_with(&format!("keeping:{keeps}:"))), "{}", state(keeps));
     // Cancelled while it waited for room, and while its machine was being asked for.
     let (waiting, launching) = (job("waiting"), job("launching"));
     edit(waiting, &|j| { j["state"] = "waiting".into(); for k in ["machine_id", "runner", "runner_id"] { j.as_object_mut().unwrap().remove(k); } });

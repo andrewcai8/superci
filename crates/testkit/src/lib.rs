@@ -1192,7 +1192,12 @@ impl Aws {
                 items.insert(at, a["Item"].clone());
                 (200, json!({}))
             }
-            "DeleteItem" => { items.remove(&key(&table, &a["Key"])); (200, json!({})) }
+            "DeleteItem" => {
+                let at = key(&table, &a["Key"]);
+                if a["ConditionExpression"] == "v = :was" && items.get(&at).is_none_or(|h| h["v"] != a["ExpressionAttributeValues"][":was"]) { return Some(failed("ConditionalCheckFailedException")) }
+                items.remove(&at);
+                (200, json!({}))
+            }
             "Query" => {
                 let vals = &a["ExpressionAttributeValues"];
                 let (p, prefix) = (vals[":p"]["S"].as_str().unwrap_or_default(), vals[":k"]["S"].as_str().unwrap_or(""));

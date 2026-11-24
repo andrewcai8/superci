@@ -547,9 +547,6 @@ pub const JOB_KEPT_MS: u64 = 90 * 86_400_000;
 /// The lines of one job given at most in one answer of a run's status (their records' size): what is left comes at
 /// the next ask.
 const RUN_LINES_BYTES: usize = 1_500_000;
-/// How long a job stays among the live ones once nothing more is done for it (machines counted against an account's
-/// limits a little longer than they run).
-const LIVE_AFTER_MS: u64 = 30 * 60_000;
 /// How long a runner's name is kept with its job: past the longest job.
 const RUNNER_KEPT_MS: u64 = MAX_JOB_MINUTES as u64 * 60_000 + 86_400_000;
 /// Where it is said that the jobs' indexes are complete.
@@ -569,15 +566,33 @@ const DAY_KEPT_MS: u64 = 400 * 86_400_000;
 pub fn over(j: &Job) -> bool { !["waiting", "launching", "launched", "running", "orphan", "pending"].contains(&j.state.as_str()) }
 
 /// Whether the sweep still has something to do for a job: one not over; one to be run again, or whose failure is
-/// still to be said; an AWS machine whose sent data is still to be added to its cost; a job of GitHub's that ended
-/// before any runner took it (its machine may still be coming); or one that ended a moment ago.
+/// still to be said; an AWS machine whose sent data is still to be added to its cost; or a job of GitHub's that ended
+/// before any runner took it (its machine may still be coming). (One that ended a moment ago is among those every start
+/// weighs a little while, see `hot`.)
 pub fn needs_care(j: &Job, now: u64) -> bool {
     let ended = j.ended_ms.unwrap_or(j.at_ms);
-    !over(j) || j.rerun.as_ref().is_some_and(|r| r.state == "pending") || j.fail_pending.is_some()
-        || (j.region.is_some() && j.cost_from.is_some() && j.sent_gb.is_none() && now < ended + 2 * 86_400_000)
-        || (!(j.began || j.over || j.failed_fast) && now.saturating_sub(j.at_ms) < 86_400_000)
-        || now < ended + LIVE_AFTER_MS
+    !over(j) || every_sweep(j, now) || (j.region.is_some() && j.cost_from.is_some() && j.sent_gb.is_none() && now < ended + 2 * 86_400_000)
 }
+
+/// Whether each sweep has something to do for a job that ended: run it again, say its failure, or see whether GitHub
+/// still has it queued (it ended before any runner took it).
+fn every_sweep(j: &Job, now: u64) -> bool {
+    j.rerun.as_ref().is_some_and(|r| r.state == "pending") || j.fail_pending.is_some() || (!(j.began || j.over || j.failed_fast) && now.saturating_sub(j.at_ms) < 86_400_000)
+}
+
+/// When CloudWatch has counted what an AWS machine sent, after it ended.
+const SENT_COUNTED_MS: u64 = 12 * 60_000;
+
+/// When the sweep next has something to do for a job it cares for that ended a while ago (see `CARE`): at each sweep,
+/// or once what its machine sent can be added to its cost.
+fn care_due(j: &Job, now: u64) -> u64 { if !over(j) || every_sweep(j, now) { now } else { j.ended_ms.unwrap_or(j.at_ms) + SENT_COUNTED_MS } }
+
+/// The most of the jobs it cares for that ended a while ago a sweep reads, the soonest due first: the rest at the next.
+const CARE_PER_SWEEP: usize = 1_000;
+
+/// How long into a sweep it goes on adding what AWS machines sent to their costs (one call to CloudWatch each): the
+/// rest at the next sweep, well within the minute the function may run and the minute and a half a sweep's claim holds.
+const SETTLE_BUDGET_MS: u64 = 30_000;
 
 /// How long a job that ended stays among those every start weighs (`live:`): AWS counts its machine against the
 /// account's limits for a little while after (see `spot_ending`, `aws_machines_up`).
@@ -587,7 +602,8 @@ const ENDED_HOT_MS: u64 = 3 * 60_000;
 fn hot(j: &Job, now: u64) -> bool { !over(j) || now < j.ended_ms.unwrap_or(j.at_ms) + ENDED_HOT_MS }
 
 /// The index of the jobs that ended a while ago and that the sweep still cares for (see `needs_care`), apart from
-/// what every start reads (`live:`).
+/// what every start reads (`live:`): each with when it is next to be seen to (see `care_due`), so that a sweep reads only
+/// those due. (One noted before it said when: due.)
 const CARE: &str = "care:";
 
 /// The longest the sweep cares for a job after it ended (its sent data is added two days on, see `needs_care`).
@@ -602,6 +618,11 @@ const ACTIVE_PARTS: usize = 16;
 /// What one of those records holds: jobs by key (`job:` taken off), and when each was put in (ms).
 type Running = std::collections::BTreeMap<String, u64>;
 
+/// A machine that keeps its job's images after the job, still to be ended if it has not gone by itself by `due_ms`
+/// (`keeping:<job>:<machine>`): the machine as its job's record held it when its runner's job ended.
+#[derive(Serialize, Deserialize)]
+struct Keeping { due_ms: u64, machine: Job }
+
 /// The place a job's machine runs on, while it runs or is being started.
 fn running_on(j: &Job) -> Option<String> { (active(j) && !j.cloud.is_empty()).then(|| place_of(j).to_string()) }
 
@@ -613,6 +634,20 @@ fn running_place(key: &str) -> &str { key.trim_start_matches("active:").split_on
 /// What the jobs going have cost so far, by the day each was queued and by place, as the last sweep added it up: a
 /// start weighs it against the limits on spending without reading every job going (see `spend`).
 const ACCRUED: &str = "accrued";
+
+/// What machines cost this month, by the day and by place, as the last sweep added it up from the days' totals and the
+/// jobs going (see `Spent`): what a start weighs against the limits on spending, one small record, not the month's
+/// totals (a busy day's are some 100 KB) read at every start.
+const SPENT: &str = "spent";
+
+/// How old what `SPENT` says may be for a start to go by it (the sweep writes it every minute while machines are up):
+/// older, the month's totals are read.
+const SPENT_FRESH_MS: u64 = 10 * 60_000;
+
+/// What `SPENT` holds: the month it is of (its first day, since the epoch), when it was added up (ms), and each day's
+/// spend by place.
+#[derive(Serialize, Deserialize, Default)]
+struct Spent { month: u64, at_ms: u64, days: std::collections::BTreeMap<u64, std::collections::BTreeMap<String, f64>> }
 
 /// Where an AWS machine of SuperCI's that ended a moment ago is noted (when, ms), by its account, and for a spot one by
 /// its region too: AWS counts a machine against the account's limits for a little while after (see `aws_machines_up`,
@@ -671,20 +706,36 @@ pub struct Hour {
 
 impl Hour {
     pub fn add(&mut self, o: &Hour) {
+        // (How many waits each one's are of: every job that ran has one.)
+        let (seen, more) = (self.ran.max(self.waits.len() as u64), o.ran.max(o.waits.len() as u64));
         (self.runs, self.jobs, self.ran, self.not_ran, self.ms, self.billed) = (self.runs + o.runs, self.jobs + o.jobs, self.ran + o.ran, self.not_ran + o.not_ran, self.ms + o.ms, self.billed + o.billed);
         (self.usd, self.host_usd) = (self.usd + o.usd, self.host_usd + o.host_usd);
-        self.waits.extend_from_slice(&o.waits);
-        if self.waits.len() > WAITS_KEPT {
-            self.waits.sort_unstable();
-            let n = self.waits.len();
-            self.waits = (0..WAITS_KEPT).map(|i| self.waits[i * (n - 1) / (WAITS_KEPT - 1)]).collect();
-        }
+        self.waits = sample(&self.waits, seen, &o.waits, more);
     }
 }
 
-/// The waits an hour keeps at most: the shortest, the longest and evenly between them, for their median. (Every job's
-/// made a busy day's record larger than a store keeps one, DynamoDB's 400 KB.)
+/// The waits an hour keeps at most, for their median: a sample of them, each as likely as any other to be kept. (Every
+/// job's made a busy day's record larger than a store keeps one, DynamoDB's 400 KB.)
 const WAITS_KEPT: usize = 64;
+
+/// A sample of `WAITS_KEPT` waits of two samples' jobs together, each wait as likely as any other to be in it: `a`, a
+/// sample of `na` waits, and `b`, of `nb` (or every one of them). From each as many as its waits are of all of them (the
+/// fraction rounded up as often as it falls, so that one wait beside many is taken as often as it should be), and which
+/// of each by chance. The chance is drawn from the waits and counts themselves: the same waits give the same sample.
+fn sample(a: &[u64], na: u64, b: &[u64], nb: u64) -> Vec<u64> {
+    if a.len() + b.len() <= WAITS_KEPT { return [a, b].concat() }
+    let mix = |mut x: u64| { x = x.wrapping_add(0x9e37_79b9_7f4a_7c15); x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9); x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb); x ^ (x >> 31) };
+    let seed = a.iter().chain(b).fold(mix(na ^ mix(nb)), |h, w| mix(h ^ w));
+    let share = WAITS_KEPT as f64 * na as f64 / (na + nb).max(1) as f64;
+    let rounded = share.floor() as usize + usize::from((mix(seed) % 1_000_000) as f64 / 1e6 < share.fract());
+    let from_a = rounded.clamp(WAITS_KEPT.saturating_sub(b.len()), a.len().min(WAITS_KEPT));
+    let pick = |s: &[u64], n: usize, salt: u64| {
+        let mut by: Vec<(u64, u64)> = s.iter().enumerate().map(|(i, w)| (mix(seed ^ salt ^ (i as u64).wrapping_mul(0x2545_f491_4f6c_dd1d)), *w)).collect();
+        by.sort_unstable();
+        by.into_iter().take(n).map(|(_, w)| w).collect::<Vec<u64>>()
+    };
+    [pick(a, from_a, 1), pick(b, WAITS_KEPT - from_a, 2)].concat()
+}
 
 /// Where a day's totals are kept: by the day's number since the epoch, so they sort by time.
 pub fn day_key(day: u64) -> String { format!("day:{day:06}") }
@@ -692,7 +743,7 @@ pub fn day_key(day: u64) -> String { format!("day:{day:06}") }
 /// The records a day's totals are kept in, added up when read: one before they were kept apart, and one for each
 /// part of the day's jobs (by id). Every job's end adds to its day's, and a record that every one of them writes over
 /// is written by many requests at once, each losing to the others.
-const DAY_PARTS: u64 = 4;
+const DAY_PARTS: u64 = 8;
 pub fn day_keys(day: u64) -> Vec<String> { std::iter::once(day_key(day)).chain((0..DAY_PARTS).map(|p| format!("{}:{p}", day_key(day)))).collect() }
 fn day_part_key(day: u64, job_id: u64) -> String { format!("{}:{}", day_key(day), job_id % DAY_PARTS) }
 
@@ -1145,10 +1196,6 @@ fn warm_idle_minutes() -> u32 { WARM_IDLE_MINUTES }
 
 /// Where stand-in ids begin: far above any id GitHub gives a job, so that none is ever one of GitHub's.
 pub const WARM_IDS: u64 = 1 << 62;
-
-/// How long past its idle time a warm runner GitHub cannot be asked to give back is kept before its machine is ended
-/// all the same (see `take_back`).
-const WARM_GRACE_MS: u64 = 10 * 60_000;
 
 /// The longest a label waits after its warm runners failed to start (see `ControlPlane::warm_failed`).
 const WARM_BACKOFF_MAX_MS: u64 = 15 * 60_000;
@@ -2939,18 +2986,19 @@ impl<'a> ControlPlane<'a> {
     /// Whether other jobs' GPU machines are up in AWS now (then a quota refusal means it is full, not that it is 0).
     /// How many other jobs of this control plane have a machine in AWS now, and how many had one until two minutes
     /// ago (AWS counts a machine against the account's limits a little longer than it runs).
-    async fn aws_machines_up(&self, account: &str, job_id: u64) -> (usize, usize) {
+    /// (Not read, as when the store is throttled: an error, never none.)
+    async fn aws_machines_up(&self, account: &str, job_id: u64) -> Result<(usize, usize)> {
         let now = self.clock.now_ms();
-        let places: Vec<String> = self.store.list("active:").await.unwrap_or_default().into_iter().map(|(k, _)| running_place(&k).to_string())
+        let places: Vec<String> = self.store.list("active:").await?.into_iter().map(|(k, _)| running_place(&k).to_string())
             .filter(|p| self.config.records.account_of(p) == account).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
-        let ours = self.running(&places, &job_id.to_string()).await.unwrap_or_default().values().sum();
-        let ended = get_json::<u64>(self.store, &ended_key(account, None)).await.ok().flatten().is_some_and(|at| now.saturating_sub(at) < 120_000);
-        (ours, ended as usize)
+        let ours = self.running(&places, &job_id.to_string()).await?.values().sum();
+        let ended = get_json::<u64>(self.store, &ended_key(account, None)).await?.is_some_and(|at| now.saturating_sub(at) < 120_000);
+        Ok((ours, ended as usize))
     }
 
-    async fn gpu_machines_up(&self, account: &str, job_id: u64) -> bool {
-        let jobs = self.live_index().await.unwrap_or_default();
-        jobs.iter().any(|j| j.job_id != job_id && self.config.records.account_of(&j.cloud) == account && active(j) && self.config.parse(&j.label).and_then(|s| s.ok()).is_some_and(|s| s.gpu.is_some()))
+    async fn gpu_machines_up(&self, account: &str, job_id: u64) -> Result<bool> {
+        let jobs = self.live_index().await?;
+        Ok(jobs.iter().any(|j| j.job_id != job_id && self.config.records.account_of(&j.cloud) == account && active(j) && self.config.parse(&j.label).and_then(|s| s.ok()).is_some_and(|s| s.gpu.is_some())))
     }
 
     /// Its own network in an AWS region (made by the dashboard), looked up at most every ten minutes; without one
@@ -3009,9 +3057,7 @@ impl<'a> ControlPlane<'a> {
         };
         if candidates.is_empty() { return Ok(Placement::Fail(format!("no cloud connected for jobs: connect one in the {} dashboard", self.config.name()))) }
         // (What was spent is read only for a limit on it.)
-        let capped = routing.monthly_usd.is_some() || routing.daily_usd.is_some() || !routing.account_usd.is_empty() || !routing.account_daily_usd.is_empty()
-            || routing.order.iter().any(|p| p.monthly_usd.is_some());
-        let (spend, today) = if capped { self.spend().await? } else { Default::default() };
+        let (spend, today) = if self.capped() { self.spend().await? } else { Default::default() };
         let running = if self.indexed().await? { self.running(&candidates, "").await? }
             else { self.live_jobs(true).await?.into_iter().filter_map(|(_, j)| running_on(&j)).fold(HashMap::new(), |mut m, p| { *m.entry(p).or_insert(0) += 1; m }) };
         // The whole CI's limit for the month: at it nothing is started, wherever.
@@ -3270,9 +3316,18 @@ impl<'a> ControlPlane<'a> {
         Ok(())
     }
 
+    /// Before a write over what was read is tried again (another request wrote it in between): a moment, longer at
+    /// each try and partly by chance, so that requests that lost together do not try together again.
+    async fn backoff(&self, tries: u32) {
+        let most = (10u64 << tries.min(6)).min(400);
+        let r = crate::crypto::random_bytes(2);
+        self.timer.pause(u16::from_le_bytes([r[0], r[1]]) as u64 % most + 1).await
+    }
+
     /// One record of what runs, edited over what was read (another request's write between: read again).
     async fn edit_running(&self, key: &str, edit: impl Fn(&mut Running)) -> Result<()> {
-        for _ in 0..8 {
+        for tries in 0..8 {
+            if tries > 0 { self.backoff(tries).await }
             let was = self.store.get(key).await?;
             let mut running: Running = was.as_deref().and_then(|v| serde_json::from_str(v).ok()).unwrap_or_default();
             let before = running.clone();
@@ -3345,13 +3400,16 @@ impl<'a> ControlPlane<'a> {
         Ok(jobs)
     }
 
-    /// Every job the sweep cares for (see `needs_care`): those of `live:`, with what that index holds of each, and those
-    /// that ended a while ago with something still to do (`care:`); each with its key, as kept now.
-    async fn cared_for(&self) -> Result<Vec<(String, Job, Option<String>, bool)>> {
+    /// Every job the sweep cares for now (see `needs_care`): those of `live:`, with what that index holds of each, and
+    /// those that ended a while ago and have something to do now (`care:`, `CARE_PER_SWEEP` at most, the soonest due
+    /// first); each with its key, as kept now.
+    async fn cared_for(&self, now: u64) -> Result<Vec<(String, Job, Option<String>, bool)>> {
         if !self.indexed().await? { return Ok(self.live_jobs(true).await?.into_iter().map(|(k, j)| (k, j, None, false)).collect()) }
         let mut at: std::collections::BTreeMap<String, (Option<String>, bool)> = Default::default();
         for (k, v) in self.store.list("live:").await? { at.entry(format!("job:{}", &k["live:".len()..])).or_default().0 = Some(v) }
-        for (k, _) in self.store.list(CARE).await? { at.entry(format!("job:{}", &k[CARE.len()..])).or_default().1 = true }
+        let mut due: Vec<(u64, String)> = self.store.list(CARE).await?.into_iter().map(|(k, v)| (v.trim_matches('"').parse::<u64>().unwrap_or(0), k)).filter(|(at, _)| *at <= now).collect();
+        due.sort_unstable();
+        for (_, k) in due.into_iter().take(CARE_PER_SWEEP) { at.entry(format!("job:{}", &k[CARE.len()..])).or_default().1 = true }
         let keys: Vec<String> = at.keys().cloned().collect();
         let read = self.store.get_many(&keys).await?;
         Ok(at.into_iter().zip(read).filter_map(|((k, (live, care)), v)| Some((k, serde_json::from_str::<Job>(&v?).ok()?, live, care))).collect())
@@ -3390,6 +3448,7 @@ impl<'a> ControlPlane<'a> {
     async fn note_newest(&self, at_ms: u64, id: &str) -> Result<()> {
         let mut lost = 0;
         loop {
+            if lost > 0 { self.backoff(lost).await }
             let (was, mut newest) = self.newest().await?;
             // (One made from the index has it already: kept, then.)
             let has = newest.iter().any(|(_, i)| i == id);
@@ -3422,7 +3481,7 @@ impl<'a> ControlPlane<'a> {
         }
         let keys: Vec<String> = (today - days..=today).flat_map(day_keys).collect();
         let parts = day_keys(today).len();
-        let kept = self.store.get_many(&keys).await?.into_iter().enumerate().filter_map(|(i, v)| v.and_then(|v| serde_json::from_str::<Day>(&v).ok()).map(|d| (today - days + (i / parts) as u64, d)));
+        let kept = self.store.get_many_stale(&keys).await?.into_iter().enumerate().filter_map(|(i, v)| v.and_then(|v| serde_json::from_str::<Day>(&v).ok()).map(|d| (today - days + (i / parts) as u64, d)));
         for (day, d) in kept {
             for (i, h) in d.hours.iter().enumerate() { if h.jobs > 0 || h.runs > 0 || h.usd != 0.0 { hours.entry(day * 24 + i as u64).or_insert_with(Hour::default).add(h) } }
             let s = spend.entry(day).or_default();
@@ -3436,6 +3495,16 @@ impl<'a> ControlPlane<'a> {
     /// have cost so far as the last sweep added it up (`ACCRUED`; before the indexes, every job read).
     async fn spend(&self) -> Result<(HashMap<String, f64>, HashMap<String, f64>)> {
         let now = self.clock.now_ms();
+        if self.indexed().await? {
+            let added = self.store.get_many_stale(&[SPENT.to_string()]).await?.into_iter().next().flatten().and_then(|v| serde_json::from_str::<Spent>(&v).ok());
+            if let Some(s) = added.filter(|s| s.month == month_start_ms(now) / 86_400_000 && now < s.at_ms + SPENT_FRESH_MS) { return Ok(month_and_day(now, s.days)) }
+        }
+        self.spend_now(now).await
+    }
+
+    /// What machines cost this month by the day and by place, from the month's totals and what the jobs going have cost
+    /// so far as the last sweep added it up.
+    async fn spend_by_day(&self, now: u64) -> Result<std::collections::BTreeMap<u64, std::collections::BTreeMap<String, f64>>> {
         let (_, mut spend) = self.hours_with((now - month_start_ms(now)) / 86_400_000, &[]).await?;
         if self.indexed().await? {
             for (day, by) in get_json::<std::collections::BTreeMap<u64, std::collections::BTreeMap<String, f64>>>(self.store, ACCRUED).await?.unwrap_or_default() {
@@ -3443,7 +3512,15 @@ impl<'a> ControlPlane<'a> {
                 for (place, usd) in by { *s.entry(place).or_insert(0.0) += usd }
             }
         }
-        Ok(month_and_day(now, spend))
+        Ok(spend)
+    }
+
+    async fn spend_now(&self, now: u64) -> Result<(HashMap<String, f64>, HashMap<String, f64>)> { Ok(month_and_day(now, self.spend_by_day(now).await?)) }
+
+    /// Whether any limit on spending is set: only then is what was spent read, or added up.
+    fn capped(&self) -> bool {
+        let routing = &self.config.routing;
+        routing.monthly_usd.is_some() || routing.daily_usd.is_some() || !routing.account_usd.is_empty() || !routing.account_daily_usd.is_empty() || routing.order.iter().any(|p| p.monthly_usd.is_some())
     }
 
     /// Whether AWS refused a machine by the rule its budget puts on this control plane's role: the refusal names
@@ -3461,6 +3538,7 @@ impl<'a> ControlPlane<'a> {
         let mut tries = 0;
         loop {
             if tries == 8 { return Err(format!("{key} kept changing while it was written")) }
+            if tries > 0 { self.backoff(tries).await }
             tries += 1;
             let was = self.store.get(&key).await?;
             let mut d: Day = was.as_deref().and_then(|v| serde_json::from_str(v).ok()).unwrap_or_default();
@@ -3503,8 +3581,7 @@ impl<'a> ControlPlane<'a> {
         }
         else {
             let care = format!("{CARE}{id}");
-            let until = if needs_care(j, now) { j.ended_ms.unwrap_or(j.at_ms) + CARED_MS } else { now + LIVE_AFTER_MS };
-            self.store.put_until(&care, String::new(), until).await?;
+            if needs_care(j, now) { self.store.put_until(&care, care_due(j, now).to_string(), j.ended_ms.unwrap_or(j.at_ms) + CARED_MS).await? } else { self.store.delete(&care).await? }
             self.store.delete(&format!("live:{id}")).await?
         }
         // (A warm runner's stand-in is no job to list, nor a repository's: one is made every few minutes.)
@@ -3589,7 +3666,8 @@ impl<'a> ControlPlane<'a> {
         // (Written over exactly what was read, see `Store::swap`: changed in between, it is read and weighed again.)
         let mut tries = 0;
         loop {
-            if tries == 4 { return Err(format!("{key} kept changing while it was written")) }
+            if tries == 6 { return Err(format!("{key} kept changing while it was written")) }
+            if tries > 0 { self.backoff(tries).await }
             tries += 1;
             let was = self.store.get(key).await?;
             let kept = was.as_deref().and_then(|v| serde_json::from_str::<Job>(v).ok()).filter(|kept| kept.rev != job.rev);
@@ -3597,11 +3675,26 @@ impl<'a> ControlPlane<'a> {
             let mut write = match kept {
                 None => { let fresh = job.clone(); fresh.rev.set(job.rev.get() + 1); fresh }
                 Some(kept) if kept.ended_ms.is_some() => {
-                    if job.machine_id.is_some() && job.machine_id != kept.machine_id {
-                        let plane_url = get_json::<String>(self.store, "plane_url").await?.unwrap_or_default();
-                        self.release(&plane_url, job, false).await;
-                    } else if job.runner != kept.runner || job.runner_id != kept.runner_id { self.withdraw_runner(job).await }
-                    return Ok(())
+                    if job.machine_id.is_none() || job.machine_id == kept.machine_id {
+                        if job.runner != kept.runner || job.runner_id != kept.runner_id { self.withdraw_runner(job).await }
+                        return Ok(())
+                    }
+                    let plane_url = get_json::<String>(self.store, "plane_url").await?.unwrap_or_default();
+                    match self.release(&plane_url, job, false).await {
+                        Back::Taken | Back::Gone => return Ok(()),
+                        // Its runner runs a job (GitHub gave it one a moment ago), or GitHub could not say: the machine
+                        // stays, and the record holds it, running (its job's end finds it by its runner) or as an orphan
+                        // the sweep asks GitHub of again. No machine is up that no record holds.
+                        back => {
+                            let mut held = job.clone();
+                            if back == Back::Busy { busy(&mut held, self.clock.now_ms()) } else { held.state = "orphan".into() }
+                            held.ended_ms = None;
+                            held.began |= kept.began;
+                            held.conclusion = held.conclusion.take().or(kept.conclusion);
+                            held.rev.set(kept.rev.get() + 1);
+                            held
+                        }
+                    }
                 }
                 Some(kept) => {
                     let mut merged = job.clone();
@@ -3622,9 +3715,12 @@ impl<'a> ControlPlane<'a> {
             let add = self.counting(&mut write);
             if self.store.swap_until(key, was.as_deref(), crate::io::json(&write), Self::job_end(&write, self.clock.now_ms())).await? {
                 job.rev.set(write.rev.get());
-                self.indexes(key, &write, was.is_none(), add).await?;
+                // The record is written. What follows from it (its indexes, the records of what runs on each place) fails
+                // nothing that wrote it: what is left undone, the sweep sets right from the records (see `settle_running`
+                // and the indexes it keeps to the jobs).
+                let _ = self.indexes(key, &write, was.is_none(), add).await;
                 let before = was.as_deref().and_then(|v| serde_json::from_str::<Job>(v).ok()).as_ref().and_then(running_on);
-                self.moved(key.trim_start_matches("job:"), before, running_on(&write)).await?;
+                let _ = self.moved(key.trim_start_matches("job:"), before, running_on(&write)).await;
                 return Ok(())
             }
         }
@@ -3708,12 +3804,18 @@ impl<'a> ControlPlane<'a> {
         // Whether it failed for what its label asks (not for its repository, nor for a cloud's hiccup): then any job with
         // that label fails here alike, and a failing runner can take it (see `fail_fast`).
         let mut intrinsic = false;
+        // Whether what it is weighed against could not be read (the store throttled, or not answering): nothing is known
+        // against it, so it waits and is tried again, never failed for it.
+        let mut unknown = false;
+        // Whether a machine was started that its record could not be written to hold (see below).
+        let mut unrecorded = false;
         let result: Result<()> = async {
             let spec = match spec { Ok(s) => s, Err(e) => { intrinsic = true; return Err(e) } };
             if let Some(why) = self.config.routing.too_large(&spec) { intrinsic = true; return Err(why) }
             let image = match self.config.routing.image_of(&spec) { Ok(i) => i, Err(why) => { intrinsic = true; return Err(why) } };
             let now = self.clock.now_ms();
-            let places = match self.place(&spec, gitlab, !job.spot_again && (job.no_spot || self.spot_paused(now).await), job.no_spot, &job.failed_at).await? {
+            let placed = self.place(&spec, gitlab, !job.spot_again && (job.no_spot || self.spot_paused(now).await), job.no_spot, &job.failed_at).await;
+            let places = match placed.inspect_err(|_| unknown = true)? {
                 Placement::Run(p) => p,
                 Placement::Wait(why) => {
                     job.state = "waiting".into();
@@ -4108,7 +4210,8 @@ impl<'a> ControlPlane<'a> {
                     // every refusal was for the account's limits, or every on-demand one was (spot may have said
                     // something else: a type a zone does not have).
                     let no_quota = quota_only || (on_demand_refused && on_demand_quota_only);
-                    if spec.gpu.is_some() && no_quota && !answers.is_empty() && !self.gpu_machines_up(self.config.records.account_of(&job.cloud), job.job_id).await {
+                    let others_up = if spec.gpu.is_some() && no_quota && !answers.is_empty() { self.gpu_machines_up(self.config.records.account_of(&job.cloud), job.job_id).await.inspect_err(|_| unknown = true)? } else { true };
+                    if !others_up {
                         let (spot, od) = ("“All G and VT Spot Instance Requests” (https://console.aws.amazon.com/servicequotas/home/services/ec2/quotas/L-3819A6DF)", "“Running On-Demand G and VT instances” (https://console.aws.amazon.com/servicequotas/home/services/ec2/quotas/L-DB2E81BA)");
                         let why = format!("{NO_GPU_QUOTA}{}{}", match (tried_spot && quota_only, tried_on_demand) { (true, true) => format!("{spot} or {od}"), (true, false) => spot.to_string(), _ => od.to_string() }, " in each region it uses");
                         if failures.is_empty() { return Err(why) }
@@ -4170,13 +4273,35 @@ impl<'a> ControlPlane<'a> {
                 self.settle(plane_url, job).await;
                 return self.keep(&key, &*job).await
             }
-            self.keep(&key, &*job).await?;
+            // The record that holds the machine: written, asked again (a throttled write), or the machine ended only once
+            // its runner is taken back from GitHub (which refuses while it runs a job: then left as it is, see `unrecorded`).
+            let mut kept = self.keep(&key, &*job).await;
+            for tries in 1..4 {
+                if kept.is_ok() { break }
+                self.backoff(tries).await;
+                kept = self.keep(&key, &*job).await;
+            }
+            if let Err(e) = kept {
+                if !self.release(plane_url, job, false).await.ended() { unrecorded = true; return Err(e) }
+                (job.state, job.machine_id, job.machine_type) = ("launching".into(), None, None);
+                return Err(e)
+            }
             if job.warm { let _ = self.store.delete(&warm_fail_key(&job.label)).await; }
             self.timer.wake_in(60_000).await
         }.await;
         if let Err(e) = result {
+            // A machine is up that its record could not be written to hold, and GitHub would not take its runner back
+            // (it may run a job already): left as it is, its record as it was (its runner's events find the record by
+            // the runner, and the sweep asks GitHub of it).
+            if unrecorded { return Err(e) }
             self.withdraw_runner(job).await;
             job.runner_id = None;
+            if unknown {
+                job.state = "waiting".into();
+                job.error = Some(format!("waiting: what it is weighed against could not be read; trying again ({})", e.chars().take(200).collect::<String>()));
+                self.keep(&key, &*job).await?;
+                return self.timer.wake_in(20_000).await;
+            }
             // Spot pools left to ask: gone on with in a moment, and not counted as a start that failed.
             if e == MORE_SPOT {
                 job.state = "waiting".into();
@@ -4200,7 +4325,15 @@ impl<'a> ControlPlane<'a> {
             let e = match e.strip_prefix(AT_LIMIT) {
                 None => e,
                 Some(said) => {
-                    let (ours, ended) = self.aws_machines_up(self.config.records.account_of(&job.cloud), job.job_id).await;
+                    let (ours, ended) = match self.aws_machines_up(self.config.records.account_of(&job.cloud), job.job_id).await {
+                        Ok(up) => up,
+                        Err(unread) => {
+                            job.state = "waiting".into();
+                            job.error = Some(format!("waiting: at your AWS account's limit of running CPUs, and what of yours runs there could not be read; trying again ({})", unread.chars().take(160).collect::<String>()));
+                            self.keep(&key, &*job).await?;
+                            return self.timer.wake_in(20_000).await;
+                        }
+                    };
                     if ours > 0 {
                         job.state = "waiting".into();
                         job.error = Some(format!("waiting: your AWS account's limit of running CPUs is in use by {ours} of your job{} there; it starts when one ends ({})", if ours == 1 { "" } else { "s" }, said.chars().take(160).collect::<String>()));
@@ -4425,6 +4558,8 @@ impl<'a> ControlPlane<'a> {
                         // The machine as it is: where it is, what it costs and since when, and what it says if AWS
                         // takes it back.
                         (other.zone, other.disk_gb, other.waiting_usd_per_hour, other.launched_ms) = (j.zone.take(), j.disk_gb.take(), j.waiting_usd_per_hour.take(), j.launched_ms);
+                        // (Whether it keeps its images after its job, and has the layer store: the machine's, not the job's.)
+                        (other.keeps, other.layers) = (std::mem::take(&mut j.keeps), std::mem::take(&mut j.layers));
                         (other.on_demand, other.notice, other.interrupted, other.private, other.for_job) = (j.on_demand, j.notice.take(), j.interrupted, j.private, None);
                         other.spot_refused = j.spot_refused.take();
                         // (Its machine's own link goes with it: what it sends of its log as it goes is this job's now.)
@@ -4514,15 +4649,16 @@ impl<'a> ControlPlane<'a> {
     /// A machine nobody waits for any more (its job was cancelled before any runner took it), ended at once: its
     /// runner is taken back from GitHub first, which GitHub refuses while the runner is running a job (it may have
     /// been given another one a moment ago, the event still on its way). Only then is the machine stopped. A warm pool's
-    /// that GitHub no longer knows is taken back already. `overdue` (a warm runner long past its time): only GitHub's refusal keeps
-    /// it; one GitHub cannot be asked of, or that it refuses for anything else, is ended all the same. Whether it was.
-    async fn take_back(&self, plane_url: &str, j: &mut Job, overdue: bool) -> Back {
+    /// that GitHub no longer knows is taken back already. No answer from GitHub keeps it, however long: only a machine
+    /// `past` its longest time (and five minutes) is ended without one, as it has powered itself off by then (see
+    /// `aws::runner_user_data`). Whether it was.
+    async fn take_back(&self, plane_url: &str, j: &mut Job, past: bool) -> Back {
         if !j.provider.is_empty() { return Back::Unknown }
         let back = match self.ask_back(j).await {
             // (A cancelled job's left to the sweep, which asks GitHub of its job; nothing else sees to a warm pool's.)
-            Back::Gone if !pooled(j) && !overdue => return Back::Unknown,
+            Back::Gone if !pooled(j) && !past => return Back::Unknown,
             Back::Busy => return Back::Busy,
-            Back::Unknown if !overdue => return Back::Unknown,
+            Back::Unknown if !past => return Back::Unknown,
             Back::Unknown => Back::Taken,
             back => back,
         };
@@ -4611,9 +4747,12 @@ impl<'a> ControlPlane<'a> {
                             j.up = true;
                             self.keep(&key, &j).await?;
                         }
-                        // (A spot machine AWS took back is gone already. One GitHub will not take back was just given a job: kept.)
+                        // (A spot machine AWS took back is gone already. One GitHub will not take back was just given a job:
+                        // running, no idle runner of the pool's any more.)
                         let retiring = kept >= count || age > idle_ms || j.interrupted || (!j.up && age > boot);
-                        if retiring && self.retire(plane_url, &key, &mut j, age > idle_ms + WARM_GRACE_MS).await? { continue }
+                        let past = age > (self.machine_minutes(&j.cloud) as u64 + 5) * 60_000;
+                        if retiring && self.retire(plane_url, &key, &mut j, past).await? { continue }
+                        if !pooled(&j) { continue }
                     }
                 }
                 kept += 1;
@@ -4652,9 +4791,18 @@ impl<'a> ControlPlane<'a> {
 
     /// A warm pool's idle runner ended (see `warm_up`): taken back from GitHub first, which refuses while it runs a job
     /// it was given a moment ago, then its machine. Over as done: its job, if it had one, ran on another runner.
-    /// Whether it was.
-    async fn retire(&self, plane_url: &str, key: &str, j: &mut Job, overdue: bool) -> Result<bool> {
-        if !self.take_back(plane_url, j, overdue).await.ended() { return Ok(false) }
+    /// Refused: it runs a job (its events lost, or still on their way), and is kept as running, to end with that job
+    /// or at its time, not asked of again as an idle one. Whether it was ended.
+    async fn retire(&self, plane_url: &str, key: &str, j: &mut Job, past: bool) -> Result<bool> {
+        match self.take_back(plane_url, j, past).await {
+            Back::Taken | Back::Gone => {}
+            Back::Busy => {
+                busy(j, self.clock.now_ms());
+                self.keep(key, j).await?;
+                return Ok(false)
+            }
+            Back::Unknown => return Ok(false),
+        }
         (j.state, j.for_job) = ("done".into(), None);
         self.keep(key, j).await?;
         Ok(true)
@@ -5691,10 +5839,14 @@ impl<'a> ControlPlane<'a> {
         }
         if let (Some(name), Some(mut j)) = (runner, holder) {
             if j.job_id != job_id { on_anothers = Some(j.for_job.unwrap_or(j.job_id)) }
-            // (One that keeps its job's images goes off by itself once it has: ended later only if it has not.)
+            // (One that keeps its job's images goes off by itself once it has: ended later only if it has not. That
+            // machine, as it is now: its job's record may hold another by then.)
             if j.keeps && self.config.records.provider_of(&j.cloud) == "aws" {
-                self.store.put_until(&format!("keeping:{}", j.job_id), (self.clock.now_ms() + KEEPING_MS).to_string(), self.clock.now_ms() + 2 * KEEPING_MS).await?;
-                self.timer.wake_in(KEEPING_MS).await?;
+                let now = self.clock.now_ms();
+                if let Some(machine) = &j.machine_id {
+                    self.store.put_until(&format!("keeping:{}:{machine}", j.job_id), crate::io::json(&Keeping { due_ms: now + KEEPING_MS, machine: j.clone() }), now + 2 * KEEPING_MS).await?;
+                    self.timer.wake_in(KEEPING_MS).await?;
+                }
             } else { self.stop_machine(plane_url, &j).await; }
             j.state = "done".into();
             if j.job_id == job_id { j.began = true; j.conclusion = ev.conclusion.clone() }
@@ -5796,7 +5948,7 @@ impl<'a> ControlPlane<'a> {
         // (And the runs of jobs counted before runs were, once the indexes are there.)
         let indexed = self.indexed().await?;
         if indexed { let _ = self.recount_runs(150).await; }
-        let kept = self.cared_for().await?;
+        let kept = self.cared_for(now).await?;
         // (The jobs to be run again once their runs have finished: those of one run are asked for together.)
         let reruns: Vec<Rerun> = kept.iter().filter_map(|(_, j, _, _)| j.rerun.clone()).filter(|r| r.state == "pending").collect();
         // GitHub's jobs that still wait as far as it has said (with the runners that can take them), and the jobs
@@ -5826,7 +5978,7 @@ impl<'a> ControlPlane<'a> {
                     if live.as_deref() != Some(held.as_str()) { self.store.put(&format!("live:{id}"), held).await? }
                     if let (true, Some(at)) = (over(j), j.ended_ms) { if now.saturating_sub(at) < 120_000 { self.note_ended(j, at).await } }
                 } else if live.is_some() {
-                    if !*care { self.store.put(&format!("{CARE}{id}"), String::new()).await? }
+                    if !*care { self.store.put_until(&format!("{CARE}{id}"), care_due(j, now).to_string(), j.ended_ms.unwrap_or(j.at_ms) + CARED_MS).await? }
                     self.store.delete(&format!("live:{id}")).await?
                 }
             }
@@ -5834,6 +5986,7 @@ impl<'a> ControlPlane<'a> {
             let mut accrued: std::collections::BTreeMap<u64, std::collections::BTreeMap<String, f64>> = Default::default();
             for (_, j, ..) in kept.iter().filter(|(_, j, ..)| j.counted_usd.is_none()) { *accrued.entry(j.at_ms / 86_400_000).or_default().entry(place_of(j).to_string()).or_insert(0.0) += job_usd(j, now) }
             put_json(self.store, ACCRUED, &accrued).await?;
+            if self.capped() { put_json(self.store, SPENT, &Spent { month: month_start_ms(now) / 86_400_000, at_ms: now, days: self.spend_by_day(now).await? }).await? }
         }
         for (key, mut j, _, _) in kept {
             // Nothing more to do for it (time has passed since it was written).
@@ -5856,7 +6009,15 @@ impl<'a> ControlPlane<'a> {
             // A start cut off midway (the runtime stopped while it waited on a cloud): placed again, twice at most.
             if j.state == "launching" {
                 if now.saturating_sub(j.launched_ms.unwrap_or(j.at_ms)) < 120_000 { active += 1; continue }
-                if j.machine_id.is_some() && !self.release(&plane_url, &j, true).await.ended() { active += 1; continue }
+                // Its machine, or a runner of GitHub's alone (a machine started that its record could not be written to
+                // hold): taken back first. One GitHub will not give back runs a job: running, as its record says then.
+                if j.machine_id.is_some() || (j.runner_id.is_some() && j.provider.is_empty()) {
+                    match self.release(&plane_url, &j, true).await {
+                        Back::Taken | Back::Gone => {}
+                        Back::Busy => { busy(&mut j, now); self.keep(&key, &j).await?; active += 1; continue }
+                        Back::Unknown => { active += 1; continue }
+                    }
+                }
                 if j.retries >= 2 {
                     j.state = "failed".into();
                     j.error = Some("its machine's start was cut off, three times".into());
@@ -5885,9 +6046,10 @@ impl<'a> ControlPlane<'a> {
                 if queued { self.fail_fast(&plane_url, &mut j, &why).await; active += 1 } else { j.fail_pending = None; self.keep(&key, &j).await? }
                 continue;
             }
-            // An AWS machine that ended a while ago: what it sent, once CloudWatch has counted it, added to its cost.
-            if self.config.records.provider_of(&j.cloud) == "aws" && j.cost_from.is_some() && j.sent_gb.is_none() && j.ended_ms.is_some_and(|e| now > e + 12 * 60_000 && now < e + 2 * 86_400_000) {
-                if self.settle_sent(&plane_url, &mut j).await { self.keep(&key, &j).await?; }
+            // An AWS machine that ended a while ago: what it sent, once CloudWatch has counted it, added to its cost. (Not
+            // past the sweep's time for it: the next sweep.)
+            if self.config.records.provider_of(&j.cloud) == "aws" && j.cost_from.is_some() && j.sent_gb.is_none() && j.ended_ms.is_some_and(|e| now > e + SENT_COUNTED_MS && now < e + 2 * 86_400_000) {
+                if self.clock.now_ms().saturating_sub(now) < SETTLE_BUDGET_MS && self.settle_sent(&plane_url, &mut j).await { self.keep(&key, &j).await?; }
                 continue;
             }
             if !["launched", "running", "orphan"].contains(&j.state.as_str()) { continue; }
@@ -6130,15 +6292,26 @@ impl<'a> ControlPlane<'a> {
         if let Err(e) = self.sweep_cache(&plane_url, now).await { let _ = self.store.put("cache-sweep-error", e).await; }
         // The layer store: what the converter made, and once an hour what goes.
         if let Err(e) = self.sweep_layers(&plane_url, now).await { let _ = self.store.put("layers-sweep-error", e).await; }
-        // Machines that kept their jobs' images and are still there a while after: ended now.
+        // Machines that kept their jobs' images and are still there a while after: ended now. Each the machine noted, as
+        // its runner's one job is over (its end named it), whichever its job's record holds by then.
         for (k, v) in self.store.list("keeping:").await.unwrap_or_default() {
-            if v.parse::<u64>().is_ok_and(|due| due > now) { continue }
-            let key = format!("job:{}", k.trim_start_matches("keeping:"));
-            // (Not read, or written meanwhile: the next sweep.)
-            let Ok(held) = get_json::<Job>(self.store, &key).await else { continue };
-            if let Some(j) = held {
-                if !self.fence(&key, &j).await.unwrap_or(false) { continue }
-                self.stop_machine(&plane_url, &j).await;
+            match serde_json::from_str::<Keeping>(&v) {
+                Ok(kept) => {
+                    if kept.due_ms > now { continue }
+                    self.stop_machine(&plane_url, &kept.machine).await;
+                }
+                // (Noted before the note held its machine: by its job's record, only while that record is over. One
+                // that went on to another machine holds that one now, and the kept one goes off by itself.)
+                Err(_) => {
+                    if v.parse::<u64>().is_ok_and(|due| due > now) { continue }
+                    let key = format!("job:{}", k.trim_start_matches("keeping:"));
+                    // (Not read, or written meanwhile: the next sweep.)
+                    let Ok(held) = get_json::<Job>(self.store, &key).await else { continue };
+                    if let Some(j) = held.filter(over) {
+                        if !self.fence(&key, &j).await.unwrap_or(false) { continue }
+                        self.stop_machine(&plane_url, &j).await;
+                    }
+                }
             }
             let _ = self.store.delete(&k).await;
         }
