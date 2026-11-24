@@ -8501,6 +8501,8 @@ fn aws_starts_that_find_no_image_run_out_of_time_or_meet_the_accounts_limit_say_
     served.store.0.lock().unwrap().insert("job:96".into(), serde_json::json!({ "job_id": 96, "run_id": 1, "repo": "acme/app", "state": "done", "cloud": "aws", "machine_id": "i-0ended", "at_ms": now - 600_000,
         "ended_ms": now - 30_000, "installation_id": 42, "seen_in_progress": true, "began": true }).to_string());
     served.store.0.lock().unwrap().insert("live:96".into(), String::new());
+    // (Its end written by another request: the sweep notes it for the starts after.)
+    served.upkeep();
     let limited = queue("at the limit");
     let still_counted = |id: u64| state(id)["state"] == "waiting" && state(id)["error"].as_str().unwrap_or_default().contains("AWS still counts a machine of yours that ended a moment ago");
     assert!(still_counted(limited), "{}", state(limited));

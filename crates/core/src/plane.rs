@@ -610,13 +610,13 @@ fn running_key(place: &str, id: &str) -> String { format!("active:{:02}:{place}"
 /// The place one of those records is of.
 fn running_place(key: &str) -> &str { key.trim_start_matches("active:").split_once(':').map_or("", |(_, p)| p) }
 
-/// Where an AWS machine of SuperCI's that ended a moment ago is noted (when, ms), by its account, and for a spot one by
-/// its region too: AWS counts a machine against the account's limits for a little while after (see `aws_machines_up`,
-/// `spot_ending`).
 /// What the jobs going have cost so far, by the day each was queued and by place, as the last sweep added it up: a
 /// start weighs it against the limits on spending without reading every job going (see `spend`).
 const ACCRUED: &str = "accrued";
 
+/// Where an AWS machine of SuperCI's that ended a moment ago is noted (when, ms), by its account, and for a spot one by
+/// its region too: AWS counts a machine against the account's limits for a little while after (see `aws_machines_up`,
+/// `spot_ending`).
 fn ended_key(account: &str, region: Option<&str>) -> String { match region { Some(r) => format!("ended:{account}:{r}"), None => format!("ended:{account}") } }
 
 /// What the index of the jobs going (`live:<id>`) holds of each: what every start weighs of them (the machines each
