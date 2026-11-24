@@ -372,13 +372,14 @@ fn main() {
             refreshed?;
             // One sweep at a time: the schedule's and the function's own could otherwise each start a machine for
             // the same waiting job. One that finds another going leaves it to that one (which asks for the next
-            // itself); a note older than a minute and a half is of a sweep that was cut off.
+            // itself); a note older than a minute and a half is of a sweep that was cut off, taken over by one alone.
+            // (The note not read, as when DynamoDB is throttled: no sweep. Two at once would each act on the jobs.)
             let sweep = || -> io::Result<Value> {
                 let now = now_ms();
-                if !block_on(store.put_if_absent(SWEEPING, now.to_string())).unwrap_or(true) {
-                    let since = block_on(store.get(SWEEPING)).ok().flatten().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
-                    if now.saturating_sub(since) < 90_000 { return Ok(json!({ "swept": false })) }
-                    let _ = block_on(store.put(SWEEPING, now.to_string()));
+                if !block_on(store.put_if_absent(SWEEPING, now.to_string()))? {
+                    let held = block_on(store.get(SWEEPING))?;
+                    let since = held.as_deref().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+                    if now.saturating_sub(since) < 90_000 || !block_on(store.swap(SWEEPING, held.as_deref(), now.to_string()))? { return Ok(json!({ "swept": false })) }
                 }
                 let done = block_on(plane.alarm()).map(|_| json!({ "swept": true }));
                 let _ = block_on(store.delete(SWEEPING));

@@ -1094,6 +1094,27 @@ enum Runner { Aws(AwsConnection), Launcher(Launcher), Own }
 /// (no connected place can run its machine), each with why. A place comes with the machine it starts for the job.
 enum Placement { Run(Vec<(String, Runner, Size)>), Wait(String), Fail(String) }
 
+/// What GitHub said when a job's runner was asked back (removed, so that it takes no job; see `ControlPlane::release`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Back {
+    Taken,
+    /// GitHub knows no such runner (it removes a just-in-time one once its job has ended).
+    Gone,
+    /// GitHub refuses: the runner is running a job.
+    Busy,
+    /// No answer to go by: GitHub could not be asked, or failed.
+    Unknown,
+}
+
+impl Back { fn ended(self) -> bool { matches!(self, Back::Taken | Back::Gone) } }
+
+/// A job's machine seen running a job (its runner busy at GitHub), whichever job that is.
+fn busy(j: &mut Job, now: u64) {
+    (j.seen_in_progress, j.for_job) = (true, None);
+    j.state = "running".into();
+    j.started_ms.get_or_insert(now);
+}
+
 /// The start of this month (UTC), in ms.
 pub fn month_start_ms(now_ms: u64) -> u64 {
     let days = now_ms / 86_400_000;
@@ -2234,7 +2255,7 @@ impl<'a> ControlPlane<'a> {
             "jobs": with_machines,
             "usage": usage,
             // How its store stands: whether the jobs' indexes are built, and nothing is left in an earlier layout.
-            "store": { "indexed": self.indexed().await, "moved": self.store.migrate(0).await.unwrap_or(false) },
+            "store": { "indexed": self.indexed().await?, "moved": self.store.migrate(0).await.unwrap_or(false) },
         })))
     }
 
@@ -2590,8 +2611,12 @@ impl<'a> ControlPlane<'a> {
         if j.provider == "gitlab" {
             if let Some(gl) = self.gitlab_of(j) { if gitlab::delete_runner(self.http, gl, rid).await.is_ok() { let _ = self.store.delete(&format!("glrunner:{}", gitlab::local(&gl.id, rid))).await; } }
         } else if let Some(app) = self.app_of(j) {
-            if let Ok(t) = self.installation_token(app, j.installation_id).await { let _ = github::delete_runner(self.http, &app.api(), &t, &Self::owner_of(app), &j.repo, rid).await; }
-            if let Some(name) = &j.runner { let _ = self.store.delete(&format!("runner:{name}")).await; }
+            let removed = match self.installation_token(app, j.installation_id).await {
+                Ok(t) => github::delete_runner(self.http, &app.api(), &t, &Self::owner_of(app), &j.repo, rid).await.map_or_else(|e| e.contains(": 404 "), |_| true),
+                Err(_) => false,
+            };
+            // (Kept while GitHub keeps the runner, which it does while the runner runs a job: that job's events find it.)
+            if let (true, Some(name)) = (removed, &j.runner) { let _ = self.store.delete(&format!("runner:{name}")).await; }
         }
     }
 
@@ -3108,11 +3133,11 @@ impl<'a> ControlPlane<'a> {
     /// Whether the jobs' indexes are complete: `live:` (the jobs the sweep still cares for), `recent:` (every job by
     /// when it was queued) and `day:` (each day's totals), built once from the jobs kept before them (`reindex`).
     /// Until then what reads them reads every job instead.
-    async fn indexed(&self) -> bool {
-        if self.cache.indexed.get() { return true }
-        let done = self.store.get(INDEXED).await.ok().flatten().is_some();
+    async fn indexed(&self) -> Result<bool> {
+        if self.cache.indexed.get() { return Ok(true) }
+        let done = self.store.get(INDEXED).await?.is_some();
         self.cache.indexed.set(done);
-        done
+        Ok(done)
     }
 
     /// The jobs the sweep still cares for (see `needs_care`), each with its key, as they are kept now.
@@ -3129,7 +3154,7 @@ impl<'a> ControlPlane<'a> {
 
     async fn live_jobs(&self) -> Result<Vec<(String, Job)>> {
         let now = self.clock.now_ms();
-        if !self.indexed().await {
+        if !self.indexed().await? {
             return Ok(self.store.list("job:").await?.into_iter().filter_map(|(k, v)| Some((k, serde_json::from_str::<Job>(&v).ok()?))).filter(|(_, j)| needs_care(j, now)).collect())
         }
         // (The jobs themselves, read at once: an index says only which.)
@@ -3139,7 +3164,7 @@ impl<'a> ControlPlane<'a> {
 
     /// The newest `n` jobs, the newest first.
     async fn newest_jobs(&self, n: usize) -> Result<Vec<Job>> {
-        if !self.indexed().await {
+        if !self.indexed().await? {
             let mut all: Vec<Job> = self.store.list("job:").await?.into_iter().filter_map(|(_, v)| serde_json::from_str::<Job>(&v).ok()).filter(|j| !j.warm).collect();
             all.sort_by(|a, b| b.at_ms.cmp(&a.at_ms));
             all.truncate(n);
@@ -3186,7 +3211,7 @@ impl<'a> ControlPlane<'a> {
     /// Each hour's totals over the last `days` days and today, from each day's (jobs still going counted as they
     /// stand now), by the hour since the epoch; and each day's spend by place.
     async fn hours(&self, days: u64) -> Result<(std::collections::BTreeMap<u64, Hour>, std::collections::BTreeMap<u64, std::collections::BTreeMap<String, f64>>)> {
-        let live = if self.indexed().await { self.live_jobs().await? } else { vec![] };
+        let live = if self.indexed().await? { self.live_jobs().await? } else { vec![] };
         self.hours_with(days, &live).await
     }
 
@@ -3200,7 +3225,7 @@ impl<'a> ControlPlane<'a> {
             *spend.entry(j.at_ms / 86_400_000).or_default().entry(place_of(j).to_string()).or_insert(0.0) += h.usd;
             hours.entry(hour).or_insert_with(Hour::default).add(&h);
         };
-        if !self.indexed().await {
+        if !self.indexed().await? {
             let since = (today - days) * 86_400_000;
             for (_, v) in self.store.list("job:").await? { if let Ok(j) = serde_json::from_str::<Job>(&v) { if j.at_ms >= since { add(&j, &mut hours, &mut spend) } } }
             return Ok((hours, spend))
@@ -3308,7 +3333,7 @@ impl<'a> ControlPlane<'a> {
     /// Builds the jobs' indexes from the jobs kept before them, `budget` jobs at a time (the first one not done yet is kept, to go on from);
     /// whether they are complete.
     async fn reindex(&self, budget: usize) -> Result<bool> {
-        if self.indexed().await { return Ok(true) }
+        if self.indexed().await? { return Ok(true) }
         let now = self.clock.now_ms();
         let after = self.store.get("reindex-at").await?.unwrap_or_default();
         let mut done = 0;
@@ -3356,17 +3381,16 @@ impl<'a> ControlPlane<'a> {
         loop {
             if tries == 4 { return Err(format!("{key} kept changing while it was written")) }
             tries += 1;
-            let was = self.store.get(key).await.ok().flatten();
+            let was = self.store.get(key).await?;
             let kept = was.as_deref().and_then(|v| serde_json::from_str::<Job>(v).ok()).filter(|kept| kept.rev != job.rev);
             let counted = was.as_deref().and_then(|v| serde_json::from_str::<Job>(v).ok()).and_then(|k| k.counted_usd);
             let mut write = match kept {
                 None => { let fresh = job.clone(); fresh.rev.set(job.rev.get() + 1); fresh }
                 Some(kept) if kept.ended_ms.is_some() => {
                     if job.machine_id.is_some() && job.machine_id != kept.machine_id {
-                        let plane_url = get_json::<String>(self.store, "plane_url").await.ok().flatten().unwrap_or_default();
-                        self.stop_machine(&plane_url, job).await;
-                    }
-                    if job.machine_id != kept.machine_id || job.runner != kept.runner || job.runner_id != kept.runner_id { self.withdraw_runner(job).await }
+                        let plane_url = get_json::<String>(self.store, "plane_url").await?.unwrap_or_default();
+                        self.release(&plane_url, job).await;
+                    } else if job.runner != kept.runner || job.runner_id != kept.runner_id { self.withdraw_runner(job).await }
                     return Ok(())
                 }
                 Some(kept) => {
@@ -4138,10 +4162,12 @@ impl<'a> ControlPlane<'a> {
     /// A job's record written again, under its key.
     pub(crate) async fn keep_job(&self, job: &Job) -> Result<()> { self.keep(&job_key(job), job).await }
 
+    /// The job whose machine a runner is on. Only while that job's record still has the runner: one whose record went
+    /// on to another machine (written over by a request that read it before) has no machine of this runner's to end.
     async fn by_runner(&self, runner: Option<&str>) -> Result<Option<Job>> {
         let Some(name) = runner else { return Ok(None) };
         let Some(job_id) = get_json::<u64>(self.store, &format!("runner:{name}")).await? else { return Ok(None) };
-        get_json::<Job>(self.store, &format!("job:{job_id}")).await
+        Ok(get_json::<Job>(self.store, &format!("job:{job_id}")).await?.filter(|j| failing_runner(name) || j.runner.as_deref() == Some(name)))
     }
 
     /// A job began on a runner. GitHub gives a waiting job to any idle runner with its label, so a runner may begin a
@@ -4260,29 +4286,52 @@ impl<'a> ControlPlane<'a> {
     /// been given another one a moment ago, the event still on its way). Only then is the machine stopped. A warm pool's
     /// that GitHub no longer knows is taken back already. `overdue` (a warm runner long past its time): only GitHub's refusal keeps
     /// it; one GitHub cannot be asked of, or that it refuses for anything else, is ended all the same. Whether it was.
-    async fn take_back(&self, plane_url: &str, j: &mut Job, overdue: bool) -> bool {
-        if !j.provider.is_empty() { return false }
-        let asked = match (self.app_of(j), j.runner_id) {
-            (Some(app), Some(runner_id)) => match self.installation_token(app, j.installation_id).await {
-                Ok(token) => Some(github::delete_runner(self.http, &app.api(), &token, &Self::owner_of(app), &j.repo, runner_id).await),
-                Err(_) => None,
-            },
-            _ => None,
-        };
-        match asked {
-            Some(Ok(())) => {}
+    async fn take_back(&self, plane_url: &str, j: &mut Job, overdue: bool) -> Back {
+        if !j.provider.is_empty() { return Back::Unknown }
+        let back = match self.ask_back(j).await {
             // (A cancelled job's left to the sweep, which asks GitHub of its job; nothing else sees to a warm pool's.)
-            Some(Err(e)) if e.contains(": 404 ") && pooled(j) => {}
-            Some(Err(e)) if e.contains(": 422 ") => return false,
-            _ if !overdue => return false,
-            _ => {}
-        }
+            Back::Gone if !pooled(j) && !overdue => return Back::Unknown,
+            Back::Busy => return Back::Busy,
+            Back::Unknown if !overdue => return Back::Unknown,
+            Back::Unknown => Back::Taken,
+            back => back,
+        };
         if let Some(name) = &j.runner { let _ = self.store.delete(&format!("runner:{name}")).await; }
         self.stop_machine(plane_url, j).await;
         (j.state, j.runner_id) = ("cancelled".into(), None);
         j.ended_ms.get_or_insert(self.clock.now_ms());
         self.settle(plane_url, j).await;
-        true
+        back
+    }
+
+    /// Asks GitHub to remove a job's runner, so that it can take no job: what GitHub said (see `Back`).
+    async fn ask_back(&self, j: &Job) -> Back {
+        let (Some(app), Some(runner_id)) = (self.app_of(j), j.runner_id) else { return Back::Unknown };
+        let Ok(token) = self.installation_token(app, j.installation_id).await else { return Back::Unknown };
+        match github::delete_runner(self.http, &app.api(), &token, &Self::owner_of(app), &j.repo, runner_id).await {
+            Ok(()) => Back::Taken,
+            Err(e) if e.contains(": 404 ") => Back::Gone,
+            Err(e) if e.contains(": 422 ") => Back::Busy,
+            Err(_) => Back::Unknown,
+        }
+    }
+
+    /// Ends the machine of a job nobody waits for any more, only once its runner can take no job: GitHub removes the
+    /// runner first, and refuses while the runner runs a job (GitHub gives a waiting job to any idle runner with its
+    /// label, and that job's event may not have come yet, or may have been lost). What GitHub said: the machine was
+    /// ended for `Taken` and `Gone` alone. A GitLab job's machine and a run from a computer's are ended at once.
+    async fn release(&self, plane_url: &str, j: &Job) -> Back {
+        if !j.provider.is_empty() {
+            self.stop_machine(plane_url, j).await;
+            self.withdraw_runner(j).await;
+            return Back::Taken
+        }
+        let back = self.ask_back(j).await;
+        if back.ended() {
+            if let Some(name) = &j.runner { let _ = self.store.delete(&format!("runner:{name}")).await; }
+            self.stop_machine(plane_url, j).await;
+        }
+        back
     }
 
     /// Each warm label's runners (see `Warm`), once the sweep has seen to every other machine. One idle past its time,
@@ -4374,7 +4423,7 @@ impl<'a> ControlPlane<'a> {
     /// it was given a moment ago, then its machine. Over as done: its job, if it had one, ran on another runner.
     /// Whether it was.
     async fn retire(&self, plane_url: &str, key: &str, j: &mut Job, overdue: bool) -> Result<bool> {
-        if !self.take_back(plane_url, j, overdue).await { return Ok(false) }
+        if !self.take_back(plane_url, j, overdue).await.ended() { return Ok(false) }
         (j.state, j.for_job) = ("done".into(), None);
         self.keep(key, j).await?;
         Ok(true)
@@ -5457,8 +5506,12 @@ impl<'a> ControlPlane<'a> {
                 match on_anothers {
                     Some(waiting) => { own.over = true; own.for_job.get_or_insert(waiting); }
                     None if own.over => {}
-                    None if self.take_back(plane_url, &mut own, false).await => {}
-                    None => own.state = "orphan".into(),
+                    None => match self.take_back(plane_url, &mut own, false).await {
+                        Back::Taken | Back::Gone => {}
+                        // GitHub gave its runner another job a moment ago, whose event has not come yet: busy.
+                        Back::Busy => busy(&mut own, self.clock.now_ms()),
+                        Back::Unknown => own.state = "orphan".into(),
+                    },
                 }
                 own.began = true;
                 self.keep(&format!("job:{job_id}"), &own).await?;
@@ -5502,7 +5555,8 @@ impl<'a> ControlPlane<'a> {
         // The jobs still cared for, once the indexes are built from the jobs kept before them (a batch at a time).
         let _ = self.reindex(150).await;
         // (And the runs of jobs counted before runs were, once the indexes are there.)
-        if self.indexed().await { let _ = self.recount_runs(150).await; }
+        let indexed = self.indexed().await?;
+        if indexed { let _ = self.recount_runs(150).await; }
         let kept = self.live_jobs().await?;
         // GitHub's jobs that still wait as far as it has said (with the runners that can take them), and the jobs
         // that machines still coming are for.
@@ -5517,7 +5571,7 @@ impl<'a> ControlPlane<'a> {
         }
         for (key, mut j) in kept {
             // Nothing more to do for it (time has passed since it was written): no longer among the live ones.
-            if self.indexed().await && !needs_care(&j, now) { self.store.delete(&format!("live:{}", key.trim_start_matches("job:"))).await?; continue }
+            if indexed && !needs_care(&j, now) { self.store.delete(&format!("live:{}", key.trim_start_matches("job:"))).await?; continue }
             // A warm pool's idle runner is the pool's to see to, below: what follows asks GitHub of the job a machine is
             // for, and these are for none.
             if pooled(&j) { pool = true; continue }
@@ -5583,7 +5637,7 @@ impl<'a> ControlPlane<'a> {
                 let told_gone = self.store.get(&gone_key(&j)).await.ok().flatten().is_some();
                 // (Its runner is taken back from GitHub, which refuses while it runs a job, and the machine ended: the
                 // job is cancelled, as when the note is seen in time. Refused: as any machine nobody waits for, below.)
-                if told_gone && j.for_job.is_none() && self.take_back(&plane_url, &mut j, false).await {
+                if told_gone && j.for_job.is_none() && self.take_back(&plane_url, &mut j, false).await.ended() {
                     let _ = self.store.delete(&gone_key(&j)).await;
                     j.began = true;
                     self.keep(&key, &j).await?;
@@ -5621,15 +5675,13 @@ impl<'a> ControlPlane<'a> {
                             continue;
                         }
                         // Its runner is busy all the same (what said so was lost): the machine is running a job.
-                        let busy = match (&github, j.runner_id) {
+                        let running = match (&github, j.runner_id) {
                             (Some((app, t)), Some(id)) => github::runner_busy(self.http, &app.api(), &t, &Self::owner_of(app), &j.repo, id).await,
                             _ => Ok(false),
                         };
-                        if busy.is_err() && !late { active += 1; continue }
-                        if busy == Ok(true) {
-                            (j.seen_in_progress, j.for_job) = (true, None);
-                            j.state = "running".into();
-                            j.started_ms.get_or_insert(now);
+                        if running.is_err() && !late { active += 1; continue }
+                        if running == Ok(true) {
+                            busy(&mut j, now);
                             self.keep(&key, &j).await?;
                             active += 1;
                             continue;
@@ -5666,9 +5718,20 @@ impl<'a> ControlPlane<'a> {
                             }
                         }
                     }
+                    // Its machine came up and its runner waits, and GitHub still has the job queued: GitHub has not
+                    // handed the job out (as when its Actions are degraded), and another machine would wait the same.
+                    // (Asked before its runner is taken back, below.)
+                    let held = late && !gone && waits_there && j.provider.is_empty() && j.for_job.is_none() && self.runner_waits(&j, &github).await;
+                    // Its runner taken back first: one that took a job since GitHub was asked above is running it.
+                    if gone || late {
+                        match self.release(&plane_url, &j).await {
+                            Back::Taken | Back::Gone => {}
+                            Back::Busy => { busy(&mut j, now); self.keep(&key, &j).await?; active += 1; continue }
+                            // (GitHub not answering: asked again at the next sweep. Its machine ends by itself at its time.)
+                            Back::Unknown => { active += 1; continue }
+                        }
+                    }
                     if gone {
-                        self.stop_machine(&plane_url, &j).await;
-                        self.withdraw_runner(&j).await;
                         // Else its machine began nothing and its job waits no more (taken elsewhere or cancelled, untold).
                         j.state = if elsewhere { "done" } else { "swept" }.into();
                         j.for_job = None;
@@ -5678,21 +5741,16 @@ impl<'a> ControlPlane<'a> {
                         continue;
                     }
                     if late {
-                        // Its machine came up and its runner waits, and GitHub still has the job queued: GitHub has not
-                        // handed the job out (as when its Actions are degraded), and another machine would wait the
-                        // same. The machine is ended (it is paid while it waits) and the job held, with no machine,
-                        // for `HELD_MS`; then one is started again. Not counted as a machine that did not start.
-                        if waits_there && j.provider.is_empty() && j.for_job.is_none() && self.runner_waits(&j, &github).await {
-                            self.stop_machine(&plane_url, &j).await;
+                        // The machine is ended (it is paid while it waits) and the job held, with no machine, for
+                        // `HELD_MS`; then one is started again. Not counted as a machine that did not start.
+                        if held {
                             j.held_until_ms = Some(now + HELD_MS);
                             self.unplace(&key, &mut j, &format!("GitHub had not handed this job to its runner {} minutes after its machine was started, though the runner was ready for it (GitHub may be slow to hand out jobs); a machine is started again in {} minutes",
                                 age / 60_000, HELD_MS / 60_000)).await?;
                             active += 1;
                             continue;
                         }
-                        self.stop_machine(&plane_url, &j).await;
                         if j.retries >= 2 {
-                            self.withdraw_runner(&j).await;
                             j.state = "failed".into();
                             let why = format!("{place} did not start a machine for it, three times");
                             j.error = Some(why.clone());
@@ -5713,12 +5771,23 @@ impl<'a> ControlPlane<'a> {
             // Its machine's age (a job may have waited long for room before it got one).
             let age = now.saturating_sub(j.launched_ms.unwrap_or(j.at_ms));
             let longest = self.machine_minutes(&j.cloud) as u64;
-            let stale = j.state == "orphan" || (!j.seen_in_progress && age > 10 * 60_000) || age > (longest + 5) * 60_000;
+            let past = age > (longest + 5) * 60_000;
+            let stale = past || j.state == "orphan" || (!j.seen_in_progress && age > 10 * 60_000);
             if !stale { active += 1; continue; }
-            self.stop_machine(&plane_url, &j).await;
-            self.withdraw_runner(&j).await;
+            // Past its longest time it is ended whatever it runs (it powers itself off then too); before, only once its
+            // runner is taken back (an orphan's may have been given a job whose event has not come).
+            if past {
+                self.stop_machine(&plane_url, &j).await;
+                self.withdraw_runner(&j).await;
+            } else {
+                match self.release(&plane_url, &j).await {
+                    Back::Taken | Back::Gone => {}
+                    Back::Busy => { busy(&mut j, now); self.keep(&key, &j).await?; active += 1; continue }
+                    Back::Unknown => { active += 1; continue }
+                }
+            }
             // (Said, when it is known: a job that ran past its longest time.)
-            if j.state != "orphan" && age > (longest + 5) * 60_000 && j.error.is_none() {
+            if j.state != "orphan" && past && j.error.is_none() {
                 j.error = Some(format!("it ran past its longest time ({}), and its machine was ended", if longest % 60 == 0 { format!("{} hours", longest / 60) } else { format!("{longest} minutes") }));
             }
             j.state = "swept".into();
@@ -5821,7 +5890,7 @@ impl<'a> ControlPlane<'a> {
         if self.config.app.is_none() { return moved_lately }
         if !moved_lately && get_json::<u64>(self.store, "untold_at").await.ok().flatten().is_some_and(|at| now.saturating_sub(at) < 5 * 60_000 - 5_000) { return false }
         let _ = put_json(self.store, "untold_at", &now).await;
-        let kept = if self.indexed().await { self.store.list("repo:").await } else { self.store.list("job:").await };
+        let kept = match self.indexed().await { Ok(true) => self.store.list("repo:").await, Ok(false) => self.store.list("job:").await, Err(e) => Err(e) };
         let Ok(kept) = kept else { return moved_lately };
         let mut jobs: Vec<Job> = kept.into_iter().filter_map(|(_, v)| serde_json::from_str::<Job>(&v).ok()).filter(|j| j.provider.is_empty() && now.saturating_sub(j.at_ms) < 14 * 86_400_000).collect();
         jobs.sort_by(|a, b| b.at_ms.cmp(&a.at_ms));

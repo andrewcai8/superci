@@ -3186,11 +3186,11 @@ fn a_machine_for_a_job_cancelled_before_any_runner_took_it_is_ended_at_once() {
     run(job_event("completed", 7, "acme/app", None));
     let j = job(&store, 7);
     assert_eq!((j["state"].as_str(), j["began"].as_bool(), ended(), withdrawn(), j["ended_ms"].is_u64()), (Some("cancelled"), Some(true), 1, 1, true), "{j}");
-    // GitHub will not give the runner back (it was handed another job a moment ago): the machine stays, as before.
+    // GitHub will not give the runner back (it was handed another job a moment ago): the machine stays, running it.
     busy.set(true);
     run(job_event("queued", 8, "acme/app", None));
     run(job_event("completed", 8, "acme/app", None));
-    assert_eq!((job(&store, 8)["state"].as_str(), ended()), (Some("orphan"), 1));
+    assert_eq!((job(&store, 8)["state"].as_str(), ended()), (Some("running"), 1));
     busy.set(false);
     // Cancelled while its machine was still being asked for: the machine AWS has just given is ended at once.
     run(job_event("queued", 9, "acme/app", None));
@@ -3207,6 +3207,91 @@ fn a_machine_for_a_job_cancelled_before_any_runner_took_it_is_ended_at_once() {
     let before = launches(&clouds.0).len();
     run(job_event("queued", 10, "acme/app", None));
     assert_eq!((job(&store, 10)["state"].as_str(), job(&store, 10).get("machine_id").filter(|m| !m.is_null()), launches(&clouds.0).len()), (Some("cancelled"), None, before));
+}
+
+/// GitHub as it answers of runners and jobs: a runner is taken back unless it is among `busy` (running a job: 422), and
+/// says whether it is; every job is still queued.
+fn runners_busy(busy: &RefCell<Vec<u64>>) -> impl Fn(&Request, &str) -> Option<Response> + '_ {
+    move |r: &Request, _: &str| {
+        if let Some(id) = r.url.strip_prefix("https://api.github.com/orgs/acme/actions/runners/").and_then(|i| i.parse::<u64>().ok()) {
+            let running = busy.borrow().contains(&id);
+            return Some(match r.method.as_str() {
+                "GET" => Response::new(200, "application/json", serde_json::json!({ "id": id, "status": "online", "busy": running }).to_string()),
+                _ if running => Response::new(422, "application/json", r#"{"message":"Runner is still running a job"}"#.to_string()),
+                _ => Response::new(204, "application/json", String::new()),
+            })
+        }
+        r.url.starts_with("https://api.github.com/repos/acme/app/actions/jobs/").then(|| Response::new(200, "application/json", r#"{"status":"queued"}"#.to_string()))
+    }
+}
+
+/// GitHub gives a waiting job to any idle runner with its label, and says so in an event of the job's own, which can
+/// come after the end of the job the runner's machine was started for (or never). Job 9's machine runs job 10 when job 9
+/// ends on a runner this control plane has no record of (another's, or one whose record a failed write lost): GitHub
+/// refuses to take back the runner of a machine running a job, and nothing ends it until job 10's end.
+#[test]
+fn a_machine_running_another_jobs_work_is_not_ended_when_its_own_job_ends_first() {
+    let busy = RefCell::new(vec![]);
+    let clouds = With(FakeClouds::default(), runners_busy(&busy));
+    let (store, wakes, cache, own) = (Mem::default(), Wakes::default(), Cache::default(), OwnContainers::default());
+    let clock = MovingClock(std::cell::Cell::new(1_790_000_000_000));
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.containers = true;
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
+    let run = |r: Request| block_on(plane.handle(r));
+    let runner = |id: u64| format!("superci-{PLANE_ID}-{id}");
+    let stopped = |id: u64| own.0.borrow().iter().filter(|c| **c == format!("stop {}", runner(id))).count();
+    run(job_event("queued", 9, "acme/app", None));
+    run(job_event("queued", 10, "acme/app", None));
+    busy.borrow_mut().push(job(&store, 9)["runner_id"].as_u64().unwrap());
+    run(concluded(9, &runner(8), "success"));
+    block_on(plane.alarm()).unwrap();
+    assert_eq!(stopped(9), 0, "ended while it runs job 10: {}", job(&store, 9));
+    assert_eq!(job(&store, 9)["state"], "running");
+    // Job 10's start comes at last, then its end: the machine ends with it.
+    run(job_event("in_progress", 10, "acme/app", Some(&runner(9))));
+    block_on(plane.alarm()).unwrap();
+    assert_eq!((job(&store, 9)["ran"].as_u64(), stopped(9)), (Some(10), 0));
+    run(concluded(10, &runner(9), "success"));
+    assert_eq!((job(&store, 9)["state"].as_str(), stopped(9)), (Some("done"), 1));
+}
+
+/// The sweep's other ends of a machine nobody seems to wait for: none while its runner runs a job. Job 12's record went
+/// on to another machine (written over by a request that read it before) while the index of the runner it had still
+/// names it: that runner's end is no end of the record's machine. Job 11's machine took a job whose events never came,
+/// and its own job still waits: past the time a machine has to begin its job, its runner is taken back first, and GitHub
+/// refuses.
+#[test]
+fn the_sweep_and_a_stale_runner_record_end_no_machine_whose_runner_runs_a_job() {
+    let busy = RefCell::new(vec![]);
+    let clouds = With(FakeClouds::default(), runners_busy(&busy));
+    let (store, wakes, cache, own) = (Mem::default(), Wakes::default(), Cache::default(), OwnContainers::default());
+    let clock = MovingClock(std::cell::Cell::new(1_790_000_000_000));
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.containers = true;
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
+    let run = |r: Request| block_on(plane.handle(r));
+    let runner = |id: u64| format!("superci-{PLANE_ID}-{id}");
+    let stopped = |id: u64| own.0.borrow().iter().filter(|c| **c == format!("stop {}", runner(id))).count();
+    run(job_event("queued", 12, "acme/app", None));
+    store.0.borrow_mut().insert(format!("runner:{}", runner(13)), "12".into());
+    busy.borrow_mut().push(job(&store, 12)["runner_id"].as_u64().unwrap());
+    run(concluded(12, &runner(13), "success"));
+    assert_eq!((job(&store, 12)["state"].as_str(), stopped(12)), (Some("running"), 0), "{}", job(&store, 12));
+    run(job_event("queued", 11, "acme/app", None));
+    busy.borrow_mut().push(job(&store, 11)["runner_id"].as_u64().unwrap());
+    clock.0.set(clock.0.get() + 9 * 60_000);
+    block_on(plane.alarm()).unwrap();
+    assert_eq!((job(&store, 11)["state"].as_str(), stopped(11), stopped(12)), (Some("running"), 0, 0), "{}", job(&store, 11));
+    // Its runner idle and its job still queued: taken back, the machine ended, and the job held for a new one.
+    busy.borrow_mut().clear();
+    let mut late = job(&store, 11);
+    (late["state"], late["seen_in_progress"]) = ("launched".into(), false.into());
+    store.0.borrow_mut().insert("job:11".into(), late.to_string());
+    block_on(plane.alarm()).unwrap();
+    assert_eq!((stopped(11), job(&store, 11)["state"].as_str(), job(&store, 11)["held_until_ms"].is_u64()), (1, Some("waiting"), true), "{}", job(&store, 11));
 }
 
 #[test]
@@ -8118,7 +8203,9 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         a_label_whose_warm_runners_fail_to_start_waits_longer_after_each_and_starts_again_once_one_does,
         a_warm_runner_spot_reclaimed_while_running_a_job_holds_its_label_back_not,
         a_warm_machine_that_never_comes_up_is_replaced_once_a_jobs_would_have_and_one_that_did_is_asked_of_once,
-        no_runner_is_kept_warm_while_the_organizations_default_runner_group_allows_public_repositories
+        no_runner_is_kept_warm_while_the_organizations_default_runner_group_allows_public_repositories,
+        a_machine_running_another_jobs_work_is_not_ended_when_its_own_job_ends_first,
+        the_sweep_and_a_stale_runner_record_end_no_machine_whose_runner_runs_a_job
     ];
     // (Each test of this file is in it but those that already step through every point of a flow themselves.)
     let stepping = ["a_job_cancelled_at_any_step_of_its_start_or_of_a_sweep_leaves_no_machine_and_stays_cancelled", "a_job_that_begins_at_any_step_of_a_sweep_keeps_its_machine",
