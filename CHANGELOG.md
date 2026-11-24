@@ -3,6 +3,7 @@
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
 ## 0.20.5
+- A label can be kept warm: `superci warm set superci/cpu=4 --count=2` keeps two runners registered and idle for it, so GitHub hands its next job to one at once instead of waiting 13 to 17 seconds for a machine to start. Each is a machine like a job's, within the jobs at once and the limits, and its cost is in the spend. One idle half an hour (`--idle-minutes`) is replaced. `superci warm list` shows them, and `superci warm delete` ends them. Update your control plane for it.
 - A dashboard left running keeps your sign-ins when another program is midway through writing them. It read the half-written file as every sign-in ended, and removed it.
 - Deleting a control plane takes its Cloudflare launcher out just after you signed in to Cloudflare again in a terminal. It was left in Cloudflare, and nothing said so. When Cloudflare does not list your accounts, the launcher is named among what was left.
 - A move bringing AWS runners to a Cloudflare control plane checks their account's sign-in before anything moves: one AWS ended stops it at once, said by its account. It stopped partway through.
