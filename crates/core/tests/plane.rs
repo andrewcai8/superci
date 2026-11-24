@@ -3209,6 +3209,169 @@ fn a_machine_for_a_job_cancelled_before_any_runner_took_it_is_ended_at_once() {
     assert_eq!((job(&store, 10)["state"].as_str(), job(&store, 10).get("machine_id").filter(|m| !m.is_null()), launches(&clouds.0).len()), (Some("cancelled"), None, before));
 }
 
+/// GitHub as it answers of runners and jobs: a runner is taken back unless it is among `busy` (running a job: 422), and
+/// says whether it is; every job is still queued.
+fn runners_busy(busy: &RefCell<Vec<u64>>) -> impl Fn(&Request, &str) -> Option<Response> + '_ {
+    move |r: &Request, _: &str| {
+        if let Some(id) = r.url.strip_prefix("https://api.github.com/orgs/acme/actions/runners/").and_then(|i| i.parse::<u64>().ok()) {
+            let running = busy.borrow().contains(&id);
+            return Some(match r.method.as_str() {
+                "GET" => Response::new(200, "application/json", serde_json::json!({ "id": id, "status": "online", "busy": running }).to_string()),
+                _ if running => Response::new(422, "application/json", r#"{"message":"Runner is still running a job"}"#.to_string()),
+                _ => Response::new(204, "application/json", String::new()),
+            })
+        }
+        r.url.starts_with("https://api.github.com/repos/acme/app/actions/jobs/").then(|| Response::new(200, "application/json", r#"{"status":"queued"}"#.to_string()))
+    }
+}
+
+/// GitHub gives a waiting job to any idle runner with its label, and says so in an event of the job's own, which can
+/// come after the end of the job the runner's machine was started for (or never). Job 9's machine runs job 10 when job 9
+/// ends on a runner this control plane has no record of (another's, or one whose record a failed write lost): GitHub
+/// refuses to take back the runner of a machine running a job, and nothing ends it until job 10's end.
+#[test]
+fn a_machine_running_another_jobs_work_is_not_ended_when_its_own_job_ends_first() {
+    let busy = RefCell::new(vec![]);
+    let clouds = With(FakeClouds::default(), runners_busy(&busy));
+    let (store, wakes, cache, own) = (Mem::default(), Wakes::default(), Cache::default(), OwnContainers::default());
+    let clock = MovingClock(std::cell::Cell::new(1_790_000_000_000));
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.containers = true;
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
+    let run = |r: Request| block_on(plane.handle(r));
+    let runner = |id: u64| format!("superci-{PLANE_ID}-{id}");
+    let stopped = |id: u64| own.0.borrow().iter().filter(|c| **c == format!("stop {}", runner(id))).count();
+    run(job_event("queued", 9, "acme/app", None));
+    run(job_event("queued", 10, "acme/app", None));
+    busy.borrow_mut().push(job(&store, 9)["runner_id"].as_u64().unwrap());
+    run(concluded(9, &runner(8), "success"));
+    block_on(plane.alarm()).unwrap();
+    assert_eq!(stopped(9), 0, "ended while it runs job 10: {}", job(&store, 9));
+    assert_eq!(job(&store, 9)["state"], "running");
+    // Job 10's start comes at last, then its end: the machine ends with it.
+    run(job_event("in_progress", 10, "acme/app", Some(&runner(9))));
+    block_on(plane.alarm()).unwrap();
+    assert_eq!((job(&store, 9)["ran"].as_u64(), stopped(9)), (Some(10), 0));
+    run(concluded(10, &runner(9), "success"));
+    assert_eq!((job(&store, 9)["state"].as_str(), stopped(9)), (Some("done"), 1));
+}
+
+/// Two jobs of one label, each run on the other's runner (GitHub gives a waiting job to any idle runner with its label),
+/// their events delivered in every order, each one twice at every later point, and each start's event never, a sweep
+/// after each, minutes apart. GitHub answers as things are: a runner busy until its job's end has been sent, then gone.
+/// Whatever the order: no machine is ended while its runner runs a job, every machine started is ended by the last
+/// sweep, and both jobs end done.
+#[test]
+fn two_jobs_on_each_others_runners_end_right_whatever_order_their_events_come_in() {
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Ev { Queued(u64), Began(u64), Ended(u64) }
+    fn orders<T: Clone>(items: &[T]) -> Vec<Vec<T>> {
+        if items.is_empty() { return vec![vec![]] }
+        (0..items.len()).flat_map(|i| { let mut rest = items.to_vec(); let first = rest.remove(i); orders(&rest).into_iter().map(move |mut o| { o.insert(0, first.clone()); o }) }).collect()
+    }
+    let runner = |id: u64| format!("superci-{PLANE_ID}-{id}");
+    let ran_on = |job: u64| runner(if job == 7 { 8 } else { 7 });
+    let mut all: Vec<Vec<Ev>> = vec![];
+    for order in orders(&[Ev::Began(7), Ev::Began(8), Ev::Ended(7), Ev::Ended(8)]) {
+        all.push(order.clone());
+        for (i, e) in order.iter().enumerate() { for at in i + 1..=order.len() { let mut again = order.clone(); again.insert(at, *e); all.push(again) } }
+        for e in [Ev::Queued(7), Ev::Queued(8)] { for at in 0..=order.len() { let mut again = order.clone(); again.insert(at, e); all.push(again) } }
+        for lost in [Ev::Began(7), Ev::Began(8)] { all.push(order.iter().copied().filter(|e| *e != lost).collect()) }
+    }
+    let the_app = app();
+    for order in &all {
+        let (ended, removed) = (RefCell::new(std::collections::BTreeSet::<u64>::new()), RefCell::new(std::collections::BTreeSet::<u64>::new()));
+        // Job 7's runner (registered first: 5) runs job 8 until job 8's end is sent; job 8's (101) runs job 7. Any other is idle.
+        let busy = |id: u64| match id { 5 => !ended.borrow().contains(&8), 101 => !ended.borrow().contains(&7), _ => false };
+        let clouds = With(FakeClouds::default(), |r: &Request, _: &str| {
+            if let Some(job) = r.url.strip_prefix("https://api.github.com/repos/acme/app/actions/jobs/").and_then(|j| j.parse::<u64>().ok()) {
+                let said = if ended.borrow().contains(&job) { serde_json::json!({ "status": "completed", "conclusion": "success", "runner_name": ran_on(job) }) } else { serde_json::json!({ "status": "in_progress", "runner_name": ran_on(job) }) };
+                return Some(Response::new(200, "application/json", said.to_string()))
+            }
+            let id = r.url.strip_prefix("https://api.github.com/orgs/acme/actions/runners/")?.parse::<u64>().ok()?;
+            let known = !removed.borrow().contains(&id) && match id { 5 => !ended.borrow().contains(&8), 101 => !ended.borrow().contains(&7), _ => true };
+            Some(match r.method.as_str() {
+                _ if !known => Response::new(404, "application/json", r#"{"message":"Not Found"}"#.to_string()),
+                "GET" => Response::new(200, "application/json", serde_json::json!({ "id": id, "status": "online", "busy": busy(id) }).to_string()),
+                _ if busy(id) => Response::new(422, "application/json", r#"{"message":"Runner is still running a job"}"#.to_string()),
+                _ => { removed.borrow_mut().insert(id); Response::new(204, "application/json", String::new()) }
+            })
+        });
+        let (store, wakes, cache, own) = (Mem::default(), Wakes::default(), Cache::default(), OwnContainers::default());
+        let clock = MovingClock(std::cell::Cell::new(1_790_000_000_000));
+        let mut config = Config::new(PLANE_ID.into());
+        config.app = Some(the_app.clone());
+        config.containers = true;
+        let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
+        let run = |r: Request| { block_on(plane.handle(r)); };
+        let deliver = |e: Ev| match e {
+            Ev::Queued(j) => run(job_event("queued", j, "acme/app", None)),
+            Ev::Began(j) => run(job_event("in_progress", j, "acme/app", Some(&ran_on(j)))),
+            Ev::Ended(j) => { ended.borrow_mut().insert(j); run(concluded(j, &ran_on(j), "success")) }
+        };
+        let mut seen = 0;
+        let mut check = |at: &str| {
+            let calls = own.0.borrow();
+            for stop in calls[seen..].iter().filter_map(|c| c.strip_prefix("stop ")) {
+                let id = if stop == runner(7) { 5 } else if stop == runner(8) { 101 } else { 0 };
+                assert!(!busy(id), "{order:?}, {at}: {stop} ended while its runner runs a job");
+            }
+            seen = calls.len();
+        };
+        for e in [Ev::Queued(7), Ev::Queued(8)].iter().chain(order) {
+            deliver(*e);
+            check(&format!("{e:?}"));
+            clock.0.set(clock.0.get() + 4 * 60_000);
+            block_on(plane.alarm()).unwrap();
+            check(&format!("the sweep after {e:?}"));
+        }
+        for _ in 0..2 { clock.0.set(clock.0.get() + 4 * 60_000); block_on(plane.alarm()).unwrap(); check("a last sweep") }
+        let calls = own.0.borrow();
+        let started: std::collections::BTreeSet<&str> = calls.iter().filter_map(|c| c.strip_prefix("start ")?.split(' ').next()).collect();
+        let stopped: std::collections::BTreeSet<&str> = calls.iter().filter_map(|c| c.strip_prefix("stop ")).collect();
+        assert!(started.is_subset(&stopped), "{order:?}: left up {:?}", started.difference(&stopped).collect::<Vec<_>>());
+        for id in [7, 8] { assert_eq!((job(&store, id)["state"].as_str(), job(&store, id)["conclusion"].as_str()), (Some("done"), Some("success")), "{order:?}: {}", job(&store, id)) }
+    }
+}
+
+/// The sweep's other ends of a machine nobody seems to wait for: none while its runner runs a job. Job 12's record went
+/// on to another machine (written over by a request that read it before) while the index of the runner it had still
+/// names it: that runner's end is no end of the record's machine. Job 11's machine took a job whose events never came,
+/// and its own job still waits: past the time a machine has to begin its job, its runner is taken back first, and GitHub
+/// refuses.
+#[test]
+fn the_sweep_and_a_stale_runner_record_end_no_machine_whose_runner_runs_a_job() {
+    let busy = RefCell::new(vec![]);
+    let clouds = With(FakeClouds::default(), runners_busy(&busy));
+    let (store, wakes, cache, own) = (Mem::default(), Wakes::default(), Cache::default(), OwnContainers::default());
+    let clock = MovingClock(std::cell::Cell::new(1_790_000_000_000));
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.containers = true;
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
+    let run = |r: Request| block_on(plane.handle(r));
+    let runner = |id: u64| format!("superci-{PLANE_ID}-{id}");
+    let stopped = |id: u64| own.0.borrow().iter().filter(|c| **c == format!("stop {}", runner(id))).count();
+    run(job_event("queued", 12, "acme/app", None));
+    store.0.borrow_mut().insert(format!("runner:{}", runner(13)), "12".into());
+    busy.borrow_mut().push(job(&store, 12)["runner_id"].as_u64().unwrap());
+    run(concluded(12, &runner(13), "success"));
+    assert_eq!((job(&store, 12)["state"].as_str(), stopped(12)), (Some("running"), 0), "{}", job(&store, 12));
+    run(job_event("queued", 11, "acme/app", None));
+    busy.borrow_mut().push(job(&store, 11)["runner_id"].as_u64().unwrap());
+    clock.0.set(clock.0.get() + 9 * 60_000);
+    block_on(plane.alarm()).unwrap();
+    assert_eq!((job(&store, 11)["state"].as_str(), stopped(11), stopped(12)), (Some("running"), 0, 0), "{}", job(&store, 11));
+    // Its runner idle and its job still queued: taken back, the machine ended, and the job held for a new one.
+    busy.borrow_mut().clear();
+    let mut late = job(&store, 11);
+    (late["state"], late["seen_in_progress"]) = ("launched".into(), false.into());
+    store.0.borrow_mut().insert("job:11".into(), late.to_string());
+    block_on(plane.alarm()).unwrap();
+    assert_eq!((stopped(11), job(&store, 11)["state"].as_str(), job(&store, 11)["held_until_ms"].is_u64()), (1, Some("waiting"), true), "{}", job(&store, 11));
+}
+
 #[test]
 fn a_jobs_start_is_kept_what_aws_was_asked_and_what_its_machine_said_of_itself() {
     // AWS has no spot machine of the first type in any zone; the second type starts.
