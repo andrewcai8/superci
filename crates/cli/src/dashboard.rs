@@ -2302,7 +2302,9 @@ impl Dashboard {
         let kept = self.kept();
         let text = serde_json::to_string(&kept).unwrap_or_default();
         if text == self.kept_as { return }
-        let done = if kept.worth_keeping() { store.write(&kept) } else { store.remove().map(|_| ()) };
+        // (Signed in only by name for this run, nothing of the sign-in is kept, but the control plane in use and its key are.)
+        let by_name = self.cf_given || self.modal_given || self.aws_accounts().iter().any(|a| a.given_by_name());
+        let done = if kept.worth_keeping() || (by_name && kept.plane.is_some()) { store.write(&kept) } else { store.remove().map(|_| ()) };
         match done {
             Ok(()) => self.kept_as = text,
             Err(e) => if !self.keep_failed { eprintln!("{e}"); self.keep_failed = true },
@@ -8345,6 +8347,20 @@ mod tests {
         assert!(d.aws.as_ref().unwrap().given_by_name());
         assert_eq!(d.aws_others.len(), 2);
         assert_eq!(kept_oauth(&store.read()), Some(serde_json::to_string(&oauth).unwrap()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Signed in only by a sign-in given by name, the control plane in use is kept (with its key), the sign-in not.
+    #[test]
+    fn signed_in_only_by_name_the_control_plane_in_use_is_kept() {
+        let root = std::env::temp_dir().join(format!("superci-given-plane-{}-{}", std::process::id(), superci_core::crypto::random_id(6)));
+        let store = Store::under(&root, "default");
+        let mut d = Dashboard::signed_in(Some(store.clone()));
+        d.aws = Some(aws::Session::given_for_test("243891825325"));
+        d.kept_plane = Some(Plane::Aws { account_id: "243891825325".into(), region: "us-east-1".into(), plane_id: "82flwf4vz2os".into(), url: "https://example.lambda-url.us-east-1.on.aws/".into(), label: "superci".into() });
+        d.keep();
+        let kept = store.read();
+        assert_eq!((kept.plane.map(|p| p.plane_id().to_string()), kept.aws.is_none(), kept.key.is_some()), (Some("82flwf4vz2os".to_string()), true, true));
         let _ = std::fs::remove_dir_all(&root);
     }
 
