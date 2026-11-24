@@ -880,6 +880,8 @@ mod tests {
         let mut config = Config::new(superci_testkit::PLANE.into());
         config.read_settings(&[("GITHUB_APP".to_string(), superci_testkit::GitHub::app().to_string())]);
         config.containers = true;
+        // (Room for every job going: a job beside them starts its own machine, not waits.)
+        config.routing.order = vec![superci_core::plane::Pool { max_jobs: Some(100_000), ..superci_core::plane::Pool::of("cloudflare") }];
         config
     }
 
