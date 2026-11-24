@@ -431,7 +431,12 @@ mod tests {
         /// Throttled ever more (every call): what asking again does not get past.
         throttled: RefCell<bool>,
         /// Every batch leaves all but its first key for later.
-        unprocessed_always: RefCell<bool> }
+        unprocessed_always: RefCell<bool>,
+        calm: RefCell<bool>,
+        throttle_ops: RefCell<Vec<&'static str>>,
+        units: RefCell<BTreeMap<String, (f64, f64)>> }
+
+    fn size(item: &Value) -> usize { item.as_object().map_or(0, |o| o.iter().map(|(k, v)| k.len() + v.as_object().and_then(|t| t.values().next()).and_then(Value::as_str).map_or(0, str::len)).sum()) }
 
     #[async_trait(?Send)]
     impl Http for FakeDynamo {
@@ -439,16 +444,20 @@ mod tests {
             let n = { let mut c = self.calls.borrow_mut(); *c += 1; *c };
             let op = r.header("x-amz-target").unwrap_or_default().trim_start_matches("DynamoDB_20120810.").to_string();
             let fail = |kind: &str| Ok(Response::new(400, "application/x-amz-json-1.0", json!({ "__type": format!("com.amazonaws.dynamodb.v20120810#{kind}"), "message": kind }).to_string()));
-            if n % 13 == 0 || *self.throttled.borrow() { return fail("ThrottlingException") }
+            if (n % 13 == 0 && !*self.calm.borrow()) || *self.throttled.borrow() || self.throttle_ops.borrow().contains(&op.as_str()) { return fail("ThrottlingException") }
             if *self.fail_at.borrow() == Some(n) { return fail("ValidationException") }
             let b: Value = serde_json::from_slice(&r.body).unwrap_or_default();
             let key = |k: &Value| (k["p"]["S"].as_str().unwrap_or_default().to_string(), k["k"]["S"].as_str().unwrap_or_default().to_string());
             let ok = |v: Value| Ok(Response::new(200, "application/x-amz-json-1.0", v.to_string()));
             let mut items = self.items.borrow_mut();
+            let factor = if b["ConsistentRead"] == true { 1.0 } else { 0.5 };
+            let read = |p: &str, bytes: usize| self.units.borrow_mut().entry(p.to_string()).or_default().0 += (bytes.div_ceil(4096).max(1)) as f64 * factor;
+            let wrote = |p: &str, bytes: usize| self.units.borrow_mut().entry(p.to_string()).or_default().1 += bytes.div_ceil(1024).max(1) as f64;
             match op.as_str() {
-                "GetItem" => ok(match items.get(&key(&b["Key"])) { Some(i) => json!({ "Item": i }), None => json!({}) }),
+                "GetItem" => { let at = key(&b["Key"]); read(&at.0, items.get(&at).map_or(0, size)); ok(match items.get(&at) { Some(i) => json!({ "Item": i }), None => json!({}) }) }
                 "PutItem" => {
                     let at = key(&b["Item"]);
+                    wrote(&at.0, size(&b["Item"]).max(items.get(&at).map_or(0, size)));
                     let held = items.get(&at);
                     let allowed = match b["ConditionExpression"].as_str() {
                         Some("attribute_not_exists(k)") => held.is_none(),
@@ -459,7 +468,7 @@ mod tests {
                     items.insert(at, b["Item"].clone());
                     ok(json!({}))
                 }
-                "DeleteItem" => { items.remove(&key(&b["Key"])); ok(json!({})) }
+                "DeleteItem" => { let at = key(&b["Key"]); wrote(&at.0, items.get(&at).map_or(0, size)); items.remove(&at); ok(json!({})) }
                 "Query" => {
                     let vals = &b["ExpressionAttributeValues"];
                     let (p, prefix) = (vals[":p"]["S"].as_str().unwrap_or_default(), vals[":k"]["S"].as_str().unwrap_or(""));
@@ -469,8 +478,10 @@ mod tests {
                     let forward = b["ScanIndexForward"] != false;
                     let start = after.map(|a| hits.iter().position(|i| i["k"]["S"].as_str() == Some(a.as_str())).map(|x| x + 1).unwrap_or(0)).unwrap_or(0);
                     if self.empty_page_once.replace(false) { return ok(json!({ "Items": [], "LastEvaluatedKey": { "p": { "S": p }, "k": { "S": "" } } })) }
-                    let page = b["Limit"].as_u64().unwrap_or(2).min(2) as usize;
+                    let most = if *self.calm.borrow() { 1_000 } else { 2 };
+                    let page = b["Limit"].as_u64().map_or(most, |l| (l as usize).min(most));
                     let shown: Vec<Value> = hits.iter().skip(start).take(page).cloned().collect();
+                    read(p, shown.iter().map(size).sum());
                     let more = start + page < hits.len();
                     let _ = forward;
                     ok(if more { json!({ "Items": shown, "LastEvaluatedKey": { "p": { "S": p }, "k": shown.last().unwrap()["k"] } }) } else { json!({ "Items": shown }) })
@@ -481,6 +492,7 @@ mod tests {
                     let first = !*self.unprocessed_once.borrow();
                     *self.unprocessed_once.borrow_mut() = true;
                     let (now, later) = if (first || *self.unprocessed_always.borrow()) && keys.len() > 1 { keys.split_at(1) } else { keys.split_at(keys.len()) };
+                    for k in now { let at = key(k); read(&at.0, items.get(&at).map_or(0, size)) }
                     let found: Vec<Value> = now.iter().filter_map(|k| items.get(&key(k)).cloned()).collect();
                     ok(json!({ "Responses": { &table: found }, "UnprocessedKeys": if later.is_empty() { json!({}) } else { json!({ &table: { "Keys": later } }) } }))
                 }
@@ -715,5 +727,91 @@ mod tests {
         block_on(timer.wake_in(1_000)).unwrap();
         assert!(lambda.called.borrow().is_empty());
         assert_eq!(block_on(s.get(WAKING)).unwrap(), None);
+    }
+
+    /// A control plane over the store as it runs in AWS, its machines containers of its own (so that DynamoDB is what is
+    /// counted), GitHub as the test kit has it.
+    #[derive(Default)]
+    struct Own(RefCell<Vec<String>>);
+    #[async_trait(?Send)]
+    impl superci_core::io::Containers for Own {
+        async fn start(&self, name: &str, _work: &superci_core::io::Work, _max: u32, _size: superci_core::spec::Size) -> io::Result<String> { self.0.borrow_mut().push(format!("start {name}")); Ok(name.to_string()) }
+        async fn stop(&self, id: &str) -> io::Result<()> { self.0.borrow_mut().push(format!("stop {id}")); Ok(()) }
+    }
+    impl Own { fn stopped(&self, runner: &str) -> bool { self.0.borrow().iter().any(|c| *c == format!("stop {runner}")) } }
+
+    struct At(std::cell::Cell<u64>);
+    impl Clock for At { fn now_ms(&self) -> u64 { self.0.get() } }
+
+    struct Later;
+    #[async_trait(?Send)]
+    impl Timer for Later { async fn wake_in(&self, _ms: u64) -> io::Result<()> { Ok(()) } }
+
+    fn webhook(plane: &ControlPlane<'_>, (body, signature): (Vec<u8>, String)) -> u16 {
+        block_on(plane.handle(Request::new("POST", "https://plane.example/webhook").with_header("x-github-event", "workflow_job").with_header("x-hub-signature-256", &signature).with_body(body))).status
+    }
+
+    fn github_plane() -> Config {
+        let mut config = Config::new(superci_testkit::PLANE.into());
+        config.read_settings(&[("GITHUB_APP".to_string(), superci_testkit::GitHub::app().to_string())]);
+        config.containers = true;
+        config
+    }
+
+    fn runner_of(id: u64) -> String { format!("superci-{}-{id}", superci_testkit::PLANE) }
+
+    /// What GitHub's events cost DynamoDB, as DynamoDB counts it (read units of 4 KB, half for an eventually consistent
+    /// read; write units of 1 KB), with 50 jobs going and with 2,000: about the same, as an event reads and writes its own
+    /// job's records and none that grow with the jobs going. And no partition takes a large part of a busy minute's: at
+    /// 50 events a second (a job's three), each partition's share stays under a quarter of what DynamoDB lets one take
+    /// (3,000 read units, 1,000 write units a second).
+    #[test]
+    fn measure_what_an_event_costs_dynamodb() {
+        let mut costs: Vec<Vec<(f64, f64)>> = vec![];
+        let mut report: Vec<String> = vec![];
+        for going in [50u64, 2_000] {
+            let fake = FakeDynamo { calm: RefCell::new(true), ..Default::default() };
+            fake.items.borrow_mut().insert(("layout".into(), "layout".into()), json!({ "p": { "S": "layout" }, "k": { "S": "layout" }, "v": { "S": "kinds" } }));
+            let (s, github, own, cache, config) = (store(&fake), superci_testkit::GitHub::default(), Own::default(), Cache::default(), github_plane());
+            let clock = At(std::cell::Cell::new(1_790_000_000_000));
+            let plane = ControlPlane { store: &s, http: &github, clock: &clock, timer: &Later, config: &config, cache: &cache, containers: Some(&own) };
+            block_on(plane.alarm()).unwrap();
+            // One job going by GitHub's events; the others copies of its records (their ids apart), set right by a sweep.
+            let (first, queued) = github.queue("first", "superci", clock.now_ms());
+            assert!(webhook(&plane, queued) < 300 && webhook(&plane, github.start(first)) < 300);
+            let one = first.to_string();
+            let copies: Vec<((String, String), Value)> = fake.items.borrow().iter()
+                .filter(|((_, k), _)| k.contains(&one) && ["job:", "live:", "runner:", "recent:"].iter().any(|p| k.starts_with(p)))
+                .flat_map(|((_, k), item)| { let one = &one; (1..going).map(move |n| {
+                    let id = (80_000_000_000 + n).to_string();
+                    let k = k.replace(one, &id);
+                    let mut item: Value = serde_json::from_str(&item.to_string().replace(one, &id)).unwrap();
+                    item["p"] = json!({ "S": part(&k) });
+                    ((part(&k), k), item)
+                }) }).collect();
+            fake.items.borrow_mut().extend(copies);
+            block_on(plane.alarm()).unwrap();
+            assert_eq!(block_on(s.list("live:")).unwrap().len() as u64, going);
+            let take = || std::mem::take(&mut *fake.units.borrow_mut());
+            let total = |u: &BTreeMap<String, (f64, f64)>| (u.values().map(|(r, _)| r).sum::<f64>(), u.values().map(|(_, w)| w).sum::<f64>());
+            // Jobs beside them, each queued (and given its machine), begun and ended: what each event cost, and over them all,
+            // what each partition took a job.
+            let (mut each, mut by_part, jobs) = (vec![(0.0, 0.0); 3], BTreeMap::<String, (f64, f64)>::new(), 32.0);
+            take();
+            for _ in 0..jobs as u64 {
+                let (id, queued) = github.queue("beside", "superci", clock.now_ms());
+                let events = [queued, github.start(id), github.finish(id, "success", "ok", clock.now_ms())];
+                for (i, event) in events.into_iter().enumerate() {
+                    assert!(webhook(&plane, event) < 300);
+                    let u = take();
+                    let (r, w) = total(&u);
+                    (each[i].0, each[i].1) = (each[i].0 + r / jobs, each[i].1 + w / jobs);
+                    for (p, (r, w)) in u { let t = by_part.entry(p).or_default(); (t.0, t.1) = (t.0 + r / jobs, t.1 + w / jobs) }
+                }
+            }
+            report.push(format!("{going} going: per event (read, write) {each:?}; per job by partition {by_part:?}"));
+            costs.push(each);
+        }
+        panic!("MEASURED\n{}", report.join("\n"));
     }
 }
