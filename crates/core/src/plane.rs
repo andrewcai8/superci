@@ -583,9 +583,9 @@ fn every_sweep(j: &Job, now: u64) -> bool {
 /// When CloudWatch has counted what an AWS machine sent, after it ended.
 const SENT_COUNTED_MS: u64 = 12 * 60_000;
 
-/// When the sweep next has something to do for a job it cares for that ended a while ago (see `CARE`): at each sweep,
-/// or once what its machine sent can be added to its cost.
-fn care_due(j: &Job, now: u64) -> u64 { if !over(j) || every_sweep(j, now) { now } else { j.ended_ms.unwrap_or(j.at_ms) + SENT_COUNTED_MS } }
+/// When the sweep next has something to do for a job it cares for that ended a while ago (see `CARE`): at each sweep
+/// (0: due whenever a sweep looks, the one going included), or once what its machine sent can be added to its cost.
+fn care_due(j: &Job, now: u64) -> u64 { if !over(j) || every_sweep(j, now) { 0 } else { j.ended_ms.unwrap_or(j.at_ms) + SENT_COUNTED_MS } }
 
 /// The most of the jobs it cares for that ended a while ago a sweep reads, the soonest due first: the rest at the next.
 const CARE_PER_SWEEP: usize = 1_000;
@@ -5970,13 +5970,15 @@ impl<'a> ControlPlane<'a> {
         if indexed {
             for (key, j, live, care) in &kept {
                 let id = key.trim_start_matches("job:");
-                if !needs_care(j, now) {
-                    if live.is_some() { self.store.delete(&format!("live:{id}")).await? }
-                    if *care { self.store.delete(&format!("{CARE}{id}")).await? }
-                } else if hot(j, now) {
+                // (One that ended a moment ago is among those every start weighs whether or not anything is left to do
+                // for it.)
+                if hot(j, now) {
                     let held = crate::io::json(&Live::of(j));
                     if live.as_deref() != Some(held.as_str()) { self.store.put(&format!("live:{id}"), held).await? }
                     if let (true, Some(at)) = (over(j), j.ended_ms) { if now.saturating_sub(at) < 120_000 { self.note_ended(j, at).await } }
+                } else if !needs_care(j, now) {
+                    if live.is_some() { self.store.delete(&format!("live:{id}")).await? }
+                    if *care { self.store.delete(&format!("{CARE}{id}")).await? }
                 } else if live.is_some() {
                     if !*care { self.store.put_until(&format!("{CARE}{id}"), care_due(j, now).to_string(), j.ended_ms.unwrap_or(j.at_ms) + CARED_MS).await? }
                     self.store.delete(&format!("live:{id}")).await?

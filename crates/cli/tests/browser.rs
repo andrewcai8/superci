@@ -8438,6 +8438,8 @@ fn jobs_off_the_usual_way_are_noted_failed_at_once_or_taken_back_as_their_events
     limited.upkeep();
     let now = limited.now_ms();
     limited.store.0.lock().unwrap().insert(superci_core::plane::day_key(now / 86_400_000), serde_json::json!({ "hours": [], "spend": { "cloudflare": 20.0 } }).to_string());
+    // (What was spent is weighed as the last sweep added it up.)
+    limited.upkeep();
     let (m, q) = limited.github.queue("mac", "superci/os=macos", now);
     assert!(limited.webhook(q) < 300);
     let j = limited.store.under(&format!("job:{m}"))[0].1.clone();
