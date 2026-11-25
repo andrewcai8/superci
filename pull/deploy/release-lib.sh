@@ -43,3 +43,15 @@ source_of() {
 release_json_sha() {
   python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["sha256"].get(sys.argv[2], ""))' "$1" "$2"
 }
+
+# released_object <bucket> <region> <key> <out file>: fetches the object to the file only if its sha256 is the one
+# the bucket's bin/RELEASE.json names; otherwise prints why and fails.
+released_object() {
+  local b=$1 r=$2 k=$3 out=$4 m want got
+  m=$(mktemp)
+  aws --profile ci-runners s3 cp --quiet --region "$r" "s3://$b/bin/RELEASE.json" "$m" 2>/dev/null || { rm -f "$m"; echo "refusing: no bin/RELEASE.json in $b; release first" >&2; return 1; }
+  want=$(release_json_sha "$m" "$k"); rm -f "$m"
+  aws --profile ci-runners s3 cp --quiet --region "$r" "s3://$b/$k" "$out" 2>/dev/null || { echo "refusing: no $k in $b" >&2; return 1; }
+  got=$(sha256sum "$out" | cut -d' ' -f1)
+  [ -n "$want" ] && [ "$got" = "$want" ] || { echo "refusing: $k in $b has sha256 $got, its bin/RELEASE.json says ${want:-nothing}" >&2; return 1; }
+}

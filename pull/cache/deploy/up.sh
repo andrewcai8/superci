@@ -181,16 +181,6 @@ if $A iam get-role --role-name superci-pull-cache-replication >/dev/null 2>&1; t
   $A iam delete-role --role-name superci-pull-cache-replication && echo "deleted role superci-pull-cache-replication"
 fi
 
-# release_zip region: the region's bin/pullcache-lambda-arm64.zip, fetched to $tmp/fn-<region>.zip only if its sha256
-# is the one the bucket's bin/RELEASE.json names; the functions take that file, so what was checked is what runs.
-release_zip() {
-  local r=$1 b; b=$(bucket "$1")
-  $A s3 cp --quiet --region "$r" "s3://$b/bin/RELEASE.json" "$tmp/release-$r.json" 2>/dev/null || { echo "refusing: no bin/RELEASE.json in $b; release with pull/cache/deploy/release.sh" >&2; return 1; }
-  $A s3 cp --quiet --region "$r" "s3://$b/bin/pullcache-lambda-arm64.zip" "$tmp/fn-$r.zip" 2>/dev/null || { echo "refusing: no bin/pullcache-lambda-arm64.zip in $b" >&2; return 1; }
-  local want got; want=$(release_json_sha "$tmp/release-$r.json" bin/pullcache-lambda-arm64.zip); got=$(sha256sum "$tmp/fn-$r.zip" | cut -d' ' -f1)
-  [ -n "$want" ] && [ "$got" = "$want" ] || { echo "refusing: bin/pullcache-lambda-arm64.zip in $b has sha256 $got, its RELEASE.json says ${want:-nothing}" >&2; return 1; }
-}
-
 # function name region env memory timeout
 function_up() {
   local name=$1 r=$2 env=$3 mem=$4 timeout=$5 zip=$tmp/fn-$2.zip
@@ -214,7 +204,9 @@ function_up() {
 case ${ISSUER:-} in *[,{}\ ]*) echo "refusing: ISSUER holds a comma, a brace or a space" >&2; exit 1 ;; esac
 for r in $REGIONS; do
   b=$(bucket "$r")
-  release_zip "$r" || exit 1
+  # The functions take the zip as this local file, fetched only with the sha256 the bucket's bin/RELEASE.json names,
+  # so what was checked is what runs.
+  released_object "$b" "$r" bin/pullcache-lambda-arm64.zip "$tmp/fn-$r.zip" || exit 1
   jwks=""; [ -n "${BROKER_JWKS_URL:-}" ] && jwks=",PULLCACHE_JWKS_URL=$BROKER_JWKS_URL"
   case ${ISSUER:-} in
     "") ;;

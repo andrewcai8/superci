@@ -18,8 +18,8 @@ B=s3://$LISTENER_BUCKET
 T=$DIR/listener
 # The listener refuses to start without its claims bucket (claims.go), so a release before up.sh made it is an outage.
 $A s3api get-bucket-policy --bucket superci-pull-claims-243891825325 --query Policy --output text | grep -q if-none-match || { echo "refusing: the claims bucket or its policy is missing; run pull/deploy/up.sh first" >&2; exit 1; }
-"$here/manifest.sh" "$DIR" listener > "$T/bin/RELEASE.json.new"
-mv "$T/bin/RELEASE.json.new" "$T/bin/RELEASE.json"
+"$here/manifest.sh" "$DIR" listener > "$DIR/listener.RELEASE.json"
+mv "$DIR/listener.RELEASE.json" "$T/bin/RELEASE.json"
 want=$(release_json_sha "$T/bin/RELEASE.json" bin/superci-pull)
 $SSH "cat > /tmp/superci-pull.check && chmod 755 /tmp/superci-pull.check" < "$T/bin/superci-pull"
 $SSH "/tmp/superci-pull.check -validate -config /dev/stdin" < "$T/config/config.json" || { echo "refusing: config/config.json is invalid" >&2; exit 1; }
@@ -29,4 +29,4 @@ echo "released $(cat "$T/bin/RELEASE.json") to $B"
 $SSH "set -e; sudo aws s3 cp --quiet $B/bin/superci-pull /usr/local/bin/superci-pull.new
 [ \"\$(sha256sum < /usr/local/bin/superci-pull.new | cut -d' ' -f1)\" = $want ] || { echo 'refusing: the bucket binary is not the one RELEASE.json names'; exit 1; }
 sudo install -m 755 /usr/local/bin/superci-pull.new /usr/local/bin/superci-pull && sudo /usr/local/bin/superci-pull-sync && sudo systemctl restart superci-pull && systemctl is-active superci-pull"
-"$here/verify-release.sh" listener
+SSH=$SSH "$here/verify-release.sh" listener

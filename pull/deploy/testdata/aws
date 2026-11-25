@@ -1,0 +1,86 @@
+#!/usr/bin/env -S python3 -I
+"""The aws CLI as release_test.sh needs it: S3 objects and Lambda code kept under $FAKE_AWS, every call logged to
+$FAKE_AWS/calls.log, and any other call answered as success (an id for a --query, 1 for a length)."""
+import base64, hashlib, os, shutil, sys
+
+root = os.environ["FAKE_AWS"]
+args = sys.argv[1:]
+with open(os.path.join(root, "calls.log"), "a") as log:
+    log.write(" ".join(args) + "\n")
+
+
+def opt(name, default=None):
+    return args[args.index(name) + 1] if name in args else default
+
+
+pos = []
+skip = False
+for i, a in enumerate(args):
+    if skip:
+        skip = False
+        continue
+    if a in ("--quiet", "--only-show-errors", "--with-decryption", "--recursive"):
+        continue
+    if a.startswith("--"):
+        skip = True
+        continue
+    pos.append(a)
+
+
+def path(url):
+    bucket, _, key = url[len("s3://"):].partition("/")
+    return os.path.join(root, "s3", bucket, key)
+
+
+def keys(bucket, prefix):
+    base = os.path.join(root, "s3", bucket)
+    out = []
+    for d, _, fs in os.walk(base):
+        for f in fs:
+            k = os.path.relpath(os.path.join(d, f), base)
+            if k.startswith(prefix):
+                out.append(k)
+    return sorted(out)
+
+
+svc, cmd = pos[0], pos[1] if len(pos) > 1 else ""
+if svc == "sts":
+    print("243891825325")
+elif svc == "s3" and cmd == "cp":
+    src, dst = pos[2], pos[3]
+    if src.startswith("s3://"):
+        if not os.path.isfile(path(src)):
+            sys.stderr.write("fatal error: An error occurred (404) when calling the HeadObject operation\n")
+            sys.exit(1)
+        if dst == "-":
+            sys.stdout.buffer.write(open(path(src), "rb").read())
+        else:
+            shutil.copyfile(path(src), dst)
+    else:
+        os.makedirs(os.path.dirname(path(dst)), exist_ok=True)
+        data = sys.stdin.buffer.read() if src == "-" else open(src, "rb").read()
+        open(path(dst), "wb").write(data)
+elif svc == "s3" and cmd == "rm":
+    os.remove(path(pos[2]))
+elif svc == "s3api" and cmd == "list-objects-v2":
+    if os.path.exists(os.path.join(root, "fail-list")):
+        sys.exit(255)
+    ks = keys(opt("--bucket"), opt("--prefix", ""))
+    print("\t".join(ks) if ks else "None")
+elif svc == "s3api" and cmd == "head-object":
+    sys.exit(0 if os.path.isfile(os.path.join(root, "s3", opt("--bucket"), opt("--key"))) else 254)
+elif svc == "s3api" and cmd == "get-bucket-policy":
+    print('{"Condition":{"Null":{"s3:if-none-match":"true"}}}')
+elif svc == "lambda":
+    state = os.path.join(root, "lambda", opt("--region", "us-east-1"), opt("--function-name", "none"))
+    if cmd in ("update-function-code", "create-function"):
+        data = open(opt("--zip-file")[len("fileb://"):], "rb").read()
+        os.makedirs(os.path.dirname(state), exist_ok=True)
+        open(state, "w").write(base64.b64encode(hashlib.sha256(data).digest()).decode())
+    elif cmd in ("get-function", "get-function-configuration"):
+        if not os.path.isfile(state):
+            sys.exit(254)
+        if opt("--query") == "CodeSha256":
+            print(open(state).read())
+elif opt("--query") is not None:
+    print("1" if opt("--query").startswith("length(") else "stub-id")

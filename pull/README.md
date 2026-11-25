@@ -441,7 +441,11 @@ What runs is only what a manifest names: a listener instance's boot refuses a `b
 its `RELEASE.json`'s and starts no listener (the launch template takes this boot at `deploy/up.sh`), a machine runs
 no `pullcache` whose sha256 is not its region's `RELEASE.json`'s (it runs on GitHub's cache), and `cache/deploy/up.sh`
 puts on the functions only the zip whose sha256 the manifest names. A machine that boots in the seconds between a
-cache release's `bin/up.sh` and its `RELEASE.json` runs on GitHub's cache.
+cache release's `bin/up.sh` and its `RELEASE.json` runs on GitHub's cache. `deploy/up.sh` moves the listener's
+template to this boot only once `bin/superci-pull` is the one `bin/RELEASE.json` names, so a replaced instance always
+starts. Nothing refuses the other files where they are used: the listener's `deploy/*` and `config/config.json`, and a
+machine's `bin/up.sh`, run as the bucket holds them, and `verify-release.sh` finds a change to one only after the fact;
+`bin/issuer` is an operator's file, outside every manifest, which it only lists.
 
 `verify-release.sh [listener|cache|all]` checks each bucket's manifest commit is on main, every file it lists is in
 the bucket with its sha256, the bucket holds nothing else under the release's prefixes but an operator's files

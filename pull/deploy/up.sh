@@ -24,6 +24,7 @@ ACCOUNT=$($A sts get-caller-identity --query Account --output text)
 BUCKET=$NAME-$ACCOUNT
 
 here=$(cd "$(dirname "$0")" && pwd)
+. "$here/release-lib.sh"
 
 if ! $A iam get-role --role-name $NAME >/dev/null 2>&1; then
   $A iam create-role --role-name $NAME --tags $TAGS --assume-role-policy-document \
@@ -120,6 +121,14 @@ DATA=$(cat <<JSON
 JSON
 )
 LT=$($A ec2 describe-launch-templates --region $PRIMARY --filters Name=launch-template-name,Values=$NAME-listener --query 'LaunchTemplates[0].LaunchTemplateId' --output text)
+# listener-boot.sh starts no listener unless bin/superci-pull is the one bin/RELEASE.json names, so the group's template
+# takes this boot only when a release is in place: an instance it replaces would otherwise start nothing.
+released=$(mktemp); trap 'rm -f "${tmp:-}" "$released"' EXIT
+release_ok() { released_object "$BUCKET" $PRIMARY bin/superci-pull "$released"; }
+if [ "$LT" != None ] && ! release_ok; then
+  echo "refusing: the listener's template keeps its boot until a release is in s3://$BUCKET (run release.sh, then this again)" >&2
+  exit 1
+fi
 if [ "$LT" = None ]; then
   for i in 1 2 3 4 5 6; do # (a new instance profile takes a few seconds to be usable)
     LT=$($A ec2 create-launch-template --region $PRIMARY --launch-template-name $NAME-listener --launch-template-data "$DATA" \
@@ -136,7 +145,7 @@ echo "listener launch template: $LT (superci-pull-role=listener)"
 
 SUBNETS=$($A ec2 describe-subnets --region $PRIMARY --filters Name=default-for-az,Values=true \
   Name=availability-zone,Values=us-east-1a,us-east-1b,us-east-1c,us-east-1d,us-east-1f --query 'Subnets[].SubnetId' --output text | tr '\t' ',')
-if ! $A s3api head-object --bucket $BUCKET --key bin/superci-pull >/dev/null 2>&1; then
+if ! release_ok 2>/dev/null; then
   echo "no release in s3://$BUCKET yet: run release.sh, then this again to start the listener's group"
   exit 0
 fi
