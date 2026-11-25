@@ -112,6 +112,8 @@ func TestEachSetsMachinesReadTheirOwnLabelsManifest(t *testing.T) {
 		if !strings.Contains(got, "/hydrate/"+label+".json") {
 			t.Fatalf("%s: the machine does not read its own label's manifest", label)
 		}
+	}
+}
 
 func TestOnlyKeepsTheSizesItNames(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "override.json")
