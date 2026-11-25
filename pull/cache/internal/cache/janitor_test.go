@@ -426,3 +426,71 @@ func (g *gate) List(ctx context.Context, prefix string, max int) ([]cache.Object
 	}
 	return objs, err
 }
+
+func TestSupersededEntriesNobodyRestoredGoWhateverTheSize(t *testing.T) {
+	seed := func(run string, saved time.Time) cache.Object {
+		return entry(main, "git-seed-v1-Linux-X64-"+run, gib, saved)
+	}
+	live := seed("10000000009", ago(hour))
+	recent := seed("10000000008", ago(30*hour)) // superseded for a day: inside the grace
+	dead := seed("10000000007", ago(5*day))     // superseded for days, never restored
+	used := seed("10000000006", ago(6*day))     // restored yesterday: someone still wants it
+	marks := marked(map[cache.Object][]time.Time{used: {ago(day)}})
+	p := cache.Policy{CapBytes: 100 * gib, MaxIdle: 30 * day, SupersededGrace: 2 * day}
+	plan := cache.Plan([]cache.Object{live, recent, dead, used}, marks, p, t0)
+	if got := names(plan); !reflect.DeepEqual(got, []string{"git-seed-v1-Linux-X64-10000000007"}) || plan[0].Reason != cache.Superseded {
+		t.Fatalf("plan %v %v: of four seeds in a bucket far under its cap, only the one superseded and unrestored for days goes", names(plan), reasons(plan))
+	}
+}
+
+// heads counts the HEADs the janitor makes.
+type heads struct {
+	*cachetest.Mem
+	mu sync.Mutex
+	n  int
+}
+
+func (h *heads) Head(ctx context.Context, key string) (cache.Object, bool, error) {
+	h.mu.Lock()
+	h.n++
+	h.mu.Unlock()
+	return h.Mem.Head(ctx, key)
+}
+
+func TestACopyIsRankedByTheSaveTimeItKeepsNotByWhenItWasCopied(t *testing.T) {
+	// The state of us-east-1 on Nov 25: run ...410 was saved at 17:15 in the other region and copied by hand at
+	// 18:23, after run ...088 was saved here at 17:45. By LastModified the copy is the newest seed; by its save time
+	// it is the older one, and the one to delete.
+	m := cachetest.NewMem()
+	sevenFifteen := time.Date(2026, 11, 25, 17, 15, 0, 0, time.UTC)
+	seed := func(run string, saved time.Time) string {
+		return entry(main, "git-seed-v1-Linux-X64-"+run, gib, saved).Key
+	}
+	older, newer := seed("45662624410", sevenFifteen), seed("45664552088", time.Date(2026, 11, 25, 17, 45, 15, 0, time.UTC))
+	m.Set(newer, []byte("x"), time.Date(2026, 11, 25, 17, 45, 15, 0, time.UTC))
+	m.SetCopy(older, []byte("x"), sevenFifteen, time.Date(2026, 11, 25, 18, 23, 54, 0, time.UTC))
+	h := &heads{Mem: m}
+	now := time.Date(2026, 11, 25, 19, 0, 0, 0, time.UTC)
+	rep, err := cache.Janitor(context.Background(), sized{h, gib}, cache.Policy{CapBytes: gib}, now, false, log.New(&tape{}, "", 0))
+	if err != nil || rep.Deleted != 1 {
+		t.Fatalf("report %+v, %v", rep, err)
+	}
+	if left := m.Keys("v1/"); !reflect.DeepEqual(left, []string{newer}) {
+		t.Fatalf("left %v: the seed saved last is the one to keep", left)
+	}
+	if h.n != 2 {
+		t.Fatalf("%d HEADs, want one for each of the two entries of the family", h.n)
+	}
+}
+
+func TestNothingToDeleteCostsNoHeads(t *testing.T) {
+	m := cachetest.NewMem()
+	for i := range 20 {
+		plant(m, entry(main, fmt.Sprintf("git-seed-v1-Linux-X64-%011d", i), gib, ago(time.Duration(i)*hour)))
+	}
+	h := &heads{Mem: m}
+	rep, err := cache.Janitor(context.Background(), sized{h, gib}, cache.Policy{CapBytes: 100 * gib, MaxIdle: 30 * day, SupersededGrace: 2 * day}, t0, false, log.New(&tape{}, "", 0))
+	if err != nil || rep.Planned != 0 || h.n != 0 {
+		t.Fatalf("report %+v, %v, %d HEADs", rep, err, h.n)
+	}
+}
