@@ -54,6 +54,7 @@ issued its runner superci-pull-issued=<when>
 | Who a machine is | the instance identity document EC2 signed (PKCS7, RSA-2048), checked against AWS's certificate | the same |
 | The organization's registration rate | the advance of runner ids (one sequence for the organization), less ours | blind (0.3/s) for about 90 s |
 | Spend today and this month | accrued from running machines at their pool's spot price | the SSM parameter `/superci-pull/spend` |
+| Each set's burst and launch times | the SSM parameter `/superci-pull/pool/<deployment>`, one per deployment so no listener overwrites another's (`-pool-param` is the prefix); saved every minute, the carried burst held for the first window | the same parameter, if saved within the window |
 | The listener's TLS key, which machines pin | the SSM SecureString `/superci-pull/tls` | the same key |
 
 ### Invariants
@@ -451,11 +452,18 @@ aws --profile ci-runners --region us-east-1 sns subscribe --topic-arn arn:aws:sn
 | superci-pull-registration-refusals | GitHub refused a registration in a 5-minute period |
 | superci-pull-registration-errors | a registration failed otherwise in a 5-minute period (GitHub's API, a name GitHub already held, the issued tag refused) |
 | superci-pull-queue-wait-p90 | queue wait p90 over 60 s in two 5-minute periods running |
-| superci-pull-orphans | orphans above 0 for 10 minutes |
+| superci-pull-orphans | orphans above 0 for 10 minutes (a probe runner left registered more than 3 minutes counts, and the lister removes it) |
+| superci-pull-pool-at-floor | a set's pool at the hour's floor for 5 minutes while more of its jobs waited than it had idle runners |
 | superci-pull-spend-daily | today's spend past 80% of the daily cap the listener runs with (`SpendDailyCapUSD`) |
 | superci-pull-spend-capped | a spend cap is reached: CI on superci stops |
 | superci-pull-launch-shortfall | EC2 started fewer machines than asked for 15 minutes running |
 | superci-pull-org-rate-unknown | the organization's rate unmeasured for 15 minutes |
+
+**`superci-pull-pool-at-floor`.** The pool is not following the jobs. Read `curl -s localhost:8080/state | jq '.sets[]'`
+on the listener: a set whose `pool` stays at its floor while jobs wait is reading no arrivals, or has no carried burst.
+Look in the listener log for `load pools` and `save pools` errors (the IAM grant for `/superci-pull/pool/*`, or a
+parameter the roll left unreadable), and for the set's JobAssigned and JobAvailable messages. To stop the wait at once,
+pin the pool: `curl -s -X POST 'localhost:8080/override?set=<set>&pool=<n>'` (the next config change clears it).
 
 **Release.** Off-peak (before 13:00Z or after 01:00Z), since a release restarts the listener: jobs wait about 10 s.
 A listener that cannot reach its claims bucket does not start: run `deploy/up.sh` (it makes the bucket and grants
@@ -493,6 +501,12 @@ machine's `bin/up.sh`, run as the bucket holds them, and `verify-release.sh` fin
 the bucket with its sha256, the bucket holds nothing else under the release's prefixes but an operator's files
 (`bin/issuer`, `bin/hydrate/*.json`, `bin/dev-*/`), the running listener's sha256 and `-version`, and each cache
 function's `CodeSha256` in both regions.
+
+Before the release that moves the pool parameter to `/superci-pull/pool/<deployment>`: apply `deploy/listener-policy.json`
+(`aws --profile ci-runners iam put-role-policy --role-name superci-pull --policy-name superci-pull --policy-document file://pull/deploy/listener-policy.json`)
+so the new listener may read and write it, and run `deploy/alarms.sh` for the alarms. The first start after the
+release finds no saved burst there and starts from the floor once. The policy still grants the old parameter
+`/superci-pull/pool`, which the previous binary uses, so a roll back works; drop it with that binary.
 
 **Roll back.** Release an older commit of main: `build.sh /tmp/rollback <commit>`, then the release scripts.
 

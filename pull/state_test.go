@@ -449,7 +449,7 @@ func TestARestartStartsFromTheBurstTheLastListenerCarried(t *testing.T) {
 		old.Issue(m, &Runner{ID: int64(i + 1), Name: runnerName("set", m.ID), Issued: t0.Add(30 * time.Second)})
 	}
 	old.Burst(t0.Add(time.Minute), testRule)
-	c := old.Carry()
+	c := old.Carry(t0.Add(time.Minute), testRule)
 	restart := t0.Add(2 * time.Minute)
 	s := NewState("set", 0, 100, []string{"us-east-1"}, restart)
 	s.Resume(c)
