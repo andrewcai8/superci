@@ -82,8 +82,11 @@ func (e ManifestEntry) pattern() *regexp.Regexp {
 type Hydrator struct {
 	Reader        Reader
 	DefaultBranch string
-	Root          string
-	Log           *log.Logger
+	// AnyScope lets a manifest name a scope other than the default branch's. Only main's jobs write main's scope, so
+	// without it no PR's save can become what another machine's job starts from; a dev listener's A/B sets it.
+	AnyScope bool
+	Root     string
+	Log      *log.Logger
 	// Unpack is tar and Checkout is git; tests replace them.
 	Unpack   func(ctx context.Context, archive io.Reader, dir string) error
 	Checkout func(ctx context.Context, dir string) error
@@ -121,8 +124,17 @@ func (h *Hydrator) Run(ctx context.Context, m Manifest) []Hydrated {
 	roots := make([]string, len(m.Scopes))
 	listed := make([][]Object, len(m.Scopes))
 	for i, sc := range m.Scopes {
+		if !h.AnyScope && Class(sc, h.DefaultBranch) != "d" {
+			for i := range out {
+				out[i].Error = fmt.Sprintf("scope %s is not the default branch's", sc)
+			}
+			return out
+		}
 		roots[i] = scopeRoot(m.Repository, Scope{Name: sc}, h.DefaultBranch)
 		objs, err := h.Reader.List(ctx, roots[i], maxListed)
+		if len(objs) == maxListed {
+			h.logf("hydrate: scope %s listed its first %d entries only; keys sorting after them are not hydrated", sc, maxListed)
+		}
 		if err != nil {
 			for i := range out {
 				out[i].Error = fmt.Sprintf("scope %s could not be listed: %v", sc, err)

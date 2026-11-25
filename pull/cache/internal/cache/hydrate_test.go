@@ -100,7 +100,7 @@ func TestTheFirstScopeWithAMatchWinsAsAJobsRestoreReadsItsOwnScopeThenMains(t *t
 	put(mem, branch, "git-seed-v1-Linux-X64-2", archive(t, map[string]string{".git/HEAD": "branch"}), now.Add(-time.Hour))
 	put(mem, mainScope, "git-seed-v1-Linux-X64-3", archive(t, map[string]string{".git/HEAD": "main"}), now)
 	put(mem, mainScope, "mods-1", archive(t, map[string]string{"node_modules/x": "main"}), now)
-	h := &cache.Hydrator{Reader: mem, DefaultBranch: "main", Root: root}
+	h := &cache.Hydrator{Reader: mem, DefaultBranch: "main", AnyScope: true, Root: root}
 	m := manifest(cache.ManifestEntry{Key: "git-seed-v1-Linux-X64-"}, cache.ManifestEntry{Key: "mods-"})
 	m.Scopes = []string{branch.Name, "refs/heads/main"}
 
@@ -108,6 +108,27 @@ func TestTheFirstScopeWithAMatchWinsAsAJobsRestoreReadsItsOwnScopeThenMains(t *t
 
 	if res[0].Key != "git-seed-v1-Linux-X64-2" || res[1].Key != "mods-1" || res[0].Error != "" || res[1].Error != "" {
 		t.Fatalf("want the branch's own seed though main's is newer, and main's tree the branch lacks: %+v", res)
+	}
+}
+
+func TestAManifestNamingAScopeOtherThanMainsHydratesNothing(t *testing.T) {
+	mem, root, now := cachetest.NewMem(), t.TempDir(), time.Now()
+	pr := cache.Scope{Name: "refs/pull/7/merge"}
+	put(mem, pr, "seed-1", archive(t, map[string]string{".git/HEAD": "pr"}), now)
+	put(mem, mainScope, "seed-0", archive(t, map[string]string{".git/HEAD": "main"}), now.Add(-time.Hour))
+	h := &cache.Hydrator{Reader: mem, DefaultBranch: "main", Root: root}
+	m := manifest(cache.ManifestEntry{Key: "seed-"})
+	m.Scopes = []string{pr.Name, "refs/heads/main"}
+
+	res := h.Run(context.Background(), m)
+
+	if res[0].Key != "" || res[0].Error == "" {
+		t.Fatalf("a PR's save must never become what another machine's job starts from: %+v", res)
+	}
+	for _, k := range []string{"seed-1", "seed-0"} {
+		if _, err := os.Stat(filepath.Join(root, k)); !os.IsNotExist(err) {
+			t.Fatalf("nothing may be in place when a manifest names a PR scope (%s): %v", k, err)
+		}
 	}
 }
 
