@@ -141,8 +141,10 @@ fewer jobs than the pool arrived in the launch time up to it, since each job tak
 the pool is, for each job the set saw in the last 30 minutes (`window_minutes`), how many jobs arrived within one
 launch time up to and including it, taken at the 88th percentile (`quantile`), and never less than the largest such
 burst of the last 5 minutes (`hold_minutes`: a pool runner retired is a registration and a boot spent for nothing).
-The launch time is the set's own: the 90th percentile, over its last 64 launches, from the launch call to the runner's
-registration, so it follows the image, hydration and the registration budget. Until a set has eight launches it is
+The launch time is the set's own: the 90th percentile, over its last 64 launches, from the launch call to the
+machine's first ask for its runner, so it follows the image and hydration. The wait for the registration budget is
+left out: it is a rate no pool can buy ahead, and counting it fed back (a longer launch time sized a larger pool, whose
+registrations lengthened the wait, to 244 s on a dev set). Until a set has eight launches it is
 `ready_seconds` (22). A job arrives with its first JobAvailable or JobAssigned; GitHub assigns a set's jobs without
 offering them first, and a job is known by its job id. Before Nov 25 19:00Z every arrival (and every `QueueWait`)
 read as none and each pool stayed at its floor; the load tests above pinned their pools, which hid it.

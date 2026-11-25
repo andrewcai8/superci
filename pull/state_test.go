@@ -460,3 +460,18 @@ func TestARestartStartsFromTheBurstTheLastListenerCarried(t *testing.T) {
 		t.Fatalf("a window after the restart: burst %d, want 0", n)
 	}
 }
+
+// The budget's wait is not a launch time: counting it grew the pool, whose registrations grew the wait (dev, Nov 25).
+func TestTheLaunchTimeEndsAtTheMachinesFirstAsk(t *testing.T) {
+	s := newState(0, 100)
+	s.Observe(stats(0, 0), t0)
+	for i := 0; i < 8; i++ {
+		m := &Machine{ID: fmt.Sprintf("i-%04d", i), Set: "set", Region: "us-east-1", Launched: t0}
+		s.Launched(fmt.Sprintf("r-%d", i), []*Machine{m}, t0)
+		s.Ask(m.ID, t0.Add(20*time.Second), closed(), 8*time.Hour)
+		s.Issue(m, &Runner{ID: int64(i + 1), Name: runnerName("set", m.ID), Issued: t0.Add(2 * time.Minute)})
+	}
+	if got := s.Snapshot(t0).LaunchS; got != 20 {
+		t.Fatalf("machines that asked 20 s after their launch and waited for the budget until 2 min: launch time %v s, want 20", got)
+	}
+}
