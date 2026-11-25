@@ -79,8 +79,8 @@
     "cap": 1500,
     "window_s": 300,
     "margin": 0.2,
-    "pool_rate": 0.5,
-    "pool_share": 0.5,
+    "pool_rate": 5,
+    "pool_share": 0.9,
     "blind_rate": 0.3,
     "concurrency": 64
   },

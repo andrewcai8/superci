@@ -194,7 +194,9 @@ func (b *Budget) Take(now time.Time, p Priority) bool {
 	if !e.Known && float64(countBetween(b.ours, now.Add(-b.window()), now)+b.pending+1) > b.c.BlindRate*w {
 		return false
 	}
-	burst := max(3, e.SpareRate*10)
+	// The saved-up burst spans a launch and a margin (30 s): what the spare rate refills while a burst's machines boot
+	// is theirs when they ask, rather than lost above a shallower bucket. The window guard above bounds the whole.
+	burst := max(3, e.SpareRate*30)
 	poolRate := min(b.c.PoolRate, e.SpareRate*b.c.PoolShare)
 	dt := max(0, now.Sub(b.refilled).Seconds())
 	b.refilled = now
