@@ -163,7 +163,7 @@ func run(ctx context.Context, f flags) error {
 	if err != nil {
 		return err
 	}
-	userData := bootData(cfg, fmt.Sprintf("https://%s%s", f.publicIP, f.listen), id.Pin)
+	listenAt := fmt.Sprintf("https://%s%s", f.publicIP, f.listen)
 	now := time.Now()
 	l := &Listener{path: f.configPath, cfg: cfg, modified: modTime(f.configPath), pins: map[string]int{}, group: group, fleet: fleet,
 		tagger: NewTagger(ctx, fleet), budget: NewBudget(cfg.Registration, now), spend: NewSpend(cfg.DailyUSD, cfg.MonthlyUSD, specs, now),
@@ -186,7 +186,7 @@ func run(ctx context.Context, f flags) error {
 		if err != nil {
 			return fmt.Errorf("scale set %s: %w", spec.Name, err)
 		}
-		sf, err := fleet.AddSet(ctx, spec, userData, f.groups)
+		sf, err := fleet.AddSet(ctx, spec, bootData(cfg, listenAt, id.Pin, spec.Label), f.groups)
 		if err != nil {
 			return err
 		}
@@ -262,10 +262,11 @@ func run(ctx context.Context, f flags) error {
 	}
 }
 
-// bootData is a machine's user data: boot.sh with the listener's address and key, and the longest a machine may live
-// (the oldest a pool machine may be, and the longest job after it).
-func bootData(c Config, listener, pin string) string {
-	return strings.NewReplacer("@LISTENER@", listener, "@PIN@", pin, "@LIFE_SECONDS@", strconv.Itoa(int(c.life().Seconds()))).Replace(bootScript)
+// bootData is a machine's user data: boot.sh with the listener's address and key, the longest a machine may live
+// (the oldest a pool machine may be, and the longest job after it), and its set's label, which names the hydration
+// manifest it reads.
+func bootData(c Config, listener, pin, label string) string {
+	return strings.NewReplacer("@LISTENER@", listener, "@PIN@", pin, "@LIFE_SECONDS@", strconv.Itoa(int(c.life().Seconds())), "@LABEL@", label).Replace(bootScript)
 }
 
 // ensureScaleSet finds or makes the set at GitHub, in the deployment's runner group, with its labels: its name, and

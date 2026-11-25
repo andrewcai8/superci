@@ -292,6 +292,43 @@ From fastest and smallest to full. None touches the listener's sessions, `SUPERC
    still names the profile fail.
 4. **Remove the cache itself** (buckets stay): `pull/cache/deploy/down.sh`. Nothing in the listener needs it gone.
 
+## Hydration
+
+A machine idles in its set's pool until GitHub hands it its one job. With a manifest for its label, it spends part
+of that time unpacking main's caches, so the job's setup takes them with a rename instead of a download and an untar.
+
+- **What.** `bin/hydrate/<label>.json` in the region's cache bucket (the machines' role reads only `bin/` and `v1/`).
+  Each entry is a restore key (`*` stands for any run of characters); the machine takes the newest entry that
+  matches in the first of `scopes` that has one, as a job's restore reads its own scope and then main's. `checkout` also checks out the git work tree
+  of the entry (a seed of `.git`), so a checkout over it writes only what its commit changes.
+
+  ```json
+  {"repository": "1351063449", "scopes": ["refs/heads/main"], "workspace": "/home/runner/_work/megpt-mono/megpt-mono",
+   "entries": [{"key": "git-seed-v1-Linux-X64-", "checkout": true},
+               {"key": "bun-modules-v1-Linux-X64-bun*-aura-hono-api-scripts-on-"},
+               {"key": "bun-modules-v1-Linux-X64-bun*-aura-hono-api-mind-scripts-on-"},
+               {"key": "mind-python-v1-Linux-X64-"}]}
+  ```
+- **When.** `boot.sh` runs `pullcache hydrate` after the cache daemon starts and before it asks `/jit`, as the
+  `runner` user, for at most 100 s. The runner does not exist until it is done, so no job can see a half-unpacked
+  entry, and each entry is unpacked in `.tmp-<key>/` and renamed into place whole. `<root>/.hydrated.json` says what
+  became of each entry and how long it took.
+- **Where.** `/home/runner/hydrated/<key>/`, in which that directory stands for `/`: an archive's files are where
+  actions/cache would restore them, under that prefix. The runner's `.env` gives every job
+  `SUPERCI_HYDRATED=/home/runner/hydrated`. A job takes a path P of key K by `mv $SUPERCI_HYDRATED/K/P P` when it
+  restores K, and restores as before when it is not there (megpt-mono's `bun-install`, `mind-python-env` and
+  lint-test-backend's git seed steps do).
+- **Why it is safe.** It reads only S3, with the machine's read-only role, and only the manifest's scopes: main's
+  entries are written only by main's jobs (the broker's per-job credentials), so nothing a pull request's job writes
+  is hydrated anywhere. What a machine hydrates serves its one job; a machine runs one job, ever (Invariants).
+- **Cost.** A hydrated machine registers its runner later by the time hydration takes; the pool's `fill_seconds`
+  covers it, and a job past the pool waits that much longer and saves it in setup.
+- **Turn it on.** `aws --profile ci-runners s3 cp manifest.json s3://superci-pull-cache-243891825325-<region>/bin/hydrate/<label>.json`
+  for each region; machines launched afterwards hydrate. It needs this branch's listener (the label in each set's
+  user data) and its `pullcache` in `bin/`.
+- **Turn it off.** Delete `bin/hydrate/<label>.json`; machines launched afterwards hydrate nothing. A job on a machine
+  that hydrated nothing restores as it did.
+
 ## Operate
 
 ```bash
