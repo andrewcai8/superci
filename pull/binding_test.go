@@ -76,6 +76,7 @@ func TestABusyRunnerGitHubNoLongerListsIsGone(t *testing.T) {
 
 func TestAMachinePastItsAgeIsToldToEnd(t *testing.T) {
 	s := NewState("set", 5, 10)
+	s.Observe(stats(0, 0), t0)
 	launch(s, machines(1, t0), t0)
 	if v, _ := s.Ask("i-0000", t0.Add(9*time.Hour), open(), 8*time.Hour); v != End {
 		t.Fatalf("an 9-hour-old machine: %v, want End", v)
@@ -135,5 +136,24 @@ func TestSpendRollsOverAtMidnight(t *testing.T) {
 	}
 	if snap := sp.Snapshot(); snap.Day != "2026-11-26" || snap.DayUSD >= snap.MonthUSD {
 		t.Fatalf("after midnight: %+v, want a new day with less than the month", snap)
+	}
+}
+
+func TestUntilTheQueueIsKnownMachinesWaitAndNothingEndsOrLaunches(t *testing.T) {
+	s := NewState("set", 0, 10)
+	s.Seen("us-east-1", machines(3, t0), t0)
+	s.Registered("i-0002", &Runner{ID: 7, Name: "set-i-0002-cc", Issued: t0.Add(-time.Hour)})
+	if v := ask(s, "i-0000", t0); v != Wait {
+		t.Fatalf("an ask before the session's statistics: %v, want Wait (the queue may hold its job)", v)
+	}
+	if got := s.Surplus(t0.Add(time.Hour), 20*time.Second, 100); len(got) != 0 {
+		t.Fatalf("surplus %v before the statistics", ids(got))
+	}
+	if _, n := s.Deficit(t0, 100); n != 0 {
+		t.Fatalf("launched %d before the statistics", n)
+	}
+	s.Observe(stats(3, 0), t0)
+	if v := ask(s, "i-0000", t0); v != Grant {
+		t.Fatalf("after the statistics (three jobs for three machines): %v, want Grant", v)
 	}
 }

@@ -33,11 +33,8 @@ func publish(ctx context.Context, cw *cloudwatch.Client, m Metrics, now time.Tim
 	}
 	data := []cwtypes.MetricDatum{
 		d("Heartbeat", 1, cwtypes.StandardUnitCount),
-		d("OrgRegistrationRate", m.Budget.OrgRate, cwtypes.StandardUnitCountSecond),
-		d("OthersRegistrationRate", m.Budget.OthersRate, cwtypes.StandardUnitCountSecond),
 		d("OurRegistrationRate", m.Budget.OursRate, cwtypes.StandardUnitCountSecond),
 		d("SpareRegistrationRate", m.Budget.SpareRate, cwtypes.StandardUnitCountSecond),
-		d("RegistrationWindowUse", m.Budget.WindowUse, cwtypes.StandardUnitCount),
 		d("OrgRateKnown", b2f(m.Budget.Known), cwtypes.StandardUnitCount),
 		d("Registrations", float64(m.Regs), cwtypes.StandardUnitCount),
 		d("RegistrationRefusals", float64(m.Refused), cwtypes.StandardUnitCount),
@@ -47,6 +44,11 @@ func publish(ctx context.Context, cw *cloudwatch.Client, m Metrics, now time.Tim
 		d("SpendMonthUSD", m.Spend.MonthUSD, cwtypes.StandardUnitNone),
 		d("SpendPerHourUSD", m.Spend.PerHour, cwtypes.StandardUnitNone),
 		d("SpendCapped", b2f(m.Spend.Capped), cwtypes.StandardUnitCount),
+	}
+	if m.Budget.Known {
+		data = append(data, d("OrgRegistrationRate", m.Budget.OrgRate, cwtypes.StandardUnitCountSecond),
+			d("OthersRegistrationRate", m.Budget.OthersRate, cwtypes.StandardUnitCountSecond),
+			d("RegistrationWindowUse", m.Budget.WindowUse, cwtypes.StandardUnitCount))
 	}
 	machines, od := 0, 0
 	for _, s := range m.Sets {

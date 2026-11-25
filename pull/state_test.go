@@ -235,7 +235,7 @@ func TestASpotNoticeReplacesTheMachineAndFencesOnlyAnIdleRunner(t *testing.T) {
 
 // open is a budget that never refuses.
 func open() *Budget {
-	return NewBudget(RegConfig{Cap: 1e9, WindowS: 300, Margin: 0.2, PoolRate: 1e6, BlindRate: 1e6}, t0.Add(-time.Hour))
+	return NewBudget(RegConfig{Cap: 1e9, WindowS: 300, Margin: 0.2, PoolRate: 1e6, PoolShare: 1, BlindRate: 1e6}, t0.Add(-time.Hour))
 }
 
 func ask(s *State, id string, at time.Time) Verdict {

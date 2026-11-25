@@ -58,6 +58,7 @@ type State struct {
 	pool     int
 	max      int
 	capped   bool // the spend cap is reached: no launches, no pool
+	known    bool // the message session has given its statistics since this process started
 	machines map[string]*Machine
 	reserved map[string]int // per launch round, capacity asked of EC2 and not yet seen
 	rounds   int
@@ -164,7 +165,7 @@ func (s *State) Noticed(id string) (m *Machine, idle *Runner) {
 func (s *State) Deficit(now time.Time, limit int) (round string, n int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.capped {
+	if s.capped || !s.known {
 		return "", 0
 	}
 	n = s.desired() - s.live()
@@ -237,7 +238,9 @@ const (
 // Ask decides for a machine that asks for a runner. A machine gets a runner only when it holds none that could take
 // or hold a job: its last one was reported complete, or GitHub no longer lists it, or it never started and GitHub
 // removed it. So a second ask while a job runs on the machine (by anything on it that can read its identity) gets no
-// runner. A granted ask takes a registration from the budget, ahead of the pool's when a job waits.
+// runner. A granted ask takes a registration from the budget, ahead of the pool's when a job waits. Until the
+// message session has given the queue's statistics (after a restart, while a dead listener's session lapses), every
+// machine is told to wait: nothing is known to end it for, or to register for.
 func (s *State) Ask(id string, now time.Time, b *Budget, maxAge time.Duration) (Verdict, *Runner) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -258,6 +261,9 @@ func (s *State) Ask(id string, now time.Time, b *Budget, maxAge time.Duration) (
 		}
 	}
 	m.Runner = nil
+	if !s.known && !m.Ending && !m.Notice {
+		return Wait, nil
+	}
 	if m.Ending || m.Notice || now.Sub(m.Launched) > maxAge || s.live() > s.desired() {
 		m.Ending = true
 		return End, nil
@@ -328,6 +334,7 @@ func (s *State) Observe(msg *scaleset.RunnerScaleSetMessage, now time.Time) {
 	}
 	if msg.Statistics != nil {
 		s.stats = *msg.Statistics
+		s.known = true
 	}
 	if len(msg.JobAvailableMessages)+len(msg.JobAssignedMessages)+len(msg.JobStartedMessages) > 0 {
 		s.lastActivity = now
@@ -496,7 +503,7 @@ func (s *State) Surplus(now time.Time, hold time.Duration, limit int) []*Machine
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	excess := s.live() - s.desired()
-	if excess <= 0 {
+	if excess <= 0 || !s.known {
 		s.surplusSince = time.Time{}
 		return nil
 	}

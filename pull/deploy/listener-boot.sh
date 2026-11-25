@@ -2,11 +2,13 @@
 # User data of the listener's instance, which its Auto Scaling group (of one) starts and replaces. It takes the
 # listener's Elastic IP (the address machines reach), installs the released binary and units from S3, and starts the
 # service. Placeholders are filled by up.sh.
-set -euxo pipefail
+set -euo pipefail
 exec > >(tee /var/log/superci-pull-boot.log) 2>&1
 BUCKET=@BUCKET@
 T=$(curl -s -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 300' http://169.254.169.254/latest/api/token)
 ID=$(curl -s -H "X-aws-ec2-metadata-token: $T" http://169.254.169.254/latest/meta-data/instance-id)
+unset T
+set -x
 for i in $(seq 1 30); do
   aws ec2 associate-address --region us-east-1 --allocation-id @EIP_ALLOC@ --instance-id "$ID" --allow-reassociation && break
   sleep 5

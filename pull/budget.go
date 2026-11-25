@@ -122,7 +122,7 @@ func (b *Budget) estimate(now time.Time) Estimate {
 		}
 	}
 	span := last.at.Sub(at).Seconds()
-	if span < 60 || now.Sub(last.at) > 3*time.Minute {
+	if span < 60 || now.Sub(last.at) > 5*time.Minute {
 		return e
 	}
 	advance := float64(last.id) - id
@@ -141,9 +141,10 @@ func (b *Budget) Estimate(now time.Time) Estimate {
 }
 
 // Take reserves one registration now, or says no. A registration is allowed when the organization's use of the
-// window leaves room under Cap less half the margin, and the spare rate has saved up a token (a pool registration
-// also needs half the saved-up burst left for jobs, and its own slower pace). While the organization's rate is
-// unknown, the listener registers at BlindRate only. After a refusal by GitHub, no one registers for a while.
+// window leaves room under Cap less half the margin, and the spare rate has saved up a token. A pool registration
+// also leaves half the saved-up burst to jobs, and keeps to its own pace: PoolRate, and PoolShare of the spare rate.
+// While the organization's rate is unknown, the listener registers at BlindRate only. After a refusal by GitHub, no
+// one registers for a while.
 func (b *Budget) Take(now time.Time, p Priority) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -159,7 +160,7 @@ func (b *Budget) Take(now time.Time, p Priority) bool {
 		return false
 	}
 	burst := max(3, e.SpareRate*10)
-	poolRate := min(b.c.PoolRate, e.SpareRate/2)
+	poolRate := min(b.c.PoolRate, e.SpareRate*b.c.PoolShare)
 	dt := max(0, now.Sub(b.refilled).Seconds())
 	b.refilled = now
 	b.tokens = min(burst, b.tokens+dt*e.SpareRate)

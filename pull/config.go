@@ -71,6 +71,7 @@ type RegConfig struct {
 	WindowS     int     `json:"window_s"`
 	Margin      float64 `json:"margin"`
 	PoolRate    float64 `json:"pool_rate"`
+	PoolShare   float64 `json:"pool_share"`
 	BlindRate   float64 `json:"blind_rate"`
 	Concurrency int     `json:"concurrency"`
 }
@@ -104,8 +105,8 @@ func (c Config) validate() error {
 			return fmt.Errorf("config: size %s needs cpu, split >= 1, max and types", label)
 		}
 	}
-	if c.Registration.Cap <= 0 || c.Registration.WindowS <= 0 || c.Registration.Margin < 0 || c.Registration.Margin >= 1 {
-		return errors.New("config: registration needs cap, window_s and a margin in [0, 1)")
+	if r := c.Registration; r.Cap <= 0 || r.WindowS <= 0 || r.Margin < 0 || r.Margin >= 1 || r.PoolShare < 0 || r.PoolShare > 1 {
+		return errors.New("config: registration needs cap, window_s, a margin in [0, 1) and a pool_share in [0, 1]")
 	}
 	if c.JobMinutes <= 0 || c.MaxAgeHours <= 0 {
 		return errors.New("config: job_minutes and max_age_hours must be positive")

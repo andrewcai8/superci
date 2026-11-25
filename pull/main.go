@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -165,7 +166,9 @@ func run(ctx context.Context, f flags) error {
 		}
 		l.sets = append(l.sets, &Set{spec: spec, id: gid, state: NewState(spec.Name, 0, spec.Max), fleet: sf})
 	}
-	client.SetSystemInfo(scaleset.SystemInfo{System: "superci-pull", Version: "0.2.0", Subsystem: "listener"})
+	if err := pruneScaleSets(ctx, client, specs); err != nil {
+		return fmt.Errorf("prune scale sets: %w", err)
+	}
 	refresh := l.refresher()
 	for _, r := range fleet.regions {
 		refresh(ctx, r.Name)
@@ -181,10 +184,12 @@ func run(ctx context.Context, f flags) error {
 	go serve(ctx, &http.Server{Addr: f.listen, Handler: srv, ReadHeaderTimeout: 10 * time.Second}, &id)
 	go serve(ctx, &http.Server{Addr: f.admin, Handler: Admin(l.status, l.healthy, l.override)}, nil)
 	errs := make(chan error, len(l.sets))
+	var sessions sync.WaitGroup
 	for _, s := range l.sets {
 		wake := make(chan struct{}, 1)
 		go l.launcher(ctx, s, wake)
-		go func() { errs <- listenSet(ctx, client, s, wake) }()
+		sessions.Add(1)
+		go func() { defer sessions.Done(); errs <- listenSet(ctx, client, s, wake) }()
 	}
 	go l.reconciler(ctx, refresh)
 	go every(ctx, 15*time.Second, func() { l.setPools(time.Now()) })
@@ -212,6 +217,14 @@ func run(ctx context.Context, f flags) error {
 	go l.price(ctx)
 	select {
 	case <-ctx.Done():
+		// Each set closes its message session on the way out; a session left open would refuse the next listener's
+		// for about a minute.
+		closed := make(chan struct{})
+		go func() { sessions.Wait(); close(closed) }()
+		select {
+		case <-closed:
+		case <-time.After(10 * time.Second):
+		}
 		return ctx.Err()
 	case err := <-errs:
 		return err
@@ -268,6 +281,29 @@ func ensureScaleSet(ctx context.Context, client *scaleset.Client, spec SetSpec) 
 	}
 	slog.Info("scale set", "name", spec.Name, "id", s.ID, "labels", labelNames(s.Labels))
 	return s.ID, nil
+}
+
+// ownSetName is the form of every set this listener makes: superci-<cpu>cpu, or superci-<cpu>cpu-<k> for a split.
+var ownSetName = regexp.MustCompile(`^superci-[0-9]+cpu(-[0-9]+)?$`)
+
+// pruneScaleSets deletes the sets of ours the config no longer has (a size removed, or a split made smaller): one
+// left at GitHub would keep taking a share of its label's jobs with no listener to run them. GitHub removes a
+// deleted set's runners, so a job one of them held fails; shrink a split while the size is idle, or re-run them.
+func pruneScaleSets(ctx context.Context, client *scaleset.Client, specs []SetSpec) error {
+	want := map[string]bool{}
+	for _, s := range specs {
+		want[s.Name] = true
+	}
+	sets, err := client.ListRunnerScaleSets(ctx, group)
+	if err != nil {
+		return err
+	}
+	for _, s := range sets {
+		if ownSetName.MatchString(s.Name) && !want[s.Name] {
+			slog.Warn("deleting scale set the config no longer has", "name", s.Name, "id", s.ID, "err", errString(client.DeleteRunnerScaleSet(ctx, s.ID)))
+		}
+	}
+	return nil
 }
 
 func labelNames(ls []scaleset.Label) []string {
@@ -559,9 +595,10 @@ func (l *Listener) reconciler(ctx context.Context, refresh func(context.Context,
 }
 
 // sampleOrg learns the organization's highest runner id from a listing when our own registrations have not told it
-// lately.
+// lately. A listing reads every page of the organization's runners (2,600 at a busy hour, 27 requests of the App's
+// 5,000 an hour), so it runs at most every 100 s.
 func (l *Listener) sampleOrg(ctx context.Context) {
-	if time.Since(l.budget.LastHead()) < 40*time.Second {
+	if time.Since(l.budget.LastHead()) < 100*time.Second {
 		return
 	}
 	id, err := l.rest.OrgHead(ctx)

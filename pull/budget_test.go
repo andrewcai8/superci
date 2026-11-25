@@ -7,7 +7,7 @@ import (
 )
 
 func reg() RegConfig {
-	return RegConfig{Cap: 1500, WindowS: 300, Margin: 0.2, PoolRate: 0.5, BlindRate: 0.3}
+	return RegConfig{Cap: 1500, WindowS: 300, Margin: 0.2, PoolRate: 0.5, PoolShare: 0.5, BlindRate: 0.3}
 }
 
 // heads feeds the budget the organization's highest runner id advancing at rate a second from t0 for d.
