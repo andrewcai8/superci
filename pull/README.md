@@ -133,8 +133,11 @@ registration) times `factor` (1.5), measured over the set's last 10 minutes of a
 for the hour (UTC). The caps come from megpt-mono's Blacksmith arrivals by hour (`tools/pools.py`); the floors are 1
 for 2, 4 and 8 vCPU and 0 for 16 and 32. Within 15 minutes of the next hour, the larger of the two hours' bounds
 applies, so a busy hour's pool is registered slowly ahead of it. A split size divides its bounds among its sets.
-After a start, arrivals are rated over the time since it (at least a minute), and no idle runner is trimmed in the
-first window (10 minutes), so a restart does not read as no arrivals and shed the pool.
+A job arrives with its first JobAssigned or JobAvailable message: GitHub assigns these sets' jobs directly, with
+no JobAvailable, so before Nov 25 19:00Z every arrival (and every `QueueWait`) read as none and each pool stayed at
+its floor; the load tests above pinned their pools, which hid it. After a start, arrivals are rated over the time
+since it (at least a minute), and no idle runner is trimmed in the first window (10 minutes), so a restart does not
+read as no arrivals and shed the pool.
 
 ### Sizes and split
 

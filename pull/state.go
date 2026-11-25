@@ -90,8 +90,8 @@ type State struct {
 	surplusSince time.Time            // since when the supply has exceeded the demand
 	orphanSince  map[string]time.Time // stale runners, by name, since first listed as such
 
-	arrivals    []time.Time         // jobs that became available, for the pool's rate
-	available   map[int64]time.Time // when each waiting job became available, by runner request, for its queue wait
+	arrivals    []time.Time         // jobs that arrived, for the pool's rate
+	available   map[int64]time.Time // when each waiting job was queued, by runner request, for its queue wait
 	lost        []JobRef            // jobs that ended on a machine AWS was taking back, for a re-run
 	waits       []float64           // queue waits (s) of jobs started since the metrics last took them
 	odLaunched  []time.Time
@@ -401,8 +401,9 @@ func runnerOf(m *Machine, name string, id int64, now time.Time) *Runner {
 }
 
 // Observe takes in one answer of the message session: its statistics, the jobs that arrived, and which runners
-// started and finished jobs (with how long each started job waited in the queue). A machine whose job completed ends:
-// the listener ends it, rather than trust what runs on it to.
+// started and finished jobs (with how long each started job waited in the queue). A job arrives with its first
+// JobAvailable or JobAssigned: GitHub assigns these sets' jobs directly, with no JobAvailable. A machine whose job
+// completed ends: the listener ends it, rather than trust what runs on it to.
 func (s *State) Observe(msg *scaleset.RunnerScaleSetMessage, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -419,12 +420,10 @@ func (s *State) Observe(msg *scaleset.RunnerScaleSetMessage, now time.Time) {
 		s.staleWaiting = 0
 	}
 	for _, j := range msg.JobAvailableMessages {
-		s.arrivals = append(s.arrivals, now)
-		queued := now
-		if !j.QueueTime.IsZero() && j.QueueTime.Before(now) {
-			queued = j.QueueTime
-		}
-		s.available[j.RunnerRequestID] = queued
+		s.arrived(j.JobMessageBase, now)
+	}
+	for _, j := range msg.JobAssignedMessages {
+		s.arrived(j.JobMessageBase, now)
 	}
 	for _, j := range msg.JobStartedMessages {
 		queued, ok := s.available[j.RunnerRequestID]
@@ -447,6 +446,7 @@ func (s *State) Observe(msg *scaleset.RunnerScaleSetMessage, now time.Time) {
 		}
 	}
 	for _, j := range msg.JobCompletedMessages {
+		delete(s.available, j.RunnerRequestID)
 		if m := s.machineOf(j.RunnerName); m != nil {
 			r := runnerOf(m, j.RunnerName, int64(j.RunnerID), now)
 			r.Busy, r.Done = true, true
@@ -463,6 +463,19 @@ func (s *State) Observe(msg *scaleset.RunnerScaleSetMessage, now time.Time) {
 	} else {
 		s.waitingSince = time.Time{}
 	}
+}
+
+// arrived takes in a job the first time a message names it: one arrival, queued since GitHub queued it.
+func (s *State) arrived(j scaleset.JobMessageBase, now time.Time) {
+	if _, ok := s.available[j.RunnerRequestID]; ok {
+		return
+	}
+	s.arrivals = append(s.arrivals, now)
+	queued := now
+	if !j.QueueTime.IsZero() && j.QueueTime.Before(now) {
+		queued = j.QueueTime
+	}
+	s.available[j.RunnerRequestID] = queued
 }
 
 // Stalled says whether jobs have waited for the set for over d with none started meanwhile.

@@ -327,3 +327,21 @@ func ids(ms []*Machine) []string {
 	}
 	return out
 }
+
+// GitHub assigns these sets' jobs with JobAssigned and no JobAvailable, so arrivals and queue waits counted only from
+// JobAvailable read as none: the pool kept to its floor and no queue wait was published.
+func TestAJobAssignedWithNoJobAvailableArrivesAndIsTimed(t *testing.T) {
+	s := NewState("set", 0, 10, []string{"us-east-1"}, t0.Add(-time.Hour))
+	queued := t0.Add(-4 * time.Second)
+	for i := 0; i < 60; i++ {
+		base := scaleset.JobMessageBase{RunnerRequestID: int64(i), QueueTime: queued}
+		s.Observe(&scaleset.RunnerScaleSetMessage{JobAssignedMessages: []*scaleset.JobAssigned{{JobMessageBase: base}, {JobMessageBase: base}}}, t0)
+	}
+	if r := s.ArrivalRate(t0.Add(time.Minute), 10*time.Minute); r != 0.1 {
+		t.Fatalf("rate %v, want 60 jobs (each assigned twice, counted once) over 10 minutes", r)
+	}
+	s.Observe(&scaleset.RunnerScaleSetMessage{JobStartedMessages: []*scaleset.JobStarted{{JobMessageBase: scaleset.JobMessageBase{RunnerRequestID: 7}}}}, t0.Add(2*time.Second))
+	if w := s.TakeWaits(); len(w) != 1 || w[0] != 6 {
+		t.Fatalf("waits %v, want one of 6 s: from when GitHub queued the job", w)
+	}
+}

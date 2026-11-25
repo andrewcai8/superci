@@ -26,6 +26,8 @@ MUTANTS = [
     ("OPS-3 arrivals over the whole window", "state.go", "/ min(window, max(time.Minute, now.Sub(s.started))).Seconds()", "/ window.Seconds()",
      "TestARestartDoesNotReadAsNoArrivals"),
     ("OPS-3 pool slack trimmed in the first window", "state.go", " || now.Sub(s.started) < warmup", "", "TestNoPoolRunnerIsTrimmedInTheFirstWindowAfterAStart"),
+    ("arrivals and queue waits only from JobAvailable", "state.go", f"{T}for _, j := range msg.JobAssignedMessages {{\n{T}{T}s.arrived(j.JobMessageBase, now)\n{T}}}\n", "",
+     "TestAJobAssignedWithNoJobAvailableArrivesAndIsTimed"),
     ("OPS-4 the second sample after 100 s", "budget.go", "wait = 61 * time.Second", "wait = 100 * time.Second", "TestTheSecondSampleComesAMinuteAfterTheFirst"),
     ("OPS-5 decisions before every region is listed", "state.go", f"{T}for _, at := range s.listings {{\n{T}{T}if at.IsZero() {{", f"{T}for _, at := range s.listings {{\n{T}{T}if false && at.IsZero() {{",
      "TestNothingIsDecidedUntilEveryRegionIsListed"),
