@@ -136,6 +136,60 @@ class Gate1(unittest.TestCase):
         self.assertEqual(printed(slow, "gate 1"), 1)
 
 
+class Sources(unittest.TestCase):
+    def test_a_sample_is_evenly_spread_and_the_same_on_every_rerun(self):
+        items = list(range(1000))
+        picked = G.sample(items, 100)
+        self.assertEqual(picked, G.sample(items, 100))
+        self.assertEqual((picked[0], picked[1], picked[-1]), (0, 10, 990))
+        self.assertEqual(G.sample([1, 2], 100), [1, 2])
+
+    def test_runs_the_listing_could_not_read_fail_the_verdict_unless_allowed(self):
+        class Gh:
+            skipped = [7, 9]
+        self.assertEqual(G.unread(Gh)[0].status, G.FAIL)
+        self.assertEqual(G.unread(Gh, 2)[0].status, G.PASS)
+        self.assertEqual(G.unread(type("Clean", (), {})), [])
+
+    def test_the_noise_floor_is_run_to_run_not_leg_to_leg(self):
+        legs = [obs(w, run=r) for r, ws in enumerate(([10, 100, 200], [11, 101, 201], [9, 99, 199], [10, 100, 200]), 1) for w in ws]
+        self.assertLess(G.run_spread(legs, lambda o: o.wall), 2.0)
+        self.assertGreater(G.iqr([o.wall for o in legs]), 80)
+
+
+class RecordedCanary(unittest.TestCase):
+    """The verify-tools legs of Nov 25, as GitHub's API returned them: superci's canary against Blacksmith's day before."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(HERE, "fixtures", "verify-tools-canary.json")) as fh:
+            cls.rec = json.load(fh)
+        cls.S = [o for o in (G.is_obs(j, {}) for j in cls.rec["superci"]) if o]
+        cls.B = [o for o in (G.is_obs(j, {}) for j in cls.rec["blacksmith"]) if o]
+
+    def test_the_recorded_canary_fails_on_wall_and_queue_wait_as_measured(self):
+        rows = rows_by_name(G.evaluate_job(self.S, self.B, 625.0, [22.0] * len(self.S)))
+        for name in ("wall p50", "wall p90", "queue wait p50", "queue wait p90", "unexplained p50 (timeline)"):
+            self.assertEqual(rows[name].status, G.FAIL, name)
+        self.assertEqual(rows["n (superci runs)"].status, G.PASS)
+        self.assertGreater(T.q([o.wall for o in self.S], 50), 2 * T.q([o.wall for o in self.B], 50))
+
+    def test_the_same_legs_at_a_third_of_the_time_pass(self):
+        fast = [G.dataclasses.replace(o, wall=o.wall / 3, queue=o.queue / 20) for o in self.S]
+        rows = rows_by_name(G.evaluate_job(fast, self.B, 625.0, [0.4] * len(fast)))
+        self.assertEqual({n: r.status for n, r in rows.items()}, {n: G.PASS for n in rows}, [r for r in rows.values() if r.status != G.PASS])
+
+    def test_a_rerun_attempt_is_not_an_observation(self):
+        rerun = next(j for j in self.rec["blacksmith"] if (j["run_attempt"] or 1) > 1)
+        self.assertIsNone(G.is_obs(rerun, {}))
+        first_attempts = [j for j in self.rec["blacksmith"] if (j["run_attempt"] or 1) == 1 and j["conclusion"] in ("success", "failure")]
+        self.assertEqual(len(self.B), len(first_attempts))
+
+    def test_the_fleet_comes_from_the_runner_group_and_labels(self):
+        self.assertEqual({o.fleet for o in self.S}, {"superci"})
+        self.assertEqual({o.fleet for o in self.B}, {"blacksmith"})
+
+
 def scale(**kw):
     base = dict(replayed=100, completed=100, stranded=[], lost=0, waits=spread_around(3, 1, 100), window_use=[(1000.0, 400.0), (1060.0, 700.0)], org_known=[1.0, 1.0],
                 claims={f"i-{n}" for n in range(10)}, issued=collections.Counter({f"i-{n}": 1 for n in range(10)}), claim_taken=collections.Counter({f"i-{n}": 1 for n in range(10)}),

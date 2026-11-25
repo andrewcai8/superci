@@ -19,8 +19,9 @@ Exit 0 only when every criterion passes. 1 is FAIL, or INCONCLUSIVE when every m
 
 Superci runs are the job's runs in the runner group `superci-pull` created from `--since` (default the last 24 h), on branches
 matching `--branch-glob` when one is given. Blacksmith's are the same job's runs on Blacksmith over the `--baseline-hours`
-ending now. When a window holds more than `--max-runs` runs, their jobs are read from an evenly spaced sample of that many,
-the same ones each rerun. `<job>` is the job's name, or a matrix job's name for all its legs.
+ending now. The superci window is always read whole. The baseline's jobs are read from at most `--max-runs` (300) runs, an
+evenly spaced sample, the same ones each rerun. Rerun attempts are left out of every row: a rerun keeps its first attempt's
+`created_at`, so its queue wait is not real. `<job>` is the job's name, or a matrix job's name for all its legs.
 
 | Row | Passes when |
 | --- | --- |
@@ -37,7 +38,7 @@ the gap, so add runs. Nothing is rounded toward either verdict.
 
 ## gate 2: `gate scale`
 
-Reads the replay's runs (`--workflow`, `--branch-glob`), the listener's timeline events and CloudWatch, and lists the claims
+Reads the replay's runs (every run in the window whose workflow file is `--workflow` and whose branch matches `--branch-glob`; a load workflow that exists only on its branch has no name GitHub resolves), the listener's timeline events and CloudWatch, and lists the claims
 bucket read-only.
 
 | Row | Source | Passes when |

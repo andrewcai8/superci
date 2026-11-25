@@ -79,6 +79,15 @@ class Row:
     note: str = ""
 
 
+def run_spread(obs, get):
+    """The run-to-run noise of a metric: the IQR, across runs, of each run's median over its legs. A matrix job's legs differ
+    systematically (leg 1 is not leg 3), and that is not noise; a one-leg job's run is its own median."""
+    by = collections.defaultdict(list)
+    for o in obs:
+        by[o.run_id].append(get(o))
+    return iqr([T.q(v, 50) for v in by.values()])
+
+
 def iqr(values):
     return (T.q(values, 75) - T.q(values, 25)) if values else 0.0
 
@@ -101,12 +110,15 @@ def at_most(name, value, bound, threshold, spread_s=0.0, unit=fmt_s):
         return Row(name, unit(value), threshold, FAIL, f"over by {unit(value - bound)}")
     margin = bound - value
     if margin < spread_s:
-        return Row(name, unit(value), threshold, NOISE, f"margin {unit(margin)} is inside the superci spread (IQR {unit(spread_s)}): add runs")
+        return Row(name, unit(value), threshold, NOISE, f"margin {unit(margin)} is inside the superci run-to-run spread (IQR of run medians {unit(spread_s)}): add runs")
     return Row(name, unit(value), threshold, PASS, f"margin {unit(margin)}")
 
 
 def is_obs(job, run):
-    """An Obs from a REST job and its run, or None when the job did not finish with success or failure."""
+    """An Obs from a REST job and its run, or None when the job did not finish with success or failure, or is a rerun: a
+    rerun attempt keeps its first attempt's created_at, so its queue wait (and, here, its place in a failure rate) is not real."""
+    if (job.get("run_attempt") or 1) > 1:
+        return None
     if not job.get("completed_at") or not job.get("started_at") or job.get("conclusion") not in ("success", "failure"):
         return None
     created, started, completed = T.ts(job["created_at"]), T.ts(job["started_at"]), T.ts(job["completed_at"])
@@ -141,10 +153,12 @@ def evaluate_job(S, B, ceiling, unexplained, min_runs=MIN_RUNS):
         p90_cap = P90_FACTOR * T.q(bw, 90)
         th90 = f"min(B p90 {T.q(bw, 90):.1f} x {P90_FACTOR} = {p90_cap:.1f}, ceiling {'none' if ceiling is None else f'{ceiling:g}'})"
         bound90 = p90_cap if ceiling is None else min(p90_cap, ceiling)
-        rows.append(at_most("wall p50", T.q(sw, 50), T.q(bw, 50), f"<= B p50 {T.q(bw, 50):.1f} s", iqr(sw)))
-        rows.append(at_most("wall p90", T.q(sw, 90), bound90, f"<= {th90}", iqr(sw)))
-        rows.append(at_most("queue wait p50", T.q(sq, 50), T.q(bq, 50), f"<= B p50 {T.q(bq, 50):.1f} s", iqr(sq)))
-        rows.append(at_most("queue wait p90", T.q(sq, 90), T.q(bq, 90) + QUEUE_P90_SLACK_S, f"<= B p90 {T.q(bq, 90):.1f} + {QUEUE_P90_SLACK_S:g} s", iqr(sq)))
+        wall_noise = run_spread([o for o in S if o.ok], lambda o: o.wall)
+        queue_noise = run_spread(S, lambda o: o.queue)
+        rows.append(at_most("wall p50", T.q(sw, 50), T.q(bw, 50), f"<= B p50 {T.q(bw, 50):.1f} s", wall_noise))
+        rows.append(at_most("wall p90", T.q(sw, 90), bound90, f"<= {th90}", wall_noise))
+        rows.append(at_most("queue wait p50", T.q(sq, 50), T.q(bq, 50), f"<= B p50 {T.q(bq, 50):.1f} s", queue_noise))
+        rows.append(at_most("queue wait p90", T.q(sq, 90), T.q(bq, 90) + QUEUE_P90_SLACK_S, f"<= B p90 {T.q(bq, 90):.1f} + {QUEUE_P90_SLACK_S:g} s", queue_noise))
     everything = list(S) + list(B)
     counted = [o for o in S if not o.ok and not excused(o, everything)]
     b_rate = sum(1 for o in B if not o.ok) / len(B) if B else 0.0
@@ -268,7 +282,7 @@ def superci_label(labels):
 
 def build_trace(jobs, start, hours=1, bucket_s=60, source=None):
     """The arrival trace of REST jobs created from `start` for `hours`: each Linux job's creation offset, label and run
-    time. Jobs that never ran (skipped, cancelled before a runner) and other runner kinds are counted, not listed. Pure."""
+    time. Jobs that never ran (skipped, or cancelled before a runner took them) and other runner kinds are counted, not listed. Pure."""
     lo, hi = start, start + 3600 * hours
     legs, dropped = [], collections.Counter()
     for j in jobs:
@@ -278,7 +292,7 @@ def build_trace(jobs, start, hours=1, bucket_s=60, source=None):
         label = superci_label(j.get("labels"))
         if label is None:
             dropped["other runner: " + (",".join(j.get("labels") or []) or "none")] += 1
-        elif not (j.get("started_at") and j.get("completed_at")) or j.get("conclusion") in ("skipped", "cancelled"):
+        elif not (j.get("started_at") and j.get("completed_at")) or j.get("conclusion") == "skipped":
             dropped[f"{label} job that did not run ({j.get('conclusion') or j.get('status')})"] += 1
         else:
             legs.append({"t": round(created - lo, 1), "label": label, "duration_s": round(max(1.0, T.ts(j["completed_at"]) - T.ts(j["started_at"])), 1),
@@ -385,10 +399,14 @@ def claim_objects(profile, lo, hi):
 # Commands.
 # ---------------------------------------------------------------------------------------------------------------------
 
-def unread(gh):
-    """A row that fails when GitHub would not list some run's jobs: the other rows were drawn without them."""
-    n = len(getattr(gh, "skipped", []))
-    return [Row("every run read", f"{n} skipped", "0", FAIL, "GitHub would not list their jobs (5xx): rerun, the cache keeps what was read")] if n else []
+def unread(gh, allowed=0):
+    """A row that fails when GitHub would not list more than `allowed` runs' jobs: the other rows were drawn without them.
+    A run that fails every time (GitHub's own 5xx) is named so it can be allowed."""
+    skipped = getattr(gh, "skipped", [])
+    if not skipped:
+        return []
+    return [Row("every run read", f"{len(skipped)} skipped", f"<= {allowed}", PASS if len(skipped) <= allowed else FAIL,
+                f"GitHub would not list jobs of runs {sorted(skipped)[:5]}: rerun (the cache keeps what was read) or --allow-unread")]
 
 
 def print_rows(title, rows, verdict_name):
@@ -413,7 +431,7 @@ def show_spread(label, obs):
             print(f"  {label:11} {what:5} n=0")
             continue
         s = spread(v)
-        print(f"  {label:11} {what:5} n={s['n']:<4} min {s['min']:7.1f}  p25 {s['p25']:7.1f}  p50 {s['p50']:7.1f}  p75 {s['p75']:7.1f}  p90 {s['p90']:7.1f}  max {s['max']:7.1f}   IQR {iqr(v):.1f}")
+        print(f"  {label:11} {what:5} n={s['n']:<4} min {s['min']:7.1f}  p25 {s['p25']:7.1f}  p50 {s['p50']:7.1f}  p75 {s['p75']:7.1f}  p90 {s['p90']:7.1f}  max {s['max']:7.1f}   leg IQR {iqr(v):.1f}  run-to-run IQR {run_spread([o for o in obs if o.ok or what == 'queue'], get):.1f}")
 
 
 def cmd_job(a):
@@ -427,7 +445,7 @@ def cmd_job(a):
     listed = runs_of(gh, a.workflow, min(since, b_lo), now)
     s_runs = [r for r in listed if T.ts(r["created_at"]) >= since and fnmatch.fnmatch(r.get("head_branch") or "", a.branch_glob or "*")]
     b_runs = [r for r in listed if b_lo <= T.ts(r["created_at"]) <= b_hi and r["id"] not in {x["id"] for x in s_runs}]
-    s_runs, b_runs = sample(s_runs, a.max_runs), sample(b_runs, a.max_runs)
+    b_runs = sample(b_runs, a.max_runs)
     runs = s_runs + b_runs
     by_run = {r["id"]: r for r in runs}
     jobs = [(j, by_run[rid]) for rid, js in jobs_of(gh, runs).items() for j in js if matches(j["name"], a.job)]
@@ -444,18 +462,20 @@ def cmd_job(a):
     print(f"gate job {a.job}  workflow {a.workflow}  ({len(listed)} runs listed, jobs read from {len(s_runs)} superci-window and {len(b_runs)} baseline runs, {gh.calls} GitHub calls)")
     print(f"  superci: runner group {a.superci_group}, branches {a.branch_glob or '*'}, created {T.iso(since)} to {T.iso(now)}")
     print(f"  blacksmith: created {T.iso(b_lo)} to {T.iso(b_hi)}; ceiling " + (f"{ceiling:g} s ({LIMITS_PATH})" if ceiling is not None else f"none (no {a.workflow} / {a.job} row)"))
+    print(f"  excluded: {sum(1 for j in S_jobs + B_jobs if (j.get('run_attempt') or 1) > 1)} rerun attempts (a rerun keeps its first attempt's created_at, so its queue wait is not real)")
     print("  quantiles are interpolated (wall over successful runs, queue wait over every run):")
     show_spread("superci", S)
     show_spread("blacksmith", B)
     print()
-    return print_rows("criteria", evaluate_job(S, B, ceiling, unexplained) + unread(gh), f"gate 1 for {a.job}")
+    return print_rows("criteria", evaluate_job(S, B, ceiling, unexplained) + unread(gh, a.allow_unread), f"gate 1 for {a.job}")
 
 
 def collect_scale(a):
     now = time.time()
     lo, hi = T.ts(a.since), T.ts(a.until)
     gh = T.GitHub(a.repo, T.Cache(a.cache))
-    runs = [r for r in runs_of(gh, a.workflow, lo - 60, hi) if fnmatch.fnmatch(r.get("head_branch") or "", a.branch_glob)]
+    # a workflow that lives only on the load branches has no file name GitHub resolves, so every run is listed and matched by path
+    runs = [r for r in runs_of(gh, None, lo - 60, hi) if os.path.basename(r.get("path") or "") == a.workflow and fnmatch.fnmatch(r.get("head_branch") or "", a.branch_glob)]
     jobs = [j for js in jobs_of(gh, runs).values() for j in js if j.get("conclusion") != "skipped"]
     started = [j for j in jobs if j.get("started_at") and j.get("runner_group_name") == a.superci_group]
     waits = [T.ts(j["started_at"]) - T.ts(j["created_at"]) for j in started]
@@ -488,7 +508,7 @@ def cmd_scale(a):
     print(f"gate scale  {a.since} to {a.until}  workflow {a.workflow} branches {a.branch_glob}  ({gh.calls} GitHub calls)")
     print(f"  registration token waits (the budget guard, never hidden): {s.waited_asks} grants, longest {s.max_wait_s:.1f} s")
     print()
-    return print_rows("criteria", evaluate_scale(s) + unread(gh), "gate 2")
+    return print_rows("criteria", evaluate_scale(s) + unread(gh, a.allow_unread), "gate 2")
 
 
 def cmd_replay_trace(a):
@@ -514,6 +534,7 @@ def main(argv=None):
     p.add_argument("--repo", default=REPO)
     p.add_argument("--cache", default=os.path.expanduser("~/.cache/superci-timeline"), help="directory of cached GitHub answers")
     p.add_argument("--legacy", action="store_true", help="rebuild launches and registrations from CloudTrail for a window before the listener's tl events")
+    p.add_argument("--allow-unread", type=int, default=0, help="runs whose jobs GitHub will not list (a persistent 5xx) that the verdict tolerates")
     sub = p.add_subparsers(dest="cmd", required=True)
     j = sub.add_parser("job", help="gate 1: speed parity of one job against Blacksmith")
     j.add_argument("job")
@@ -522,7 +543,7 @@ def main(argv=None):
     j.add_argument("--branch-glob", help="count a superci run only from branches matching this glob (default: any branch)")
     j.add_argument("--baseline-hours", type=float, default=BASELINE_HOURS, help="Blacksmith's window, ending now")
     j.add_argument("--baseline-until", help="end Blacksmith's window here instead of now")
-    j.add_argument("--max-runs", type=int, default=300, help="read the jobs of at most this many runs a side, spread evenly (GitHub's rate limit is 5,000 an hour)")
+    j.add_argument("--max-runs", type=int, default=300, help="read the baseline's jobs from at most this many runs, spread evenly (GitHub's rate limit is 5,000 an hour); the superci window is always read whole")
     j.add_argument("--limits", help="a ci-limits.tsv to read instead of origin/main's")
     j.add_argument("--superci-group", default=T.SUPERCI_RUNNER_GROUP)
     j.set_defaults(fn=cmd_job)
