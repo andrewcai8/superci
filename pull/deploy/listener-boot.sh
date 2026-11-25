@@ -23,8 +23,15 @@ fi
 mkdir -p /etc/superci-pull
 echo "BUCKET=$BUCKET" > /etc/superci-pull/bucket
 echo "$eip" > /etc/superci-pull/eip
-aws s3 cp "s3://$BUCKET/bin/superci-pull" /usr/local/bin/superci-pull
-chmod 755 /usr/local/bin/superci-pull
+aws s3 cp "s3://$BUCKET/bin/superci-pull" /usr/local/bin/superci-pull.new
+# Only the binary the release names starts (release.sh writes bin/RELEASE.json): any other leaves no listener running.
+want=$(aws s3 cp "s3://$BUCKET/bin/RELEASE.json" - | sed -n 's/.*"bin\/superci-pull":"\([0-9a-f]\{64\}\)".*/\1/p') || want=""
+got=$(sha256sum < /usr/local/bin/superci-pull.new | cut -d' ' -f1)
+if [ -z "$want" ] || [ "$got" != "$want" ]; then
+  echo "superci-pull: refusing s3://$BUCKET/bin/superci-pull: sha256 $got, bin/RELEASE.json says ${want:-nothing}; not starting"
+  exit 1
+fi
+install -m 755 /usr/local/bin/superci-pull.new /usr/local/bin/superci-pull
 aws s3 cp --recursive "s3://$BUCKET/deploy/" /tmp/superci-deploy/
 install -m 755 /tmp/superci-deploy/sync.sh /usr/local/bin/superci-pull-sync
 install -m 755 /tmp/superci-deploy/health.sh /usr/local/bin/superci-pull-health
