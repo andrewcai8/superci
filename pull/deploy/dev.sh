@@ -9,6 +9,7 @@
 #    "sizes":{"superci-96cpu":{"cpu":2,"split":1,"max":20,"disk_gb":40,"types":["c7i.large", ...]}}}
 #
 #   pull/deploy/dev.sh up NAME <binary> <override.json>   starts the instance and the listener
+#   pull/deploy/dev.sh push NAME <binary>                  installs a new binary and restarts the listener
 #   pull/deploy/dev.sh ssh NAME [command]                 a shell on it (a key made for the call: EC2 Instance Connect)
 #   pull/deploy/dev.sh down NAME                           deletes its scale sets and terminates it
 set -euo pipefail
@@ -31,7 +32,26 @@ ssh_run() {
   ssh -q -i "$tmp/key" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$tmp/known" -o ConnectTimeout=10 "ec2-user@$ip" "$@"
 }
 
+CLAIMS=superci-pull-claims-243891825325-$NAME
+
+# The claims bucket (the machine's one-runner fence) is the deployment's own, and the role may use only it and the dev
+# parameters: an inline policy per dev listener on the role superci-pull-dev, which the production role does not share.
+claims() {
+  $A s3api head-bucket --bucket $CLAIMS 2> /dev/null || {
+    $A s3api create-bucket --bucket $CLAIMS --region us-east-1 > /dev/null
+    $A s3api put-public-access-block --bucket $CLAIMS --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+    $A s3api put-bucket-tagging --bucket $CLAIMS --tagging 'TagSet=[{Key=purpose,Value=superci-pull-dev}]'
+  }
+  $A iam put-role-policy --role-name superci-pull-dev --policy-name superci-pull-claims-$NAME --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"s3:PutObject\",\"s3:GetObject\"],\"Resource\":\"arn:aws:s3:::$CLAIMS/issued/*\"},{\"Effect\":\"Allow\",\"Action\":\"s3:ListBucket\",\"Resource\":\"arn:aws:s3:::$CLAIMS\"}]}"
+}
+
 case $cmd in
+  push)
+    ssh_run 'sudo systemctl stop superci-pull; sudo tee /usr/local/bin/superci-pull > /dev/null && sudo chmod 755 /usr/local/bin/superci-pull' < "${3:?binary}"
+    claims
+    ssh_run "sudo sed -i 's|^FLAGS=.*-claims=[^ ]*|&|; /-claims=/! s|\$| -claims=$CLAIMS|' /etc/superci-pull.env && sudo systemctl start superci-pull"
+    ssh_run 'sudo cat /etc/superci-pull.env; sudo systemctl is-active superci-pull'
+    ;;
   up)
     BIN=${3:?binary}; OVERRIDE=${4:?override.json}
     [ "$(instance | cut -f1)" = None ] || { echo "superci-pull-dev-$NAME is already running" >&2; exit 1; }
@@ -51,7 +71,8 @@ case $cmd in
     ssh_run 'sudo mkdir -p /etc/superci-pull /var/log/superci-pull && sudo tee /usr/local/bin/superci-pull > /dev/null && sudo chmod 755 /usr/local/bin/superci-pull' < "$BIN"
     ssh_run 'sudo tee /etc/superci-pull/config.json > /dev/null' < "$OVERRIDE"
     ssh_run 'sudo /usr/local/bin/superci-pull -validate -config /etc/superci-pull/config.json'
-    ssh_run "sudo tee /etc/superci-pull.env > /dev/null" <<< "FLAGS=-public-ip=$IP -security-groups=${RUNNERS%,} -tls-param=/superci-pull-dev/tls -spend-param=/superci-pull-dev/spend"
+    claims
+    ssh_run "sudo tee /etc/superci-pull.env > /dev/null" <<< "FLAGS=-public-ip=$IP -security-groups=${RUNNERS%,} -tls-param=/superci-pull-dev/tls -spend-param=/superci-pull-dev/spend -claims=$CLAIMS"
     ssh_run 'sudo tee /etc/systemd/system/superci-pull.service > /dev/null' < "$here/superci-pull.service"
     ssh_run 'sudo tee /etc/superci-pull-agent.json > /dev/null' < "$here/cloudwatch-agent.json"
     ssh_run 'sudo systemctl daemon-reload && sudo systemctl enable --now superci-pull.service'
