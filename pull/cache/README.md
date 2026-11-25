@@ -22,6 +22,7 @@ pullcache serve   one process per machine, on the machine's private address (sys
 S3, in the machine's region        entries: v1/<d|r>/<repository id>/<scope>/<version>/<key>   one object each
                                    blocks:  u/<repository id>/<scope>/<upload id>/<block>      stage bucket
 broker (Lambda, per region)        job token -> credentials for that scope's two prefixes, an hour at a time
+mirror (Lambda, per save of main)  copies the default branch's new entry into the other region's bucket, written once
 janitor (Lambda, every 15 min)     deletes the oldest entries past the region's cap; the only role that can
 ```
 
@@ -61,7 +62,7 @@ Entries are never changed once written. The scope of `main` is class `d`, every 
 | What | Rule | Where it is set |
 | --- | --- | --- |
 | Class `r` (pull requests, merge-queue batches, other branches) | gone 3 days after it was saved | `deploy/lifecycle.json` |
-| Class `d` (the default branch) | gone 30 days after it was saved | `deploy/lifecycle.json` |
+| Class `d` (the default branch) | gone 7 days after it was saved | `deploy/lifecycle.json` |
 | Size | the janitor function, every 15 minutes in each region, deletes class `r` then class `d`, oldest first, until the region holds at most `CAP_GB` (1,000 GB) | `deploy/up.sh` (`CAP_GB=`) |
 | An upload's blocks | deleted at finish, with the job's own credentials; the stage bucket expires anything left after a day | `deploy/lifecycle-stage.json` |
 | Old versions, delete markers | versioning is suspended, so a deleted entry frees its bytes at once; versions from before that expire a day after they became old | `deploy/lifecycle.json` |
@@ -78,11 +79,25 @@ would delete).
 ### Two regions
 
 The launcher spreads machines over `us-east-1` and `us-east-2` (equal weights by default). Each region has its own
-bucket, broker and janitor, and a machine uses only its own region's, so it never pays for cross-region reads.
-Nothing is replicated. Each region's default-branch jobs save that region's entries of the default branch, so a key
-that changes is saved once per region instead of once and copied. Replication would save that second save and cost
-$0.02 a GB, versioning (which it needs, and with it a day's copy of every deleted entry), and a writer the
-`If-None-Match` rule cannot see: two regions saving one key at once overwrote each other through it.
+bucket, broker, janitor and mirror, and a machine reads only its own region's bucket, so it never pays for a
+cross-region read.
+
+A default-branch job runs in one region, so it saves its entry in one bucket: on Nov 25 the git seed was only in
+us-east-2 and the Go modules only in us-east-1, and a pull request's job in the other region missed each. The mirror
+function copies each entry the default branch saves into the other bucket, on the bucket's notice of the new object.
+It reads the version it was told of (`If-Match` on its ETag) and completes the copy with `If-None-Match`, so it never
+writes over an entry: a key both regions saved keeps each region's own first save, and an entry deleted and saved
+again mid-copy ends the copy. A copy is 16 MiB part copies, 32 at a time (one cross-region `CopyObject` of a 452 MB
+entry took 88 s, ten parts at a time 13 s). Pull requests' entries are not copied: they are read by later runs of the
+same pull request only, and they are most of what is saved. S3 replication is not used: it needs versioning, and its
+writer is one the `If-None-Match` rule cannot see (two regions saving one key at once overwrote each other through
+it). `pullcache mirror -bucket B -region R -peer-bucket P -peer-region PR` copies whatever an entry prefix of B
+(`-prefix`, `v1/d/` by default) holds that P lacks, as the function does for one save.
+
+The default branch's entries live 7 days: the warm jobs of `ci-cache-warm.yml` save them again within an hour of a
+miss (most every 12 minutes). The git seed is a new 450 MB key every 12 minutes: kept 30 days and copied to both
+regions, the seeds alone would pass the janitor's 1,000 GB cap (about 1,600 GB a region), and over the cap it
+evicts every pull request's entry first. Kept 7 days they hold about 380 GB a region.
 
 ## Why this and not the others
 

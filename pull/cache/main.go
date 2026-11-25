@@ -3,10 +3,12 @@
 //	pullcache serve    the cache service, on the machine's private address
 //	pullcache wrap D   put it in front of the runner's Node (D: the runner's externals folder)
 //	pullcache janitor  keep the bucket under a size
+//	pullcache mirror   copy the default branch's entries the peer region lacks (what the mirror function does per save)
 //
 // As `node` (a wrapped Node) it becomes the real Node, with the job's cache service pointed here. As `bootstrap` it
 // is a Lambda function: the broker (PULLCACHE_LAMBDA=broker), which gives a job credentials to write its own scope,
-// or the janitor (PULLCACHE_LAMBDA=janitor).
+// the janitor (PULLCACHE_LAMBDA=janitor), or the mirror (PULLCACHE_LAMBDA=mirror), which copies each entry the
+// default branch saves into the other region's bucket.
 package main
 
 import (
@@ -19,6 +21,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -26,6 +29,7 @@ import (
 
 	"superci-pull-cache/internal/broker"
 	"superci-pull-cache/internal/cache"
+	"superci-pull-cache/internal/mirror"
 	"superci-pull-cache/internal/s3store"
 )
 
@@ -54,7 +58,7 @@ func main() {
 	}
 	lg := log.New(os.Stderr, "pullcache: ", log.LstdFlags|log.Lmicroseconds)
 	if len(os.Args) < 2 {
-		lg.Fatal("usage: pullcache serve | wrap <externals> | janitor")
+		lg.Fatal("usage: pullcache serve | wrap <externals> | janitor | mirror")
 	}
 	var err error
 	switch os.Args[1] {
@@ -67,6 +71,8 @@ func main() {
 		err = cache.Wrap(os.Args[2])
 	case "janitor":
 		err = janitor(lg, os.Args[2:])
+	case "mirror":
+		err = mirrorAll(lg, os.Args[2:])
 	default:
 		err = fmt.Errorf("not a command: %s", os.Args[1])
 	}
@@ -151,4 +157,44 @@ func janitor(lg *log.Logger, args []string) error {
 		lg.Printf("janitor: %d entries deleted, %d MB freed", n, freed>>20)
 	}
 	return err
+}
+
+func mirrorAll(lg *log.Logger, args []string) error {
+	fs := flag.NewFlagSet("mirror", flag.ExitOnError)
+	bucket := fs.String("bucket", "", "the bucket to copy from")
+	region := fs.String("region", "", "its region")
+	peer := fs.String("peer-bucket", "", "the bucket to copy into")
+	peerRegion := fs.String("peer-region", "", "its region")
+	prefix := fs.String("prefix", cache.EntryRoot+"d/", "the entries to copy")
+	_ = fs.Parse(args)
+	ctx := context.Background()
+	m, err := newMirror(ctx, *bucket, *region, *peer, *peerRegion)
+	if err != nil {
+		return err
+	}
+	if !strings.HasPrefix(*prefix, cache.EntryRoot) {
+		return fmt.Errorf("-prefix %q is not under %s", *prefix, cache.EntryRoot)
+	}
+	m.Prefix = *prefix
+	st, err := s3store.New(ctx, *bucket, *bucket+"-stage", *region, nil)
+	if err != nil {
+		return err
+	}
+	objs, err := st.List(ctx, m.Prefix, 1<<22)
+	if err != nil {
+		return err
+	}
+	counts := map[mirror.Outcome]int{}
+	for _, o := range objs {
+		out, err := m.Copy(ctx, o.Key)
+		if err != nil {
+			return fmt.Errorf("%s: %w", o.Key, err)
+		}
+		counts[out]++
+		if out == mirror.Copied {
+			lg.Printf("mirror: copied %s (%d MB)", o.Key, o.Size>>20)
+		}
+	}
+	lg.Printf("mirror: %d entries of %s: %v", len(objs), *bucket, counts)
+	return nil
 }
