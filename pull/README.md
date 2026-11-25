@@ -4,6 +4,9 @@ One GitHub runner scale set (`superci-pull-4cpu`) served by EC2 spot in the `ci-
 webhook-push demand path of superci with GitHub's pull protocol. GitHub holds the queue, one listener reads it, and
 the machines are the only state.
 
+Status: torn down on Nov 25 2026 after the burst bakeoff (scale set deleted, nothing tagged `purpose=superci-pull`
+left); `deploy/up.sh` and `deploy/install.sh` bring it back.
+
 A workflow asks for it by name:
 
 ```yaml
