@@ -3186,11 +3186,11 @@ fn a_machine_for_a_job_cancelled_before_any_runner_took_it_is_ended_at_once() {
     run(job_event("completed", 7, "acme/app", None));
     let j = job(&store, 7);
     assert_eq!((j["state"].as_str(), j["began"].as_bool(), ended(), withdrawn(), j["ended_ms"].is_u64()), (Some("cancelled"), Some(true), 1, 1, true), "{j}");
-    // GitHub will not give the runner back (it was handed another job a moment ago): the machine stays, as before.
+    // GitHub will not give the runner back (it was handed another job a moment ago): the machine stays, running it.
     busy.set(true);
     run(job_event("queued", 8, "acme/app", None));
     run(job_event("completed", 8, "acme/app", None));
-    assert_eq!((job(&store, 8)["state"].as_str(), ended()), (Some("orphan"), 1));
+    assert_eq!((job(&store, 8)["state"].as_str(), ended()), (Some("running"), 1));
     busy.set(false);
     // Cancelled while its machine was still being asked for: the machine AWS has just given is ended at once.
     run(job_event("queued", 9, "acme/app", None));
@@ -3207,6 +3207,169 @@ fn a_machine_for_a_job_cancelled_before_any_runner_took_it_is_ended_at_once() {
     let before = launches(&clouds.0).len();
     run(job_event("queued", 10, "acme/app", None));
     assert_eq!((job(&store, 10)["state"].as_str(), job(&store, 10).get("machine_id").filter(|m| !m.is_null()), launches(&clouds.0).len()), (Some("cancelled"), None, before));
+}
+
+/// GitHub as it answers of runners and jobs: a runner is taken back unless it is among `busy` (running a job: 422), and
+/// says whether it is; every job is still queued.
+fn runners_busy(busy: &RefCell<Vec<u64>>) -> impl Fn(&Request, &str) -> Option<Response> + '_ {
+    move |r: &Request, _: &str| {
+        if let Some(id) = r.url.strip_prefix("https://api.github.com/orgs/acme/actions/runners/").and_then(|i| i.parse::<u64>().ok()) {
+            let running = busy.borrow().contains(&id);
+            return Some(match r.method.as_str() {
+                "GET" => Response::new(200, "application/json", serde_json::json!({ "id": id, "status": "online", "busy": running }).to_string()),
+                _ if running => Response::new(422, "application/json", r#"{"message":"Runner is still running a job"}"#.to_string()),
+                _ => Response::new(204, "application/json", String::new()),
+            })
+        }
+        r.url.starts_with("https://api.github.com/repos/acme/app/actions/jobs/").then(|| Response::new(200, "application/json", r#"{"status":"queued"}"#.to_string()))
+    }
+}
+
+/// GitHub gives a waiting job to any idle runner with its label, and says so in an event of the job's own, which can
+/// come after the end of the job the runner's machine was started for (or never). Job 9's machine runs job 10 when job 9
+/// ends on a runner this control plane has no record of (another's, or one whose record a failed write lost): GitHub
+/// refuses to take back the runner of a machine running a job, and nothing ends it until job 10's end.
+#[test]
+fn a_machine_running_another_jobs_work_is_not_ended_when_its_own_job_ends_first() {
+    let busy = RefCell::new(vec![]);
+    let clouds = With(FakeClouds::default(), runners_busy(&busy));
+    let (store, wakes, cache, own) = (Mem::default(), Wakes::default(), Cache::default(), OwnContainers::default());
+    let clock = MovingClock(std::cell::Cell::new(1_790_000_000_000));
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.containers = true;
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
+    let run = |r: Request| block_on(plane.handle(r));
+    let runner = |id: u64| format!("superci-{PLANE_ID}-{id}");
+    let stopped = |id: u64| own.0.borrow().iter().filter(|c| **c == format!("stop {}", runner(id))).count();
+    run(job_event("queued", 9, "acme/app", None));
+    run(job_event("queued", 10, "acme/app", None));
+    busy.borrow_mut().push(job(&store, 9)["runner_id"].as_u64().unwrap());
+    run(concluded(9, &runner(8), "success"));
+    block_on(plane.alarm()).unwrap();
+    assert_eq!(stopped(9), 0, "ended while it runs job 10: {}", job(&store, 9));
+    assert_eq!(job(&store, 9)["state"], "running");
+    // Job 10's start comes at last, then its end: the machine ends with it.
+    run(job_event("in_progress", 10, "acme/app", Some(&runner(9))));
+    block_on(plane.alarm()).unwrap();
+    assert_eq!((job(&store, 9)["ran"].as_u64(), stopped(9)), (Some(10), 0));
+    run(concluded(10, &runner(9), "success"));
+    assert_eq!((job(&store, 9)["state"].as_str(), stopped(9)), (Some("done"), 1));
+}
+
+/// Two jobs of one label, each run on the other's runner (GitHub gives a waiting job to any idle runner with its label),
+/// their events delivered in every order, each one twice at every later point, and each start's event never, a sweep
+/// after each, minutes apart. GitHub answers as things are: a runner busy until its job's end has been sent, then gone.
+/// Whatever the order: no machine is ended while its runner runs a job, every machine started is ended by the last
+/// sweep, and both jobs end done.
+#[test]
+fn two_jobs_on_each_others_runners_end_right_whatever_order_their_events_come_in() {
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Ev { Queued(u64), Began(u64), Ended(u64) }
+    fn orders<T: Clone>(items: &[T]) -> Vec<Vec<T>> {
+        if items.is_empty() { return vec![vec![]] }
+        (0..items.len()).flat_map(|i| { let mut rest = items.to_vec(); let first = rest.remove(i); orders(&rest).into_iter().map(move |mut o| { o.insert(0, first.clone()); o }) }).collect()
+    }
+    let runner = |id: u64| format!("superci-{PLANE_ID}-{id}");
+    let ran_on = |job: u64| runner(if job == 7 { 8 } else { 7 });
+    let mut all: Vec<Vec<Ev>> = vec![];
+    for order in orders(&[Ev::Began(7), Ev::Began(8), Ev::Ended(7), Ev::Ended(8)]) {
+        all.push(order.clone());
+        for (i, e) in order.iter().enumerate() { for at in i + 1..=order.len() { let mut again = order.clone(); again.insert(at, *e); all.push(again) } }
+        for e in [Ev::Queued(7), Ev::Queued(8)] { for at in 0..=order.len() { let mut again = order.clone(); again.insert(at, e); all.push(again) } }
+        for lost in [Ev::Began(7), Ev::Began(8)] { all.push(order.iter().copied().filter(|e| *e != lost).collect()) }
+    }
+    let the_app = app();
+    for order in &all {
+        let (ended, removed) = (RefCell::new(std::collections::BTreeSet::<u64>::new()), RefCell::new(std::collections::BTreeSet::<u64>::new()));
+        // Job 7's runner (registered first: 5) runs job 8 until job 8's end is sent; job 8's (101) runs job 7. Any other is idle.
+        let busy = |id: u64| match id { 5 => !ended.borrow().contains(&8), 101 => !ended.borrow().contains(&7), _ => false };
+        let clouds = With(FakeClouds::default(), |r: &Request, _: &str| {
+            if let Some(job) = r.url.strip_prefix("https://api.github.com/repos/acme/app/actions/jobs/").and_then(|j| j.parse::<u64>().ok()) {
+                let said = if ended.borrow().contains(&job) { serde_json::json!({ "status": "completed", "conclusion": "success", "runner_name": ran_on(job) }) } else { serde_json::json!({ "status": "in_progress", "runner_name": ran_on(job) }) };
+                return Some(Response::new(200, "application/json", said.to_string()))
+            }
+            let id = r.url.strip_prefix("https://api.github.com/orgs/acme/actions/runners/")?.parse::<u64>().ok()?;
+            let known = !removed.borrow().contains(&id) && match id { 5 => !ended.borrow().contains(&8), 101 => !ended.borrow().contains(&7), _ => true };
+            Some(match r.method.as_str() {
+                _ if !known => Response::new(404, "application/json", r#"{"message":"Not Found"}"#.to_string()),
+                "GET" => Response::new(200, "application/json", serde_json::json!({ "id": id, "status": "online", "busy": busy(id) }).to_string()),
+                _ if busy(id) => Response::new(422, "application/json", r#"{"message":"Runner is still running a job"}"#.to_string()),
+                _ => { removed.borrow_mut().insert(id); Response::new(204, "application/json", String::new()) }
+            })
+        });
+        let (store, wakes, cache, own) = (Mem::default(), Wakes::default(), Cache::default(), OwnContainers::default());
+        let clock = MovingClock(std::cell::Cell::new(1_790_000_000_000));
+        let mut config = Config::new(PLANE_ID.into());
+        config.app = Some(the_app.clone());
+        config.containers = true;
+        let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
+        let run = |r: Request| { block_on(plane.handle(r)); };
+        let deliver = |e: Ev| match e {
+            Ev::Queued(j) => run(job_event("queued", j, "acme/app", None)),
+            Ev::Began(j) => run(job_event("in_progress", j, "acme/app", Some(&ran_on(j)))),
+            Ev::Ended(j) => { ended.borrow_mut().insert(j); run(concluded(j, &ran_on(j), "success")) }
+        };
+        let mut seen = 0;
+        let mut check = |at: &str| {
+            let calls = own.0.borrow();
+            for stop in calls[seen..].iter().filter_map(|c| c.strip_prefix("stop ")) {
+                let id = if stop == runner(7) { 5 } else if stop == runner(8) { 101 } else { 0 };
+                assert!(!busy(id), "{order:?}, {at}: {stop} ended while its runner runs a job");
+            }
+            seen = calls.len();
+        };
+        for e in [Ev::Queued(7), Ev::Queued(8)].iter().chain(order) {
+            deliver(*e);
+            check(&format!("{e:?}"));
+            clock.0.set(clock.0.get() + 4 * 60_000);
+            block_on(plane.alarm()).unwrap();
+            check(&format!("the sweep after {e:?}"));
+        }
+        for _ in 0..2 { clock.0.set(clock.0.get() + 4 * 60_000); block_on(plane.alarm()).unwrap(); check("a last sweep") }
+        let calls = own.0.borrow();
+        let started: std::collections::BTreeSet<&str> = calls.iter().filter_map(|c| c.strip_prefix("start ")?.split(' ').next()).collect();
+        let stopped: std::collections::BTreeSet<&str> = calls.iter().filter_map(|c| c.strip_prefix("stop ")).collect();
+        assert!(started.is_subset(&stopped), "{order:?}: left up {:?}", started.difference(&stopped).collect::<Vec<_>>());
+        for id in [7, 8] { assert_eq!((job(&store, id)["state"].as_str(), job(&store, id)["conclusion"].as_str()), (Some("done"), Some("success")), "{order:?}: {}", job(&store, id)) }
+    }
+}
+
+/// The sweep's other ends of a machine nobody seems to wait for: none while its runner runs a job. Job 12's record went
+/// on to another machine (written over by a request that read it before) while the index of the runner it had still
+/// names it: that runner's end is no end of the record's machine. Job 11's machine took a job whose events never came,
+/// and its own job still waits: past the time a machine has to begin its job, its runner is taken back first, and GitHub
+/// refuses.
+#[test]
+fn the_sweep_and_a_stale_runner_record_end_no_machine_whose_runner_runs_a_job() {
+    let busy = RefCell::new(vec![]);
+    let clouds = With(FakeClouds::default(), runners_busy(&busy));
+    let (store, wakes, cache, own) = (Mem::default(), Wakes::default(), Cache::default(), OwnContainers::default());
+    let clock = MovingClock(std::cell::Cell::new(1_790_000_000_000));
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.containers = true;
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
+    let run = |r: Request| block_on(plane.handle(r));
+    let runner = |id: u64| format!("superci-{PLANE_ID}-{id}");
+    let stopped = |id: u64| own.0.borrow().iter().filter(|c| **c == format!("stop {}", runner(id))).count();
+    run(job_event("queued", 12, "acme/app", None));
+    store.0.borrow_mut().insert(format!("runner:{}", runner(13)), "12".into());
+    busy.borrow_mut().push(job(&store, 12)["runner_id"].as_u64().unwrap());
+    run(concluded(12, &runner(13), "success"));
+    assert_eq!((job(&store, 12)["state"].as_str(), stopped(12)), (Some("running"), 0), "{}", job(&store, 12));
+    run(job_event("queued", 11, "acme/app", None));
+    busy.borrow_mut().push(job(&store, 11)["runner_id"].as_u64().unwrap());
+    clock.0.set(clock.0.get() + 9 * 60_000);
+    block_on(plane.alarm()).unwrap();
+    assert_eq!((job(&store, 11)["state"].as_str(), stopped(11), stopped(12)), (Some("running"), 0, 0), "{}", job(&store, 11));
+    // Its runner idle and its job still queued: taken back, the machine ended, and the job held for a new one.
+    busy.borrow_mut().clear();
+    let mut late = job(&store, 11);
+    (late["state"], late["seen_in_progress"]) = ("launched".into(), false.into());
+    store.0.borrow_mut().insert("job:11".into(), late.to_string());
+    block_on(plane.alarm()).unwrap();
+    assert_eq!((stopped(11), job(&store, 11)["state"].as_str(), job(&store, 11)["held_until_ms"].is_u64()), (1, Some("waiting"), true), "{}", job(&store, 11));
 }
 
 #[test]
@@ -5219,7 +5382,9 @@ fn jobs_kept_before_their_indexes_are_indexed_once_and_each_job_is_counted_in_it
     assert_eq!(after["usage"]["day"]["jobs"], before["usage"]["day"]["jobs"]);
     assert_eq!(after["usage"]["week"]["billed_minutes"], before["usage"]["week"]["billed_minutes"]);
     assert_eq!(after["jobs"].as_array().unwrap().iter().map(|j| j["job_id"].as_u64().unwrap()).collect::<Vec<_>>(), [4, 2, 1, 3], "the newest first");
-    let today = |k: &str| serde_json::from_str::<serde_json::Value>(&store.0.borrow()[&format!("day:{:06}", t / 86_400_000)]).unwrap()["spend"][k].as_f64();
+    // (A day's totals are kept in a few records, added up.)
+    let today = |k: &str| superci_core::plane::day_keys(t / 86_400_000).iter().filter_map(|d| store.0.borrow().get(d).cloned())
+        .map(|v| serde_json::from_str::<serde_json::Value>(&v).unwrap()["spend"][k].as_f64()).reduce(|a, b| Some(a.unwrap_or(0.0) + b.unwrap_or(0.0))).flatten();
     assert!((today("aws").unwrap() - 0.15).abs() < 1e-9, "the two over today, counted once: {:?}", today("aws"));
     block_on(plane.alarm()).unwrap();
     assert!((today("aws").unwrap() - 0.15).abs() < 1e-9, "not again at the next sweep");
@@ -5274,7 +5439,10 @@ fn a_machine_that_keeps_its_jobs_images_is_not_ended_with_its_job_but_goes_off_b
     let k = store.0.borrow().keys().find(|k| k.starts_with("keeping:")).cloned().expect("noted");
     block_on(plane.alarm()).unwrap();
     assert_eq!(ended(), 1, "not yet");
-    store.0.borrow_mut().insert(k.clone(), "0".into());
+    let mut kept: serde_json::Value = serde_json::from_str(&store.0.borrow()[&k]).unwrap();
+    assert_eq!((k.as_str(), kept["machine"]["machine_id"].as_str()), ("keeping:1:i-0abc", Some("i-0abc")), "the machine noted with its job");
+    kept["due_ms"] = 0.into();
+    store.0.borrow_mut().insert(k.clone(), kept.to_string());
     block_on(plane.alarm()).unwrap();
     assert_eq!(ended(), 2);
     assert!(!store.0.borrow().contains_key(&k));
@@ -7663,16 +7831,18 @@ fn an_idle_warm_runner_is_taken_back_after_its_time_and_replaced_but_not_one_git
     let next = stand_ins(&store).into_iter().find(|w| w["job_id"].as_u64() != Some(id)).unwrap();
     let (id, rid) = (next["job_id"].as_u64().unwrap(), next["runner_id"].as_u64().unwrap());
     // Past its time just as GitHub hands it a job (GitHub will not give back a runner running one): kept, its machine
-    // too, and none started beside it.
+    // too, as running; another idle one in its place.
     busy.set(true);
     clock.0.set(clock.0.get() + 31 * 60_000);
     block_on(plane.alarm()).unwrap();
-    assert_eq!((job(&store, id)["state"].as_str(), starts()), (Some("launched"), 3));
+    assert_eq!((job(&store, id)["state"].as_str(), starts()), (Some("running"), 4), "{}", job(&store, id));
     assert!(!own.0.borrow().contains(&format!("stop {}", runner(id))));
-    // Once GitHub gives it back, it goes, and another comes.
+    // The job it was given ends on its runner: it goes with it, and none more is started (one idle is there).
     busy.set(false);
+    block_on(plane.handle(concluded(99, &runner(id), "success")));
     block_on(plane.alarm()).unwrap();
-    assert_eq!((job(&store, id)["state"].as_str(), taken_back(rid), starts()), (Some("done"), true, 4));
+    assert_eq!((job(&store, id)["state"].as_str(), taken_back(rid), starts()), (Some("done"), true, 4), "{}", job(&store, id));
+    assert!(own.0.borrow().contains(&format!("stop {}", runner(id))));
 }
 
 #[test]
@@ -7722,14 +7892,16 @@ fn warm_runners_keep_to_the_limits_and_go_with_their_label_each_machine_counted_
     machines.sort();
     started.sort();
     assert_eq!(machines, started);
-    let day: superci_core::plane::Day = serde_json::from_str(&store.0.borrow()[&superci_core::plane::day_key(now / 86_400_000)]).unwrap();
-    let (spent, cost): (f64, f64) = (day.spend.values().sum(), records.iter().map(|j| superci_core::plane::job_usd(j, now)).sum());
+    // (A day's totals are kept in a few records, added up.)
+    let days: Vec<superci_core::plane::Day> = superci_core::plane::day_keys(now / 86_400_000).iter().filter_map(|k| store.0.borrow().get(k).map(|v| serde_json::from_str(v).unwrap())).collect();
+    let (spent, cost): (f64, f64) = (days.iter().flat_map(|d| d.spend.values()).sum(), records.iter().map(|j| superci_core::plane::job_usd(j, now)).sum());
     assert!(records.iter().all(superci_core::plane::over) && cost > 0.0 && (spent - cost).abs() < 1e-9, "{spent} {cost}");
-    assert_eq!((day.hours.iter().map(|h| h.jobs).sum::<u64>(), day.hours.iter().map(|h| h.ran).sum::<u64>()), (1, 1), "job 7 alone: a stand-in is no job");
+    let hours = || days.iter().flat_map(|d| d.hours.iter());
+    assert_eq!((hours().map(|h| h.jobs).sum::<u64>(), hours().map(|h| h.ran).sum::<u64>()), (1, 1), "job 7 alone: a stand-in is no job");
 }
 
 #[test]
-fn a_warm_runner_github_cannot_give_back_is_ended_past_its_time_and_a_grace_but_never_one_running_a_job() {
+fn a_warm_runner_github_cannot_give_back_is_kept_and_one_it_no_longer_knows_is_ended_at_once() {
     // GitHub's answer to a runner taken back: 204, 404 (it knows no such runner), 422 (it runs a job) or 500.
     let said = std::cell::Cell::new(500u16);
     let clouds = With(FakeClouds::default(), |r: &Request, _: &str| (r.url.contains("/actions/runners/") && ["DELETE", "GET"].contains(&r.method.as_str())).then(|| match r.method.as_str() {
@@ -7751,24 +7923,25 @@ fn a_warm_runner_github_cannot_give_back_is_ended_past_its_time_and_a_grace_but_
     block_on(plane.handle(concluded(7, &runner(7), "success")));
     block_on(plane.alarm()).unwrap();
     let id = stand_ins(&store)[0]["job_id"].as_u64().unwrap();
-    // Past its thirty idle minutes, GitHub failing each time: kept for the grace, then its machine ended all the same
-    // and another started in its place.
+    // Past its thirty idle minutes, GitHub failing each time: kept, its machine too (no answer is no proof its runner
+    // takes no job).
     clock.0.set(clock.0.get() + 31 * 60_000);
     block_on(plane.alarm()).unwrap();
     assert_eq!((job(&store, id)["state"].as_str(), stopped(id), starts()), (Some("launched"), false, 2));
     clock.0.set(clock.0.get() + 10 * 60_000);
     block_on(plane.alarm()).unwrap();
+    assert_eq!((job(&store, id)["state"].as_str(), stopped(id), starts()), (Some("launched"), false, 2));
+    // One GitHub no longer knows (its job's events lost, or removed at GitHub) is taken back already: ended at once, and
+    // another started in its place.
+    said.set(404);
+    block_on(plane.alarm()).unwrap();
     assert_eq!((job(&store, id)["state"].as_str(), stopped(id), starts()), (Some("done"), true, 3));
     let next = stand_ins(&store).into_iter().find(|w| w["job_id"].as_u64() != Some(id)).unwrap()["job_id"].as_u64().unwrap();
-    // One GitHub says runs a job is never ended, however long past its time.
+    // One GitHub says runs a job is never ended, however long past its idle time: running, and another idle in its place.
     said.set(422);
     clock.0.set(clock.0.get() + 60 * 60_000);
     block_on(plane.alarm()).unwrap();
-    assert_eq!((job(&store, next)["state"].as_str(), stopped(next), starts()), (Some("launched"), false, 3));
-    // One GitHub no longer knows (its job's events lost, or removed at GitHub) is taken back already: ended at once.
-    said.set(404);
-    block_on(plane.alarm()).unwrap();
-    assert_eq!((job(&store, next)["state"].as_str(), stopped(next), starts()), (Some("done"), true, 4));
+    assert_eq!((job(&store, next)["state"].as_str(), stopped(next), starts()), (Some("running"), false, 4));
 }
 
 /// Containers that will not start while `refusing`, each try counted.
@@ -8114,15 +8287,25 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         a_label_kept_warm_has_its_count_of_idle_runners_and_a_job_one_takes_leaves_its_own_machine_in_its_place,
         an_idle_warm_runner_is_taken_back_after_its_time_and_replaced_but_not_one_github_has_given_a_job,
         warm_runners_keep_to_the_limits_and_go_with_their_label_each_machine_counted_once,
-        a_warm_runner_github_cannot_give_back_is_ended_past_its_time_and_a_grace_but_never_one_running_a_job,
+        a_warm_runner_github_cannot_give_back_is_kept_and_one_it_no_longer_knows_is_ended_at_once,
         a_label_whose_warm_runners_fail_to_start_waits_longer_after_each_and_starts_again_once_one_does,
         a_warm_runner_spot_reclaimed_while_running_a_job_holds_its_label_back_not,
         a_warm_machine_that_never_comes_up_is_replaced_once_a_jobs_would_have_and_one_that_did_is_asked_of_once,
-        no_runner_is_kept_warm_while_the_organizations_default_runner_group_allows_public_repositories
+        no_runner_is_kept_warm_while_the_organizations_default_runner_group_allows_public_repositories,
+        a_machine_running_another_jobs_work_is_not_ended_when_its_own_job_ends_first,
+        the_sweep_and_a_stale_runner_record_end_no_machine_whose_runner_runs_a_job,
+        a_warm_runner_is_ended_only_on_proof_its_runner_takes_no_job_and_one_github_says_is_busy_is_running,
+        a_machine_kept_for_its_images_is_the_one_ended_later_not_the_one_its_jobs_record_holds_by_then,
+        a_start_that_cannot_read_what_it_weighs_waits_and_is_tried_again,
+        a_count_of_its_own_machines_not_read_at_the_accounts_limits_is_waited_out_not_taken_for_none,
+        what_follows_a_jobs_written_record_failing_fails_no_start_and_a_new_machine_is_always_in_its_record,
+        a_machine_started_for_a_job_that_ended_meanwhile_and_whose_runner_runs_a_job_stays_in_its_record
     ];
     // (Each test of this file is in it but those that already step through every point of a flow themselves.)
     let stepping = ["a_job_cancelled_at_any_step_of_its_start_or_of_a_sweep_leaves_no_machine_and_stays_cancelled", "a_job_that_begins_at_any_step_of_a_sweep_keeps_its_machine",
         "a_job_that_runs_and_ends_at_any_step_of_a_sweep_stays_done", "a_gitlab_job_cancelled_at_any_step_of_its_start_leaves_no_machine_and_no_runner", "every_test_here_holds_with_each_call_and_store_operation_failing",
+        // (And one that steps through every order of its events.)
+        "two_jobs_on_each_others_runners_end_right_whatever_order_their_events_come_in",
         // (And one that measures, over a thousand jobs: a fault would only make it slower.)
         "a_busy_request_costs_the_same_however_many_jobs_are_kept_and_fits_what_waits_for_it"];
     let all: Vec<&str> = include_str!("plane.rs").split("#[test]\nfn ").skip(1).filter_map(|t| t.split('(').next()).collect();
@@ -8634,4 +8817,214 @@ fn an_edit_is_the_changes_of_its_fields_and_they_apply_over_others() {
     let sent: Vec<Change> = serde_json::from_str(r#"[{"op":"set","path":["a"],"value":1,"from":null},{"op":"set","path":["a"],"value":1}]"#).unwrap();
     assert_eq!(sent, vec![Change::Set { path: path(&["a"]), value: 1.into(), from: Some(serde_json::Value::Null) }, Change::Set { path: path(&["a"]), value: 1.into(), from: None }]);
     assert_eq!(serde_json::to_string(&sent[1]).unwrap(), r#"{"op":"set","path":["a"],"value":1}"#);
+}
+
+/// A warm runner's machine is ended only on proof that its runner can take no job: GitHub takes the runner back (204) or
+/// knows it no more (404), or the machine is past its longest time and five minutes (it has powered itself off). GitHub
+/// not answering is no such proof, however long past its idle time. GitHub refusing (422: it runs a job whose events
+/// never came) marks it running, and it is not asked of again at every sweep.
+#[test]
+fn a_warm_runner_is_ended_only_on_proof_its_runner_takes_no_job_and_one_github_says_is_busy_is_running() {
+    let said = std::cell::Cell::new(500u16);
+    let clouds = With(FakeClouds::default(), |r: &Request, _: &str| (r.url.contains("/actions/runners/") && ["DELETE", "GET"].contains(&r.method.as_str())).then(|| match r.method.as_str() {
+        "GET" => Response::new(200, "application/json", serde_json::json!({ "status": "online", "busy": said.get() == 422 }).to_string()),
+        _ => Response::new(said.get(), "application/json", String::new()),
+    }));
+    let (store, wakes, cache, own) = (Mem::default(), Wakes::default(), Cache::default(), OwnContainers::default());
+    let clock = MovingClock(std::cell::Cell::new(1_790_000_000_000));
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.containers = true;
+    config.routing.warm = vec![kept_warm("superci", 1)];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
+    let stopped = |id: u64| own.0.borrow().contains(&format!("stop superci-{PLANE_ID}-{id}"));
+    let runner = |id: u64| format!("superci-{PLANE_ID}-{id}");
+    let asked = |rid: u64| clouds.0.calls.borrow().iter().filter(|c| c.0 == "DELETE" && c.1.ends_with(&format!("/actions/runners/{rid}"))).count();
+    let sweep_after = |ms: u64| { clock.0.set(clock.0.get() + ms); block_on(plane.alarm()).unwrap() };
+    block_on(plane.handle(job_event("queued", 7, "acme/app", None)));
+    block_on(plane.handle(job_event("in_progress", 7, "acme/app", Some(&runner(7)))));
+    block_on(plane.handle(concluded(7, &runner(7), "success")));
+    block_on(plane.alarm()).unwrap();
+    let id = stand_ins(&store)[0]["job_id"].as_u64().unwrap();
+    // Past its thirty idle minutes and well past any grace after them, GitHub failing every time: kept, and asked again.
+    sweep_after(31 * 60_000);
+    for minute in 1..=15 { sweep_after(60_000); assert!(!stopped(id), "{minute} minutes past its idle time, GitHub not answering: ended: {}", job(&store, id)) }
+    assert_eq!(job(&store, id)["state"], "launched");
+    // Past its machine's longest time (Cloudflare's six hours) and five minutes: it powered itself off, and its record ends.
+    sweep_after(6 * 60 * 60_000);
+    assert!(stopped(id) && job(&store, id)["state"] == "done", "{}", job(&store, id));
+    // The one started in its place is given a job whose events never come: GitHub will not give its runner back.
+    let next = stand_ins(&store).into_iter().find(|w| w["job_id"].as_u64() != Some(id)).expect("another in its place");
+    let (next, rid) = (next["job_id"].as_u64().unwrap(), next["runner_id"].as_u64().unwrap());
+    said.set(422);
+    sweep_after(31 * 60_000);
+    let w = job(&store, next);
+    assert_eq!((w["state"].as_str(), w["seen_in_progress"].as_bool(), stopped(next)), (Some("running"), Some(true), false), "{w}");
+    // Running: not asked of again each minute, and not ended when GitHub then fails, however long, short of its time.
+    let after = asked(rid);
+    said.set(500);
+    for _ in 0..15 { sweep_after(60_000) }
+    assert_eq!((asked(rid), stopped(next), job(&store, next)["state"].as_str()), (after, false, Some("running")), "{}", job(&store, next));
+}
+
+/// A machine that keeps its job's images after the job (`keeps`) is ended a while later if it has not gone by itself:
+/// that very machine, whichever machine its job's record holds by then. Job 7's machine ran job 9's work and keeps its
+/// images; then job 7 itself began on job 8's machine, which job 7's record holds now. That machine runs job 7: when job
+/// 7's kept machine is ended, it is not.
+#[test]
+fn a_machine_kept_for_its_images_is_the_one_ended_later_not_the_one_its_jobs_record_holds_by_then() {
+    let n = std::cell::Cell::new(0u32);
+    let clouds = With(FakeClouds::default(), |_: &Request, body: &str| body.contains("Action=RunInstances").then(|| {
+        n.set(n.get() + 1);
+        Response::new(200, "text/xml", format!("<RunInstancesResponse><instancesSet><item><instanceId>i-{}</instanceId><placement><availabilityZone>us-east-1b</availabilityZone></placement></item></instancesSet></RunInstancesResponse>", n.get()))
+    }));
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let clock = MovingClock(std::cell::Cell::new(1_790_000_000_000));
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let run = |r: Request| block_on(plane.handle(r));
+    let runner = |id: u64| format!("superci-{PLANE_ID}-{id}");
+    let ended = |m: &str| clouds.0.calls.borrow().iter().any(|c| c.2.contains("Action=TerminateInstances") && c.2.split('&').any(|f| f == format!("InstanceId.1={m}")));
+    for id in [7, 8, 9] { run(job_event("queued", id, "acme/app", None)); }
+    assert_eq!([7, 8, 9].map(|id| job(&store, id)["machine_id"].as_str().unwrap_or_default().to_string()), ["i-1", "i-2", "i-3"]);
+    let mut seven = job(&store, 7);
+    seven["keeps"] = true.into();
+    store.0.borrow_mut().insert("job:7".into(), seven.to_string());
+    // Job 7's machine runs job 9's work and keeps its images after: not ended with it.
+    run(job_event("in_progress", 9, "acme/app", Some(&runner(7))));
+    run(concluded(9, &runner(7), "success"));
+    assert!(!ended("i-1") && store.0.borrow().keys().any(|k| k.starts_with("keeping:7")), "{:?}", store.0.borrow().keys().collect::<Vec<_>>());
+    // Job 7 itself begins on job 8's machine, a minute later: its record holds that machine now.
+    clock.0.set(clock.0.get() + 60_000);
+    run(job_event("in_progress", 7, "acme/app", Some(&runner(8))));
+    assert_eq!((job(&store, 7)["state"].as_str(), job(&store, 7)["machine_id"].as_str()), (Some("running"), Some("i-2")), "{}", job(&store, 7));
+    // Past the time a kept machine has to go by itself: the kept one is ended, and the one running job 7 is not.
+    clock.0.set(clock.0.get() + superci_core::plane::KEEPING_MS);
+    block_on(plane.alarm()).unwrap();
+    assert!(!ended("i-2"), "the machine running job 7 ended: {:?}", clouds.0.calls.borrow().iter().filter(|c| c.2.contains("Action=TerminateInstances")).map(|c| &c.2).collect::<Vec<_>>());
+    assert!(ended("i-1"), "the kept machine left up");
+    assert!(!store.0.borrow().keys().any(|k| k.starts_with("keeping:")));
+    assert_eq!((job(&store, 7)["state"].as_str(), job(&store, 7)["machine_id"].as_str()), (Some("running"), Some("i-2")));
+}
+
+/// What a start weighs (the records of what runs on each place) not read, as when DynamoDB throttles: the job waits and
+/// is tried again, never failed for it (it would sit queued at GitHub for a day with no machine, nothing here trying).
+#[test]
+fn a_start_that_cannot_read_what_it_weighs_waits_and_is_tried_again() {
+    let (store, clouds, wakes, cache, own) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default(), OwnContainers::default());
+    let clock = MovingClock(std::cell::Cell::new(1_790_000_000_000));
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.containers = true;
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
+    block_on(plane.alarm()).unwrap();
+    store.refusing("get", "active:", 0);
+    block_on(plane.handle(job_event("queued", 7, "acme/app", None)));
+    let j = job(&store, 7);
+    assert_eq!((j["state"].as_str(), j.get("retries").and_then(|r| r.as_u64()).unwrap_or(0)), (Some("waiting"), 0), "{j}");
+    assert!(wakes.0.borrow().iter().any(|ms| *ms <= 30_000), "tried again soon: {:?}", wakes.0.borrow());
+    clock.0.set(clock.0.get() + 20_000);
+    block_on(plane.alarm()).unwrap();
+    assert_eq!(job(&store, 7)["state"], "launched", "{}", job(&store, 7));
+}
+
+/// At the AWS account's limits a start counts the account's machines of its own: a limit in use by its own jobs, it
+/// waits for one to end; none, it can never fit and fails saying which limits to raise. Those records not read
+/// (DynamoDB throttling): it waits and asks again, never counted as a start that failed. Likewise a GPU job AWS refuses
+/// for the account's quota, when whether other GPU machines of the account's are up cannot be read: it waits.
+#[test]
+fn a_count_of_its_own_machines_not_read_at_the_accounts_limits_is_waited_out_not_taken_for_none() {
+    let clouds = With(FakeClouds::default(), |_: &Request, body: &str| body.contains("Action=RunInstances").then(|| aws_refuses(if body.contains("MarketType=spot") { "MaxSpotInstanceCountExceeded" } else { "VcpuLimitExceeded" })));
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let clock = MovingClock(std::cell::Cell::new(1_790_000_000_000));
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.alarm()).unwrap();
+    // (The sweep lists what runs once itself before it tries the job again: the start's own list is the next.)
+    store.refusing("list", "active:", 0);
+    block_on(plane.handle(job_event("queued", 7, "acme/app", None)));
+    for _ in 0..3 { clock.0.set(clock.0.get() + 20_000); store.refusing("list", "active:", 1); block_on(plane.alarm()).unwrap() }
+    let j = job(&store, 7);
+    assert_eq!((j["state"].as_str(), j.get("retries").and_then(|r| r.as_u64()).unwrap_or(0)), (Some("waiting"), 0), "{j}");
+    // A GPU job AWS refuses for its quota, the jobs going not read: waits, not failed at once.
+    let (store, gpus, cache, own) = (Mem::default(), Kinds { clouds: FakeClouds::default(), no_gpus: true }, Cache::default(), OwnContainers::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.containers = true;
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.routing.order = vec![Pool { regions: vec![], off: false, cloud: "cloudflare".into(), max_jobs: None, monthly_usd: None }, Pool { regions: vec![], off: false, cloud: "aws".into(), max_jobs: None, monthly_usd: None }];
+    let plane = ControlPlane { store: &store, http: &gpus, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
+    block_on(plane.alarm()).unwrap();
+    store.refusing("list", "live:", 0);
+    block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci/gpu=l4")));
+    assert_eq!(job(&store, 1)["state"], "waiting", "{}", job(&store, 1));
+}
+
+/// A job's record written, what follows from it (its indexes, the records of what runs on each place) failing, as a
+/// throttled write does: the start goes on (the sweep sets those right), never counted as a start that failed. And the
+/// machine a start has just been given is in its record, however that record's write fails the first time: its runner
+/// is not taken back from GitHub, nor the job placed again.
+#[test]
+fn what_follows_a_jobs_written_record_failing_fails_no_start_and_a_new_machine_is_always_in_its_record() {
+    let (store, clouds, wakes, cache, own) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default(), OwnContainers::default());
+    let clock = MovingClock(std::cell::Cell::new(1_790_000_000_000));
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.containers = true;
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
+    let runner = |id: u64| format!("superci-{PLANE_ID}-{id}");
+    let withdrawn = || clouds.calls.borrow().iter().filter(|c| c.0 == "DELETE" && c.1.contains("/actions/runners/")).count();
+    block_on(plane.alarm()).unwrap();
+    // The write of the place's record of what runs refused, once.
+    store.refusing("swap", "active:", 0);
+    block_on(plane.handle(job_event("queued", 7, "acme/app", None)));
+    let j = job(&store, 7);
+    assert_eq!((j["state"].as_str(), j.get("retries").and_then(|r| r.as_u64()).unwrap_or(0), withdrawn()), (Some("launched"), 0, 0), "{j}");
+    block_on(plane.alarm()).unwrap();
+    assert!(store.0.borrow().iter().any(|(k, v)| k.starts_with("active:") && v.contains("\"7\"")), "the sweep puts it in: {:?}", store.0.borrow().iter().filter(|(k, _)| k.starts_with("active:")).collect::<Vec<_>>());
+    // The read before the write that holds a new machine refused, once (the fourth read of the job's record in its start).
+    store.refusing("get", "job:8", 3);
+    block_on(plane.handle(job_event("queued", 8, "acme/app", None)));
+    let j = job(&store, 8);
+    assert_eq!((j["state"].as_str(), j["machine_id"].as_str(), j["runner_id"].is_u64(), withdrawn()), (Some("launched"), Some(runner(8).as_str()), true, 0), "{j}");
+    assert!(!own.0.borrow().iter().any(|c| c.starts_with("stop")), "{:?}", own.0.borrow());
+}
+
+/// While job 9's machine is being started its record ends (cancelled, in another request), and GitHub has already handed
+/// the new machine's runner a job (it will not give the runner back: 422). The machine runs that job: its record holds
+/// it, running, so that the job's end finds it; no machine is up that no record holds.
+#[test]
+fn a_machine_started_for_a_job_that_ended_meanwhile_and_whose_runner_runs_a_job_stays_in_its_record() {
+    let clouds = With(FakeClouds::default(), |r: &Request, _: &str| (r.method == "DELETE" && r.url.contains("/actions/runners/")).then(|| Response::new(422, "application/json", r#"{"message":"Runner is still running a job"}"#.to_string())));
+    let (store, wakes, cache, own) = (Mem::default(), Wakes::default(), Cache::default(), OwnContainers::default());
+    let clock = MovingClock(std::cell::Cell::new(1_790_000_000_000));
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.containers = true;
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
+    let runner = |id: u64| format!("superci-{PLANE_ID}-{id}");
+    block_on(plane.alarm()).unwrap();
+    // (The start reads whether its job was cancelled before it asks for the machine and after: at the second, another
+    // request has written the job's end over its record.)
+    let mut reads = 0;
+    store.meddling(move |op, k, m| {
+        if op != "get" || k != "gone:9" { return }
+        reads += 1;
+        if reads != 2 { return }
+        let mut j: serde_json::Value = serde_json::from_str(&m["job:9"]).unwrap();
+        let rev = j["rev"].as_u64().unwrap_or(0) + 1;
+        (j["state"], j["began"], j["ended_ms"], j["rev"]) = ("cancelled".into(), true.into(), 1_790_000_000_000u64.into(), rev.into());
+        m.insert("job:9".into(), j.to_string());
+    });
+    block_on(plane.handle(job_event("queued", 9, "acme/app", None)));
+    let j = job(&store, 9);
+    assert_eq!((j["machine_id"].as_str(), j["runner"].as_str(), j["state"].as_str()), (Some(runner(9).as_str()), Some(runner(9).as_str()), Some("running")), "{j}");
+    assert!(!own.0.borrow().iter().any(|c| c.starts_with("stop")), "{:?}", own.0.borrow());
+    // The job it runs ends on its runner: the machine ends with it.
+    block_on(plane.handle(concluded(10, &runner(9), "success")));
+    assert!(own.0.borrow().contains(&format!("stop {}", runner(9))), "{:?}", own.0.borrow());
 }

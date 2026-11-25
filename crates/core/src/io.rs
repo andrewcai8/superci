@@ -114,6 +114,11 @@ pub trait Store {
         for k in keys { out.push(self.get(k).await?) }
         Ok(out)
     }
+    /// `list`, where what was written a moment ago may be missing or as it was: for what only weighs the records (a
+    /// count to keep to a limit, a page to show), at half the price where the store has such reads (DynamoDB's).
+    async fn list_stale(&self, prefix: &str) -> Result<Vec<(String, String)>> { self.list(prefix).await }
+    /// `get_many` likewise.
+    async fn get_many_stale(&self, keys: &[String]) -> Result<Vec<Option<String>>> { self.get_many(keys).await }
     /// Removes what has passed its end, where the store does not by itself; how many.
     async fn expire(&self, now_ms: u64) -> Result<usize> { let _ = now_ms; Ok(0) }
     /// Moves records kept in an earlier layout of this store into its own, at most `budget` of them; whether none
@@ -148,6 +153,8 @@ impl<T: Store + ?Sized> Store for &T {
     async fn swap_until(&self, key: &str, was: Option<&str>, value: String, until_ms: Option<u64>) -> Result<bool> { (**self).swap_until(key, was, value, until_ms).await }
     async fn list_last(&self, prefix: &str, n: usize) -> Result<Vec<(String, String)>> { (**self).list_last(prefix, n).await }
     async fn get_many(&self, keys: &[String]) -> Result<Vec<Option<String>>> { (**self).get_many(keys).await }
+    async fn list_stale(&self, prefix: &str) -> Result<Vec<(String, String)>> { (**self).list_stale(prefix).await }
+    async fn get_many_stale(&self, keys: &[String]) -> Result<Vec<Option<String>>> { (**self).get_many_stale(keys).await }
     async fn expire(&self, now_ms: u64) -> Result<usize> { (**self).expire(now_ms).await }
     async fn migrate(&self, budget: usize) -> Result<bool> { (**self).migrate(budget).await }
 }
@@ -179,6 +186,8 @@ impl<S: Store> Store for Ending<S> {
     }
     async fn list_last(&self, prefix: &str, n: usize) -> Result<Vec<(String, String)>> { self.0.list_last(prefix, n).await }
     async fn get_many(&self, keys: &[String]) -> Result<Vec<Option<String>>> { self.0.get_many(keys).await }
+    async fn list_stale(&self, prefix: &str) -> Result<Vec<(String, String)>> { self.0.list_stale(prefix).await }
+    async fn get_many_stale(&self, keys: &[String]) -> Result<Vec<Option<String>>> { self.0.get_many_stale(keys).await }
     async fn expire(&self, now_ms: u64) -> Result<usize> {
         let mut gone = 0;
         for (mark, _) in self.0.list("~x:").await? {
