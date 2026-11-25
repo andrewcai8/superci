@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -181,5 +182,25 @@ func TestShedEndsOnlyMachinesLongWaitingWithNoRunner(t *testing.T) {
 	}
 	if snap := s.Snapshot(t0.Add(10 * time.Minute)); snap.Ending != 2 {
 		t.Fatalf("ending %d", snap.Ending)
+	}
+}
+
+func TestAJobThatEndsOnAMachineBeingTakenBackIsLost(t *testing.T) {
+	s := NewState("set", 0, 10)
+	s.Seen("us-east-1", machines(2, t0), t0)
+	for i, name := range []string{"set-i-0000-aa", "set-i-0001-bb"} {
+		s.Registered(fmt.Sprintf("i-%04d", i), &Runner{ID: int64(i + 1), Name: name, Issued: t0})
+	}
+	s.Observe(&scaleset.RunnerScaleSetMessage{JobStartedMessages: []*scaleset.JobStarted{
+		{RunnerName: "set-i-0000-aa", JobMessageBase: scaleset.JobMessageBase{WorkflowRunID: 9, JobDisplayName: "a"}},
+		{RunnerName: "set-i-0001-bb", JobMessageBase: scaleset.JobMessageBase{WorkflowRunID: 9, JobDisplayName: "b"}},
+	}}, t0)
+	s.Noticed("i-0000")
+	s.Observe(&scaleset.RunnerScaleSetMessage{JobCompletedMessages: []*scaleset.JobCompleted{{RunnerName: "set-i-0000-aa"}, {RunnerName: "set-i-0001-bb"}}}, t0)
+	if lost := s.TakeLost(); len(lost) != 1 || lost[0].Name != "a" {
+		t.Fatalf("lost %+v: want the job of the noticed machine only", lost)
+	}
+	if lost := s.TakeLost(); len(lost) != 0 {
+		t.Fatalf("handed over twice: %+v", lost)
 	}
 }

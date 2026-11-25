@@ -565,6 +565,9 @@ func (l *Listener) reconciler(ctx context.Context, refresh func(context.Context,
 			}
 			end = append(end, s.state.ToEnd(now)...)
 			running = append(running, s.state.Running()...)
+			for _, j := range s.state.TakeLost() {
+				l.rerun.Add(j, now)
+			}
 		}
 		l.mu.Lock()
 		for _, m := range l.strays {

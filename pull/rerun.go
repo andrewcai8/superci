@@ -7,10 +7,11 @@ import (
 	"time"
 )
 
-// Rerunner runs again, once, each job lost with its machine: a runner seen taking a job whose machine EC2 stopped
-// listing before the job was reported complete (AWS took the spot machine back mid-job). GitHub re-runs a job only
-// once its whole run has completed, so a lost job waits here until then. The list is in memory: a restart of the
-// listener forgets the jobs it held, which then stay failed for a person to re-run.
+// Rerunner runs again, once, each job lost with its machine: a job that completed on a machine AWS had given notice
+// it takes back (a spot reclaim), or one whose machine EC2 stopped listing before the job was reported complete. A
+// job GitHub reports a success is left alone. GitHub re-runs a job only once its whole run has completed, so a lost
+// job waits here until then. The list is in memory: a restart of the listener forgets the jobs it held, which then
+// stay failed for a person to re-run.
 type Rerunner struct {
 	mu   sync.Mutex
 	rest *REST

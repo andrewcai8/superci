@@ -74,6 +74,7 @@ type State struct {
 	orphanSince  map[string]time.Time // stale runners, by name, since first listed as such
 
 	arrivals    []time.Time // jobs that became available, for the pool's rate
+	lost        []JobRef    // jobs that ended on a machine AWS was taking back, for a re-run
 	waits       []float64   // queue waits (s) of jobs started since the metrics last took them
 	odLaunched  []time.Time
 	allLaunched []time.Time
@@ -369,8 +370,21 @@ func (s *State) Observe(msg *scaleset.RunnerScaleSetMessage, now time.Time) {
 	for _, j := range msg.JobCompletedMessages {
 		if m := s.machineOf(j.RunnerName); m != nil && m.Runner != nil && m.Runner.Name == j.RunnerName {
 			m.Runner.Busy, m.Runner.Done = true, true
+			if m.Notice && m.Runner.Job != nil {
+				s.lost = append(s.lost, *m.Runner.Job)
+			}
 		}
 	}
+}
+
+// TakeLost hands over the jobs that completed on a machine AWS gave notice it takes back (whether each failed is
+// GitHub's to say when the re-run is decided).
+func (s *State) TakeLost() []JobRef {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	l := s.lost
+	s.lost = nil
+	return l
 }
 
 // ArrivalRate is the jobs a second that became available over the last window.
@@ -393,7 +407,7 @@ func (s *State) TakeWaits() []float64 {
 // Seen merges one DescribeInstances listing of a region: machines it lists are live (a new one, met after a restart
 // or launched by a call whose answer was lost, is adopted); machines it does not list, launched long enough ago for
 // the listing to show them, are gone. It returns the jobs lost with them: a machine gone while its runner held a job
-// not reported complete (AWS took it back mid-job).
+// not reported complete (it died mid-job, before GitHub noticed).
 func (s *State) Seen(region string, listed []*Machine, now time.Time) (lost []JobRef) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
