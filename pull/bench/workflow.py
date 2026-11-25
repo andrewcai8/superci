@@ -6,8 +6,53 @@ push whose commit message contains "burst" runs instead one matrix of BURST legs
 machine (type, vCPUs, memory) and sleeps 30-90 s. Push-triggered on one branch only; no secrets, no checkout.
 
   workflow.py BRANCH 2=9,4=27,8=9,16=1,32=1 [BURST] [BURST_LABEL] [CACHE] > .github/workflows/superci-load.yml
+
+A real hour's arrivals (`gate replay-trace`) are driven bucket by bucket instead: the legs of one bucket, each sleeping the
+run time its real job had (capped at MAX_SLEEP seconds), as matrices of at most 256 legs a label.
+
+  workflow.py --trace TRACE.json BRANCH BUCKET [MAX_SLEEP] > .github/workflows/superci-load.yml
+  workflow.py --schedule TRACE.json                    prints "<bucket> <offset seconds> <legs>" for each non-empty bucket
 """
+import json
 import sys
+
+MATRIX_LIMIT = 256
+
+
+def trace_buckets(trace):
+    """{bucket index: [leg]} of a trace file's jobs, by the push of the replay that carries each."""
+    out = {}
+    for leg in trace["jobs"]:
+        out.setdefault(int(leg["t"] // trace["bucket_s"]), []).append(leg)
+    return out
+
+
+def trace_workflow(branch, legs, max_sleep=900):
+    """The workflow of one bucket: for each runner label, its legs in matrices of MATRIX_LIMIT, each sleeping its real duration."""
+    out = ["name: superci-load", f"# One bucket of a real hour's arrivals. Push-triggered on {branch} only; no secrets, no checkout.", "on:", "  push:",
+           f"    branches: [{branch}]", "", "permissions: {}", "", "jobs:"]
+    by_label = {}
+    for leg in legs:
+        by_label.setdefault(leg["label"], []).append(min(max_sleep, int(round(leg["duration_s"]))))
+    for label, durations in sorted(by_label.items()):
+        cpu = label.removeprefix("superci-").removesuffix("cpu")
+        for n, i in enumerate(range(0, len(durations), MATRIX_LIMIT)):
+            chunk = durations[i:i + MATRIX_LIMIT]
+            out += [f"  cpu{cpu}_{n + 1}:", f"    runs-on: {label}", f"    timeout-minutes: {max(chunk) // 60 + 3}", "    strategy:", "      fail-fast: false", "      matrix:",
+                    "        include: [" + ", ".join(f"{{i: {k + 1}, d: {d}}}" for k, d in enumerate(chunk)) + "]", "    steps:", "      - name: sleep",
+                    f'        run: echo "runner=$RUNNER_NAME label={label} i=${{{{ matrix.i }}}}"; sleep ${{{{ matrix.d }}}}']
+    return "\n".join(out)
+
+
+if sys.argv[1] == "--schedule":
+    trace = json.load(open(sys.argv[2]))
+    for idx, legs in sorted(trace_buckets(trace).items()):
+        print(idx, idx * trace["bucket_s"], len(legs))
+    sys.exit(0)
+if sys.argv[1] == "--trace":
+    trace = json.load(open(sys.argv[2]))
+    print(trace_workflow(sys.argv[3], trace_buckets(trace)[int(sys.argv[4])], int(sys.argv[5]) if len(sys.argv) > 5 else 900))
+    sys.exit(0)
 
 branch, wave = sys.argv[1], [tuple(map(int, kv.split("="))) for kv in sys.argv[2].split(",")]
 burst = int(sys.argv[3]) if len(sys.argv) > 3 else 200
