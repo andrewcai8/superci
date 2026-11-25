@@ -64,6 +64,26 @@ print("  by zone:", dict(Counter(m["az"] for m in machines.values())))
 print("  by type:", dict(Counter(m["type"] for m in machines.values()).most_common(8)))
 print("  still running:", sum(1 for m in machines.values() if m["state"] in ("pending", "running")))
 
+# Cost: each machine's seconds (a minute at least, as EC2 bills Linux) at its pool's spot price when it started, or an
+# on-demand estimate, plus its gp3 volume (30 GB, 250 MB/s).
+EBS_PER_HOUR = (30 * 0.08 + 125 * 0.04) / 730
+prices = {}
+for (region, az, kind) in {(m["az"][:-1], m["az"], m["type"]) for m in machines.values()}:
+    out = json.loads(sh("aws", "--profile", "ci-runners", "ec2", "describe-spot-price-history", "--region", region,
+                        "--availability-zone", az, "--instance-types", kind, "--product-descriptions", "Linux/UNIX",
+                        "--start-time", created.isoformat(), "--end-time", created.isoformat(), "--output", "json"))
+    prices[(az, kind)] = float(out["SpotPriceHistory"][0]["SpotPrice"]) if out["SpotPriceHistory"] else 0.0
+cost, seconds = 0.0, 0.0
+for m in machines.values():
+    end = datetime.now(created.tzinfo)
+    if "(" in (m["reason"] or ""):
+        end = datetime.strptime(m["reason"].split("(")[1].split(")")[0], "%Y-%m-%d %H:%M:%S %Z").replace(tzinfo=created.tzinfo)
+    secs = max(60.0, (end - ts(m["launch"])).total_seconds())
+    rate = prices[(m["az"], m["type"])] if (m["life"] or "on-demand") == "spot" else 0.20
+    seconds += secs
+    cost += secs / 3600 * (rate + EBS_PER_HOUR)
+print(f"machine time {seconds / 3600:.1f} h, cost ${cost:.2f} (spot price at the run's start per pool, on-demand at $0.20/h, gp3 included)")
+
 if len(sys.argv) > 2:
     regs, errors, notices, stuck, fleets = [], 0, 0, 0, Counter()
     for line in open(sys.argv[2]):
