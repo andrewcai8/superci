@@ -34,8 +34,8 @@ ssh_run() {
 
 CLAIMS=superci-pull-claims-243891825325-$NAME
 
-# The claims bucket (the machine's one-runner fence) is the deployment's own, and the role may use only it and the dev
-# parameters: an inline policy per dev listener on the role superci-pull-dev, which the production role does not share.
+# The claims bucket (the machine's one-runner fence) is the deployment's own, and so is the right to write the listener's log
+# group: inline policies per dev listener on the role superci-pull-dev, which the production role does not share.
 claims() {
   $A s3api head-bucket --bucket $CLAIMS 2> /dev/null || {
     $A s3api create-bucket --bucket $CLAIMS --region us-east-1 > /dev/null
@@ -43,6 +43,7 @@ claims() {
     $A s3api put-bucket-tagging --bucket $CLAIMS --tagging 'TagSet=[{Key=purpose,Value=superci-pull-dev}]'
   }
   $A iam put-role-policy --role-name superci-pull-dev --policy-name superci-pull-claims-$NAME --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"s3:PutObject\",\"s3:GetObject\"],\"Resource\":\"arn:aws:s3:::$CLAIMS/issued/*\"},{\"Effect\":\"Allow\",\"Action\":\"s3:ListBucket\",\"Resource\":\"arn:aws:s3:::$CLAIMS\"}]}"
+  $A iam put-role-policy --role-name superci-pull-dev --policy-name superci-pull-logs-$NAME --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["logs:CreateLogStream","logs:PutLogEvents","logs:DescribeLogStreams"],"Resource":["arn:aws:logs:us-east-1:243891825325:log-group:/superci-pull/listener","arn:aws:logs:us-east-1:243891825325:log-group:/superci-pull/listener:*"]}]}'
 }
 
 case $cmd in

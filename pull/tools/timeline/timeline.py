@@ -141,6 +141,13 @@ def first(events, name, **match):
 MACHINE_MARKS = ("boot.start", "cache.start", "cache.up", "doc.got", "jit.sent", "jit.answered", "runner.start", "runner.online", "job.running")
 
 
+def on_listener_clock(e):
+    """A machine mark on the listener's clock. skew_ms is the listener's clock less the machine's at the post that carried
+    the mark, plus one way latency (a few ms): a machine's clock is seconds off at boot until chrony steps it (1.7 s on the
+    first live run, 36 ms by the end), so each post's own skew moves its marks, not one offset for the machine."""
+    return e["t"] + (e.get("skew_ms") or 0) / 1000
+
+
 def machine_milestones(tl, events, created):
     """Fill tl.marks and tl.attrs of a superci job from the events of its machine and of its run."""
     m, inst = tl.marks, tl.inst
@@ -150,7 +157,7 @@ def machine_milestones(tl, events, created):
         tl.attrs["set"] = js.get("set")
         if js.get("runner_assign_time"):
             m["runner.assigned"] = ts(js["runner_assign_time"])
-        seen = [e for name in ("job.assigned", "job.available") for e in [first(events, name, rr=js.get("rr"), set=js.get("set"))] if e]
+        seen = [e for name in ("job.assigned", "job.available") for e in [first(events, name, job=js.get("job"), set=js.get("set"))] if e]
         if seen:  # GitHub sends this listener JobAssigned, never JobAvailable (0 of 7,023 messages on Nov 25)
             m["listener.seen"] = min(e["t"] for e in seen)
     ln = first(mine, "machine.launched")
@@ -167,7 +174,7 @@ def machine_milestones(tl, events, created):
     for name in MACHINE_MARKS + ("poweroff", "jit.ask", "jit.granted", "jit.issued", "machine.ended"):
         e = first(mine, name)
         if e:
-            m[name] = e["t"]
+            m[name] = on_listener_clock(e)
     c = first(mine, "jit.claim")
     if c:
         m["jit.claimed"] = c["t"]
@@ -175,7 +182,7 @@ def machine_milestones(tl, events, created):
     bs = first(mine, "boot.start")
     if bs and bs.get("val"):
         try:
-            m["os.up"] = bs["t"] - float(bs["val"])
+            m["os.up"] = on_listener_clock(bs) - float(bs["val"])
         except ValueError:
             pass
     done = first([e for e in mine if e.get("run") == tl.run], "job.completed")
@@ -185,16 +192,9 @@ def machine_milestones(tl, events, created):
         e = first(mine, name)
         if e:
             tl.attrs[key] = e.get(field)
-    # skew_ms is the listener's clock less the machine's at receipt, plus one way latency; the least over the machine's
-    # posts is the clock offset to within that latency. A machine clock off by over 250 ms is moved onto the listener's.
     skews = [e["skew_ms"] for e in mine if e.get("skew_ms") is not None]
-    off = min(skews) / 1000 if skews else 0.0
-    tl.attrs["clock_offset_ms"] = round(off * 1000) if skews else None
-    if abs(off) > CLOCK_FLAG_S:
-        for name in MACHINE_MARKS + ("os.up", "poweroff"):
-            if name in m:
-                m[name] += off
-        tl.attrs["clock_corrected"] = True
+    tl.attrs["clock_offset_ms"] = max(skews, key=abs) if skews else None
+    tl.attrs["clock_corrected"] = any(abs(k) > CLOCK_FLAG_S * 1000 for k in skews) or None
     tl.cache = [cache_mark(e) for e in sorted(mine, key=lambda e: e["t"]) if e["ev"] in ("cache.restore", "cache.save")]
 
 
@@ -380,9 +380,9 @@ def ec2_events(profile, regions, ids, start, end):
     out = []
     for region in regions:
         for i in range(0, len(ids), 50):
-            cond = " or ".join(f'detail.`instance-id` = "{x}"' for x in ids[i:i + 50])
+            pattern = "|".join(ids[i:i + 50])  # the field name has a dash Insights will not take, so match the line
             try:
-                rows = insights(profile, region, EC2_GROUP, f"fields @message | filter {cond}", start, end)
+                rows = insights(profile, region, EC2_GROUP, f"fields @message | filter @message like /({pattern})/", start, end)
             except SystemExit:
                 return out  # the group does not exist in this window: the notifications were not on yet
             for r in rows:
@@ -408,8 +408,8 @@ def legacy_events(profile, start, end, regions=("us-east-1", "us-east-2")):
                 "--start-time", iso(start - 60), "--end-time", iso(end + 60))  # the CLI follows the pages
         for ev in d.get("Events", []):
             ce = json.loads(ev["CloudTrailEvent"])
-            req = ce.get("requestParameters", {}).get("CreateFleetRequest", {})
-            items = ce.get("responseElements", {}).get("CreateFleetResponse", {}).get("fleetInstanceSet", {}).get("item", [])
+            req = (ce.get("requestParameters") or {}).get("CreateFleetRequest", {})
+            items = ((ce.get("responseElements") or {}).get("CreateFleetResponse") or {}).get("fleetInstanceSet", {}).get("item", [])
             if isinstance(items, dict):
                 items = [items]
             f = fleets.get(req.get("ClientToken"), {})
@@ -605,7 +605,8 @@ def cmd_compare(a):
         g = lambda t, n=n: next((y - x for m, x, y in t.steps if m == n), None)
         add("step: " + n[:48], g, g, 1)
     add("wall (created to completed)", lambda t: t.wall, lambda t: t.wall)
-    add("unexplained", lambda t: t.unexplained, lambda t: t.unexplained)
+    add("unexplained (unobserved intervals and the tail after the last milestone)", lambda t: t.unexplained, lambda t: t.unexplained)
+    add("overlap clamped (sources disagreeing within their resolution)", lambda t: t.overlap, lambda t: t.overlap)
     print(f"\n{'':54} {'superci':^26} {'blacksmith':^26}")
     print(f"{'seconds':54} {'p50':>7} {'p90':>7} {'n':>5}   {'p50':>7} {'p90':>7} {'n':>5}")
     hidden = 0
