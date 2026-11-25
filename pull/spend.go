@@ -1,0 +1,162 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"sync"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/ssm"
+	ssmtypes "github.com/aws/aws-sdk-go-v2/service/ssm/types"
+)
+
+// Spend is what the machines have cost today and this month (UTC), accrued every reconcile from each running
+// machine's price: its pool's spot price, or for on-demand (and a spot pool not yet priced) an estimate per vCPU,
+// plus its gp3 volume. It is an estimate made to cap the bill, not the bill. It survives a restart in an SSM
+// parameter. At either cap the listener launches nothing and keeps no pool, so the bill stops growing once the
+// running jobs end.
+type Spend struct {
+	mu         sync.Mutex
+	DailyCap   float64 `json:"-"`
+	MonthlyCap float64 `json:"-"`
+	Day        string  `json:"day"`
+	Month      string  `json:"month"`
+	DayUSD     float64 `json:"day_usd"`
+	MonthUSD   float64 `json:"month_usd"`
+	PerHour    float64 `json:"per_hour"`
+	last       time.Time
+	prices     map[string]float64 // zone/type -> spot $/h
+	sets       map[string]SetSpec
+}
+
+const (
+	onDemandPerVCPUHour = 0.058            // m7a's list price, at the top of the types used
+	gp3PerGBHour        = 0.08 / 730       // storage
+	gp3ExtraPerHour     = 125 * 0.04 / 730 // 250 MB/s is 125 above the free 125; 3,000 IOPS are free
+)
+
+func NewSpend(daily, monthly float64, sets []SetSpec, now time.Time) *Spend {
+	s := &Spend{DailyCap: daily, MonthlyCap: monthly, prices: map[string]float64{}, sets: map[string]SetSpec{}, last: now,
+		Day: now.UTC().Format("2006-01-02"), Month: now.UTC().Format("2006-01")}
+	for _, spec := range sets {
+		s.sets[spec.Name] = spec
+	}
+	return s
+}
+
+func (s *Spend) SetCaps(daily, monthly float64) {
+	s.mu.Lock()
+	s.DailyCap, s.MonthlyCap = daily, monthly
+	s.mu.Unlock()
+}
+
+func (s *Spend) SetPrices(p map[string]float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k, v := range p {
+		s.prices[k] = v
+	}
+}
+
+// price is a machine's cost an hour.
+func (s *Spend) price(m Machine) float64 {
+	spec := s.sets[m.Set]
+	od := onDemandPerVCPUHour * float64(max(1, spec.CPU))
+	p := od
+	if m.Lifecycle == "spot" {
+		if v, ok := s.prices[m.AZ+"/"+m.Type]; ok && v > 0 {
+			p = v
+		}
+	}
+	return p + float64(spec.DiskGB)*gp3PerGBHour + gp3ExtraPerHour
+}
+
+// Accrue adds the running machines' cost since the last accrual (at most five minutes of it, so a pause of the
+// listener is not charged at today's fleet).
+func (s *Spend) Accrue(now time.Time, ms []Machine) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	day, month := now.UTC().Format("2006-01-02"), now.UTC().Format("2006-01")
+	if month != s.Month {
+		s.Month, s.MonthUSD = month, 0
+	}
+	if day != s.Day {
+		s.Day, s.DayUSD = day, 0
+	}
+	hours := min(5*time.Minute, max(0, now.Sub(s.last))).Hours()
+	s.last = now
+	perHour := 0.0
+	for _, m := range ms {
+		perHour += s.price(m)
+	}
+	s.PerHour = perHour
+	s.DayUSD += perHour * hours
+	s.MonthUSD += perHour * hours
+}
+
+// Over says whether a cap is reached.
+func (s *Spend) Over() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return (s.DailyCap > 0 && s.DayUSD >= s.DailyCap) || (s.MonthlyCap > 0 && s.MonthUSD >= s.MonthlyCap)
+}
+
+type SpendSnapshot struct {
+	Day        string  `json:"day"`
+	DayUSD     float64 `json:"day_usd"`
+	MonthUSD   float64 `json:"month_usd"`
+	PerHour    float64 `json:"per_hour"`
+	DailyCap   float64 `json:"daily_cap"`
+	MonthlyCap float64 `json:"monthly_cap"`
+	Capped     bool    `json:"capped"`
+}
+
+func (s *Spend) Snapshot() SpendSnapshot {
+	over := s.Over()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return SpendSnapshot{Day: s.Day, DayUSD: s.DayUSD, MonthUSD: s.MonthUSD, PerHour: s.PerHour, DailyCap: s.DailyCap,
+		MonthlyCap: s.MonthlyCap, Capped: over}
+}
+
+// Load takes the totals a previous listener saved, if they are of this day and month.
+func (s *Spend) Load(ctx context.Context, client *ssm.Client, name string) error {
+	out, err := client.GetParameter(ctx, &ssm.GetParameterInput{Name: aws.String(name)})
+	var missing *ssmtypes.ParameterNotFound
+	if errors.As(err, &missing) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var saved struct {
+		Day, Month       string
+		DayUSD, MonthUSD float64
+	}
+	if err := json.Unmarshal([]byte(aws.ToString(out.Parameter.Value)), &saved); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if saved.Month == s.Month {
+		s.MonthUSD = saved.MonthUSD
+	}
+	if saved.Day == s.Day {
+		s.DayUSD = saved.DayUSD
+	}
+	return nil
+}
+
+func (s *Spend) Save(ctx context.Context, client *ssm.Client, name string) error {
+	s.mu.Lock()
+	value, _ := json.Marshal(struct {
+		Day, Month       string
+		DayUSD, MonthUSD float64
+	}{s.Day, s.Month, s.DayUSD, s.MonthUSD})
+	s.mu.Unlock()
+	_, err := client.PutParameter(ctx, &ssm.PutParameterInput{Name: aws.String(name), Type: ssmtypes.ParameterTypeString,
+		Value: aws.String(string(value)), Overwrite: aws.Bool(true)})
+	return err
+}

@@ -22,20 +22,60 @@
       "Condition": { "StringEquals": { "aws:ResourceTag/purpose": "superci-pull" } }
     },
     {
+      "Sid": "TakeTheListenersAddress",
+      "Effect": "Allow",
+      "Action": "ec2:AssociateAddress",
+      "Resource": "*",
+      "Condition": { "StringEquals": { "aws:ResourceTag/purpose": "superci-pull" } }
+    },
+    {
       "Sid": "Read",
       "Effect": "Allow",
       "Action": [
         "ec2:DescribeInstances", "ec2:DescribeImages", "ec2:DescribeLaunchTemplates", "ec2:DescribeLaunchTemplateVersions",
         "ec2:DescribeSubnets", "ec2:DescribeSecurityGroups", "ec2:DescribeVpcs", "ec2:DescribeInstanceTypeOfferings",
-        "ec2:DescribeSpotPriceHistory", "ec2:DescribeFleets", "ec2:DescribeFleetInstances", "ec2:DescribeInstanceTypes"
+        "ec2:DescribeSpotPriceHistory", "ec2:DescribeFleets", "ec2:DescribeFleetInstances", "ec2:DescribeInstanceTypes",
+        "ec2:DescribeAddresses", "autoscaling:DescribeAutoScalingInstances"
       ],
       "Resource": "*"
     },
     {
-      "Sid": "AppCredentials",
+      "Sid": "MarkItselfUnhealthy",
       "Effect": "Allow",
-      "Action": "ssm:GetParameter",
-      "Resource": "arn:aws:ssm:us-east-1:243891825325:parameter/superci-pull/github-app"
+      "Action": "autoscaling:SetInstanceHealth",
+      "Resource": "arn:aws:autoscaling:us-east-1:243891825325:autoScalingGroup:*:autoScalingGroupName/superci-pull-listener"
+    },
+    {
+      "Sid": "Parameters",
+      "Effect": "Allow",
+      "Action": ["ssm:GetParameter"],
+      "Resource": [
+        "arn:aws:ssm:us-east-1:243891825325:parameter/superci-pull/github-app",
+        "arn:aws:ssm:us-east-1:243891825325:parameter/superci-pull/tls",
+        "arn:aws:ssm:us-east-1:243891825325:parameter/superci-pull/spend"
+      ]
+    },
+    {
+      "Sid": "KeepTlsKeyAndSpend",
+      "Effect": "Allow",
+      "Action": ["ssm:PutParameter", "ssm:AddTagsToResource"],
+      "Resource": [
+        "arn:aws:ssm:us-east-1:243891825325:parameter/superci-pull/tls",
+        "arn:aws:ssm:us-east-1:243891825325:parameter/superci-pull/spend"
+      ]
+    },
+    {
+      "Sid": "Release",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::superci-pull-243891825325", "arn:aws:s3:::superci-pull-243891825325/*"]
+    },
+    {
+      "Sid": "Metrics",
+      "Effect": "Allow",
+      "Action": "cloudwatch:PutMetricData",
+      "Resource": "*",
+      "Condition": { "StringEquals": { "cloudwatch:namespace": "superci-pull" } }
     },
     {
       "Sid": "FleetAndSpotRoles",

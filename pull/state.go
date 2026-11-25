@@ -9,10 +9,11 @@ import (
 	"github.com/actions/scaleset"
 )
 
-// A Machine is one EC2 instance of the scale set. EC2 (its tags) says it exists; everything else here is derived from
+// A Machine is one EC2 instance of a scale set. EC2 (its tags) says it exists; everything else here is derived from
 // EC2, GitHub and what the machine asked for, and is rebuilt by the reconciler after a restart.
 type Machine struct {
 	ID        string
+	Set       string // its superci-pull-set tag
 	Region    string
 	IP        string
 	Type      string
@@ -37,65 +38,74 @@ type Runner struct {
 	Done     bool // JobCompleted seen: the machine will ask again
 	Listed   bool // in GitHub's last runner listing
 	Removing bool
+	Job      *JobRef // the job it took, from JobStarted
 }
 
-// State is everything the control loop knows. One mutex: the listener goroutine, the launcher, the reconciler and the
-// HTTP handlers each hold it only to read or write these fields, never across a network call.
+// JobRef names a job well enough to find it again in GitHub's REST API.
+type JobRef struct {
+	Owner, Repo string
+	RunID       int64
+	Name        string
+	Runner      string
+}
+
+// State is everything the control loop knows about one scale set. One mutex: the listener goroutine, the launcher,
+// the reconciler and the HTTP handlers each hold it only to read or write these fields, never across a network call.
 type State struct {
 	mu       sync.Mutex
 	set      string
 	stats    scaleset.RunnerScaleSetStatistic
 	pool     int
 	max      int
+	capped   bool // the spend cap is reached: no launches, no pool
 	machines map[string]*Machine
 	reserved map[string]int // per launch round, capacity asked of EC2 and not yet seen
 	rounds   int
 	boot     string
 
-	// Registrations. GitHub refuses past 1,500 runners configured in any 5 minutes, counting every registrant of the
-	// organization, so the listener keeps its own budget under that, may pace itself further (rate, burst), and backs
-	// off when GitHub refuses anyway.
-	regs           []time.Time // registrations GitHub made, oldest first (sliding window)
-	pending        int         // registrations asked of GitHub and not yet answered
-	budget         int         // registrations allowed per window
-	window         time.Duration
-	rate, burst    float64 // pacing: tokens a second and most saved up; rate 0 is unpaced
-	tokens         float64
-	refilled       time.Time
-	throttledUntil time.Time
-	throttleWait   time.Duration
-
 	lastActivity time.Time // last message that assigned or started a job
 	staleWaiting int       // waiting jobs the statistics still count though idle runners have not taken them
+	polled       time.Time // last answer of the message session, a message or an empty poll
 
-	listedAt     time.Time // last complete listing of the scale set's runners
-	surplusSince time.Time // since when the supply has exceeded the demand
+	listedAt     time.Time            // last complete listing of the scale set's runners
+	surplusSince time.Time            // since when the supply has exceeded the demand
+	orphanSince  map[string]time.Time // stale runners, by name, since first listed as such
 
-	totalRegs    int
-	regErrors    int
-	refused      int
-	maxRegWindow int
-	odLaunched   []time.Time
-	allLaunched  []time.Time
+	arrivals    []time.Time // jobs that became available, for the pool's rate
+	waits       []float64   // queue waits (s) of jobs started since the metrics last took them
+	odLaunched  []time.Time
+	allLaunched []time.Time
 }
 
-func NewState(set string, pool, max, budget int) *State {
+func NewState(set string, pool, max int) *State {
 	now := time.Now()
-	return &State{set: set, pool: pool, max: max, budget: budget, window: 5 * time.Minute, machines: map[string]*Machine{},
-		reserved: map[string]int{}, boot: fmt.Sprintf("%x", now.UnixNano()), lastActivity: now}
-}
-
-// Pace limits registrations to rate a second, with up to burst saved up.
-func (s *State) Pace(rate, burst float64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.rate, s.burst, s.tokens = rate, burst, burst
+	return &State{set: set, pool: pool, max: max, machines: map[string]*Machine{}, reserved: map[string]int{},
+		boot: fmt.Sprintf("%x", now.UnixNano()), lastActivity: now, polled: now, orphanSince: map[string]time.Time{}}
 }
 
 // desired is the supply GitHub's queue asks for: every job assigned to the scale set or waiting to be acquired by it,
-// less waiting jobs found stale, plus the hot pool, at most max.
+// less waiting jobs found stale, plus the hot pool (none while capped), at most max.
 func (s *State) desired() int {
-	return min(s.max, s.stats.TotalAssignedJobs-s.staleWaiting+s.stats.TotalAvailableJobs+s.pool)
+	pool := s.pool
+	if s.capped {
+		pool = 0
+	}
+	return max(0, min(s.max, s.stats.TotalAssignedJobs-s.staleWaiting+s.stats.TotalAvailableJobs+pool))
+}
+
+// waitingJobs is the jobs the queue holds for the set that no runner has started.
+func (s *State) waitingJobs() int {
+	return s.stats.TotalAssignedJobs - s.stats.TotalRunningJobs - s.staleWaiting + s.stats.TotalAvailableJobs
+}
+
+func (s *State) idleRunners() int {
+	n := 0
+	for _, m := range s.machines {
+		if !m.Ending && m.Runner != nil && !m.Runner.Busy {
+			n++
+		}
+	}
+	return n
 }
 
 // MarkStale finds jobs the statistics count as waiting that no idle runner has taken for a while. GitHub's counts
@@ -148,20 +158,16 @@ func (s *State) Noticed(id string) (m *Machine, idle *Runner) {
 	return m, nil
 }
 
-// Deficit reserves the capacity to launch now, under a new round's name. While registrations are paced, or GitHub
-// lately refused one, it launches no more machines than can be registered in about a minute and a half: a machine
-// that waits for its runner is paid for and does nothing.
-func (s *State) Deficit(now time.Time) (round string, n int) {
+// Deficit reserves the capacity to launch now, under a new round's name. It launches no more machines than about
+// limit can be waiting for their runner at once (a machine that waits is paid for and does nothing), and none while
+// the spend cap holds.
+func (s *State) Deficit(now time.Time, limit int) (round string, n int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.capped {
+		return "", 0
+	}
 	n = s.desired() - s.live()
-	limit := s.max
-	if s.rate > 0 {
-		limit = max(25, int(s.rate*90))
-	}
-	if now.Before(s.throttledUntil.Add(time.Minute)) {
-		limit = min(limit, 50)
-	}
 	unregistered := 0
 	for _, k := range s.reserved {
 		unregistered += k
@@ -223,79 +229,70 @@ type Verdict int
 const (
 	Grant   Verdict = iota // register a runner for it
 	End                    // it is not needed: it holds no runner, so it may end
-	Wait                   // the registration budget is spent: ask again shortly
+	Wait                   // ask again shortly: the budget is spent, or its last runner may still hold a job
+	Replace                // its last runner never started: remove that runner (fenced) before it gets another
 	Unknown                // not one of ours
 )
 
-// Ask decides for a machine that asks for a runner (it holds none: its last one, if any, took its job and ended). It
-// grants while the supply is at most what the queue asks for, and keeps the registration budget: at most budget
-// registrations in any window.
-func (s *State) Ask(id string, now time.Time) Verdict {
+// Ask decides for a machine that asks for a runner. A machine gets a runner only when it holds none that could take
+// or hold a job: its last one was reported complete, or GitHub no longer lists it, or it never started and GitHub
+// removed it. So a second ask while a job runs on the machine (by anything on it that can read its identity) gets no
+// runner. A granted ask takes a registration from the budget, ahead of the pool's when a job waits.
+func (s *State) Ask(id string, now time.Time, b *Budget, maxAge time.Duration) (Verdict, *Runner) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	m := s.machines[id]
 	if m == nil {
-		return Unknown
+		return Unknown, nil
 	}
 	m.Asked = now
-	m.Runner = nil
-	if m.Ending || m.Notice {
-		m.Ending = true
-		return End
-	}
-	if s.live() > s.desired() {
-		m.Ending = true
-		return End
-	}
-	if now.Before(s.throttledUntil) {
-		return Wait
-	}
-	s.regs = since(s.regs, now.Add(-s.window))
-	if len(s.regs)+s.pending >= s.budget {
-		return Wait
-	}
-	if s.rate > 0 {
-		s.tokens = min(s.burst, s.tokens+now.Sub(s.refilled).Seconds()*s.rate)
-		s.refilled = now
-		if s.tokens < 1 {
-			return Wait
+	if r := m.Runner; r != nil && !r.Done {
+		gone := !r.Listed && s.listedAt.Sub(r.Issued) > time.Minute
+		switch {
+		case gone:
+		case r.Busy || r.Removing:
+			return Wait, nil
+		default:
+			r.Removing = true
+			return Replace, r
 		}
-		s.tokens--
 	}
-	s.pending++
-	return Grant
+	m.Runner = nil
+	if m.Ending || m.Notice || now.Sub(m.Launched) > maxAge || s.live() > s.desired() {
+		m.Ending = true
+		return End, nil
+	}
+	prio := ForPool
+	if s.waitingJobs() > s.idleRunners() {
+		prio = ForJob
+	}
+	if !b.Take(now, prio) {
+		return Wait, nil
+	}
+	return Grant, nil
 }
 
-// Outcome is what GitHub answered to a registration.
-type Outcome int
-
-const (
-	Made    Outcome = iota
-	Refused         // GitHub's limit on runners configured in 5 minutes
-	Failed
-)
-
-// Registered records what GitHub answered: the runner it made for a machine, or a refusal, after which no one asks
-// GitHub for a while (5 s, doubling to a minute while it keeps refusing).
-func (s *State) Registered(id string, r *Runner, outcome Outcome, now time.Time) {
+// Replaced settles the removal of a machine's runner that never started: removed, the machine holds none; refused,
+// it took a job meanwhile and is busy.
+func (s *State) Replaced(m *Machine, r *Runner, removed bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.pending--
-	switch outcome {
-	case Made:
-		s.regs = append(since(s.regs, now.Add(-s.window)), now)
-		s.totalRegs++
-		s.maxRegWindow = max(s.maxRegWindow, len(s.regs))
-		s.throttleWait = 0
-		if m := s.machines[id]; m != nil {
-			m.Runner = r
-		}
-	case Refused:
-		s.refused++
-		s.throttleWait = min(time.Minute, max(5*time.Second, 2*s.throttleWait))
-		s.throttledUntil = now.Add(s.throttleWait)
-	case Failed:
-		s.regErrors++
+	r.Removing = false
+	if !removed {
+		r.Busy = true
+		return
+	}
+	if m.Runner == r {
+		m.Runner = nil
+	}
+}
+
+// Registered records the runner GitHub made for a machine.
+func (s *State) Registered(id string, r *Runner) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if m := s.machines[id]; m != nil {
+		m.Runner = r
 	}
 }
 
@@ -311,7 +308,7 @@ func (s *State) PreviousDone(id string) bool {
 // machineOf finds the machine a runner is named after: <set>-<instance id>-<suffix>.
 func (s *State) machineOf(runner string) *Machine {
 	rest, ok := strings.CutPrefix(runner, s.set+"-")
-	if !ok {
+	if !ok || !strings.HasPrefix(rest, "i-") {
 		return nil
 	}
 	if i := strings.LastIndexByte(rest, '-'); i > 0 {
@@ -320,20 +317,36 @@ func (s *State) machineOf(runner string) *Machine {
 	return nil
 }
 
-// Observe takes in one message of the queue: its statistics, and which runners started and finished jobs.
-func (s *State) Observe(msg *scaleset.RunnerScaleSetMessage) {
+// Observe takes in one answer of the message session: its statistics, the jobs that arrived, and which runners
+// started and finished jobs (with how long each started job waited in the queue).
+func (s *State) Observe(msg *scaleset.RunnerScaleSetMessage, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.polled = now
+	if msg == nil {
+		return
+	}
 	if msg.Statistics != nil {
 		s.stats = *msg.Statistics
 	}
 	if len(msg.JobAvailableMessages)+len(msg.JobAssignedMessages)+len(msg.JobStartedMessages) > 0 {
-		s.lastActivity = time.Now()
+		s.lastActivity = now
 		s.staleWaiting = 0
 	}
+	for range msg.JobAvailableMessages {
+		s.arrivals = append(s.arrivals, now)
+	}
 	for _, j := range msg.JobStartedMessages {
+		if !j.QueueTime.IsZero() {
+			started := now
+			if !j.RunnerAssignTime.IsZero() && j.RunnerAssignTime.After(j.QueueTime) {
+				started = j.RunnerAssignTime
+			}
+			s.waits = append(s.waits, max(0, started.Sub(j.QueueTime).Seconds()))
+		}
 		if m := s.machineOf(j.RunnerName); m != nil && m.Runner != nil && m.Runner.Name == j.RunnerName {
 			m.Runner.Busy = true
+			m.Runner.Job = &JobRef{Owner: j.OwnerName, Repo: j.RepositoryName, RunID: j.WorkflowRunID, Name: j.JobDisplayName, Runner: j.RunnerName}
 		}
 	}
 	for _, j := range msg.JobCompletedMessages {
@@ -343,10 +356,28 @@ func (s *State) Observe(msg *scaleset.RunnerScaleSetMessage) {
 	}
 }
 
+// ArrivalRate is the jobs a second that became available over the last window.
+func (s *State) ArrivalRate(now time.Time, window time.Duration) float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.arrivals = since(s.arrivals, now.Add(-window))
+	return float64(len(s.arrivals)) / window.Seconds()
+}
+
+// TakeWaits hands over the queue waits recorded since the last call.
+func (s *State) TakeWaits() []float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	w := s.waits
+	s.waits = nil
+	return w
+}
+
 // Seen merges one DescribeInstances listing of a region: machines it lists are live (a new one, met after a restart
 // or launched by a call whose answer was lost, is adopted); machines it does not list, launched long enough ago for
-// the listing to show them, are gone.
-func (s *State) Seen(region string, listed []*Machine, now time.Time) {
+// the listing to show them, are gone. It returns the jobs lost with them: a machine gone while its runner held a job
+// not reported complete (AWS took it back mid-job).
+func (s *State) Seen(region string, listed []*Machine, now time.Time) (lost []JobRef) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	in := map[string]bool{}
@@ -368,9 +399,13 @@ func (s *State) Seen(region string, listed []*Machine, now time.Time) {
 	}
 	for id, m := range s.machines {
 		if m.Region == region && !in[id] && now.Sub(m.Launched) > 90*time.Second {
+			if r := m.Runner; r != nil && r.Busy && !r.Done && r.Job != nil {
+				lost = append(lost, *r.Job)
+			}
 			delete(s.machines, id)
 		}
 	}
+	return lost
 }
 
 // Listed merges GitHub's complete listing of the scale set's runners. A machine adopted after a restart learns its
@@ -385,6 +420,7 @@ func (s *State) Listed(runners map[string]ListedRunner, now time.Time) (orphans 
 			m.Runner.Listed = false
 		}
 	}
+	stale := map[string]bool{}
 	for name, r := range runners {
 		m := s.machineOf(name)
 		switch {
@@ -399,7 +435,37 @@ func (s *State) Listed(runners map[string]ListedRunner, now time.Time) (orphans 
 			orphans = append(orphans, r)
 		}
 	}
+	for _, o := range orphans {
+		stale[o.Name] = true
+		if _, ok := s.orphanSince[o.Name]; !ok {
+			s.orphanSince[o.Name] = now
+		}
+	}
+	for name := range s.orphanSince {
+		if !stale[name] {
+			delete(s.orphanSince, name)
+		}
+	}
 	return orphans
+}
+
+// Orphans counts what should not be there: runners stale for over two minutes (removal keeps failing), and machines
+// told to end over three minutes ago that EC2 still lists running.
+func (s *State) Orphans(now time.Time) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, t := range s.orphanSince {
+		if now.Sub(t) > 2*time.Minute {
+			n++
+		}
+	}
+	for _, m := range s.machines {
+		if m.Ending && !m.Ended.IsZero() && now.Sub(m.Ended) > 3*time.Minute && m.Seen.After(m.Ended.Add(2*time.Minute)) {
+			n++
+		}
+	}
+	return n
 }
 
 // Stuck is the machines to end without a fence, because they hold no runner that could hold a job: older than the
@@ -489,14 +555,29 @@ func (s *State) Machine(id string) *Machine {
 	return s.machines[id]
 }
 
-func (s *State) SetPool(n int) { s.mu.Lock(); s.pool = n; s.mu.Unlock() }
-func (s *State) SetMax(n int)  { s.mu.Lock(); s.max = n; s.mu.Unlock() }
+// Running is a copy of the machines EC2 lists running, for the spend.
+func (s *State) Running() []Machine {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]Machine, 0, len(s.machines))
+	for _, m := range s.machines {
+		out = append(out, *m)
+	}
+	return out
+}
+
+func (s *State) SetPool(n int)     { s.mu.Lock(); s.pool = n; s.mu.Unlock() }
+func (s *State) SetMax(n int)      { s.mu.Lock(); s.max = n; s.mu.Unlock() }
+func (s *State) SetCapped(on bool) { s.mu.Lock(); s.capped = on; s.mu.Unlock() }
+func (s *State) Polled() time.Time { s.mu.Lock(); defer s.mu.Unlock(); return s.polled }
 
 // Snapshot is the state as the admin endpoint and the logs report it.
 type Snapshot struct {
+	Set          string                           `json:"set"`
 	Stats        scaleset.RunnerScaleSetStatistic `json:"stats"`
 	Pool         int                              `json:"pool"`
 	Max          int                              `json:"max"`
+	Capped       bool                             `json:"capped"`
 	Desired      int                              `json:"desired"`
 	Live         int                              `json:"live"`
 	Inflight     int                              `json:"inflight"`
@@ -507,26 +588,20 @@ type Snapshot struct {
 	Busy         int                              `json:"busy"`
 	OnDemand     int                              `json:"on_demand"`
 	Notices      int                              `json:"notices"`
-	RegsWindow   int                              `json:"regs_window"`
-	MaxRegWindow int                              `json:"max_regs_window"`
-	TotalRegs    int                              `json:"total_regs"`
-	RegErrors    int                              `json:"reg_errors"`
-	Refused      int                              `json:"refused"`
-	Pending      int                              `json:"pending"`
 	StaleWaiting int                              `json:"stale_waiting"`
+	Orphans      int                              `json:"orphans"`
 }
 
 func (s *State) Snapshot(now time.Time) Snapshot {
+	orphans := s.Orphans(now)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.regs = since(s.regs, now.Add(-s.window))
 	inflight := 0
 	for _, k := range s.reserved {
 		inflight += k
 	}
-	out := Snapshot{Stats: s.stats, Pool: s.pool, Max: s.max, Desired: s.desired(), Live: s.live(), Inflight: inflight,
-		Machines: len(s.machines), RegsWindow: len(s.regs), MaxRegWindow: s.maxRegWindow, TotalRegs: s.totalRegs, RegErrors: s.regErrors,
-		Refused: s.refused, Pending: s.pending, StaleWaiting: s.staleWaiting}
+	out := Snapshot{Set: s.set, Stats: s.stats, Pool: s.pool, Max: s.max, Capped: s.capped, Desired: s.desired(), Live: s.live(),
+		Inflight: inflight, Machines: len(s.machines), StaleWaiting: s.staleWaiting, Orphans: orphans}
 	for _, m := range s.machines {
 		switch {
 		case m.Ending:

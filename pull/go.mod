@@ -6,10 +6,12 @@ require (
 	github.com/actions/scaleset v0.5.0
 	github.com/aws/aws-sdk-go-v2 v1.48.0
 	github.com/aws/aws-sdk-go-v2/config v1.33.21
+	github.com/aws/aws-sdk-go-v2/service/cloudwatch v1.76.0
 	github.com/aws/aws-sdk-go-v2/service/ec2 v1.350.0
 	github.com/aws/aws-sdk-go-v2/service/ssm v1.84.0
 	github.com/aws/smithy-go v1.28.10
 	github.com/golang-jwt/jwt/v5 v5.3.1
+	github.com/smallstep/pkcs7 v0.2.3
 )
 
 require (

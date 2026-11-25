@@ -1,5 +1,5 @@
 [Unit]
-Description=superci-pull: the superci-pull-4cpu runner scale set on EC2
+Description=superci-pull: the superci-<N>cpu runner scale sets on EC2
 Wants=network-online.target
 After=network-online.target
 
@@ -7,7 +7,6 @@ After=network-online.target
 EnvironmentFile=/etc/superci-pull.env
 ExecStart=/usr/local/bin/superci-pull $FLAGS
 DynamicUser=yes
-StateDirectory=superci-pull
 Restart=always
 RestartSec=5
 LimitNOFILE=65536

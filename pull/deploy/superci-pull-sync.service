@@ -1,0 +1,6 @@
+[Unit]
+Description=superci-pull: fetch the override config from S3 (the listener rereads it when it changes)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/superci-pull-sync

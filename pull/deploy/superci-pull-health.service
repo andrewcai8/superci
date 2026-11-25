@@ -1,0 +1,6 @@
+[Unit]
+Description=superci-pull: mark this instance unhealthy (the Auto Scaling group replaces it) after 5 failed health checks
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/superci-pull-health

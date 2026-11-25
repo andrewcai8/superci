@@ -100,23 +100,32 @@ type ListedRunner struct {
 	Online bool
 }
 
-// Runners lists every runner of a runner group whose name starts with prefix. It fails unless it read every page,
-// so a partial listing is never taken for the whole.
-func (g *REST) Runners(ctx context.Context, group int, prefix string) (map[string]ListedRunner, error) {
+// get decodes one GET of the REST API into out.
+func (g *REST) get(ctx context.Context, url string, out any) error {
 	token, err := g.tokenFor(ctx)
 	if err != nil {
-		return nil, err
+		return err
 	}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	resp, err := g.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("%s: %s", url, resp.Status)
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+// listRunners reads every page of a runner listing. It fails unless it read every page, so a partial listing is
+// never taken for the whole.
+func (g *REST) listRunners(ctx context.Context, base string, keep func(name string) bool) (map[string]ListedRunner, int64, error) {
 	out := map[string]ListedRunner{}
+	var highest int64
 	for page := 1; ; page++ {
-		url := fmt.Sprintf("https://api.github.com/orgs/%s/actions/runner-groups/%d/runners?per_page=100&page=%d", g.org, group, page)
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-		req.Header.Set("Authorization", "Bearer "+token)
-		req.Header.Set("Accept", "application/vnd.github+json")
-		resp, err := g.http.Do(req)
-		if err != nil {
-			return nil, err
-		}
 		var body struct {
 			Total   int `json:"total_count"`
 			Runners []struct {
@@ -126,21 +135,85 @@ func (g *REST) Runners(ctx context.Context, group int, prefix string) (map[strin
 				Busy   bool   `json:"busy"`
 			} `json:"runners"`
 		}
-		err = json.NewDecoder(resp.Body).Decode(&body)
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("runners page %d: %s", page, resp.Status)
-		}
-		if err != nil {
-			return nil, err
+		if err := g.get(ctx, fmt.Sprintf("%s?per_page=100&page=%d", base, page), &body); err != nil {
+			return nil, 0, err
 		}
 		for _, r := range body.Runners {
-			if strings.HasPrefix(r.Name, prefix) {
+			highest = max(highest, r.ID)
+			if keep(r.Name) {
 				out[r.Name] = ListedRunner{ID: r.ID, Name: r.Name, Busy: r.Busy, Online: r.Status == "online"}
 			}
 		}
 		if len(body.Runners) < 100 || page*100 >= body.Total {
-			return out, nil
+			return out, highest, nil
 		}
 	}
+}
+
+// Runners lists every runner of a runner group whose name starts with prefix.
+func (g *REST) Runners(ctx context.Context, group int, prefix string) (map[string]ListedRunner, error) {
+	out, _, err := g.listRunners(ctx, fmt.Sprintf("https://api.github.com/orgs/%s/actions/runner-groups/%d/runners", g.org, group),
+		func(name string) bool { return strings.HasPrefix(name, prefix) })
+	return out, err
+}
+
+// OrgHead is the highest runner id among every runner the organization has registered now: a lower bound, by
+// seconds, of the last id GitHub issued, since a runner lives at least until it takes its job.
+func (g *REST) OrgHead(ctx context.Context) (int64, error) {
+	_, highest, err := g.listRunners(ctx, fmt.Sprintf("https://api.github.com/orgs/%s/actions/runners", g.org), func(string) bool { return false })
+	return highest, err
+}
+
+// RunCompleted says whether a workflow run has completed.
+func (g *REST) RunCompleted(ctx context.Context, owner, repo string, run int64) (bool, error) {
+	var body struct {
+		Status string `json:"status"`
+	}
+	err := g.get(ctx, fmt.Sprintf("https://api.github.com/repos/%s/%s/actions/runs/%d", owner, repo, run), &body)
+	return body.Status == "completed", err
+}
+
+// JobOf finds the job of a run that a runner took, by the runner's name, in the run's latest attempt.
+func (g *REST) JobOf(ctx context.Context, owner, repo string, run int64, runner string) (id int64, conclusion string, err error) {
+	for page := 1; page <= 20; page++ {
+		var body struct {
+			Jobs []struct {
+				ID         int64  `json:"id"`
+				RunnerName string `json:"runner_name"`
+				Conclusion string `json:"conclusion"`
+			} `json:"jobs"`
+		}
+		if err := g.get(ctx, fmt.Sprintf("https://api.github.com/repos/%s/%s/actions/runs/%d/jobs?filter=latest&per_page=100&page=%d", owner, repo, run, page), &body); err != nil {
+			return 0, "", err
+		}
+		for _, j := range body.Jobs {
+			if j.RunnerName == runner {
+				return j.ID, j.Conclusion, nil
+			}
+		}
+		if len(body.Jobs) < 100 {
+			break
+		}
+	}
+	return 0, "", nil
+}
+
+// RerunJob asks GitHub to run a job again (with the jobs that need it), as its "Re-run job" button does.
+func (g *REST) RerunJob(ctx context.Context, owner, repo string, job int64) error {
+	token, err := g.tokenFor(ctx)
+	if err != nil {
+		return err
+	}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("https://api.github.com/repos/%s/%s/actions/jobs/%d/rerun", owner, repo, job), nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	resp, err := g.http.Do(req)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		return fmt.Errorf("rerun job %d: %s", job, resp.Status)
+	}
+	return nil
 }

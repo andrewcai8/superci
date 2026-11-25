@@ -1,0 +1,77 @@
+package main
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+func TestTheBuiltInConfigHasEverySize(t *testing.T) {
+	c, err := LoadConfig("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, label := range []string{"superci-2cpu", "superci-4cpu", "superci-8cpu", "superci-16cpu", "superci-32cpu"} {
+		s, ok := c.Sizes[label]
+		if !ok || len(s.Types) < 10 {
+			t.Fatalf("%s: %+v, want 10 or more types", label, s)
+		}
+		if _, ok := c.Pools[label]; !ok {
+			t.Fatalf("%s has no pool bounds", label)
+		}
+	}
+}
+
+func TestASplitSizeRunsAsSeveralSetsWithTheLabel(t *testing.T) {
+	c := Config{Sizes: map[string]SizeConfig{"superci-4cpu": {CPU: 4, Split: 3, Max: 300, Types: []string{"m8a.xlarge"}}},
+		Pools: map[string]PoolConfig{"superci-4cpu": {Floor: [24]int{10: 7}, Cap: [24]int{10: 100}}}}
+	sets := c.Sets()
+	if len(sets) != 3 || sets[0].Name != "superci-4cpu" || sets[1].Name != "superci-4cpu-2" || sets[2].Name != "superci-4cpu-3" {
+		t.Fatalf("sets %+v", sets)
+	}
+	for _, s := range sets {
+		if s.Label != "superci-4cpu" || s.Max != 100 {
+			t.Fatalf("set %+v: want the size's label and a third of its max", s)
+		}
+	}
+	if floor, top := c.PoolBounds(sets[1], time.Date(2026, 11, 25, 10, 30, 0, 0, time.UTC)); floor != 3 || top != 34 {
+		t.Fatalf("bounds %d/%d: want a third of 7 and of 100, rounded up", floor, top)
+	}
+}
+
+func TestThePoolFollowsArrivalsWithinTheHoursBounds(t *testing.T) {
+	c := Config{Pool: PoolRule{FillSeconds: 40, Factor: 1.5, LeadMinutes: 15},
+		Pools: map[string]PoolConfig{"l": {Floor: [24]int{3: 1, 4: 2}, Cap: [24]int{3: 50, 4: 120}}}}
+	spec := SetSpec{Name: "l", Label: "l", Split: 1}
+	at := func(h, m int) time.Time { return time.Date(2026, 11, 25, h, m, 0, 0, time.UTC) }
+	if n := c.PoolTarget(spec, at(3, 10), 0); n != 1 {
+		t.Fatalf("no arrivals: %d, want the floor", n)
+	}
+	if n := c.PoolTarget(spec, at(3, 10), 0.5); n != 30 {
+		t.Fatalf("0.5 jobs/s: %d, want 0.5*40*1.5", n)
+	}
+	if n := c.PoolTarget(spec, at(3, 10), 5); n != 50 {
+		t.Fatalf("5 jobs/s: %d, want the hour's cap", n)
+	}
+	if n := c.PoolTarget(spec, at(3, 50), 5); n != 120 {
+		t.Fatalf("within the lead of a busier hour: %d, want its cap", n)
+	}
+	if n := c.PoolTarget(spec, at(3, 50), 0); n != 2 {
+		t.Fatalf("within the lead of a busier hour, no arrivals: %d, want its floor", n)
+	}
+}
+
+func TestTheOverrideFileReplacesOnlyWhatItNames(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"daily_usd": 50, "pools": {"superci-8cpu": {"floor": [5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5], "cap": [9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.DailyUSD != 50 || c.Pools["superci-8cpu"].Floor[0] != 5 || c.Pools["superci-4cpu"].Cap[22] == 0 || len(c.Sizes) != 5 {
+		t.Fatalf("override %+v", c)
+	}
+}
