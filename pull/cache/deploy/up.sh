@@ -4,7 +4,8 @@
 # traffic to the bucket never leaves the region and costs no data transfer); an entries bucket (private, encrypted,
 # versioning suspended, expiring by age, written once per key) and a stage bucket for an upload's blocks; the broker
 # function, which gives a job credentials to write its own scope; and the janitor function, run every 15 minutes,
-# which keeps the entries under a size. Once: the machines' role and instance profile (read the entries, call the
+# which keeps the entries under a size; and the mirror function, which copies each entry the default branch saves
+# into the other region's bucket, written once there too. Once: the machines' role and instance profile (read the entries, call the
 # broker, write nothing), the writer role the broker narrows per job, and the broker's and janitor's own roles.
 # Run again at will: it changes nothing that exists but the policies, settings and code, which it writes anew.
 # Prints ids, never a secret.
@@ -26,6 +27,7 @@ MACHINE=superci-pull-cache-machine
 WRITER=superci-pull-cache-writer
 BROKER=superci-pull-cache-broker
 JANITOR=superci-pull-cache-janitor
+MIRROR=superci-pull-cache-mirror
 CAP_GB=${CAP_GB:-1000}
 here=$(cd "$(dirname "$0")" && pwd)
 bucket() { echo "superci-pull-cache-$ACCOUNT-$1"; }
@@ -45,9 +47,9 @@ for r in $REGIONS; do
   echo "gateway endpoint $r: $id (default VPC $vpc)"
 done
 
-# Buckets. Nothing replicates between the regions: each region's machines save their own entries of the default
-# branch, which costs a save per region and no replication. Without replication the entries' bucket needs no
-# versioning, so it is suspended (a deleted entry frees its bytes at once instead of a day later).
+# Buckets. S3 replication is not used: it needs versioning and writes over an entry the peer saved. The mirror
+# function (below) copies the default branch's entries with If-None-Match instead, so the entries' bucket needs no
+# versioning, and it is suspended (a deleted entry frees its bytes at once instead of a day later).
 for r in $REGIONS; do
  for kind in entries stage; do
   b=$(bucket "$r"); [ $kind = stage ] && b=$b-stage
@@ -153,6 +155,16 @@ cat > "$tmp/janitor.json" <<JSON
 JSON
 role $JANITOR "$(printf "$trust_service" lambda.amazonaws.com)" "$tmp/janitor.json"
 
+# The mirror: read the default branch's entries in either bucket and create them in the other, written once (the
+# bucket policy refuses a create without If-None-Match, from this role too). ListBucket so a missing key is 404.
+cat > "$tmp/mirror.json" <<JSON
+{ "Version": "2012-10-17", "Statement": [
+    { "Sid": "Read", "Effect": "Allow", "Action": "s3:GetObject", "Resource": ["arn:aws:s3:::$B1/v1/d/*", "arn:aws:s3:::$B2/v1/d/*"] },
+    { "Sid": "List", "Effect": "Allow", "Action": "s3:ListBucket", "Resource": ["arn:aws:s3:::$B1", "arn:aws:s3:::$B2"] },
+    { "Sid": "Create", "Effect": "Allow", "Action": ["s3:PutObject", "s3:AbortMultipartUpload"], "Resource": ["arn:aws:s3:::$B1/v1/d/*", "arn:aws:s3:::$B2/v1/d/*"] }, $(logs $MIRROR) ] }
+JSON
+role $MIRROR "$(printf "$trust_service" lambda.amazonaws.com)" "$tmp/mirror.json"
+
 # The old replication role, from before the regions stopped replicating.
 if $A iam get-role --role-name superci-pull-cache-replication >/dev/null 2>&1; then
   $A iam delete-role-policy --role-name superci-pull-cache-replication --policy-name superci-pull-cache-replication 2>/dev/null || true
@@ -201,4 +213,12 @@ for r in $REGIONS; do
     --principal events.amazonaws.com --source-arn "$rule" >/dev/null 2>&1 || true
   $A events put-targets --region "$r" --rule $JANITOR --targets "Id=janitor,Arn=arn:aws:lambda:$r:$ACCOUNT:function:$JANITOR" >/dev/null
   echo "janitor $r: every 15 minutes, cap $CAP_GB GB"
+  peer=us-east-2; [ "$r" = us-east-2 ] && peer=us-east-1
+  function_up $MIRROR "$r" "Variables={PULLCACHE_LAMBDA=mirror,PULLCACHE_BUCKET=$b,PULLCACHE_PEER_BUCKET=$(bucket $peer),PULLCACHE_PEER_REGION=$peer}" 256 300 || continue
+  $A lambda add-permission --region "$r" --function-name $MIRROR --statement-id s3 --action lambda:InvokeFunction --principal s3.amazonaws.com \
+    --source-arn "arn:aws:s3:::$b" --source-account $ACCOUNT >/dev/null 2>&1 || true
+  # The bucket's whole notification configuration: this one rule.
+  $A s3api put-bucket-notification-configuration --region "$r" --bucket "$b" --notification-configuration \
+    "{\"LambdaFunctionConfigurations\":[{\"Id\":\"mirror\",\"LambdaFunctionArn\":\"arn:aws:lambda:$r:$ACCOUNT:function:$MIRROR\",\"Events\":[\"s3:ObjectCreated:*\"],\"Filter\":{\"Key\":{\"FilterRules\":[{\"Name\":\"prefix\",\"Value\":\"v1/d/\"}]}}}]}"
+  echo "mirror $r: the default branch's new entries are copied to $(bucket $peer)"
 done
