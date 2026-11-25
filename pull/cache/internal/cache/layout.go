@@ -8,12 +8,13 @@ import (
 // The bucket's layout (see the README):
 //
 //	v1/<class>/<repository id>/<scope>/<version>/<key>   an entry: one object, never changed once written
-//	u/<upload id>/<block>                                 an upload's blocks, until it is finished
-//	bin/...                                               the program and its start script
+//	u/<repository id>/<scope>/<upload id>/<block>         an upload's blocks, until it is finished (stage bucket)
+//	bin/...                                               the program, its start script and the functions' code
 //
 // <class> is d for the default branch's entries and r for every other scope: the bucket's lifecycle keeps the
-// first longer and replicates it to the other region; the second is only as old as a pull request or a queue
-// batch lives. Scope and key are written with esc, which keeps a prefix of a key a prefix of its object name.
+// first longer; the second is only as old as a pull request or a queue batch lives. Scope and key are written with
+// esc, which keeps a prefix of a key a prefix of its object name and leaves no character IAM reads as a wildcard
+// or a variable, so a scope's prefix can stand in a policy as it is.
 const (
 	EntryRoot   = "v1/"
 	StagingRoot = "u/"
@@ -61,9 +62,30 @@ func okKey(k string) bool {
 	return k != "" && len(k) <= 512 && !strings.ContainsFunc(k, func(r rune) bool { return r < 0x20 || r == 0x7f || r == ',' })
 }
 
+func scopeRoot(repo string, s Scope, defaultBranch string) string {
+	return EntryRoot + Class(s.Name, defaultBranch) + "/" + repo + "/" + esc(s.Name) + "/"
+}
+
 // ScopePrefix is where a scope's entries of one version are; a key's escape follows it.
 func ScopePrefix(repo string, s Scope, version, defaultBranch string) string {
-	return EntryRoot + Class(s.Name, defaultBranch) + "/" + repo + "/" + esc(s.Name) + "/" + version + "/"
+	return scopeRoot(repo, s, defaultBranch) + version + "/"
+}
+
+// Grant is where one job may write: its scope's entries, and its uploads' blocks in the stage bucket. The broker
+// gives a job credentials for these two prefixes and nothing else, so a job's step that takes them writes no more
+// than the job's token already allows.
+type Grant struct {
+	Entries string
+	Stage   string
+}
+
+// GrantFor is the job's grant, or false for a token that may not write.
+func GrantFor(a Access, defaultBranch string) (Grant, bool) {
+	sc, ok := a.Writable()
+	if !ok {
+		return Grant{}, false
+	}
+	return Grant{Entries: scopeRoot(a.Repo, sc, defaultBranch), Stage: StagingRoot + a.Repo + "/" + esc(sc.Name) + "/"}, true
 }
 
 // ObjectKey is the entry's object name, or "" for a key or version this cache does not keep.

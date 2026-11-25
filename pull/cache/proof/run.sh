@@ -1,9 +1,10 @@
 #!/bin/bash
 # The proof, on one machine of the pull fleet's image with the machines' role (no GitHub involved): runs the real
 # actions/cache (a checkout of its release in $AC, run by the runner's own wrapped Node) against this checkout's
-# cache server and the real bucket, with job tokens signed by a key of ours (the server is told where its JWKS is).
+# cache server and the real bucket, with job tokens signed by a key of ours (the server is told where its JWKS is,
+# and so is the broker: up.sh with BROKER_JWKS_URL set to an address of $P/jwks the function can read).
 #
-#   proof/run.sh big|scope        needs: ~/bin/mint, ~/bin/pullcache-linux-amd64, the checkout in $AC, sudo
+#   proof/run.sh big|scope|iam    needs: ~/bin/mint, /usr/local/bin/pullcache, the checkout in $AC, sudo
 #
 # Env: AC (default ~/ac), MODE=ebs|shm (where the job's workspace and temp are; default ebs, as a machine's job),
 #      SIZE_MB (default 2000).
@@ -119,6 +120,64 @@ scope() {
   local forged; forged=$(sed 's/\.[^.]*$/.AAAA/' <<< "$main")
   check "a forged token is refused (HTTP status)" "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer $forged" -H 'content-type: application/json' -d '{"key":"deps","version":"abc"}' "$(cat /home/runner/externals/pullcache.address)/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL")" 401
   echo "objects now:"; aws s3api list-objects-v2 --region us-east-1 --bucket $BUCKET --prefix v1/ --query 'Contents[].[Key,Size]' --output text
+}
+
+# try CMD...: allowed, or the S3 error it got (AccessDenied, PreconditionFailed).
+try() {
+  if "$@" > "$BASE/try.out" 2>&1; then echo allowed; return; fi
+  grep -o -m1 -E 'AccessDenied|PreconditionFailed' "$BASE/try.out" || { sed 's/^/    /' "$BASE/try.out" >&2; echo error; }
+}
+put() { aws s3api put-object --region us-east-1 --bucket "$1" --key "$2" --body "$BASE/probe" "${@:3}"; }
+
+# creds NAME TOKEN: the broker's credentials for the token, into $BASE/creds-NAME (never printed); prints the
+# broker's refusal, or what the credentials are for and how long they last.
+creds() {
+  local f="$BASE/creds-$1"
+  rm -f "$f"
+  ( umask 077; aws lambda invoke --region us-east-1 --function-name superci-pull-cache-broker --cli-binary-format raw-in-base64-out \
+      --payload "{\"token\":\"$2\"}" "$f.json" > "$f.meta" )
+  python3 -c '
+import datetime, json, os, sys
+f = sys.argv[1]
+r = json.load(open(f + ".json"))
+os.remove(f + ".json")
+if "errorMessage" in r:
+    print(r["errorMessage"]); sys.exit(0)
+fd = os.open(f, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+os.write(fd, ("AWS_ACCESS_KEY_ID=%s\nAWS_SECRET_ACCESS_KEY=%s\nAWS_SESSION_TOKEN=%s\n" % (r["access_key_id"], r["secret_access_key"], r["session_token"])).encode())
+os.close(fd)
+left = datetime.datetime.fromisoformat(r["expires"].replace("Z", "+00:00")) - datetime.datetime.now(datetime.timezone.utc)
+print("issued for %s and %s, %d minutes left" % (r["grant"]["Entries"], r["grant"]["Stage"], left.total_seconds() // 60))
+' "$f"
+}
+as() { local who=$1; shift; (set -a; . "$BASE/creds-$who"; set +a; "$@"); }
+
+# iam: what the machine's own role, and what a job's credentials from the broker, can write, tried on the bucket.
+iam() {
+  local run=$$-$RANDOM v=0123456789abcdef
+  local main="v1/d/77/refs%2Fheads%2Fmain/$v" pr="v1/r/77/refs%2Fpull%2F7%2Fmerge/$v" other="v1/r/78/refs%2Fpull%2F7%2Fmerge/$v"
+  head -c 1024 /dev/urandom > "$BASE/probe"
+  check "machine role: create an entry in main's scope" "$(try put $BUCKET "$main/m-$run" --if-none-match '*')" AccessDenied
+  check "machine role: create an entry in a pull request's scope" "$(try put $BUCKET "$pr/m-$run" --if-none-match '*')" AccessDenied
+  check "machine role: put a block" "$(try put $BUCKET-stage "u/77/refs%2Fpull%2F7%2Fmerge/m-$run")" AccessDenied
+  check "machine role: read" "$(try aws s3api head-object --region us-east-1 --bucket $BUCKET --key bin/up.sh)" allowed
+  echo "broker, pull request 7: $(creds pr7 "$(token refs/pull/7/merge:rw refs/heads/main:r)")"
+  echo "broker, main: $(creds main "$(token refs/heads/main:rw)")"
+  echo "broker, a read-only token: $(creds ro "$(token refs/heads/main:r)")"
+  check "a read-only token gets no credentials" "$([ -e "$BASE/creds-ro" ] && echo issued || echo none)" none
+  check "pull request: create an entry in main's scope" "$(try as pr7 put $BUCKET "$main/p-$run" --if-none-match '*')" AccessDenied
+  check "pull request: create an entry in another repository's scope" "$(try as pr7 put $BUCKET "$other/p-$run" --if-none-match '*')" AccessDenied
+  check "pull request: create an entry in its own scope" "$(try as pr7 put $BUCKET "$pr/p-$run" --if-none-match '*')" allowed
+  check "pull request: write over its own entry without If-None-Match" "$(try as pr7 put $BUCKET "$pr/p-$run")" AccessDenied
+  check "pull request: write over its own entry with If-None-Match" "$(try as pr7 put $BUCKET "$pr/p-$run" --if-none-match '*')" PreconditionFailed
+  check "pull request: create an entry without If-None-Match" "$(try as pr7 put $BUCKET "$pr/q-$run")" AccessDenied
+  check "pull request: put a block in main's stage" "$(try as pr7 put $BUCKET-stage "u/77/refs%2Fheads%2Fmain/p-$run")" AccessDenied
+  check "pull request: put a block in its own stage" "$(try as pr7 put $BUCKET-stage "u/77/refs%2Fpull%2F7%2Fmerge/p-$run")" allowed
+  check "pull request: delete its own block" "$(try as pr7 aws s3api delete-object --region us-east-1 --bucket $BUCKET-stage --key "u/77/refs%2Fpull%2F7%2Fmerge/p-$run")" allowed
+  check "pull request: delete an entry" "$(try as pr7 aws s3api delete-object --region us-east-1 --bucket $BUCKET --key "$pr/p-$run")" AccessDenied
+  check "main: create an entry in main's scope" "$(try as main put $BUCKET "$main/m-$run" --if-none-match '*')" allowed
+  rm -f "$BASE"/creds-*
+  echo "probe entries: $main/m-$run $pr/p-$run"
 }
 
 "$@"

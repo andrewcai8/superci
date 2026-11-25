@@ -42,9 +42,16 @@ func Evict(objs []Object, capBytes int64) []string {
 	return gone
 }
 
+// Pruner is the bucket as the janitor's own role reaches it: it lists entries and deletes them, and nothing else
+// can delete one.
+type Pruner interface {
+	List(ctx context.Context, prefix string, max int) ([]Object, error)
+	Delete(ctx context.Context, keys []string) error
+}
+
 // Janitor deletes entries until the bucket holds at most capBytes (the bucket's lifecycle rules take the old ones
 // by age; this is the limit on size). With dry, it only says what it would delete.
-func Janitor(ctx context.Context, st Store, capBytes int64, dry bool, lg *log.Logger) (n int, freed int64, err error) {
+func Janitor(ctx context.Context, st Pruner, capBytes int64, dry bool, lg *log.Logger) (n int, freed int64, err error) {
 	objs, err := st.List(ctx, EntryRoot, 5_000_000)
 	if err != nil {
 		return 0, 0, err

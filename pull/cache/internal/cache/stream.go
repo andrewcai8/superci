@@ -15,8 +15,8 @@ const (
 	defaultAhead = 12
 )
 
-// stream sends bytes start..end of an object to w, in order, reading the chunks of it concurrently.
-func (s *Server) stream(ctx context.Context, w io.Writer, key string, start, end int64) (int64, error) {
+// stream sends bytes start..end of one version of an object to w, in order, reading the chunks of it concurrently.
+func (s *Server) stream(ctx context.Context, w io.Writer, obj Object, start, end int64) (int64, error) {
 	chunk, ahead := s.ReadChunk, s.ReadAhead
 	if chunk <= 0 {
 		chunk = defaultChunk
@@ -25,7 +25,7 @@ func (s *Server) stream(ctx context.Context, w io.Writer, key string, start, end
 		ahead = defaultAhead
 	}
 	if end-start < chunk {
-		body, err := s.Store.Open(ctx, key, start, end)
+		body, err := s.Store.Open(ctx, obj.Key, obj.ETag, start, end)
 		if err != nil {
 			return 0, err
 		}
@@ -67,7 +67,7 @@ func (s *Server) stream(ctx context.Context, w io.Writer, key string, start, end
 			go func() {
 				defer wg.Done()
 				defer close(sl.done)
-				body, err := s.Store.Open(ctx, key, from, to)
+				body, err := s.Store.Open(ctx, obj.Key, obj.ETag, from, to)
 				if err != nil {
 					sl.err = err
 					return
@@ -96,12 +96,12 @@ func (s *Server) stream(ctx context.Context, w io.Writer, key string, start, end
 }
 
 // Stream and StreamTo are for tests: the bytes stream sends.
-func (s *Server) Stream(ctx context.Context, key string, start, end int64) []byte {
+func (s *Server) Stream(ctx context.Context, obj Object, start, end int64) []byte {
 	var b bytes.Buffer
-	_, _ = s.stream(ctx, &b, key, start, end)
+	_, _ = s.stream(ctx, &b, obj, start, end)
 	return b.Bytes()
 }
 
-func (s *Server) StreamTo(ctx context.Context, w io.Writer, key string, start, end int64) (int64, error) {
-	return s.stream(ctx, w, key, start, end)
+func (s *Server) StreamTo(ctx context.Context, w io.Writer, obj Object, start, end int64) (int64, error) {
+	return s.stream(ctx, w, obj, start, end)
 }

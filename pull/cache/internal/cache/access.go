@@ -121,22 +121,53 @@ func b64(s string) []byte {
 	return b
 }
 
-// Verify returns what the token allows. A token that is not GitHub's, is expired, or says nothing it can hold to
-// is refused; ErrUnavailable (wrapped) means GitHub's keys could not be read.
+// Verify returns what the token allows. A token that is not GitHub's, is expired or has no expiry, or says nothing
+// it can hold to is refused; ErrUnavailable (wrapped) means GitHub's keys could not be read. A refusal names the
+// token's issuer and key id (neither is a secret), so a log shows what a real job's token carries when it is refused.
 func (v *Verifier) Verify(token string) (Access, error) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
 		return Access{}, errors.New("not a job's token")
 	}
 	var head struct{ Alg, Kid string }
-	if h := b64(parts[0]); h == nil || json.Unmarshal(h, &head) != nil || head.Alg != "RS256" {
+	if h := b64(parts[0]); h == nil || json.Unmarshal(h, &head) != nil {
 		return Access{}, errors.New("not a job's token")
+	}
+	var c claims
+	if p := b64(parts[1]); p == nil || json.Unmarshal(p, &c) != nil {
+		return Access{}, errors.New("not a job's token")
+	}
+	a, err := v.check(parts, head.Alg, head.Kid, c)
+	if err != nil {
+		return Access{}, fmt.Errorf("%w (iss %q, kid %q)", err, clip(c.Iss), clip(head.Kid))
+	}
+	return a, nil
+}
+
+type claims struct {
+	Iss    string          `json:"iss"`
+	Exp    float64         `json:"exp"`
+	Nbf    float64         `json:"nbf"`
+	Repo   json.RawMessage `json:"repository_id"`
+	Access string          `json:"ac"`
+}
+
+func clip(s string) string {
+	if len(s) > 100 {
+		return s[:100] + "..."
+	}
+	return s
+}
+
+func (v *Verifier) check(parts []string, alg, kid string, c claims) (Access, error) {
+	if alg != "RS256" {
+		return Access{}, errors.New("not signed with RS256")
 	}
 	sig := b64(parts[2])
 	if sig == nil {
 		return Access{}, errors.New("not a job's token")
 	}
-	pub, err := v.key(head.Kid)
+	pub, err := v.key(kid)
 	if err != nil {
 		return Access{}, err
 	}
@@ -144,21 +175,14 @@ func (v *Verifier) Verify(token string) (Access, error) {
 	if rsa.VerifyPKCS1v15(pub, crypto.SHA256, sum[:], sig) != nil {
 		return Access{}, errors.New("bad signature")
 	}
-	var c struct {
-		Iss    string          `json:"iss"`
-		Exp    float64         `json:"exp"`
-		Nbf    float64         `json:"nbf"`
-		Repo   json.RawMessage `json:"repository_id"`
-		Access string          `json:"ac"`
-	}
-	if p := b64(parts[1]); p == nil || json.Unmarshal(p, &c) != nil {
-		return Access{}, errors.New("not a job's token")
-	}
-	if c.Iss != v.Issuer {
+	if v.Issuer == "" || c.Iss != v.Issuer {
 		return Access{}, errors.New("not a GitHub job's token")
 	}
 	now := float64(v.now().Unix())
-	if c.Exp != 0 && now > c.Exp+60 {
+	if c.Exp <= 0 {
+		return Access{}, errors.New("a token without its expiry")
+	}
+	if now > c.Exp+60 {
 		return Access{}, errors.New("expired")
 	}
 	if c.Nbf != 0 && now+60 < c.Nbf {

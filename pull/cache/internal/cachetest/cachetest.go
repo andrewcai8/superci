@@ -12,6 +12,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
 	"sort"
@@ -62,8 +63,13 @@ func AC(scopes ...string) string {
 
 // Mint signs a token as GitHub does for a job: issuer, repository and the scopes in `ac`.
 func (s *Signer) Mint(iss, repo, ac string, exp time.Time) string {
+	return s.Sign(map[string]any{"iss": iss, "repository_id": repo, "ac": ac, "exp": exp.Unix(), "nbf": exp.Add(-8 * time.Hour).Unix()})
+}
+
+// Sign signs any claims.
+func (s *Signer) Sign(claims map[string]any) string {
 	head, _ := json.Marshal(map[string]string{"alg": "RS256", "typ": "JWT", "kid": s.Kid})
-	body, _ := json.Marshal(map[string]any{"iss": iss, "repository_id": repo, "ac": ac, "exp": exp.Unix(), "nbf": exp.Add(-8 * time.Hour).Unix()})
+	body, _ := json.Marshal(claims)
 	in := enc(head) + "." + enc(body)
 	sum := sha256.Sum256([]byte(in))
 	sig, err := rsa.SignPKCS1v15(rand.Reader, s.Key, crypto.SHA256, sum[:])
@@ -73,21 +79,32 @@ func (s *Signer) Mint(iss, repo, ac string, exp time.Time) string {
 	return in + "." + enc(sig)
 }
 
-// Mem is a bucket in memory.
+// Mem is a bucket in memory. Its writers keep to their grant as the broker's credentials do in S3, and an
+// entry is never written over, as the bucket's policy refuses it.
 type Mem struct {
 	// MinPart is the smallest block before the last that Assemble takes (S3's is 5 MiB).
 	MinPart int64
 	mu      sync.Mutex
 	objs    map[string][]byte
 	mod     map[string]time.Time
+	tags    map[string]string
+	n       int
 	Clock   func() time.Time
 	// Opened counts the reads of a range; with FailAfter set, reads after that many fail.
 	Opened    int
 	FailAfter int
+	// OnOpen, when set, runs before the read of a range is answered (it is given the count of reads so far), and
+	// may change the bucket.
+	OnOpen func(opened int)
+	// Granted is the grant of each writer made, in order.
+	Granted []cache.Grant
 }
 
+// ErrDenied is what a write outside a writer's grant gets.
+var ErrDenied = errors.New("AccessDenied")
+
 func NewMem() *Mem {
-	return &Mem{MinPart: 5 << 20, objs: map[string][]byte{}, mod: map[string]time.Time{}, Clock: time.Now}
+	return &Mem{MinPart: 5 << 20, objs: map[string][]byte{}, mod: map[string]time.Time{}, tags: map[string]string{}, Clock: time.Now}
 }
 
 func (m *Mem) Get(key string) ([]byte, bool) {
@@ -110,37 +127,105 @@ func (m *Mem) Keys(prefix string) []string {
 	return out
 }
 
+// Set writes an object as the test says, a new version with a new ETag (an overwrite only a test can make).
 func (m *Mem) Set(key string, b []byte, at time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.objs[key], m.mod[key] = b, at
+	m.set(key, b, at)
 }
 
-func (m *Mem) Head(_ context.Context, key string) (int64, bool, error) {
+func (m *Mem) set(key string, b []byte, at time.Time) {
+	m.n++
+	m.objs[key], m.mod[key], m.tags[key] = b, at, fmt.Sprintf(`"%d"`, m.n)
+}
+
+func (m *Mem) object(k string) cache.Object {
+	return cache.Object{Key: k, Size: int64(len(m.objs[k])), Modified: m.mod[k], ETag: m.tags[k]}
+}
+
+func (m *Mem) Head(_ context.Context, key string) (cache.Object, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	b, ok := m.objs[key]
-	return int64(len(b)), ok, nil
+	if _, ok := m.objs[key]; !ok {
+		return cache.Object{}, false, nil
+	}
+	return m.object(key), true, nil
 }
 
 func (m *Mem) List(_ context.Context, prefix string, max int) ([]cache.Object, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var out []cache.Object
-	for k, b := range m.objs {
+	for k := range m.objs {
 		if strings.HasPrefix(k, prefix) && len(out) < max {
-			out = append(out, cache.Object{Key: k, Size: int64(len(b)), Modified: m.mod[k]})
+			out = append(out, m.object(k))
 		}
 	}
 	return out, nil
 }
 
-func (m *Mem) Put(_ context.Context, key string, body []byte) error {
-	m.Set(key, append([]byte(nil), body...), m.Clock())
+func (m *Mem) Open(_ context.Context, key, etag string, start, end int64) (io.ReadCloser, error) {
+	m.mu.Lock()
+	m.Opened++
+	n, hook := m.Opened, m.OnOpen
+	m.mu.Unlock()
+	if hook != nil {
+		hook(n)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, ok := m.objs[key]
+	if !ok || m.tags[key] != etag {
+		return nil, cache.ErrChanged
+	}
+	if start < 0 || end >= int64(len(b)) || start > end {
+		return nil, errors.New("no such range")
+	}
+	if m.FailAfter > 0 && n > m.FailAfter {
+		return nil, errors.New("the read failed")
+	}
+	return io.NopCloser(bytes.NewReader(b[start : end+1])), nil
+}
+
+// Delete is the janitor's: it may delete any entry.
+func (m *Mem) Delete(_ context.Context, keys []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, k := range keys {
+		delete(m.objs, k)
+		delete(m.mod, k)
+		delete(m.tags, k)
+	}
 	return nil
 }
 
-func (m *Mem) Assemble(_ context.Context, final string, parts []cache.Part) error {
+func (m *Mem) Writer(_ context.Context, _ string, g cache.Grant) (cache.Writer, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.Granted = append(m.Granted, g)
+	return &memWriter{m: m, g: g}, nil
+}
+
+type memWriter struct {
+	m *Mem
+	g cache.Grant
+}
+
+func (w *memWriter) Put(_ context.Context, key string, body []byte) error {
+	if !strings.HasPrefix(key, w.g.Stage) {
+		return ErrDenied
+	}
+	w.m.mu.Lock()
+	defer w.m.mu.Unlock()
+	w.m.set(key, append([]byte(nil), body...), w.m.Clock())
+	return nil
+}
+
+func (w *memWriter) Assemble(_ context.Context, final string, parts []cache.Part) error {
+	if !strings.HasPrefix(final, w.g.Entries) {
+		return ErrDenied
+	}
+	m := w.m
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.objs[final]; ok {
@@ -148,39 +233,23 @@ func (m *Mem) Assemble(_ context.Context, final string, parts []cache.Part) erro
 	}
 	var all bytes.Buffer
 	for i, p := range parts {
+		if !strings.HasPrefix(p.Key, w.g.Stage) {
+			return ErrDenied
+		}
 		if i < len(parts)-1 && p.Size < m.MinPart {
 			return cache.ErrPartsTooSmall
 		}
 		all.Write(m.objs[p.Key])
 	}
-	m.objs[final], m.mod[final] = all.Bytes(), m.Clock()
+	m.set(final, all.Bytes(), m.Clock())
 	return nil
 }
 
-func (m *Mem) Open(_ context.Context, key string, start, end int64) (io.ReadCloser, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	b, ok := m.objs[key]
-	if !ok || start < 0 || end >= int64(len(b)) || start > end {
-		return nil, errors.New("no such range")
-	}
-	m.Opened++
-	if m.FailAfter > 0 && m.Opened > m.FailAfter {
-		return nil, errors.New("the read failed")
-	}
-	return io.NopCloser(bytes.NewReader(b[start : end+1])), nil
-}
-
-func (m *Mem) Delete(_ context.Context, keys []string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+func (w *memWriter) Delete(ctx context.Context, keys []string) error {
 	for _, k := range keys {
-		delete(m.objs, k)
-		delete(m.mod, k)
+		if !strings.HasPrefix(k, w.g.Stage) {
+			return ErrDenied
+		}
 	}
-	return nil
-}
-
-func (m *Mem) DeletePrefix(ctx context.Context, prefix string) error {
-	return m.Delete(ctx, m.Keys(prefix))
+	return w.m.Delete(ctx, keys)
 }

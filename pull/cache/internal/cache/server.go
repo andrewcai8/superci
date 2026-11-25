@@ -56,10 +56,13 @@ type blockInfo struct {
 	size int64
 }
 
-// An entry being saved: where it will be, and its blocks so far (by the id the client's SDK gave each).
+// An entry being saved: where it will be, how it is written, and its blocks so far (by the id the client's SDK
+// gave each).
 type upload struct {
 	mu      sync.Mutex
 	access  Access
+	w       Writer
+	stage   string
 	final   string
 	key     string
 	version string
@@ -71,10 +74,11 @@ type upload struct {
 	done    bool
 }
 
+// A download is of one version of an entry: every range of it is read with that version's ETag, so an entry
+// replaced while it is read ends the download short instead of sending the bytes of two archives.
 type download struct {
-	key  string
+	obj  Object
 	name string
-	size int64
 	made time.Time
 
 	mu       sync.Mutex
@@ -205,7 +209,7 @@ func (s *Server) serveTwirp(w http.ResponseWriter, r *http.Request, method strin
 	case "GetCacheEntryDownloadURL":
 		s.restore(w, r.Context(), access, req)
 	case "CreateCacheEntry":
-		s.begin(w, r.Context(), access, req)
+		s.begin(w, r.Context(), bearer(r), access, req)
 	case "FinalizeCacheEntryUpload":
 		s.finish(w, r.Context(), access, req)
 	default:
@@ -221,7 +225,7 @@ func (s *Server) restore(w http.ResponseWriter, ctx context.Context, a Access, r
 		miss()
 		return
 	}
-	obj, size, matched, found, err := s.lookup(ctx, a, req.Key, req.restore(), req.Version)
+	obj, matched, found, err := s.lookup(ctx, a, req.Key, req.restore(), req.Version)
 	if err != nil {
 		s.logf("restore %q: the bucket could not be read, a miss: %v", req.Key, err)
 		miss()
@@ -235,21 +239,21 @@ func (s *Server) restore(w http.ResponseWriter, ctx context.Context, a Access, r
 	id := randomID()
 	s.mu.Lock()
 	s.gc()
-	s.downloads[id] = &download{key: obj, name: matched, size: size, made: s.now()}
+	s.downloads[id] = &download{obj: obj, name: matched, made: s.now()}
 	s.mu.Unlock()
-	s.logf("restore %q: found %q (%d MB)", req.Key, matched, size>>20)
+	s.logf("restore %q: found %q (%d MB)", req.Key, matched, obj.Size>>20)
 	reply(w, 200, map[string]any{"ok": true, "signed_download_url": s.Base + loadAt + id, "matched_key": matched})
 }
 
-func (s *Server) lookup(ctx context.Context, a Access, key string, restore []string, version string) (obj string, size int64, matched string, found bool, err error) {
+func (s *Server) lookup(ctx context.Context, a Access, key string, restore []string, version string) (obj Object, matched string, found bool, err error) {
 	for _, sc := range a.Scopes {
 		if k := ObjectKey(a.Repo, sc, version, key, s.DefaultBranch); k != "" {
-			n, ok, err := s.Store.Head(ctx, k)
+			o, ok, err := s.Store.Head(ctx, k)
 			if err != nil {
-				return "", 0, "", false, err
+				return Object{}, "", false, err
 			}
 			if ok {
-				return k, n, key, true, nil
+				return o, key, true, nil
 			}
 		}
 		base := ScopePrefix(a.Repo, sc, version, s.DefaultBranch)
@@ -259,7 +263,7 @@ func (s *Server) lookup(ctx context.Context, a Access, key string, restore []str
 			}
 			objs, err := s.Store.List(ctx, base+esc(prefix), maxListed)
 			if err != nil {
-				return "", 0, "", false, err
+				return Object{}, "", false, err
 			}
 			var newest *Object
 			for i := range objs {
@@ -272,17 +276,19 @@ func (s *Server) lookup(ctx context.Context, a Access, key string, restore []str
 				if err != nil {
 					continue
 				}
-				return newest.Key, newest.Size, name, true, nil
+				return *newest, name, true, nil
 			}
 		}
 	}
-	return "", 0, "", false, nil
+	return Object{}, "", false, nil
 }
 
-// begin starts a save in the job's own scope. A scope the token cannot write to is refused as GitHub's service
-// says it ("cache write denied:", which actions/cache v5 and later tell apart from a key being saved already).
-func (s *Server) begin(w http.ResponseWriter, ctx context.Context, a Access, req twirpRequest) {
-	sc, ok := a.Writable()
+// begin starts a save in the job's own scope, written with credentials for that scope alone. A scope the token
+// cannot write to is refused as GitHub's service says it ("cache write denied:", which actions/cache v5 and later
+// tell apart from a key being saved already).
+func (s *Server) begin(w http.ResponseWriter, ctx context.Context, token string, a Access, req twirpRequest) {
+	sc, _ := a.Writable()
+	g, ok := GrantFor(a, s.DefaultBranch)
 	if !ok {
 		s.logf("save %q: denied: the token has no scope it may write", req.Key)
 		reply(w, 200, map[string]any{"ok": false, "message": "cache write denied: this job's token can read the cache, not write it"})
@@ -305,10 +311,16 @@ func (s *Server) begin(w http.ResponseWriter, ctx context.Context, a Access, req
 		reply(w, 200, map[string]any{"ok": false})
 		return
 	}
+	wr, err := s.Store.Writer(ctx, token, g)
+	if err != nil {
+		s.logf("save %q: no credentials to write with, not saved: %v", req.Key, err)
+		reply(w, 200, map[string]any{"ok": false})
+		return
+	}
 	id := randomID()
 	s.mu.Lock()
 	s.gc()
-	s.uploads[id] = &upload{access: a, final: final, key: req.Key, version: req.Version, blocks: map[string]blockInfo{}, began: s.now()}
+	s.uploads[id] = &upload{access: a, w: wr, stage: g.Stage + id + "/", final: final, key: req.Key, version: req.Version, blocks: map[string]blockInfo{}, began: s.now()}
 	s.mu.Unlock()
 	s.logf("save %q: begun in %s", req.Key, sc.Name)
 	reply(w, 200, map[string]any{"ok": true, "signed_upload_url": s.Base + uploadAt + id})
@@ -394,7 +406,7 @@ func (s *Server) finish(w http.ResponseWriter, ctx context.Context, a Access, re
 		return
 	}
 	began := s.now()
-	err := s.Store.Assemble(ctx, u.final, parts)
+	err := u.w.Assemble(ctx, u.final, parts)
 	switch {
 	case errors.Is(err, ErrExists):
 		s.logf("save %q: another job saved it first", req.Key)
@@ -410,10 +422,14 @@ func (s *Server) finish(w http.ResponseWriter, ctx context.Context, a Access, re
 	}
 	// The blocks are of no use now, whichever way it ended. (Off this goroutine: it holds u.mu, and findUpload takes
 	// s.mu and then u.mu.)
+	staged := make([]string, 0, len(u.blocks))
+	for _, b := range u.blocks {
+		staged = append(staged, b.key)
+	}
 	go func() {
 		c, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
-		_ = s.Store.DeletePrefix(c, StagingRoot+id+"/")
+		_ = u.w.Delete(c, staged)
 		s.mu.Lock()
 		delete(s.uploads, id)
 		s.mu.Unlock()
@@ -441,15 +457,16 @@ func (s *Server) serveDownload(w http.ResponseWriter, r *http.Request, id string
 	h := w.Header()
 	h.Set("Accept-Ranges", "bytes")
 	h.Set("Content-Type", "application/octet-stream")
-	start, end, partial, ok := byteRange(r.Header.Get("Range"), d.size)
+	size := d.obj.Size
+	start, end, partial, ok := byteRange(r.Header.Get("Range"), size)
 	if !ok {
-		h.Set("Content-Range", fmt.Sprintf("bytes */%d", d.size))
+		h.Set("Content-Range", fmt.Sprintf("bytes */%d", size))
 		http.Error(w, "a range outside the entry", http.StatusRequestedRangeNotSatisfiable)
 		return
 	}
 	h.Set("Content-Length", strconv.FormatInt(end-start+1, 10))
 	if partial {
-		h.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, d.size))
+		h.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
 	}
 	status := http.StatusOK
 	if partial {
@@ -459,7 +476,7 @@ func (s *Server) serveDownload(w http.ResponseWriter, r *http.Request, id string
 	case http.MethodHead:
 		w.WriteHeader(status)
 	case http.MethodGet:
-		if d.size == 0 {
+		if size == 0 {
 			w.WriteHeader(status)
 			return
 		}
@@ -469,7 +486,7 @@ func (s *Server) serveDownload(w http.ResponseWriter, r *http.Request, id string
 		d.mu.Unlock()
 		began := s.now()
 		w.WriteHeader(status)
-		n, err := s.stream(r.Context(), w, d.key, start, end)
+		n, err := s.stream(r.Context(), w, d.obj, start, end)
 		if err != nil {
 			s.logf("restore %q: cut short after %d of %d bytes: %v", d.name, n, end-start+1, err)
 		}
@@ -489,10 +506,10 @@ func (s *Server) served(d *download, began time.Time, n int64) {
 	d.inflight--
 	d.ranges++
 	d.sent += n
-	if d.sent >= d.size && !d.logged {
+	if size := d.obj.Size; d.sent >= size && !d.logged {
 		d.logged = true
 		secs := s.now().Sub(d.first).Seconds()
-		s.logf("restore %q: sent %d MB in %.1f s (%.0f MB/s) as %d reads, at most %d at once", d.name, d.size>>20, secs, rate(d.size, secs), d.ranges, d.peak)
+		s.logf("restore %q: sent %d MB in %.1f s (%.0f MB/s) as %d reads, at most %d at once", d.name, size>>20, secs, rate(size, secs), d.ranges, d.peak)
 	}
 }
 
@@ -568,13 +585,13 @@ func (s *Server) serveBlob(w http.ResponseWriter, r *http.Request, id string) {
 	q := rawQuery(r.URL.RawQuery)
 	switch q["comp"] {
 	case "":
-		s.putBlock(w, r, id, u, "")
+		s.putBlock(w, r, u, "")
 	case "block":
 		if q["blockid"] == "" {
 			http.Error(w, "no block id", 400)
 			return
 		}
-		s.putBlock(w, r, id, u, q["blockid"])
+		s.putBlock(w, r, u, q["blockid"])
 	case "blocklist":
 		var list struct {
 			Items []struct {
@@ -599,7 +616,7 @@ func (s *Server) serveBlob(w http.ResponseWriter, r *http.Request, id string) {
 }
 
 // putBlock stages a block as an object of its own. "" is a Put Blob: the whole archive, a list of itself.
-func (s *Server) putBlock(w http.ResponseWriter, r *http.Request, id string, u *upload, blockID string) {
+func (s *Server) putBlock(w http.ResponseWriter, r *http.Request, u *upload, blockID string) {
 	if r.ContentLength > maxBlock {
 		http.Error(w, "a block too large", 413)
 		return
@@ -623,8 +640,8 @@ func (s *Server) putBlock(w http.ResponseWriter, r *http.Request, id string, u *
 		sum := sha256.Sum256([]byte(blockID))
 		name = "b" + hex.EncodeToString(sum[:8])
 	}
-	key := StagingRoot + id + "/" + name
-	if err := s.Store.Put(r.Context(), key, body); err != nil {
+	key := u.stage + name
+	if err := u.w.Put(r.Context(), key, body); err != nil {
 		s.logf("save %q: a block could not be kept: %v", u.key, err)
 		http.Error(w, "the bucket could not take the block", 503)
 		return

@@ -58,3 +58,22 @@ func TestObjectKeyRefusesWhatGitHubRefuses(t *testing.T) {
 		t.Errorf("a name past S3's limit was taken: %d bytes", len(k))
 	}
 }
+
+func TestGrantIsTheWritableScopeOnly(t *testing.T) {
+	pr := Access{Repo: "77", Scopes: []Scope{{"refs/pull/7/merge", true}, {"refs/heads/main", false}}}
+	if g, ok := GrantFor(pr, "main"); !ok || g != (Grant{Entries: "v1/r/77/refs%2Fpull%2F7%2Fmerge/", Stage: "u/77/refs%2Fpull%2F7%2Fmerge/"}) {
+		t.Fatalf("pull request grant = %+v %v", g, ok)
+	}
+	main := Access{Repo: "77", Scopes: []Scope{{"refs/heads/main", true}}}
+	if g, _ := GrantFor(main, "main"); g.Entries != "v1/d/77/refs%2Fheads%2Fmain/" || g.Stage != "u/77/refs%2Fheads%2Fmain/" {
+		t.Fatalf("main grant = %+v", g)
+	}
+	if _, ok := GrantFor(Access{Repo: "77", Scopes: []Scope{{"refs/heads/main", false}}}, "main"); ok {
+		t.Fatal("a read-only token has a grant")
+	}
+	// No character of a scope survives into a grant that IAM reads as a wildcard or a policy variable.
+	g, _ := GrantFor(Access{Repo: "1", Scopes: []Scope{{"refs/heads/*?${aws:username}", true}}}, "main")
+	if strings.ContainsAny(g.Entries+g.Stage, "*?${}") {
+		t.Fatalf("grant %+v", g)
+	}
+}

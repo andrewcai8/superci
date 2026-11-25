@@ -9,10 +9,10 @@ import (
 func TestEvictTakesOtherScopesOldestFirstThenTheDefaultBranch(t *testing.T) {
 	at := time.Unix(1000, 0)
 	objs := []Object{
-		{"v1/d/1/main/v/old", 10, at},
-		{"v1/r/1/pr1/v/a", 10, at.Add(2 * time.Hour)},
-		{"v1/r/1/pr2/v/b", 10, at.Add(1 * time.Hour)},
-		{"v1/d/1/main/v/new", 10, at.Add(3 * time.Hour)},
+		{"v1/d/1/main/v/old", 10, at, ""},
+		{"v1/r/1/pr1/v/a", 10, at.Add(2 * time.Hour), ""},
+		{"v1/r/1/pr2/v/b", 10, at.Add(1 * time.Hour), ""},
+		{"v1/d/1/main/v/new", 10, at.Add(3 * time.Hour), ""},
 	}
 	if got := Evict(objs, 40); got != nil {
 		t.Fatalf("under the cap: %v", got)

@@ -2,6 +2,7 @@ package cache_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -173,6 +175,10 @@ func TestSaveAndRestoreInBlocks(t *testing.T) {
 	if keys := r.mem.Keys("v1/"); len(keys) != 1 || keys[0] != "v1/d/77/refs%2Fheads%2Fmain/"+version+"/bun-abc" {
 		t.Fatalf("the entry is at %v", keys)
 	}
+	// (The blocks are deleted off the request's goroutine.)
+	for end := time.Now().Add(2 * time.Second); len(r.mem.Keys("u/")) != 0 && time.Now().Before(end); {
+		runtime.Gosched()
+	}
 	if left := r.mem.Keys("u/"); len(left) != 0 {
 		t.Fatalf("blocks left behind: %v", left)
 	}
@@ -259,7 +265,8 @@ func TestForgedTokensAreRefused(t *testing.T) {
 	parts := strings.Split(good, ".")
 	widened := parts[0] + "." + base64.RawURLEncoding.EncodeToString([]byte(`{"iss":"`+cache.GitHubIssuer+`","repository_id":"77","ac":"[{\"Scope\":\"refs/heads/main\",\"Permission\":3}]","exp":9999999999}`)) + "." + parts[2]
 	none := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`)) + "." + parts[1] + "."
-	for name, tok := range map[string]string{"another key": other, "another issuer": wrongIss, "expired": expired, "claims changed after signing": widened, "no algorithm": none, "not a token": "x", "none": ""} {
+	noExpiry := r.signer.Sign(map[string]any{"iss": cache.GitHubIssuer, "repository_id": "77", "ac": cachetest.AC("refs/heads/main:rw")})
+	for name, tok := range map[string]string{"another key": other, "another issuer": wrongIss, "expired": expired, "claims changed after signing": widened, "no algorithm": none, "no expiry": noExpiry, "not a token": "x", "none": ""} {
 		if code, _ := r.twirp(tok, "CreateCacheEntry", map[string]any{"key": "k", "version": version}); code != 401 {
 			t.Errorf("%s: status %d, want 401", name, code)
 		}
@@ -388,5 +395,67 @@ func TestRangesAsTheClientAsksThem(t *testing.T) {
 		if resp.StatusCode != c.status || c.status == 206 && string(got) != c.want {
 			t.Errorf("%s: status %d, %q; want %d, %q", c.header, resp.StatusCode, got, c.status, c.want)
 		}
+	}
+}
+
+// A job's writes go through a writer for its own grant: a pull request's save is made with credentials that can
+// reach only its own scope's entries and its own staged blocks, never main's.
+func TestAJobWritesWithItsOwnScopesGrantOnly(t *testing.T) {
+	r := newRig(t)
+	pr := r.token("77", "refs/pull/7/merge:rw", "refs/heads/main:r")
+	if !r.save(pr, "deps", [][]byte{[]byte("aaaa"), []byte("bb")}, false) {
+		t.Fatalf("not saved:\n%s", r.log)
+	}
+	want := cache.Grant{Entries: "v1/r/77/refs%2Fpull%2F7%2Fmerge/", Stage: "u/77/refs%2Fpull%2F7%2Fmerge/"}
+	if len(r.mem.Granted) != 1 || r.mem.Granted[0] != want {
+		t.Fatalf("writers made for %+v, want one for %+v", r.mem.Granted, want)
+	}
+	if keys := r.mem.Keys("v1/"); len(keys) != 1 || !strings.HasPrefix(keys[0], want.Entries) {
+		t.Fatalf("the entry is at %v", keys)
+	}
+}
+
+func TestNoWriterNoSave(t *testing.T) {
+	r := newRig(t)
+	tok := r.token("77", "refs/heads/main:rw")
+	srv := r.srv.Config.Handler.(*cache.Server)
+	srv.Store = noWriter{r.mem}
+	if r.save(tok, "k", [][]byte{[]byte("x")}, true) {
+		t.Fatal("saved without credentials to write with")
+	}
+	if keys := r.mem.Keys(""); len(keys) != 0 {
+		t.Fatalf("written: %v", keys)
+	}
+}
+
+type noWriter struct{ *cachetest.Mem }
+
+func (noWriter) Writer(context.Context, string, cache.Grant) (cache.Writer, error) {
+	return nil, fmt.Errorf("the broker refused")
+}
+
+func TestRefusalsNameTheTokensIssuerAndKey(t *testing.T) {
+	r := newRig(t)
+	wrongIss := r.signer.Mint("https://vstoken.example", "77", cachetest.AC("refs/heads/main:rw"), time.Now().Add(time.Hour))
+	r.twirp(wrongIss, "CreateCacheEntry", map[string]any{"key": "k", "version": version})
+	if !strings.Contains(r.log.String(), `iss "https://vstoken.example", kid "k1"`) {
+		t.Fatalf("the refusal does not name the token's issuer and key:\n%s", r.log)
+	}
+	if strings.Contains(r.log.String(), wrongIss) {
+		t.Fatal("the token itself was logged")
+	}
+}
+
+func TestAVerifierWithoutAnIssuerTakesNoToken(t *testing.T) {
+	signer := cachetest.NewSigner("k1")
+	jwks := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.Write(signer.JWKS()) }))
+	defer jwks.Close()
+	v := &cache.Verifier{JWKSURL: jwks.URL}
+	if _, err := v.Verify(signer.Mint("", "77", cachetest.AC("refs/heads/main:rw"), time.Now().Add(time.Hour))); err == nil {
+		t.Fatal("a verifier with no issuer took a token with none")
+	}
+	v.Issuer = cache.GitHubIssuer
+	if _, err := v.Verify(signer.Mint(cache.GitHubIssuer, "77", cachetest.AC("refs/heads/main:rw"), time.Now().Add(time.Hour))); err != nil {
+		t.Fatalf("a good token was refused: %v", err)
 	}
 }
