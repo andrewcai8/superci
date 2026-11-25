@@ -3,6 +3,7 @@
 //	pullcache serve    the cache service, on the machine's private address
 //	pullcache wrap D   put it in front of the runner's Node (D: the runner's externals folder)
 //	pullcache janitor  keep the bucket under a size
+//	pullcache hydrate M R   unpack the entries manifest M names under R, before the machine asks for its runner
 //
 // As `node` (a wrapped Node) it becomes the real Node, with the job's cache service pointed here. As `bootstrap` it
 // is a Lambda function: the broker (PULLCACHE_LAMBDA=broker), which gives a job credentials to write its own scope,
@@ -11,6 +12,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -54,7 +56,7 @@ func main() {
 	}
 	lg := log.New(os.Stderr, "pullcache: ", log.LstdFlags|log.Lmicroseconds)
 	if len(os.Args) < 2 {
-		lg.Fatal("usage: pullcache serve | wrap <externals> | janitor")
+		lg.Fatal("usage: pullcache serve | wrap <externals> | janitor | hydrate <manifest> <root>")
 	}
 	var err error
 	switch os.Args[1] {
@@ -67,6 +69,8 @@ func main() {
 		err = cache.Wrap(os.Args[2])
 	case "janitor":
 		err = janitor(lg, os.Args[2:])
+	case "hydrate":
+		err = hydrate(lg, os.Args[2:])
 	default:
 		err = fmt.Errorf("not a command: %s", os.Args[1])
 	}
@@ -151,4 +155,48 @@ func janitor(lg *log.Logger, args []string) error {
 		lg.Printf("janitor: %d entries deleted, %d MB freed", n, freed>>20)
 	}
 	return err
+}
+
+// hydrate unpacks a manifest's entries before the machine asks for its runner (boot.sh), with the machine's read-only
+// role. boot.sh runs it as the runner's user, so what it writes is the job's own. It stops at -timeout; an entry it
+// had not finished is left in a .tmp- directory no job takes. What became of each entry goes to <root>/.hydrated.json.
+func hydrate(lg *log.Logger, args []string) error {
+	fs := flag.NewFlagSet("hydrate", flag.ExitOnError)
+	timeout := fs.Duration("timeout", 100*time.Second, "give up on what is not done by then")
+	_ = fs.Parse(args)
+	if fs.NArg() != 2 {
+		return fmt.Errorf("usage: pullcache hydrate [-timeout d] <manifest> <root>")
+	}
+	raw, err := os.ReadFile(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	m, err := cache.ParseManifest(raw)
+	if err != nil {
+		return err
+	}
+	bucket, region := os.Getenv("PULLCACHE_BUCKET"), os.Getenv("PULLCACHE_REGION")
+	if bucket == "" || region == "" {
+		return fmt.Errorf("PULLCACHE_BUCKET and PULLCACHE_REGION are not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+	st, err := s3store.New(ctx, bucket, bucket+"-stage", region, nil)
+	if err != nil {
+		return err
+	}
+	began := time.Now()
+	h := &cache.Hydrator{Reader: st, DefaultBranch: env("PULLCACHE_DEFAULT_BRANCH", "main"), Root: fs.Arg(1), Log: lg,
+		ToolCache: env("RUNNER_TOOL_CACHE", "/opt/hostedtoolcache"), Platform: cache.ThisPlatform()}
+	res := h.Run(ctx, m)
+	lg.Printf("hydrate: %d entries in %.1f s", len(res), time.Since(began).Seconds())
+	b, err := json.MarshalIndent(map[string]any{"seconds": time.Since(began).Seconds(), "entries": res}, "", "  ")
+	if err != nil {
+		return err
+	}
+	at := filepath.Join(fs.Arg(1), ".hydrated.json")
+	if err := os.WriteFile(at+".new", b, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(at+".new", at)
 }

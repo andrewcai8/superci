@@ -17,7 +17,11 @@ const (
 
 // stream sends bytes start..end of one version of an object to w, in order, reading the chunks of it concurrently.
 func (s *Server) stream(ctx context.Context, w io.Writer, obj Object, start, end int64) (int64, error) {
-	chunk, ahead := s.ReadChunk, s.ReadAhead
+	return readTo(ctx, s.Store, s.ReadChunk, s.ReadAhead, w, obj, start, end)
+}
+
+// readTo is stream over any reader of the bucket: chunk and ahead of zero are the defaults.
+func readTo(ctx context.Context, r Reader, chunk int64, ahead int, w io.Writer, obj Object, start, end int64) (int64, error) {
 	if chunk <= 0 {
 		chunk = defaultChunk
 	}
@@ -25,7 +29,7 @@ func (s *Server) stream(ctx context.Context, w io.Writer, obj Object, start, end
 		ahead = defaultAhead
 	}
 	if end-start < chunk {
-		body, err := s.Store.Open(ctx, obj.Key, obj.ETag, start, end)
+		body, err := r.Open(ctx, obj.Key, obj.ETag, start, end)
 		if err != nil {
 			return 0, err
 		}
@@ -67,7 +71,7 @@ func (s *Server) stream(ctx context.Context, w io.Writer, obj Object, start, end
 			go func() {
 				defer wg.Done()
 				defer close(sl.done)
-				body, err := s.Store.Open(ctx, obj.Key, obj.ETag, from, to)
+				body, err := r.Open(ctx, obj.Key, obj.ETag, from, to)
 				if err != nil {
 					sl.err = err
 					return

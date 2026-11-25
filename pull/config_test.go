@@ -3,6 +3,8 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"testing"
 	"time"
 )
@@ -93,6 +95,22 @@ func TestAnOverrideWithATypoOrAShortHourlyArrayIsRefused(t *testing.T) {
 		}
 		if _, err := LoadConfig(path); err == nil {
 			t.Fatalf("%s: accepted %s", name, body)
+		}
+	}
+}
+
+func TestEachSetsMachinesReadTheirOwnLabelsManifest(t *testing.T) {
+	cfg, err := LoadConfig("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, label := range []string{"superci-2cpu", "superci-4cpu"} {
+		got := bootData(cfg, "https://203.0.113.1:8443", "sha256//pin", label)
+		if left := regexp.MustCompile(`@[A-Z_]+@`).FindString(got); left != "" {
+			t.Fatalf("%s: a placeholder is left: %s", label, left)
+		}
+		if !strings.Contains(got, "/hydrate/"+label+".json") {
+			t.Fatalf("%s: the machine does not read its own label's manifest", label)
 		}
 	}
 }
