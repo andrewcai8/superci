@@ -9,6 +9,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"time"
@@ -41,6 +42,9 @@ type Config struct {
 	MarginMin    int                   `json:"margin_minutes"`
 	MaxAgeHours  float64               `json:"max_age_hours"`
 	Rerun        bool                  `json:"rerun_lost_jobs"`
+	// Only, when set, keeps just the sizes it names (and their pools): a second deployment for a test serves one label of
+	// its own, not every built-in size, which would carry the same labels as the production sets.
+	Only []string `json:"only"`
 }
 
 // SizeConfig is one runner size: the label jobs ask for is its key (superci-<cpu>cpu).
@@ -112,7 +116,21 @@ func LoadConfig(path string) (Config, error) {
 			}
 		}
 	}
+	c.keepOnly()
 	return c, c.validate()
+}
+
+// keepOnly drops the sizes and pools Only does not name.
+func (c *Config) keepOnly() {
+	if len(c.Only) == 0 {
+		return
+	}
+	for l := range c.Sizes {
+		if !slices.Contains(c.Only, l) {
+			delete(c.Sizes, l)
+			delete(c.Pools, l)
+		}
+	}
 }
 
 // decodeStrict decodes one JSON object over c, refusing a field Config does not have.
