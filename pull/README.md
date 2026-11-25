@@ -328,7 +328,7 @@ of that time unpacking main's caches, so the job's setup takes them with a renam
   PR's save can become what another machine's job starts from. `pullcache hydrate` refuses any other scope unless
   `PULLCACHE_HYDRATE_ANY_SCOPE=1`, which only a dev listener's A/B sets.
 - **When.** `boot.sh` registers the machine's runner at once (launch to runner online is what a plain machine's is)
-  and starts `pullcache hydrate` beside it, in its own process group, as the `runner` user, for at most 100 s. Hydration
+  and starts `pullcache hydrate` beside it, in its own process group, as the `runner` user (`setpriv`, which execs in place, so the group stays whole), for at most 100 s. Hydration
   never gates registration and a failure of it never blocks the machine. Each entry is unpacked in
   `.tmp-<version>-<key>/` and renamed into place whole, so a job sees all of an entry or none of it, whenever it starts.
   `<root>/.hydrated.json` says what became of each entry, how long it took and whether it was stopped. When the
