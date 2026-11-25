@@ -201,3 +201,18 @@ func TestMarksOfOneMachineAreBounded(t *testing.T) {
 		t.Fatalf("wrote %d marks, want the limit %d", len(lines), markLimit)
 	}
 }
+
+func TestAMarkValueIsCutShortSoAJobCannotFillTheListenersDisk(t *testing.T) {
+	now := time.Now()
+	h := &Server{}
+	huge := strings.Repeat("x", 1<<20)
+	lines := capture(t, func() {
+		h.markEvents(&Set{spec: SetSpec{Name: "s"}}, &Machine{ID: "i-huge"}, now, "cache.restore="+epoch(now)+"=1="+huge, "")
+	})
+	if len(lines) != 1 {
+		t.Fatalf("want the one mark, cut short: %d lines", len(lines))
+	}
+	if v := lines[0]["val"].(string); len(v) != markValMax {
+		t.Fatalf("a mark value of 1 MiB was written as %d bytes, want at most %d", len(v), markValMax)
+	}
+}
