@@ -47,7 +47,8 @@ func marked(uses map[cache.Object][]time.Time) cache.Marks {
 			objs = append(objs, cache.Object{Key: cache.MarkKey(o.Key, d)})
 		}
 	}
-	return cache.ReadMarks(objs)
+	marks, _ := cache.ReadMarks(objs, t0)
+	return marks
 }
 
 func names(plan []cache.Victim) []string {
@@ -189,6 +190,30 @@ func TestTheLeastRecentlyRestoredGoesFirstAndAMarkerSavesAnEntry(t *testing.T) {
 	plan = cache.Plan([]cache.Object{a, b, c}, nil, cache.Policy{CapBytes: 2 * gib}, t0)
 	if got := names(plan); !reflect.DeepEqual(got, []string{"tool-a"}) {
 		t.Fatalf("without markers the order is the save age: lost %v", got)
+	}
+}
+
+func TestAMarkerDatedAheadCountsForNothingAndIsDeleted(t *testing.T) {
+	m := cachetest.NewMem()
+	oldSeed := plant(m, entry(main, "git-seed-v1-Linux-X64-10000000001", gib, ago(20*day)))
+	newSeed := plant(m, entry(main, "git-seed-v1-Linux-X64-10000000002", gib, ago(hour)))
+	hot := plant(m, entry(main, "tool-hot", gib, ago(5*day)))
+	m.Set(cache.MarkKey(hot.Key, ago(hour)), nil, ago(hour))
+	forged := cache.MarkKey(oldSeed.Key, time.Date(9999, 12, 31, 0, 0, 0, 0, time.UTC))
+	m.Set(forged, nil, ago(hour))
+	stuffed := cache.MarkKey(newSeed.Key, ago(hour))
+	m.Set(stuffed, make([]byte, 64), ago(hour))
+	m.Set(cache.MarkRoot+"not-a-marker", make([]byte, 64), ago(hour))
+
+	rep, err := cache.Janitor(context.Background(), sized{m, gib}, cache.Policy{CapBytes: 2 * gib, MaxIdle: 30 * day}, t0, false, log.New(&tape{}, "", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if left := m.Keys("v1/"); !slices.Contains(left, newSeed.Key) || slices.Contains(left, oldSeed.Key) {
+		t.Fatalf("a marker dated ahead kept the old seed and cost main its newest: left %v (report %+v)", left, rep)
+	}
+	if marks := m.Keys(cache.MarkRoot); !reflect.DeepEqual(marks, []string{cache.MarkKey(hot.Key, ago(hour))}) {
+		t.Fatalf("only real markers outlive a janitor run: %v", marks)
 	}
 }
 
