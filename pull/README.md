@@ -74,3 +74,28 @@ the scale set and every resource tagged `purpose=superci-pull`.
 
 Load test: `bench/workflow.py BRANCH superci-pull-4cpu 4 250` writes the 1,000-job workflow;
 `bench/measure.py RUN_ID listener.jsonl` measures a run against the pass bar.
+
+## Measured (Nov 25 2026, megpt-mono, 4 x 250 jobs sleeping 60-120 s)
+
+| Run | Jobs | Queue wait p50 / p90 / max | On-demand | Registrations | Orphans at +10 min |
+| --- | --- | --- | --- | --- | --- |
+| Cold, pool 0 (45554738472) | 1,000 / 1,000 succeeded | 75 / 316 / 356 s | 0 of 1,063 | 1,023 made, 268 refused by GitHub | 3 machines and runners (stale statistics; fixed since) |
+| Warm, pool of 1,000 (45559227065) | 1,000 / 1,000 succeeded | 31 / 48 / 316 s | 0 of 431 | 1,021 made over 16 min, 0 refused, at most 399 in 5 min | none |
+| Two runs at once, pool of 300 (45562163344, 45562164825) | 300 / 300 | 7 and 16 / 13 and 20 s | 0 | 300 | |
+
+Two limits of GitHub's, not of this design, set those numbers:
+
+- **Registrations: 1,500 runners configured per 5 minutes across the organization, about 5 a second, shared with
+  every other registrant.** GitHub's refusal is `ConfigureTooManyRunnersException: You have configured more than 1500
+  runners within the last 5 minutes`. Runner ids are one sequence for the organization, and their advance shows the
+  rest of the organization registering 3.9 a second before the cold run; while the cap held, no other runner in the
+  organization registered at all. A just-in-time runner takes one job, so a cold burst starts at most as fast as
+  the organization's share of the cap allows: here 290 at once, then 5 a second. Registrations made ahead of
+  demand (the warm pool, paced at 1 a second) avoid it.
+- **Hand-out: about 15 jobs a second per scale set.** Against 1,000 idle runners, jobs started at exactly 80 per
+  5 s; two runs at once shared the same 15 a second. A 1,000-job burst on one label therefore needs about 66 s to
+  start however many runners wait, so its median wait cannot be under 10 s.
+
+Launches were never the limit: 1,000 spot machines were up within 53 s of the jobs being queued, across 7 zones of
+both regions, with no on-demand fallback. us-east-1's instant fleets answer slowly (28-33 s for 66-449 machines;
+us-east-2 took 7 s for 225), which the launcher absorbs by running rounds in parallel.
