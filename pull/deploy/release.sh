@@ -1,34 +1,32 @@
 #!/bin/bash
-# Releases the listener of a build (build.sh): uploads the binary, its RELEASE.json (commit, build time, sha256; see
-# manifest.sh, which refuses a commit that is not a clean one of origin's main), the units and scripts, and (when
-# given) the override config to the release bucket, then restarts the listener on its instance (which fetches them at boot too, so a replacement runs the same).
-# An override config is uploaded only if the new binary, run on the listener, accepts it.
+# Releases the listener tree of a release directory (build.sh; see release-lib.sh): writes its bin/RELEASE.json
+# (manifest.sh, which refuses a commit not on andrewcai8/superci main and any file that is not the commit's), checks
+# the override config with the new binary on the listener, uploads the tree to the release bucket from the directory
+# (RELEASE.json last), installs the binary on the listener only if its sha256 is the manifest's, restarts it, and ends
+# with verify-release.sh listener, failing if that fails. The instance fetches the same files at boot, so a
+# replacement runs the same. A rollback is a release of an older commit of main: build.sh <dir> <commit>, then this.
 #
-#   pull/deploy/release.sh <directory built by build.sh> [config.json] [ssh command for the listener, e.g. pull/deploy/ssh.sh]
+#   pull/deploy/release.sh <release directory> pull/deploy/ssh.sh
 set -euo pipefail
-DIR=${1:?directory built by build.sh}
-BIN=$DIR/superci-pull
-CONFIG=${2:-}
-SSH=${3:-}
+DIR=${1:?release directory built by build.sh}
+SSH=${2:?ssh command for the listener, e.g. pull/deploy/ssh.sh}
 A="aws --profile ci-runners"
 [ "$($A sts get-caller-identity --query Account --output text)" = 243891825325 ] || { echo "refusing: not ci-runners" >&2; exit 1; }
-B=s3://superci-pull-243891825325
+here=$(cd "$(dirname "$0")" && pwd)
+. "$here/release-lib.sh"
+B=s3://$LISTENER_BUCKET
+T=$DIR/listener
 # The listener refuses to start without its claims bucket (claims.go), so a release before up.sh made it is an outage.
 $A s3api get-bucket-policy --bucket superci-pull-claims-243891825325 --query Policy --output text | grep -q if-none-match || { echo "refusing: the claims bucket or its policy is missing; run pull/deploy/up.sh first" >&2; exit 1; }
-here=$(cd "$(dirname "$0")" && pwd)
-"$here/manifest.sh" "$DIR" superci-pull > "$DIR/RELEASE.json"
-if [ -n "$CONFIG" ]; then
-  [ -n "$SSH" ] || { echo "refusing: an override config is checked on the listener, so give its ssh command" >&2; exit 1; }
-  $SSH "cat > /tmp/superci-pull.check && chmod 755 /tmp/superci-pull.check" < "$BIN"
-  $SSH "/tmp/superci-pull.check -validate -config /dev/stdin" < "$CONFIG" || { echo "refusing: $CONFIG is invalid" >&2; exit 1; }
-fi
-$A s3 cp --quiet "$BIN" $B/bin/superci-pull
-$A s3 cp --quiet "$DIR/RELEASE.json" $B/bin/RELEASE.json
-for f in superci-pull.service superci-pull-sync.service superci-pull-sync.timer superci-pull-health.service superci-pull-health.timer sync.sh health.sh cloudwatch-agent.json logrotate.conf; do
-  $A s3 cp --quiet "$here/$f" $B/deploy/$f
-done
-[ -n "$CONFIG" ] && $A s3 cp --quiet "$CONFIG" $B/config/config.json
-echo "released $(cat "$DIR/RELEASE.json") to $B"
-if [ -n "$SSH" ]; then
-  $SSH "set -e; sudo aws s3 cp --quiet $B/bin/superci-pull /usr/local/bin/superci-pull.new && sudo install -m 755 /usr/local/bin/superci-pull.new /usr/local/bin/superci-pull && sudo /usr/local/bin/superci-pull-sync && sudo systemctl restart superci-pull && systemctl is-active superci-pull && /usr/local/bin/superci-pull -version"
-fi
+"$here/manifest.sh" "$DIR" listener > "$T/bin/RELEASE.json.new"
+mv "$T/bin/RELEASE.json.new" "$T/bin/RELEASE.json"
+want=$(release_json_sha "$T/bin/RELEASE.json" bin/superci-pull)
+$SSH "cat > /tmp/superci-pull.check && chmod 755 /tmp/superci-pull.check" < "$T/bin/superci-pull"
+$SSH "/tmp/superci-pull.check -validate -config /dev/stdin" < "$T/config/config.json" || { echo "refusing: config/config.json is invalid" >&2; exit 1; }
+(cd "$T" && find . -type f ! -path ./bin/RELEASE.json | sed 's|^\./||' | LC_ALL=C sort) | while read -r k; do $A s3 cp --quiet "$T/$k" "$B/$k"; done
+$A s3 cp --quiet "$T/bin/RELEASE.json" "$B/bin/RELEASE.json"
+echo "released $(cat "$T/bin/RELEASE.json") to $B"
+$SSH "set -e; sudo aws s3 cp --quiet $B/bin/superci-pull /usr/local/bin/superci-pull.new
+[ \"\$(sha256sum < /usr/local/bin/superci-pull.new | cut -d' ' -f1)\" = $want ] || { echo 'refusing: the bucket binary is not the one RELEASE.json names'; exit 1; }
+sudo install -m 755 /usr/local/bin/superci-pull.new /usr/local/bin/superci-pull && sudo /usr/local/bin/superci-pull-sync && sudo systemctl restart superci-pull && systemctl is-active superci-pull"
+"$here/verify-release.sh" listener

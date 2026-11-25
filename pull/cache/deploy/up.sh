@@ -11,7 +11,8 @@
 # Run again at will: it changes nothing that exists but the policies, settings and code, which it writes anew.
 # Prints ids, never a secret.
 #
-#   pull/cache/deploy/up.sh          the functions' code is bin/pullcache-lambda-arm64.zip in each region's bucket
+#   pull/cache/deploy/up.sh          the functions' code is bin/pullcache-lambda-arm64.zip in each region's bucket, taken only
+#                                    with the sha256 its bin/RELEASE.json names (pull/cache/deploy/release.sh writes both)
 #   CAP_GB=1000                      what the janitor keeps of a region's entries at most
 #   MAX_IDLE=720h                    an entry nobody restored for this long is deleted whatever the size
 #   ISSUER=<iss>                     the issuer the job tokens carry, where it is not GitHub's (https://token.actions.githubusercontent.com):
@@ -33,6 +34,7 @@ MIRROR=superci-pull-cache-mirror
 CAP_GB=${CAP_GB:-1000}
 MAX_IDLE=${MAX_IDLE:-720h}
 here=$(cd "$(dirname "$0")" && pwd)
+. "$here/../../deploy/release-lib.sh"
 bucket() { echo "superci-pull-cache-$ACCOUNT-$1"; }
 arn() { echo "arn:aws:iam::$ACCOUNT:role/$1"; }
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
@@ -179,23 +181,29 @@ if $A iam get-role --role-name superci-pull-cache-replication >/dev/null 2>&1; t
   $A iam delete-role --role-name superci-pull-cache-replication && echo "deleted role superci-pull-cache-replication"
 fi
 
+# release_zip region: the region's bin/pullcache-lambda-arm64.zip, fetched to $tmp/fn-<region>.zip only if its sha256
+# is the one the bucket's bin/RELEASE.json names; the functions take that file, so what was checked is what runs.
+release_zip() {
+  local r=$1 b; b=$(bucket "$1")
+  $A s3 cp --quiet --region "$r" "s3://$b/bin/RELEASE.json" "$tmp/release-$r.json" 2>/dev/null || { echo "refusing: no bin/RELEASE.json in $b; release with pull/cache/deploy/release.sh" >&2; return 1; }
+  $A s3 cp --quiet --region "$r" "s3://$b/bin/pullcache-lambda-arm64.zip" "$tmp/fn-$r.zip" 2>/dev/null || { echo "refusing: no bin/pullcache-lambda-arm64.zip in $b" >&2; return 1; }
+  local want got; want=$(release_json_sha "$tmp/release-$r.json" bin/pullcache-lambda-arm64.zip); got=$(sha256sum "$tmp/fn-$r.zip" | cut -d' ' -f1)
+  [ -n "$want" ] && [ "$got" = "$want" ] || { echo "refusing: bin/pullcache-lambda-arm64.zip in $b has sha256 $got, its RELEASE.json says ${want:-nothing}" >&2; return 1; }
+}
+
 # function name region env memory timeout
 function_up() {
-  local name=$1 r=$2 env=$3 mem=$4 timeout=$5 b; b=$(bucket "$2")
-  local code="S3Bucket=$b,S3Key=bin/pullcache-lambda-arm64.zip"
-  if ! $A s3api head-object --region "$r" --bucket "$b" --key bin/pullcache-lambda-arm64.zip >/dev/null 2>&1; then
-    echo "function $name $r: no bin/pullcache-lambda-arm64.zip in $b yet, skipped"; return 1
-  fi
+  local name=$1 r=$2 env=$3 mem=$4 timeout=$5 zip=$tmp/fn-$2.zip
   $A logs create-log-group --region "$r" --log-group-name "/aws/lambda/$name" --tags purpose=superci-pull-cache 2>/dev/null || true
   $A logs put-retention-policy --region "$r" --log-group-name "/aws/lambda/$name" --retention-in-days 14
   if $A lambda get-function --region "$r" --function-name "$name" >/dev/null 2>&1; then
-    $A lambda update-function-code --region "$r" --function-name "$name" --s3-bucket "$b" --s3-key bin/pullcache-lambda-arm64.zip >/dev/null
+    $A lambda update-function-code --region "$r" --function-name "$name" --zip-file "fileb://$zip" >/dev/null
     $A lambda wait function-updated-v2 --region "$r" --function-name "$name"
     $A lambda update-function-configuration --region "$r" --function-name "$name" --environment "$env" --memory-size "$mem" --timeout "$timeout" >/dev/null
   else
     for _ in 1 2 3 4 5 6; do # (a new role is not at once usable by Lambda)
       $A lambda create-function --region "$r" --function-name "$name" --runtime provided.al2023 --architectures arm64 --handler bootstrap \
-        --role "$(arn "$name")" --code "$code" --environment "$env" --memory-size "$mem" --timeout "$timeout" --tags purpose=superci-pull-cache >/dev/null 2>&1 && break
+        --role "$(arn "$name")" --zip-file "fileb://$zip" --environment "$env" --memory-size "$mem" --timeout "$timeout" --tags purpose=superci-pull-cache >/dev/null 2>&1 && break
       sleep 10
     done
   fi
@@ -206,6 +214,7 @@ function_up() {
 case ${ISSUER:-} in *[,{}\ ]*) echo "refusing: ISSUER holds a comma, a brace or a space" >&2; exit 1 ;; esac
 for r in $REGIONS; do
   b=$(bucket "$r")
+  release_zip "$r" || exit 1
   jwks=""; [ -n "${BROKER_JWKS_URL:-}" ] && jwks=",PULLCACHE_JWKS_URL=$BROKER_JWKS_URL"
   case ${ISSUER:-} in
     "") ;;

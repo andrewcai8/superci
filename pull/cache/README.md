@@ -246,15 +246,16 @@ workload costs storage, which the cap bounds, not requests. Each further TB of c
 ## Deploy
 
 ```bash
-pull/deploy/build.sh /tmp/release           # the daemons, the functions' code (the same program, named bootstrap) and the
-                                             # machine start script, built on a tagged instance, each carrying its commit
-pull/cache/deploy/release.sh /tmp/release    # to each bucket's bin/, with bin/RELEASE.json; a clean commit of main only
+pull/deploy/build.sh /tmp/release [commit]  # a commit of main: the daemons, the functions' code (the same program, named
+                                             # bootstrap) and the machine start script, each binary carrying the commit
+pull/cache/deploy/release.sh /tmp/release    # each bucket's bin/ with bin/RELEASE.json, then up.sh, then verify-release.sh cache
 pull/cache/deploy/up.sh                      # endpoints, buckets, roles, functions, schedules, in both regions; run again at will
 ```
 
 `pullcache version` prints the commit a daemon was built from, and `serve` and each function log it at start
 (`-X main.revision=<sha>`; `-trimpath` keeps it out of `go version -m`). `bin/RELEASE.json` names the commit, the build
-time and each file's sha256.
+time and each file's sha256; a machine runs only the daemon it names, and `up.sh` puts only its zip on the functions.
+The release, its checks and its rollback are in the listener's README (Release).
 
 `deploy/down.sh` removes the endpoints, functions, schedules and roles and keeps the buckets; `-buckets` removes those
 too.
