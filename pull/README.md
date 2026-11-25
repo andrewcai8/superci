@@ -141,7 +141,7 @@ launch time up to and including it, taken at the 88th percentile (`quantile`), a
 burst of the last 5 minutes (`hold_minutes`: a pool runner retired is a registration and a boot spent for nothing).
 The launch time is the set's own: the 90th percentile, over its last 64 launches, from the launch call to the runner's
 registration, so it follows the image, hydration and the registration budget. Until a set has eight launches it is
-`ready_seconds` (45). A job arrives with its first JobAvailable or JobAssigned; GitHub assigns a set's jobs without
+`ready_seconds` (22). A job arrives with its first JobAvailable or JobAssigned; GitHub assigns a set's jobs without
 offering them first, and a job is known by its job id. Before Nov 25 19:00Z every arrival (and every `QueueWait`)
 read as none and each pool stayed at its floor; the load tests above pinned their pools, which hid it.
 

@@ -72,7 +72,7 @@
     "quantile": 0.88,
     "window_minutes": 30,
     "hold_minutes": 5,
-    "ready_seconds": 45,
+    "ready_seconds": 22,
     "lead_minutes": 15
   },
   "registration": {
