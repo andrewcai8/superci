@@ -91,7 +91,9 @@ GitHub refuses runner registrations past 1,500 in 5 minutes across the whole org
 (`ConfigureTooManyRunnersException`), JIT runners of scale sets included, and Blacksmith's runners register in our
 organization too. Runner ids are one sequence for the organization, so the advance of the highest id is everyone's
 rate. The listener learns the highest id from each of its own registrations (exact) and, when it registers rarely,
-from a listing of the organization's runners (every 100 s at most). Everyone else's rate is the advance less ours.
+from a probe: a runner registered and removed at once, whose id is the head, exact (every 100 s at most, inside the
+budget and counted as ours). A listing of every organization runner (44 pages at 4,300 runners, about 1,600 of the
+App's shared 5,000 requests an hour at that pace) is only the fallback. Everyone else's rate is the advance less ours.
 
 - The spare rate is `cap x (1 - margin) / window - others' rate`: with the defaults (1,500, 20%, 300 s) we register
   only into what keeps the organization as a whole under 4 a second; when the others alone reach 4, we register none.
