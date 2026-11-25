@@ -35,6 +35,8 @@ alarm spend-daily "Today's estimated spend passed 80% of the daily cap ($DAILY)"
   SpendTodayUSD Maximum GreaterThanThreshold "$(( DAILY * 8 / 10 ))" 300 1 1 notBreaching
 alarm spend-capped "A spend cap is reached: the listener launches nothing and keeps no pool until the day or month turns, or the cap is raised" \
   SpendCapped Maximum GreaterThanOrEqualToThreshold 1 300 1 1 notBreaching
+alarm launch-shortfall "EC2 started fewer machines than asked for 15 minutes running (spot capacity, or a quota: vCPUs, gp3 storage)" \
+  LaunchShortfall Sum GreaterThanThreshold 0 300 3 3 notBreaching
 alarm org-rate-unknown "The listener has not measured the organization's registration rate for 15 minutes, so it registers at its blind rate only" \
   OrgRateKnown Maximum LessThanThreshold 1 300 3 3 notBreaching
 echo "topic: $TOPIC"

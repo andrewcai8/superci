@@ -93,6 +93,7 @@ type Listener struct {
 	rerun      *Rerunner
 	reconciled time.Time
 	strays     map[string]*Machine // machines of no configured set, by id
+	short      int                 // machines asked of EC2 and not started (capacity, quotas), since the metrics last took them
 }
 
 const group = 1 // the organization's Default runner group, which every repository may use
@@ -429,6 +430,9 @@ func (l *Listener) launcher(ctx context.Context, s *Set, wake chan struct{}) {
 			now := time.Now()
 			got := s.fleet.Launch(ctx, round, n, s.state.OnDemandRoom(l.config().OnDemand, n, now))
 			s.state.Launched(round, got, now)
+			l.mu.Lock()
+			l.short += n - len(got)
+			l.mu.Unlock()
 			slog.Info("launched", "set", s.spec.Name, "round", round, "asked", n, "got", len(got), "ms", time.Since(now).Milliseconds())
 			if len(got) < n {
 				time.Sleep(5 * time.Second)
@@ -760,6 +764,7 @@ func (l *Listener) metrics() Metrics {
 			m.Orphans++
 		}
 	}
+	m.Short, l.short = l.short, 0
 	l.mu.Unlock()
 	return m
 }

@@ -24,6 +24,7 @@ type Metrics struct {
 	Regs    int       // registrations GitHub made this minute
 	Refused int       // registrations GitHub refused this minute
 	Failed  int       // registrations that failed otherwise this minute
+	Short   int       // machines asked of EC2 this minute that did not start (capacity, quotas)
 }
 
 func publish(ctx context.Context, cw *cloudwatch.Client, m Metrics, now time.Time) {
@@ -39,6 +40,7 @@ func publish(ctx context.Context, cw *cloudwatch.Client, m Metrics, now time.Tim
 		d("Registrations", float64(m.Regs), cwtypes.StandardUnitCount),
 		d("RegistrationRefusals", float64(m.Refused), cwtypes.StandardUnitCount),
 		d("RegistrationErrors", float64(m.Failed), cwtypes.StandardUnitCount),
+		d("LaunchShortfall", float64(m.Short), cwtypes.StandardUnitCount),
 		d("Orphans", float64(m.Orphans), cwtypes.StandardUnitCount),
 		d("SpendTodayUSD", m.Spend.DayUSD, cwtypes.StandardUnitNone),
 		d("SpendMonthUSD", m.Spend.MonthUSD, cwtypes.StandardUnitNone),
