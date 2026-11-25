@@ -234,6 +234,19 @@ Spot prices on Nov 25 2026 08:00Z (median of each size's 10 cheapest pools), wit
 A busy hour costs what its jobs run for at those prices, plus about 30 s of boot and shutdown per job (a machine runs
 one job), plus the pool. `SpendPerHourUSD` is the listener's live figure.
 
+## Known limits
+
+- **GitHub's registration cap is the fleet's real limit.** Every job is a JIT registration, and the rest of the
+  organization used 2 to 4.9 of GitHub's 5 a second through the morning. Moving jobs from Blacksmith moves their
+  registrations, so ramp the fleet switch gradually and watch `OthersRegistrationRate`; adding load (a test) needs
+  a pool registered ahead.
+- **gp3 storage.** 40-150 GB disks use 50 TiB per region at about 800 machines; the quota is now 200 TiB in us-east-1
+  and 100 TiB in us-east-2 (`LaunchShortfall` and its alarm show the next limit hit).
+- **Spot vCPU quotas** are 15,000 (us-east-1) and 5,000 (us-east-2); the region weights (2:1) follow them.
+- **The re-run list is in memory**, so a job lost in the minutes before a restart stays failed.
+- **SSH** uses the key pair `superci-pull` and the admin address `up.sh` was given; the alarms' topic has no
+  subscriber until one is added.
+
 ## Measured (Nov 25 2026, megpt-mono)
 
 | Test | Run | Result |
@@ -243,6 +256,37 @@ one job), plus the pool. `SpendPerHourUSD` is the listener's live figure.
 | Crash mid-run, 30 jobs over every size | 45569779369 | `kill -9` of the process at 07:39:39, then the listener's instance terminated at 07:40:40: 30/30 succeeded; at +10 min, 0 orphaned machines, 0 orphaned runners, and `Orphans` 0 in every period |
 | Listener down (stopped 08:24:59 to 08:28:47) | | `superci-pull-listener-down` went to ALARM at 08:28:40 and back to OK at 08:30:40 (on `FILL(Heartbeat, 0)`; a plain heartbeat alarm stayed OK through an earlier 5-minute outage) |
 | Spot reclaim mid-job (AWS FIS `send-spot-instance-interruptions`, role `superci-pull-fis`) | 45573133090 | the notice reached the listener 25 s after it was sent; AWS took the machine 2 min later and GitHub failed the job (attempt 1); the listener re-ran it 5 s after the run completed, and attempt 2 succeeded on another machine |
+
+### Load test: 5 jobs a second for 10 minutes, mixed sizes, and a 200-job matrix burst
+
+`bench/replay.sh` pushed one run every 10 s to `ci/superci-load-pull-<n>` (60 waves of 50 jobs: 12 at 2 vCPU, 27
+at 4, 9 at 8, 1 at 16, 1 at 32; each job sleeps 30-90 s), and after wave 30 one run of a 200-leg matrix on
+`superci-4cpu` (split in two sets). Every job adds a registration the organization would not otherwise make, so the
+pool was registered ahead, into the spare rate only, as the pool rule does before a busy hour (floors 670, 1,690,
+500, 30 and 30, and `pool_share` 0.9). For run 1 that took 07:53-10:00Z, mostly at 0.2-0.5 a second while the rest
+of the organization ran at 3.5-4.9 a second (4.94 at 08:33, past GitHub's cap on its own), and stopped for 10
+minutes at 50 TiB of gp3 per region (raised to 200 and 100 TiB); for run 2 it took 10:25-10:36Z, with the rest of
+the organization at about 2 a second.
+
+| | Run 2 (45596611275..45598160040, 10:36-10:48Z) | Run 1 (45590743411..45592336094, 10:00-10:15Z) |
+| --- | --- | --- |
+| Jobs | 3,200 / 3,200 succeeded | 3,198 / 3,200 (2 failed) |
+| Queue wait p50 / p90 / p99 / max | 2 / 3 / 6 / 22 s | 2 / 3 / 6 / 308 s |
+| The 200-job burst, p50 / p90 / max | 4 / 6 / 7 s | 4 / 6 / 308 s |
+| Registrations during the test | 1,125 made, 0 refused | 1,113 made, 0 refused |
+| On-demand | 0 of 2,352 machines (all spot; 8 zones, 54 types) | 0 of 2,142 |
+| Spot notices (real reclaims) | 124; 12 jobs on noticed machines, all finished before AWS took them | 142 |
+| Organization's registration rate before / during | 3.60 / 3.76 a second (others 2.10 / 2.12, ours 1.47 / 1.63; peak 4.61) | 3.49 / 3.94 (others 2.86 / 2.53, ours 0.62 / 1.42; peak 4.53) |
+
+Run 1 found a bug: a listing paged while runners come and go misses some, an idle pool runner never asks, and the
+listener ended 969 machines whose runner one listing missed, two as their runner took a job (both jobs failed) and
+others just after GitHub handed them one (15 jobs waited 303 s for GitHub to hand them on). Run 2 is after the fix
+(a missed runner is checked with GitHub before its machine ends).
+
+Returning to the built-in config after run 2 (pools to their floors, the split back to one set) left 1,300 idle
+runners to remove. The reconciler removed them one at a time, a pass took over a minute, the health check failed
+five times, and the Auto Scaling group replaced the instance (11:05:47, back in about 90 s). Removals and checks now
+run 16 at a time.
 
 Crash details. systemd restarted the process in 5 s. GitHub refused its sessions as conflicts while the dead
 process's lapsed: 30 to 47 s per set. In that time the guard held every machine at Wait; no machine was told to end

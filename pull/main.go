@@ -527,12 +527,16 @@ func (l *Listener) reconciler(ctx context.Context, refresh func(context.Context,
 							own[name] = r
 						}
 					}
+					var stale []ListedRunner
 					for _, o := range s.state.Listed(own, now) {
 						if !o.Busy {
-							err := l.client.RemoveRunner(ctx, o.ID)
-							slog.Info("remove stale runner", "set", s.spec.Name, "runner", o.Name, "err", errString(err))
+							stale = append(stale, o)
 						}
 					}
+					parallel(stale, func(o ListedRunner) {
+						err := l.client.RemoveRunner(ctx, o.ID)
+						slog.Info("remove stale runner", "set", s.spec.Name, "runner", o.Name, "err", errString(err))
+					})
 				}
 			}
 		}
@@ -564,12 +568,13 @@ func (l *Listener) reconciler(ctx context.Context, refresh func(context.Context,
 				slog.Warn("stuck", "set", s.spec.Name, "machine", m.ID, "region", m.Region, "age_s", int(now.Sub(m.Launched).Seconds()))
 			}
 			l.checkGone(ctx, s, unlisted)
-			for _, m := range s.state.Surplus(now, 20*time.Second, 100) {
-				err := l.client.RemoveRunner(ctx, m.Runner.ID)
+			parallel(s.state.Surplus(now, 20*time.Second, 100), func(m *Machine) {
+				r := m.Runner
+				err := l.client.RemoveRunner(ctx, r.ID)
 				removed := err == nil || errors.Is(err, scaleset.RunnerNotFoundError) || errors.Is(err, scaleset.NotFoundError)
 				s.state.Removed(m, removed)
-				slog.Info("surplus", "set", s.spec.Name, "machine", m.ID, "runner", m.Runner.Name, "removed", removed, "err", errString(err))
-			}
+				slog.Info("surplus", "set", s.spec.Name, "machine", m.ID, "runner", r.Name, "removed", removed, "err", errString(err))
+			})
 			end = append(end, s.state.ToEnd(now)...)
 			running = append(running, s.state.Running()...)
 			for _, j := range s.state.TakeLost() {
@@ -609,29 +614,36 @@ func (l *Listener) reconciler(ctx context.Context, refresh func(context.Context,
 	}
 }
 
-// checkGone asks GitHub about each runner a listing did not show, eight at a time and at most 100 a pass: a runner
-// GitHub no longer has ends its machine, one it has was missed by the listing.
+// checkGone asks GitHub about each runner a listing did not show, at most 100 a pass: a runner GitHub no longer has
+// ends its machine, one it has was missed by the listing.
 func (l *Listener) checkGone(ctx context.Context, s *Set, ms []*Machine) {
-	sem := make(chan struct{}, 8)
-	var wg sync.WaitGroup
-	for i, m := range ms {
+	for _, m := range ms[min(len(ms), 100):] {
+		s.state.Gone(m, m.Runner, false)
+	}
+	parallel(ms[:min(len(ms), 100)], func(m *Machine) {
 		r := m.Runner
-		if i >= 100 {
-			s.state.Gone(m, r, false)
-			continue
+		_, err := l.client.GetRunner(ctx, int(r.ID))
+		gone := errors.Is(err, scaleset.RunnerNotFoundError) || errors.Is(err, scaleset.NotFoundError)
+		s.state.Gone(m, r, gone)
+		if gone {
+			slog.Warn("stuck", "set", s.spec.Name, "machine", m.ID, "runner", r.Name, "why", "runner gone")
+		} else if err != nil {
+			slog.Info("runner check", "set", s.spec.Name, "runner", r.Name, "err", err.Error())
 		}
+	})
+}
+
+// parallel calls f on every item, 16 at a time, and returns when all are done: a reconcile pass that removes or
+// checks hundreds of runners (a pool shrinking at the end of a busy hour) stays well under the health check's minute.
+func parallel[T any](items []T, f func(T)) {
+	sem := make(chan struct{}, 16)
+	var wg sync.WaitGroup
+	for _, it := range items {
 		wg.Add(1)
 		sem <- struct{}{}
 		go func() {
 			defer func() { <-sem; wg.Done() }()
-			_, err := l.client.GetRunner(ctx, int(r.ID))
-			gone := errors.Is(err, scaleset.RunnerNotFoundError) || errors.Is(err, scaleset.NotFoundError)
-			s.state.Gone(m, r, gone)
-			if gone {
-				slog.Warn("stuck", "set", s.spec.Name, "machine", m.ID, "runner", r.Name, "why", "runner gone")
-			} else if err != nil {
-				slog.Info("runner check", "set", s.spec.Name, "runner", r.Name, "err", err.Error())
-			}
+			f(it)
 		}()
 	}
 	wg.Wait()
