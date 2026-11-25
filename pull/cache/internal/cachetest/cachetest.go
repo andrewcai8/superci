@@ -200,15 +200,38 @@ func (m *Mem) Open(_ context.Context, key, etag string, start, end int64) (io.Re
 	return io.NopCloser(bytes.NewReader(b[start : end+1])), nil
 }
 
-// Delete is the janitor's: it may delete any entry.
-func (m *Mem) Delete(_ context.Context, keys []string) error {
+// Delete is the janitor's: it deletes each object that is still the version listed (by ETag), as the bucket's
+// conditional delete does, and says what it did to each.
+func (m *Mem) Delete(_ context.Context, objs []cache.Object) ([]cache.Removal, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for _, k := range keys {
-		delete(m.objs, k)
-		delete(m.mod, k)
-		delete(m.saved, k)
-		delete(m.tags, k)
+	got := make([]cache.Removal, len(objs))
+	for i, o := range objs {
+		switch tag, ok := m.tags[o.Key]; {
+		case !ok:
+			got[i] = cache.Gone
+		case tag != o.ETag:
+			got[i] = cache.Changed
+		default:
+			m.remove(o.Key)
+		}
+	}
+	return got, nil
+}
+
+func (m *Mem) remove(key string) {
+	delete(m.objs, key)
+	delete(m.mod, key)
+	delete(m.saved, key)
+	delete(m.tags, key)
+}
+
+// CreateMark writes an empty object at key unless there is one (the machine's marker write).
+func (m *Mem) CreateMark(_ context.Context, key string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.objs[key]; !ok {
+		m.set(key, nil, m.Clock())
 	}
 	return nil
 }
@@ -259,11 +282,16 @@ func (w *memWriter) Assemble(_ context.Context, final string, parts []cache.Part
 	return nil
 }
 
-func (w *memWriter) Delete(ctx context.Context, keys []string) error {
+func (w *memWriter) Delete(_ context.Context, keys []string) error {
 	for _, k := range keys {
 		if !strings.HasPrefix(k, w.g.Stage) {
 			return ErrDenied
 		}
 	}
-	return w.m.Delete(ctx, keys)
+	w.m.mu.Lock()
+	defer w.m.mu.Unlock()
+	for _, k := range keys {
+		w.m.remove(k)
+	}
+	return nil
 }

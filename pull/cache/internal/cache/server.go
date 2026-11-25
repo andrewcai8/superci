@@ -44,6 +44,9 @@ type Server struct {
 	// ReadChunk and ReadAhead set how a large read of an entry is split (see stream); zero is the default.
 	ReadChunk int64
 	ReadAhead int
+	// Uses, when set, is told of each entry a restore returns, so that the janitor can tell a used entry from one
+	// that only sits there.
+	Uses *Uses
 
 	proxy     *httputil.ReverseProxy
 	mu        sync.Mutex
@@ -241,6 +244,9 @@ func (s *Server) restore(w http.ResponseWriter, ctx context.Context, a Access, r
 	s.gc()
 	s.downloads[id] = &download{obj: obj, name: matched, made: s.now()}
 	s.mu.Unlock()
+	if s.Uses != nil {
+		s.Uses.Hit(obj.Key)
+	}
 	s.logf("restore %q: found %q (%d MB)", req.Key, matched, obj.Size>>20)
 	reply(w, 200, map[string]any{"ok": true, "signed_download_url": s.Base + loadAt + id, "matched_key": matched})
 }
