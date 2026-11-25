@@ -143,6 +143,12 @@ func (sr *setRegion) ensureTemplate(ctx context.Context, r *Region, name, userDa
 	got, err := r.ec2.DescribeLaunchTemplates(ctx, &ec2.DescribeLaunchTemplatesInput{LaunchTemplateNames: []string{name}})
 	if err == nil && len(got.LaunchTemplates) == 1 {
 		sr.template = aws.ToString(got.LaunchTemplates[0].LaunchTemplateId)
+		// A start makes a version only when the machines' data changed (a template keeps at most 10,000).
+		latest, err := r.ec2.DescribeLaunchTemplateVersions(ctx, &ec2.DescribeLaunchTemplateVersionsInput{LaunchTemplateId: aws.String(sr.template), Versions: []string{"$Latest"}})
+		if err == nil && len(latest.LaunchTemplateVersions) == 1 && sameData(latest.LaunchTemplateVersions[0].LaunchTemplateData, data) {
+			sr.version = fmt.Sprint(aws.ToInt64(latest.LaunchTemplateVersions[0].VersionNumber))
+			return nil
+		}
 		v, err := r.ec2.CreateLaunchTemplateVersion(ctx, &ec2.CreateLaunchTemplateVersionInput{LaunchTemplateId: aws.String(sr.template), LaunchTemplateData: data})
 		if err != nil {
 			return err
@@ -158,6 +164,20 @@ func (sr *setRegion) ensureTemplate(ctx context.Context, r *Region, name, userDa
 	sr.template = aws.ToString(made.LaunchTemplate.LaunchTemplateId)
 	sr.version = fmt.Sprint(aws.ToInt64(made.LaunchTemplate.LatestVersionNumber))
 	return nil
+}
+
+// sameData says whether a template version holds what a new version would: image, user data, security group, disk
+// and metadata options.
+func sameData(have *ec2types.ResponseLaunchTemplateData, want *ec2types.RequestLaunchTemplateData) bool {
+	if have == nil || have.MetadataOptions == nil || len(have.BlockDeviceMappings) != 1 || have.BlockDeviceMappings[0].Ebs == nil {
+		return false
+	}
+	h, w := have.BlockDeviceMappings[0], want.BlockDeviceMappings[0]
+	return aws.ToString(have.ImageId) == aws.ToString(want.ImageId) && aws.ToString(have.UserData) == aws.ToString(want.UserData) &&
+		slices.Equal(have.SecurityGroupIds, want.SecurityGroupIds) && aws.ToString(h.DeviceName) == aws.ToString(w.DeviceName) &&
+		aws.ToInt32(h.Ebs.VolumeSize) == aws.ToInt32(w.Ebs.VolumeSize) && aws.ToInt32(h.Ebs.Throughput) == aws.ToInt32(w.Ebs.Throughput) &&
+		aws.ToInt32(have.MetadataOptions.HttpPutResponseHopLimit) == aws.ToInt32(want.MetadataOptions.HttpPutResponseHopLimit) &&
+		string(have.MetadataOptions.HttpTokens) == string(want.MetadataOptions.HttpTokens)
 }
 
 // findPools pairs each machine type with the default subnet of every zone that offers it.

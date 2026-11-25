@@ -16,8 +16,15 @@ alarm() { # name description metric statistic comparison threshold period evalua
     --treat-missing-data "${10}" --alarm-actions "$TOPIC" --ok-actions "$TOPIC" --tags Key=purpose,Value=superci-pull
   echo "alarm superci-pull-$1"
 }
-alarm listener-down "No heartbeat from the listener for 3 minutes: the process or its instance is down (systemd and the Auto Scaling group should bring it back)" \
-  Heartbeat Sum LessThanThreshold 1 60 3 3 breaching
+# A gap in the heartbeat is filled with zeros: CloudWatch ignores "missing is breaching" while older points remain in
+# its evaluation range, so a plain alarm on Heartbeat stayed OK through a 5-minute outage.
+$A cloudwatch put-metric-alarm --alarm-name superci-pull-listener-down \
+  --alarm-description "No heartbeat from the listener for 3 minutes: the process or its instance is down (systemd and the Auto Scaling group should bring it back)" \
+  --metrics '[{"Id":"beat","MetricStat":{"Metric":{"Namespace":"superci-pull","MetricName":"Heartbeat"},"Period":60,"Stat":"Sum"},"ReturnData":false},
+              {"Id":"filled","Expression":"FILL(beat, 0)","Label":"Heartbeat, gaps as 0","ReturnData":true}]' \
+  --comparison-operator LessThanThreshold --threshold 1 --evaluation-periods 3 --datapoints-to-alarm 3 --treat-missing-data breaching \
+  --alarm-actions "$TOPIC" --ok-actions "$TOPIC" --tags Key=purpose,Value=superci-pull
+echo "alarm superci-pull-listener-down"
 alarm registration-refusals "GitHub refused a runner registration (ConfigureTooManyRunners): the organization reached its cap of 1,500 in 5 minutes" \
   RegistrationRefusals Sum GreaterThanThreshold 0 300 1 1 notBreaching
 alarm queue-wait-p90 "Jobs on superci waited over 60 s at p90 in two 5-minute periods running" \
