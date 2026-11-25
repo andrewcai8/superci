@@ -431,3 +431,32 @@ func TestThePoolShrinksOnlyAfterTheHold(t *testing.T) {
 		t.Fatalf("past the hold: burst %d, want 0", n)
 	}
 }
+
+// F9: a restart lost the bursts and launch times, so the pool fell to its floor for a window.
+func TestARestartStartsFromTheBurstTheLastListenerCarried(t *testing.T) {
+	old := NewState("set", 0, 100, []string{"us-east-1"}, t0)
+	ids := make([]int64, 30)
+	for i := range ids {
+		ids[i] = int64(i)
+	}
+	assigned(old, t0, ids...)
+	for i := 0; i < 8; i++ {
+		m := &Machine{ID: fmt.Sprintf("i-%04d", i), Set: "set", Region: "us-east-1"}
+		old.Launched(fmt.Sprintf("r-%d", i), []*Machine{m}, t0)
+		old.Issue(m, &Runner{ID: int64(i + 1), Name: runnerName("set", m.ID), Issued: t0.Add(30 * time.Second)})
+	}
+	old.Burst(t0.Add(time.Minute), testRule)
+	c := old.Carry()
+	restart := t0.Add(2 * time.Minute)
+	s := NewState("set", 0, 100, []string{"us-east-1"}, restart)
+	s.Resume(c)
+	if n := s.Burst(restart.Add(time.Minute), testRule); n != 25 {
+		t.Fatalf("a minute after the restart, no jobs yet: burst %d, want the 25 carried", n)
+	}
+	if got := s.Snapshot(restart).LaunchS; got != 30 {
+		t.Fatalf("launch time %v s after the restart, want the 30 s carried", got)
+	}
+	if n := s.Burst(restart.Add(31*time.Minute), testRule); n != 0 {
+		t.Fatalf("a window after the restart: burst %d, want 0", n)
+	}
+}
