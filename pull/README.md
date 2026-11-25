@@ -21,9 +21,10 @@ superci-pull: one process on one c7g.large, an Auto Scaling group of one in us-e
   sessions  : one message session per set; a message is acknowledged only after it is handled
   budget    : one registration budget for every set, inside what GitHub leaves the organization (below)
   launcher  : per set, desired = min(max, assigned + waiting + pool); launches desired - live as instant EC2 Fleets
-              of at most 250, price-capacity-optimized over the size's 17-18 types x every zone of us-east-1 (2/3)
-              and us-east-2 (1/3); a region's spot shortfall goes to the other, then on-demand, at most 10% of the
-              last half hour's launches; a ClientToken on every call
+              of at most 250, price-capacity-optimized over the size's 17-18 types x every zone of us-east-1 that
+              offers them (5 of 6: use1-az3 offers none) at weight 2 and of us-east-2 (3 of 3) at weight 1; a
+              region's spot shortfall goes to the other, then on-demand, at most 10% of the last half hour's
+              launches; a ClientToken on every call
   /jit      : POST with the machine's signed identity document; a runner only when the machine holds none
   reconciler: every 10 s lists EC2 and GitHub's runners; adopts, removes stale runners, ends stuck machines, trims
               surplus idle runners (RemoveRunner first), accrues spend, applies the caps
@@ -70,14 +71,15 @@ organization too. Runner ids are one sequence for the organization, so the advan
 rate. The listener learns the highest id from each of its own registrations (exact) and, when it registers rarely,
 from a listing of the organization's runners (every 100 s at most). Everyone else's rate is the advance less ours.
 
-- The spare rate is `cap x (1 - margin) / window - others' rate`: with the defaults (1,500, 20%, 300 s) the
-  organization as a whole is kept under 4 a second, and ours is what that leaves.
+- The spare rate is `cap x (1 - margin) / window - others' rate`: with the defaults (1,500, 20%, 300 s) we register
+  only into what keeps the organization as a whole under 4 a second; when the others alone reach 4, we register none.
 - A registration also needs the window's estimated use, plus those in flight, under `cap x (1 - margin / 2)`.
 - A registration a waiting job needs comes first. A pool registration leaves half the saved-up burst to jobs and
   keeps to its own pace (`pool_rate`, and `pool_share` of the spare).
 - GitHub's refusal stops every registration for 5 s, doubling to a minute while it keeps refusing.
 - Until the rate is measured (90 s after a start) the listener registers at `blind_rate` (0.3/s) at most.
-- The machines a set launches are bounded by what the budget can register in 90 s, so few machines wait unpaid-for.
+- Across every set, machines waiting for a runner are bounded by what the budget registers in 90 s (a waiting machine
+  is paid for). Past twice that, once the rate is measured, machines that have waited three minutes end.
 
 The estimate is published as `OrgRegistrationRate`, `OthersRegistrationRate`, `OurRegistrationRate`,
 `SpareRegistrationRate` and `RegistrationWindowUse`, and logged every 30 s (`"msg":"budget"`).
@@ -129,9 +131,10 @@ deleted at GitHub then, and a job one of their runners held fails, so shrink a s
   $0.058 per vCPU-hour for on-demand; gp3 included). At `daily_usd` (1,000) or `monthly_usd` (15,000) the listener
   launches nothing and keeps no pool; running jobs finish, and queued jobs wait until the day or month turns or the
   cap is raised. It is an estimate made to bound the bill, not the bill.
-- A job whose machine EC2 stops listing while its runner held it (a spot reclaim mid-job) is re-run once, with
-  GitHub's re-run API, when its run has completed and the job did not succeed (GitHub re-runs a job only in a
-  completed run). The list is in memory: a restart forgets it.
+- A job lost to a spot reclaim is re-run once with GitHub's re-run API: a job that completed on a machine AWS gave
+  notice it takes back, or one whose machine EC2 stopped listing before the job completed. It is re-run when its run
+  has completed (GitHub re-runs a job only in a completed run) and only if GitHub's conclusion is not a success, so a
+  job that finished inside the two minutes' notice is left alone. The list is in memory: a restart forgets it.
 
 ### Cache seam
 
@@ -188,10 +191,19 @@ percentiles), `Orphans`, `SpendTodayUSD`, `SpendMonthUSD`, `SpendPerHourUSD`, `S
 `deploy/release.sh <binary> [override.json] ["ssh ec2-user@$L"]` uploads to `s3://superci-pull-243891825325` and
 restarts the listener (a graceful stop closes its sessions, so the next opens at once).
 
-**Roll back.** The bucket is versioned: copy the previous `bin/superci-pull` version over the current one
-(`aws s3api list-object-versions`, then `aws s3api copy-object --copy-source ...?versionId=...`) and restart. To
-stop taking jobs, send a workflow's `runs-on` back to its Blacksmith label (the fleet switch); to stop launching at
-once, `curl -s -X POST 'localhost:8080/override?max=0'` (machines end as their jobs finish).
+**Roll back.** The bucket is versioned, the binary and the override config alike: copy the previous version over the
+current one and restart.
+
+```bash
+B=superci-pull-243891825325
+aws --profile ci-runners s3api list-object-versions --bucket $B --prefix bin/superci-pull --query 'Versions[].[VersionId,LastModified]' --output text
+aws --profile ci-runners s3api copy-object --bucket $B --key bin/superci-pull --copy-source "$B/bin/superci-pull?versionId=<previous>"
+ssh ec2-user@$L "sudo aws s3 cp --quiet s3://$B/bin/superci-pull /usr/local/bin/superci-pull && sudo systemctl restart superci-pull"
+```
+
+To stop taking jobs, send the jobs back to Blacksmith with the fleet switch (megpt-mono's `SUPERCI_JOBS`, which
+since #34100 routes a switched job to `superci-<N>cpu`); to stop launching at once,
+`curl -s -X POST 'localhost:8080/override?max=0'` (machines end as their jobs finish).
 
 **Resilience.** systemd restarts the process (5 s). A health timer marks the instance unhealthy after five failed
 `/healthz` checks and the Auto Scaling group replaces it; the group also replaces an instance EC2 reports down. A
