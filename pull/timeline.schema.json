@@ -2,7 +2,7 @@
   "version": 1,
   "line": "One JSON line of the listener's log, in CloudWatch group /superci-pull/listener: {\"msg\":\"tl\",\"v\":1,\"ev\":<name>,\"t\":<event time, RFC 3339 UTC>,\"t_ms\":<the same in epoch milliseconds>,\"boot\":<the listener process>,\"eid\":<unique to the line>,<fields>}. Append-only: one line per fact, written where the fact happens, with no counter or aggregate. t is when the fact happened by the clock of its source; the log's own time is when it was written. The log ships at least once, so a reader keeps one line of each eid, and takes the first of each (inst, name) for a machine's mark, which a machine resends until the listener answers. Fields are only ever added; a reader ignores the ones it does not know, and v changes when a field's meaning does. Every table and number the timeline tool prints is derived from these lines and the GitHub API, and can be rebuilt from them.",
   "keys": {
-    "job": "rr (runner request id, per scale set) joins every listener event of one job; run and name tie it to GitHub's REST job",
+    "job": "job (GitHub's job GUID) joins every listener event of one job, with the set; run and name tie it to GitHub's REST job. rr, the runner request id, is 0 in the assigned, started and completed messages this listener is sent, so no join uses it",
     "machine": "inst (EC2 instance id) joins every event of one machine; a job meets its machine at job.started (runner = <set>-<inst>)",
     "process": "boot names the listener process that wrote the line; listener.start opens a boot"
   },

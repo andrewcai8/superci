@@ -24,7 +24,7 @@ listener wrote events. `--cache DIR` keeps GitHub's answers (a finished job neve
 | A job's log (`timeline job`) | cache restores of the step logs: key, hit or miss, bytes, seconds |
 
 The log is the system of record. A JobTimeline is derived on each run and never stored; the lines are append-only and keyed
-by the job's runner request id (`rr`) and the machine's instance id (`inst`, which is the runner's name less its set).
+by the job's GUID (`job`, with its set; the runner request id is 0 in the messages this listener gets) and the machine's instance id (`inst`, which is the runner's name less its set).
 
 ## How the seconds are accounted
 
@@ -38,9 +38,10 @@ ec2, machine, network, runner).
   A Blacksmith job expects the API's alone.
 - **`overlap clamped`** is time that two sources disagree on by less than their resolution (GitHub's timestamps are whole
   seconds; a machine's clock may run ahead). It is reported, not hidden.
-- **A machine clock is checked on every post.** `skew_ms` is the listener's clock less the machine's at receipt, plus one way
-  latency; the least of a machine's posts is its offset. Over 250 ms, the machine's marks are moved onto the listener's
-  clock and the job says `clock_corrected`.
+- **A machine clock is corrected on every post.** `skew_ms` is the listener's clock less the machine's at the post that
+  carried a mark, plus one way latency. A machine's clock is seconds off at boot until chrony steps it (1.7 s on the first
+  live run, 36 ms by the end), so each mark moves by the skew of its own post, not by one offset for the machine. A
+  job reports the largest skew, and `clock_corrected` when one passed 250 ms.
 - **Warm or cold** is the machine's launch against the job's creation. With no launch event and a queue wait under 6 s the
   machine is `warm (inferred)`: a machine cannot launch and boot that fast.
 

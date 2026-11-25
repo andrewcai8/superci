@@ -27,12 +27,12 @@ def ev(name, dt_, **kw):
 
 def cold_events():
     return [
-        dict(ev="job.assigned", t=T0 + 0.4, rr=7, set="superci-4cpu", run=9),
+        dict(ev="job.assigned", t=T0 + 0.4, job="g7", set="superci-4cpu", run=9),
         dict(ev="machine.launched", t=T0 + 3.0, inst="i-0abc", requested=T0 + 1.0, region="us-east-2", az="us-east-2a", type="c7i.xlarge", lifecycle="spot", round="r"),
         ev("ec2.state", 1.5, state="pending"), ev("ec2.state", 4, state="running"),
         ev("boot.start", 9, val="3.0", skew_ms=40), ev("cache.start", 9.5), ev("cache.up", 12), ev("doc.got", 12.2), ev("jit.sent", 12.3),
         ev("jit.ask", 12.5, verdict="wait"), ev("jit.granted", 13.0, waited_ms=500), ev("jit.issued", 14, register_ms=1000), ev("jit.answered", 14.2), ev("runner.start", 14.3),
-        ev("runner.online", 17), dict(ev="job.started", t=T0 + 21, inst="i-0abc", run=9, rr=7, set="superci-4cpu", runner_assign_time=T.iso(T0 + 18.5)),
+        ev("runner.online", 17), dict(ev="job.started", t=T0 + 21, inst="i-0abc", run=9, job="g7", set="superci-4cpu", runner_assign_time=T.iso(T0 + 18.5)),
         ev("job.running", 19), ev("machine.ended", 62, why="job done"), ev("ec2.state", 66, state="terminated"),
     ]
 
@@ -117,6 +117,19 @@ class Machine(unittest.TestCase):
         self.assertTrue(tl.attrs["clock_corrected"])
         self.assertEqual(tl.attrs["clock_offset_ms"], 4040)
         self.assertLess(tl.overlap, 0.1)
+
+    def test_a_clock_that_chrony_steps_during_boot_is_corrected_post_by_post(self):
+        events = cold_events()
+        for e in events:
+            if e["ev"] in ("boot.start", "cache.start", "cache.up", "doc.got", "jit.sent"):
+                e["t"] -= 1.7
+                e["skew_ms"] = 1700
+            elif e["ev"] in ("jit.answered", "runner.start", "runner.online", "job.running"):
+                e["skew_ms"] = 40
+        tl = T.build(job(), events)
+        self.assertEqual(tl.attrs["clock_offset_ms"], 1700)
+        self.assertTrue(tl.attrs["clock_corrected"])
+        self.assertLess(tl.overlap, 0.2)
 
     def test_cache_marks_of_the_daemon(self):
         events = cold_events() + [ev("cache.restore", 30, val="hit:1081159529:4500:bun-modules%3Av1")]

@@ -18,7 +18,7 @@ import (
 
 // The job timeline's event log. Each fact about a job or a machine is one JSON line written where it happens (the
 // listener's own log, which the CloudWatch agent ships; a machine's marks arrive at /mark and are written here), keyed
-// by the job's runner request id and the machine's instance id. Lines are never changed or counted; every table the
+// by the job's GUID and the machine's instance id. Lines are never changed or counted; every table the
 // timeline tool prints is derived from them. timeline.schema.json names every event and its fields.
 
 // tlVersion is the schema version every line carries.
