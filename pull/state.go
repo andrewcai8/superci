@@ -28,6 +28,7 @@ type Machine struct {
 	Ending    bool      // told to end, or terminated: no longer supply
 	Ended     time.Time // when TerminateInstances was last asked for it
 	Notice    bool      // AWS gave notice that it takes this spot machine back
+	Missed    int       // complete listings in a row that showed no runner of it while it held none we know of
 }
 
 // A Runner is one just-in-time registration, which takes one job.
@@ -39,6 +40,7 @@ type Runner struct {
 	Done     bool // JobCompleted seen: the machine will ask again
 	Listed   bool // in GitHub's last runner listing
 	Removing bool
+	Checking bool    // asked GitHub whether it still exists, after a listing did not show it
 	Job      *JobRef // the job it took, from JobStarted
 }
 
@@ -464,6 +466,7 @@ func (s *State) Listed(runners map[string]ListedRunner, now time.Time) (orphans 
 			m.Runner.Listed = false
 		}
 	}
+	held := map[*Machine]bool{}
 	stale := map[string]bool{}
 	for name, r := range runners {
 		m := s.machineOf(name)
@@ -472,11 +475,21 @@ func (s *State) Listed(runners map[string]ListedRunner, now time.Time) (orphans 
 			orphans = append(orphans, r)
 		case m.Runner == nil:
 			m.Runner = &Runner{ID: r.ID, Name: name, Issued: now, Busy: r.Busy, Listed: true}
+			held[m] = true
 		case m.Runner.Name == name:
 			m.Runner.Listed = true
 			m.Runner.Busy = m.Runner.Busy || r.Busy
+			held[m] = true
 		default:
 			orphans = append(orphans, r)
+		}
+	}
+	for _, m := range s.machines {
+		switch {
+		case held[m] || m.Runner != nil:
+			m.Missed = 0
+		case now.Sub(m.Launched) > time.Minute:
+			m.Missed++
 		}
 	}
 	for _, o := range orphans {
@@ -512,25 +525,43 @@ func (s *State) Orphans(now time.Time) int {
 	return n
 }
 
-// Stuck is the machines to end without a fence, because they hold no runner that could hold a job: older than the
-// boot grace, they have not asked for a runner lately, and they have no runner, or one that a complete listing of
-// GitHub's, made well after it was issued, no longer shows. A runner seen taking a job and not seen finishing it
-// always keeps its machine.
-func (s *State) Stuck(now time.Time, grace, quiet time.Duration) []*Machine {
+// Stuck finds machines that have not asked for a runner lately and are older than the boot grace. A machine that
+// holds no runner we know of, and of which three complete listings in a row showed none, ends now (a listing paged
+// while runners come and go can miss one, and after a restart a machine's runner is known only from listings). A
+// machine whose runner a listing made well after it was issued did not show is returned to be checked with GitHub
+// first (Gone). A runner seen taking a job and not seen finishing it always keeps its machine.
+func (s *State) Stuck(now time.Time, grace, quiet time.Duration) (ended, unlisted []*Machine) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var out []*Machine
 	for _, m := range s.machines {
 		if m.Ending || now.Sub(m.Launched) < grace || now.Sub(m.Asked) < quiet {
 			continue
 		}
-		r := m.Runner
-		if r == nil || (!(r.Busy && !r.Done) && !r.Listed && s.listedAt.Sub(r.Issued) > quiet) {
+		switch r := m.Runner; {
+		case r == nil && m.Missed >= 3:
 			m.Ending = true
-			out = append(out, m)
+			ended = append(ended, m)
+		case r != nil && !(r.Busy && !r.Done) && !r.Listed && !r.Checking && s.listedAt.Sub(r.Issued) > quiet:
+			r.Checking = true
+			unlisted = append(unlisted, m)
 		}
 	}
-	return out
+	return ended, unlisted
+}
+
+// Gone settles GitHub's answer about a runner a listing did not show: gone, its machine ends (it can hold no job);
+// there, it was missed and is kept.
+func (s *State) Gone(m *Machine, r *Runner, gone bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r.Checking = false
+	if !gone {
+		r.Listed = true
+		return
+	}
+	if m.Runner == r {
+		m.Ending = true
+	}
 }
 
 // Surplus is the idle runners to remove once the supply has exceeded what the queue asks for for a while (the

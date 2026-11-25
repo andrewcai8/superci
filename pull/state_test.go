@@ -116,13 +116,41 @@ func TestOnlyAMachineThatCanHoldNoJobIsStuck(t *testing.T) {
 	give(s, "i-0003", gone)
 
 	later := t0.Add(10 * time.Minute)
-	if got := s.Stuck(later, 5*time.Minute, 3*time.Minute); len(got) != 1 || got[0].ID != "i-0000" {
-		t.Fatalf("before any listing after the runners were issued, only the machine with no runner is stuck: %v", ids(got))
+	if ended, unlisted := s.Stuck(later, 5*time.Minute, 3*time.Minute); len(ended)+len(unlisted) != 0 {
+		t.Fatalf("before any listing, nothing is stuck: %v %v", ids(ended), ids(unlisted))
 	}
-	s.Listed(map[string]ListedRunner{"set-i-0002-bb": {ID: 2, Name: "set-i-0002-bb"}}, later)
-	got := s.Stuck(later, 5*time.Minute, 3*time.Minute)
-	if len(got) != 1 || got[0].ID != "i-0003" {
-		t.Fatalf("stuck %v: want only the machine whose runner finished and is gone (a busy one and a listed one stay)", ids(got))
+	for i := 0; i < 3; i++ {
+		s.Listed(map[string]ListedRunner{"set-i-0002-bb": {ID: 2, Name: "set-i-0002-bb"}}, later.Add(time.Duration(i)*time.Minute))
+	}
+	ended, unlisted := s.Stuck(later.Add(3*time.Minute), 5*time.Minute, 3*time.Minute)
+	if len(ended) != 1 || ended[0].ID != "i-0000" {
+		t.Fatalf("ended %v: want only the machine with no runner that three listings showed none of", ids(ended))
+	}
+	if len(unlisted) != 1 || unlisted[0].ID != "i-0003" {
+		t.Fatalf("to check %v: want only the machine whose finished runner the listings do not show (a busy one and a listed one stay)", ids(unlisted))
+	}
+	s.Gone(unlisted[0], unlisted[0].Runner, false)
+	if snap := s.Snapshot(later); snap.Ending != 1 {
+		t.Fatalf("a runner GitHub still has keeps its machine: %+v", snap)
+	}
+	s.Gone(unlisted[0], unlisted[0].Runner, true)
+	if snap := s.Snapshot(later); snap.Ending != 2 {
+		t.Fatalf("a runner GitHub no longer has ends its machine: %+v", snap)
+	}
+}
+
+func TestOneListingThatMissesAnIdleRunnerEndsNothing(t *testing.T) {
+	s := NewState("set", 1, 10)
+	s.Observe(stats(0, 0), t0)
+	launch(s, machines(1, t0), t0)
+	give(s, "i-0000", &Runner{ID: 9, Name: "set-i-0000-aa", Issued: t0})
+	s.Listed(map[string]ListedRunner{}, t0.Add(10*time.Minute))
+	ended, unlisted := s.Stuck(t0.Add(10*time.Minute), 5*time.Minute, 3*time.Minute)
+	if len(ended) != 0 || len(unlisted) != 1 {
+		t.Fatalf("ended %v, to check %v: an idle pool runner one listing missed is checked, not ended", ids(ended), ids(unlisted))
+	}
+	if ended, unlisted := s.Stuck(t0.Add(11*time.Minute), 5*time.Minute, 3*time.Minute); len(ended)+len(unlisted) != 0 {
+		t.Fatalf("checked twice at once: %v %v", ids(ended), ids(unlisted))
 	}
 }
 
@@ -131,8 +159,8 @@ func TestAMachineThatAskedLatelyIsNotStuck(t *testing.T) {
 	s.Observe(stats(1, 0), t0)
 	launch(s, machines(1, t0), t0)
 	ask(s, "i-0000", t0.Add(9*time.Minute))
-	if got := s.Stuck(t0.Add(10*time.Minute), 5*time.Minute, 3*time.Minute); len(got) != 0 {
-		t.Fatalf("stuck %v", ids(got))
+	if ended, unlisted := s.Stuck(t0.Add(10*time.Minute), 5*time.Minute, 3*time.Minute); len(ended)+len(unlisted) != 0 {
+		t.Fatalf("stuck %v %v", ids(ended), ids(unlisted))
 	}
 }
 
@@ -204,8 +232,8 @@ func TestARestartAdoptsMachinesAndTheirRunners(t *testing.T) {
 	if snap := s.Snapshot(t0.Add(time.Hour)); snap.Machines != 2 || snap.Busy != 1 || snap.Booting != 1 {
 		t.Fatalf("adopted %+v", snap)
 	}
-	if got := s.Stuck(t0.Add(time.Hour+2*time.Minute), 5*time.Minute, 3*time.Minute); len(got) != 0 {
-		t.Fatalf("adopted machines are given the quiet grace from adoption: %v", ids(got))
+	if ended, unlisted := s.Stuck(t0.Add(time.Hour+2*time.Minute), 5*time.Minute, 3*time.Minute); len(ended)+len(unlisted) != 0 {
+		t.Fatalf("adopted machines are given the quiet grace from adoption: %v %v", ids(ended), ids(unlisted))
 	}
 }
 

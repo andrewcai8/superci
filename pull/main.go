@@ -559,9 +559,11 @@ func (l *Listener) reconciler(ctx context.Context, refresh func(context.Context,
 			if stale := s.state.MarkStale(now, 3*time.Minute); stale > 0 {
 				slog.Warn("stale waiting jobs", "set", s.spec.Name, "count", stale)
 			}
-			for _, m := range s.state.Stuck(now, 5*time.Minute, 3*time.Minute) {
+			ended, unlisted := s.state.Stuck(now, 5*time.Minute, 3*time.Minute)
+			for _, m := range ended {
 				slog.Warn("stuck", "set", s.spec.Name, "machine", m.ID, "region", m.Region, "age_s", int(now.Sub(m.Launched).Seconds()))
 			}
+			l.checkGone(ctx, s, unlisted)
 			for _, m := range s.state.Surplus(now, 20*time.Second, 100) {
 				err := l.client.RemoveRunner(ctx, m.Runner.ID)
 				removed := err == nil || errors.Is(err, scaleset.RunnerNotFoundError) || errors.Is(err, scaleset.NotFoundError)
@@ -605,6 +607,34 @@ func (l *Listener) reconciler(ctx context.Context, refresh func(context.Context,
 			}
 		}
 	}
+}
+
+// checkGone asks GitHub about each runner a listing did not show, eight at a time and at most 100 a pass: a runner
+// GitHub no longer has ends its machine, one it has was missed by the listing.
+func (l *Listener) checkGone(ctx context.Context, s *Set, ms []*Machine) {
+	sem := make(chan struct{}, 8)
+	var wg sync.WaitGroup
+	for i, m := range ms {
+		r := m.Runner
+		if i >= 100 {
+			s.state.Gone(m, r, false)
+			continue
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer func() { <-sem; wg.Done() }()
+			_, err := l.client.GetRunner(ctx, int(r.ID))
+			gone := errors.Is(err, scaleset.RunnerNotFoundError) || errors.Is(err, scaleset.NotFoundError)
+			s.state.Gone(m, r, gone)
+			if gone {
+				slog.Warn("stuck", "set", s.spec.Name, "machine", m.ID, "runner", r.Name, "why", "runner gone")
+			} else if err != nil {
+				slog.Info("runner check", "set", s.spec.Name, "runner", r.Name, "err", err.Error())
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 // sampleOrg learns the organization's highest runner id from a listing when our own registrations have not told it
