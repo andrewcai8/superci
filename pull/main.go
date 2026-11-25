@@ -46,6 +46,7 @@ func main() {
 		stateDir     = flag.String("state-dir", "/var/lib/superci-pull", "where the TLS key is kept")
 		listen       = flag.String("listen", ":8443", "address of the machines' endpoint")
 		admin        = flag.String("admin", "127.0.0.1:8080", "address of the operator's endpoint")
+		jitSlots     = flag.Int("jit-concurrency", 64, "most runner registrations in flight at once")
 		deleteSet    = flag.Bool("delete-scale-set", false, "delete the scale set and exit")
 	)
 	flag.Parse()
@@ -53,7 +54,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := run(ctx, options{*org, *installation, *appParam, *name, *maxRunners, *pool, *regBudget, *odFraction,
-		pairs(*regions), strings.Split(*types, ","), pairs(*groups), *publicIP, *maxMinutes, *stateDir, *listen, *admin, *deleteSet}); err != nil && !errors.Is(err, context.Canceled) {
+		pairs(*regions), strings.Split(*types, ","), pairs(*groups), *publicIP, *maxMinutes, *stateDir, *listen, *admin, *jitSlots, *deleteSet}); err != nil && !errors.Is(err, context.Canceled) {
 		slog.Error("exit", "err", err.Error())
 		os.Exit(1)
 	}
@@ -75,6 +76,7 @@ type options struct {
 	stateDir     string
 	listen       string
 	admin        string
+	jitSlots     int
 	deleteSet    bool
 }
 
@@ -147,7 +149,7 @@ func run(ctx context.Context, c options) error {
 	}
 
 	wake := make(chan struct{}, 1)
-	srv := &Server{state: state, fleet: fleet, client: client, setID: set.ID, refresh: refresh, slots: make(chan struct{}, 32)}
+	srv := &Server{state: state, fleet: fleet, client: client, setID: set.ID, refresh: refresh, slots: make(chan struct{}, c.jitSlots)}
 	go serve(ctx, &http.Server{Addr: c.listen, Handler: srv, ReadHeaderTimeout: 10 * time.Second}, &id)
 	go serve(ctx, &http.Server{Addr: c.admin, Handler: Admin(state)}, nil)
 	go launcher(ctx, state, fleet, wake, c.odFraction)
