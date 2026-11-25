@@ -14,6 +14,8 @@ The evidence behind the pool rule (`State.Burst`, the README's Pools section). E
 | Shipped rule | `rule.py DATA CONFIG SHIFT` | the config's rule with launch times SHIFT s longer (19 for hydrated machines) |
 | Cold path | `leadvalue.py DATA` | the cheapest pool's idle $ as the launch time shrinks |
 | Prediction | `predictive.py DATA HOURLY` | the bound on launching ahead for a push's later jobs |
+| Curve | `curve.py DATA HOURLY SHIFT` | idle $ against job and per-push wait, per quantile |
+| Live | `bench/burst.py`, then `bench/burstwait.py BRANCH WARMUP LOG` | a replay's waits, per job and per run |
 
 `DATA/logs/` holds the listener's log events for the canary (`canary.json`, from CloudWatch `/superci-pull/listener`),
 EC2's listing of the machines (`ec2-<region>.json`, read within the hour) and the jobs; `HOURLY` is Blacksmith's
