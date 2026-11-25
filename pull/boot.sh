@@ -7,11 +7,16 @@
 # whatever it is doing.
 exec > >(tee /var/log/superci-pull.log > /dev/console) 2>&1
 ( sleep @LIFE_SECONDS@; poweroff ) > /dev/null 2>&1 &
-printf '%s\n' kernel.apparmor_restrict_unprivileged_userns=0 kernel.apparmor_restrict_unprivileged_unconfined=0 net.ipv4.ip_local_reserved_ports=50000-59999 > /etc/sysctl.d/99-superci.conf
+# vm.dirty_ratio: a job's cache restore untars 1.5 to 2 GB (node_modules, Go's modules and build), which at the default
+# 20% waited on the volume's 250 MB/s; nothing on a one-job machine needs its writes on disk soon.
+printf '%s\n' kernel.apparmor_restrict_unprivileged_userns=0 kernel.apparmor_restrict_unprivileged_unconfined=0 net.ipv4.ip_local_reserved_ports=50000-59999 vm.dirty_ratio=50 > /etc/sysctl.d/99-superci.conf
 sysctl -eqp /etc/sysctl.d/99-superci.conf || :
 usermod -aG docker runner 2> /dev/null || :
 # First reads from a new volume are slow one at a time: the runner's own files are read 64 at a time first.
 find /home/runner/bin -type f -print0 2> /dev/null | xargs -0 -r -P 64 -n 16 cat &> /dev/null
+# The image's files a job reads next, read while the machine waits: the Node every action runs on, git, and Chrome (Go's
+# mongoose tests drive it; read cold it added 1.8 to 4.8 s to them). A cold read of the image goes at about 43 MB/s.
+( find /home/runner/externals /usr/lib/git-core /opt/google/chrome -type f -print0 2> /dev/null | xargs -0 -r -P 32 -n 16 cat &> /dev/null ) &
 L='@LISTENER@'
 PIN='@PIN@'
 T=$(curl -s -m 2 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600' http://169.254.169.254/latest/api/token)
