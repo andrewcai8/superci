@@ -1,0 +1,48 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Launch",
+      "Effect": "Allow",
+      "Action": ["ec2:CreateFleet", "ec2:RunInstances", "ec2:CreateLaunchTemplate", "ec2:CreateLaunchTemplateVersion", "ec2:ModifyLaunchTemplate"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "TagOnlyWhileCreating",
+      "Effect": "Allow",
+      "Action": "ec2:CreateTags",
+      "Resource": "*",
+      "Condition": { "StringEquals": { "ec2:CreateAction": ["CreateFleet", "RunInstances", "CreateLaunchTemplate", "CreateLaunchTemplateVersion"] } }
+    },
+    {
+      "Sid": "EndOnlyOurs",
+      "Effect": "Allow",
+      "Action": ["ec2:TerminateInstances", "ec2:DeleteLaunchTemplate"],
+      "Resource": "*",
+      "Condition": { "StringEquals": { "aws:ResourceTag/purpose": "superci-pull" } }
+    },
+    {
+      "Sid": "Read",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeInstances", "ec2:DescribeImages", "ec2:DescribeLaunchTemplates", "ec2:DescribeLaunchTemplateVersions",
+        "ec2:DescribeSubnets", "ec2:DescribeSecurityGroups", "ec2:DescribeVpcs", "ec2:DescribeInstanceTypeOfferings",
+        "ec2:DescribeSpotPriceHistory", "ec2:DescribeFleets", "ec2:DescribeFleetInstances", "ec2:DescribeInstanceTypes"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AppCredentials",
+      "Effect": "Allow",
+      "Action": "ssm:GetParameter",
+      "Resource": "arn:aws:ssm:us-east-1:243891825325:parameter/superci-pull/github-app"
+    },
+    {
+      "Sid": "FleetAndSpotRoles",
+      "Effect": "Allow",
+      "Action": "iam:CreateServiceLinkedRole",
+      "Resource": "*",
+      "Condition": { "StringEquals": { "iam:AWSServiceName": ["ec2fleet.amazonaws.com", "spot.amazonaws.com"] } }
+    }
+  ]
+}
