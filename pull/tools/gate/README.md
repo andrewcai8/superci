@@ -26,15 +26,22 @@ the same ones each rerun. `<job>` is the job's name, or a matrix job's name for 
 **What counts.** Every attempt of a run is read (`filter=all`), so a failure that a rerun then passed still counts. A job's
 outcome is `success`, `failure` or `timed_out`, and the last two are failures. A rerun attempt keeps its first attempt's
 `created_at`, so only attempts after the first lose their queue wait; their failure and wall time are counted. A `timed_out`
-job's wall time is raised to the job's ceiling, so wall p90 sees it. `cancelled` jobs have no outcome: they are left out of
-every row and reported per fleet (runs and jobs) above the rows.
+job's wall time is raised to the job's ceiling, so wall p90 sees it.
+
+**Cancelled jobs are lower bounds, on both fleets.** A cancelled job has no outcome, but it spent time, and a slow plane that
+gets cancelled must not look fast. A job that started contributes a wall sample of started to completed (and its real queue
+wait); a job cancelled in the queue contributes a queue-wait sample of created to completed (superci's is found by its
+`superci-<n>cpu` label, since it has no runner yet). Whatever cancelled it counts, a newer push superseding the run
+included: the jobs listing cannot tell them apart, and the same rule on Blacksmith keeps the p50 and p90 comparison fair. A
+lower bound only under-reports, so a row that fails on them fails on the real times too. A cancelled job is never a run for
+`n`, never a failure and never excuses one. The per-fleet cancelled counts (runs and jobs) are still printed above the rows.
 
 | Row | Passes when |
 | --- | --- |
 | n | at least 5 superci runs (runs, not shards) |
-| wall p50 | superci p50 of started to completed, over successful runs and timed-out ones at the ceiling, at or below Blacksmith's |
+| wall p50 | superci p50 of started to completed, over successful runs, timed-out ones at the ceiling and cancelled ones at the time they ran, at or below Blacksmith's |
 | wall p90 | at or below the smaller of Blacksmith's p90 x 1.1 and the job's ceiling in `scripts/verify/ci-limits.tsv` on origin/main |
-| queue wait p50, p90 | created to started: p50 at or below Blacksmith's, p90 at or below Blacksmith's plus 3 s |
+| queue wait p50, p90 | created to started (created to completed for a job cancelled in the queue): p50 at or below Blacksmith's, p90 at or below Blacksmith's plus 3 s |
 | failures | at most Blacksmith's failure rate x superci observations + 1; a failure the same commit also has on Blacksmith (main runs there) is not counted. A superci failure never excuses another, main's included |
 | unexplained p50 | under 2 s per `timeline`'s derivation |
 

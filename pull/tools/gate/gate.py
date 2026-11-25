@@ -66,10 +66,12 @@ class Obs:
     branch: str
     fleet: str
     ok: bool
-    queue: "float | None"  # created to started; None for a rerun attempt, whose created_at is its first attempt's
-    wall: float            # started to completed
+    queue: "float | None"  # created to started; None for a rerun attempt, whose created_at is its first attempt's. A job cancelled
+    #                        before it started has created to completed: at least its queue wait, a lower bound
+    wall: "float | None"   # started to completed; None for a job cancelled before it started. For a cancelled job, a lower bound
     timed_out: bool = False
     attempt: int = 1
+    cancelled: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -120,18 +122,29 @@ OUTCOMES = ("success", "failure", "timed_out")
 
 
 def is_obs(job, run):
-    """An Obs from a REST job and its run, or None when the job has no outcome to count: it never started or finished, or
-    GitHub ended it as cancelled or skipped (cancelled jobs are reported per fleet by `cancelled_by_fleet`, not measured).
+    """An Obs from a REST job and its run, or None when the job has nothing to count: it never finished, or GitHub skipped it.
     Every attempt of a run is an observation, so a failure a rerun then passed still counts. A rerun attempt keeps its first
     attempt's created_at, so its queue wait is not real and is None; its failure and its wall time (started_at to completed_at)
-    are real. A timed_out job is a failure."""
+    are real. A timed_out job is a failure.
+
+    A cancelled job has no outcome, but it did spend time, and a plane that is slow and gets cancelled must not look fast. It is
+    an observation of at least what it spent: a job that started contributes wall = started to completed (its queue wait is real);
+    one cancelled in the queue contributes queue = created to completed and no wall. Both fleets get this rule, whatever
+    cancelled the job (a newer push superseding the run is not distinguishable from any other cancel in the jobs listing, and
+    the same rule on both fleets keeps the p50 and p90 comparison fair). A lower bound can only under-report, so a row that fails
+    on lower bounds fails on the real times too; a cancelled job is never a failure and never counts as a run."""
     attempt = job.get("run_attempt") or 1
-    if not job.get("completed_at") or not job.get("started_at") or job.get("conclusion") not in OUTCOMES:
+    cancelled = job.get("conclusion") == "cancelled"
+    if not job.get("completed_at") or (job.get("conclusion") not in OUTCOMES and not cancelled) or (not job.get("started_at") and not cancelled):
         return None
-    created, started, completed = T.ts(job["created_at"]), T.ts(job["started_at"]), T.ts(job["completed_at"])
+    created, completed = T.ts(job["created_at"]), T.ts(job["completed_at"])
+    started = T.ts(job["started_at"]) if job.get("started_at") else None
+    if started is None:
+        queue, wall = (completed - created if attempt == 1 else None), None
+    else:
+        queue, wall = (started - created if attempt == 1 else None), completed - started
     return Obs(job["id"], job["run_id"], job.get("head_sha") or run.get("head_sha") or "", job.get("head_branch") or run.get("head_branch") or "",
-               T.fleet_of(job), job["conclusion"] == "success", started - created if attempt == 1 else None, completed - started,
-               job["conclusion"] == "timed_out", attempt)
+               fleet_or_label(job), job["conclusion"] == "success", queue, wall, job["conclusion"] == "timed_out", attempt, cancelled)
 
 
 def fleet_or_label(job):
@@ -153,10 +166,19 @@ def cancelled_by_fleet(jobs):
     return {f: (len(runs[f]), n[f]) for f in n}
 
 
+def is_superci(job, group):
+    """A job on superci's runner group; one cancelled in the queue has no runner yet, so its superci-<n>cpu label places it."""
+    if job.get("runner_name") or job.get("runner_group_name"):
+        return T.fleet_of(job) == "superci" and job.get("runner_group_name") == group
+    return fleet_or_label(job) == "superci"
+
+
 def wall_sample(obs, ceiling):
-    """The wall times a fleet's wall quantiles are drawn from: successful runs, and each timed_out run raised to the job's
-    ceiling (a job GitHub ended at its timeout ran at least that long, whatever the clock says), so p90 sees it."""
-    return [o.wall for o in obs if o.ok] + [o.wall if ceiling is None else max(o.wall, ceiling) for o in obs if o.timed_out]
+    """The wall times a fleet's wall quantiles are drawn from: successful runs, each timed_out run raised to the job's
+    ceiling (a job GitHub ended at its timeout ran at least that long, whatever the clock says), so p90 sees it, and each job
+    cancelled after it started at the time it ran, a lower bound."""
+    return ([o.wall for o in obs if o.ok] + [o.wall if ceiling is None else max(o.wall, ceiling) for o in obs if o.timed_out]
+            + [o.wall for o in obs if o.cancelled and o.wall is not None])
 
 
 def queue_sample(obs):
@@ -170,19 +192,19 @@ def queue_sample(obs):
 def excused(f, everything):
     """A failure that Blacksmith has on the same commit does not count against superci. Main's run of the commit is Blacksmith's
     observation (main runs on Blacksmith). A failure on superci never excuses another, main's included: that is the plane's own."""
-    return any(o.job_id != f.job_id and not o.ok and o.sha == f.sha and o.fleet == "blacksmith" for o in everything)
+    return any(o.job_id != f.job_id and not o.ok and not o.cancelled and o.sha == f.sha and o.fleet == "blacksmith" for o in everything)
 
 
 def evaluate_job(S, B, ceiling, unexplained, min_runs=MIN_RUNS):
     """Gate 1's rows from the superci runs S and Blacksmith's B of one job, the job's ceiling in seconds (None when it has no
     row in ci-limits.tsv) and the unexplained seconds of each superci job. Pure."""
     rows = []
-    runs = len({o.run_id for o in S})
+    runs = len({o.run_id for o in S if not o.cancelled})
     rows.append(Row("n (superci runs)", str(runs), f">= {min_runs}", PASS if runs >= min_runs else FAIL, "counts runs, not shards"))
     sw, bw = wall_sample(S, ceiling), wall_sample(B, ceiling)
     sq, bq = queue_sample(S), queue_sample(B)
     if not sw or not bw:
-        why = "no successful or timed-out superci runs" if not sw else "no Blacksmith runs in the baseline window"
+        why = "no successful, timed-out or cancelled-after-start superci jobs" if not sw else "no Blacksmith runs in the baseline window"
         for name, th in (("wall p50", "<= Blacksmith p50"), ("wall p90", f"<= min(Blacksmith p90 x {P90_FACTOR}, ceiling)"),
                          ("queue wait p50", "<= Blacksmith p50"), ("queue wait p90", f"<= Blacksmith p90 + {QUEUE_P90_SLACK_S:g} s")):
             rows.append(Row(name, "-", th, FAIL, why))
@@ -191,17 +213,18 @@ def evaluate_job(S, B, ceiling, unexplained, min_runs=MIN_RUNS):
         th90 = f"min(B p90 {T.q(bw, 90):.1f} x {P90_FACTOR} = {p90_cap:.1f}, ceiling {'none' if ceiling is None else f'{ceiling:g}'})"
         bound90 = p90_cap if ceiling is None else min(p90_cap, ceiling)
         wall_noise = run_spread([o for o in S if o.ok], lambda o: o.wall)
-        queue_noise = run_spread([o for o in S if o.queue is not None], lambda o: o.queue)
+        queue_noise = run_spread([o for o in S if o.queue is not None and not o.cancelled], lambda o: o.queue)
         rows.append(at_most("wall p50", T.q(sw, 50), T.q(bw, 50), f"<= B p50 {T.q(bw, 50):.1f} s", wall_noise))
         rows.append(at_most("wall p90", T.q(sw, 90), bound90, f"<= {th90}", wall_noise))
         rows.append(at_most("queue wait p50", T.q(sq, 50), T.q(bq, 50), f"<= B p50 {T.q(bq, 50):.1f} s", queue_noise))
         rows.append(at_most("queue wait p90", T.q(sq, 90), T.q(bq, 90) + QUEUE_P90_SLACK_S, f"<= B p90 {T.q(bq, 90):.1f} + {QUEUE_P90_SLACK_S:g} s", queue_noise))
     everything = list(S) + list(B)
-    counted = [o for o in S if not o.ok and not excused(o, everything)]
-    b_rate = sum(1 for o in B if not o.ok) / len(B) if B else 0.0
-    allowed = b_rate * len(S) + EXTRA_FAILURES
-    skipped = sum(1 for o in S if not o.ok) - len(counted)
-    rows.append(Row("failures (superci)", f"{len(counted)} of {len(S)}", f"<= B rate {100 * b_rate:.1f}% x {len(S)} + {EXTRA_FAILURES} = {allowed:.1f}",
+    S_done, B_done = [o for o in S if not o.cancelled], [o for o in B if not o.cancelled]
+    counted = [o for o in S_done if not o.ok and not excused(o, everything)]
+    b_rate = sum(1 for o in B_done if not o.ok) / len(B_done) if B_done else 0.0
+    allowed = b_rate * len(S_done) + EXTRA_FAILURES
+    skipped = sum(1 for o in S_done if not o.ok) - len(counted)
+    rows.append(Row("failures (superci)", f"{len(counted)} of {len(S_done)}", f"<= B rate {100 * b_rate:.1f}% x {len(S_done)} + {EXTRA_FAILURES} = {allowed:.1f}",
                     PASS if len(counted) <= allowed else FAIL, f"{skipped} more also failed on Blacksmith at the same commit" if skipped else ""))
     p50u = T.q(unexplained, 50)
     rows.append(Row("unexplained p50 (timeline)", fmt_s(p50u), f"< {MAX_UNEXPLAINED_S:g} s", PASS if p50u is not None and p50u < MAX_UNEXPLAINED_S else FAIL,
@@ -471,7 +494,7 @@ def print_rows(title, rows, verdict_name):
 
 def show_spread(label, obs, ceiling=None):
     walls = [o for o in obs if o.ok]
-    queued = [o for o in obs if o.queue is not None]
+    queued = [o for o in obs if o.queue is not None and not o.cancelled]
     for what, get, of, v in (("wall", lambda o: o.wall, walls, wall_sample(obs, ceiling)), ("queue", lambda o: o.queue, queued, queue_sample(obs))):
         if not v:
             print(f"  {label:11} {what:5} n=0")
@@ -497,8 +520,8 @@ def cmd_job(a):
     by_run = {r["id"]: r for r in runs}
     jobs = [(j, by_run[rid]) for rid, js in jobs_of(gh, runs, attempts="all").items() for j in js if matches(j["name"], a.job)]
     jobs_all = [j for j, r in jobs]
-    S_jobs = [j for j, r in jobs if T.fleet_of(j) == "superci" and j.get("runner_group_name") == a.superci_group and T.ts(j["created_at"]) >= since]
-    B_jobs = [j for j, r in jobs if T.fleet_of(j) == "blacksmith" and b_lo <= T.ts(j["created_at"]) <= b_hi]
+    S_jobs = [j for j, r in jobs if is_superci(j, a.superci_group) and T.ts(j["created_at"]) >= since]
+    B_jobs = [j for j, r in jobs if fleet_or_label(j) == "blacksmith" and b_lo <= T.ts(j["created_at"]) <= b_hi]
     runs_by_job = {j["id"]: r for j, r in jobs}
     S = [o for o in (is_obs(j, runs_by_job[j["id"]]) for j in S_jobs) if o]
     B = [o for o in (is_obs(j, runs_by_job[j["id"]]) for j in B_jobs) if o]
@@ -512,7 +535,7 @@ def cmd_job(a):
     print(f"  blacksmith: created {T.iso(b_lo)} to {T.iso(b_hi)}; ceiling " + (f"{ceiling:g} s ({LIMITS_PATH})" if ceiling is not None else f"none (no {a.workflow} / {a.job} row)"))
     print(f"  rerun attempts: {sum(1 for j in S_jobs + B_jobs if (j.get('run_attempt') or 1) > 1)} counted for failures and wall time, not for queue wait (a rerun keeps its first attempt's created_at, so its queue wait is not real)")
     cancelled = cancelled_by_fleet([j for j in jobs_all if (fleet_or_label(j) == "superci" and T.ts(j["created_at"]) >= since) or (fleet_or_label(j) == "blacksmith" and b_lo <= T.ts(j["created_at"]) <= b_hi)])
-    print("  cancelled (no outcome, left out of every row): " + ", ".join(f"{f} {cancelled.get(f, (0, 0))[0]} run{'' if cancelled.get(f, (0, 0))[0] == 1 else 's'} ({cancelled.get(f, (0, 0))[1]} job{'' if cancelled.get(f, (0, 0))[1] == 1 else 's'})" for f in ("superci", "blacksmith")))
+    print("  cancelled (no outcome; counted in wall and queue wait as lower bounds, never as runs or failures): " + ", ".join(f"{f} {cancelled.get(f, (0, 0))[0]} run{'' if cancelled.get(f, (0, 0))[0] == 1 else 's'} ({cancelled.get(f, (0, 0))[1]} job{'' if cancelled.get(f, (0, 0))[1] == 1 else 's'})" for f in ("superci", "blacksmith")))
     print("  quantiles are interpolated (wall over successful runs and timed-out ones at the ceiling, queue wait over every first attempt):")
     show_spread("superci", S, ceiling)
     show_spread("blacksmith", B, ceiling)

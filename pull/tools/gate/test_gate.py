@@ -15,9 +15,9 @@ import gate as G  # noqa: E402
 T = G.T
 
 
-def obs(wall, queue=2.0, ok=True, fleet="superci", run=None, sha="a", branch="x", job_id=None, timed_out=False, attempt=1):
+def obs(wall, queue=2.0, ok=True, fleet="superci", run=None, sha="a", branch="x", job_id=None, timed_out=False, attempt=1, cancelled=False):
     n = next(_ids)
-    return G.Obs(job_id or n, run or n, sha, branch, fleet, ok, queue, wall, timed_out, attempt)
+    return G.Obs(job_id or n, run or n, sha, branch, fleet, ok and not cancelled, queue, wall, timed_out, attempt, cancelled)
 
 
 _ids = iter(range(1, 10 ** 6))
@@ -184,7 +184,10 @@ class RecordedCanary(unittest.TestCase):
         self.assertTrue(reruns)
         self.assertEqual({(o.attempt > 1, o.queue is None) for o in self.B if o.attempt > 1}, {(True, True)})
         outcomes = [j for j in self.rec["blacksmith"] if j["conclusion"] in G.OUTCOMES and j.get("started_at") and j.get("completed_at")]
-        self.assertEqual(len(self.B), len(outcomes))
+        cancelled = [j for j in self.rec["blacksmith"] if j["conclusion"] == "cancelled" and j.get("completed_at")]
+        self.assertTrue(cancelled, "the recording holds cancelled jobs")
+        self.assertEqual(len(self.B), len(outcomes) + len(cancelled))
+        self.assertEqual(sum(1 for o in self.B if o.cancelled), len(cancelled))
 
     def test_the_fleet_comes_from_the_runner_group_and_labels(self):
         self.assertEqual({o.fleet for o in self.S}, {"superci"})
@@ -455,6 +458,26 @@ class GateJobEndToEnd(unittest.TestCase):
             FakeGitHub.run_jobs = orig
         self.assertEqual(set(seen), {"all"})
 
+    def test_slow_cancelled_superci_jobs_fail_the_gate_end_to_end(self):
+        slow = [[gh_job(800 + i, 0, 1, "cancelled", 1_000_000.0, 1_000_001.0, 1_000_301.0)] for i in range(3)]
+        code, out = self.run_gate(self.superci(5), self.blacksmith(8))
+        self.assertEqual(code, 0, out)
+        code, out = self.run_gate(self.superci(5) + slow, self.blacksmith(8))
+        self.assertEqual(code, 1, out)
+        self.assertRegex(out, r"FAIL\s+wall p90")
+        self.assertRegex(out, r"n \(superci runs\)\s+5")
+        self.assertIn("superci 3 runs (3 jobs)", out)
+
+    def test_a_superci_job_queued_and_cancelled_is_found_by_its_label_and_fails_queue_wait(self):
+        waiting = []
+        for i in range(3):
+            j = gh_job(850 + i, 0, 1, "cancelled", 1_000_000.0, None, 1_000_120.0)
+            j.update(runner_group_name=None, runner_name=None)
+            waiting.append([j])
+        code, out = self.run_gate(self.superci(5) + waiting, self.blacksmith(8))
+        self.assertEqual(code, 1, out)
+        self.assertRegex(out, r"FAIL\s+queue wait p90")
+
     def test_cancelled_jobs_are_reported_per_fleet(self):
         cancelled_s = [gh_job(801, 0, 1, "cancelled", 1_000_000.0, 1_000_001.0, 1_000_011.0)]
         cancelled_b = [gh_job(802, 0, 1, "cancelled", 1_000_000.0, 1_000_003.0, 1_000_013.0, fleet="blacksmith")]
@@ -489,11 +512,84 @@ class TimedOutAndCancelled(unittest.TestCase):
         self.assertEqual(judge(S + timed, ceiling=None)["wall p90"].status, G.FAIL)
         self.assertEqual(judge(S, ceiling=None)["wall p90"].status, G.PASS)
 
-    def test_cancelled_jobs_are_not_observations_and_are_counted_per_fleet(self):
+    def test_cancelled_jobs_are_counted_per_fleet(self):
         cancelled = [gh_job(1, 1, 1, "cancelled", self.T0, self.T0 + 2, self.T0 + 5), gh_job(2, 1, 1, "cancelled", self.T0, self.T0 + 2, self.T0 + 5),
                      gh_job(3, 2, 1, "cancelled", self.T0, self.T0 + 2, self.T0 + 5, fleet="blacksmith")]
-        self.assertIsNone(G.is_obs(cancelled[0], {}))
         self.assertEqual(G.cancelled_by_fleet(cancelled), {"superci": (1, 2), "blacksmith": (1, 1)})
+
+
+def queued_cancel(jid, run, created, completed, fleet="superci", attempt=1):
+    """A job GitHub cancelled in the queue: no start, and no runner assigned yet."""
+    j = gh_job(jid, run, attempt, "cancelled", created, None, completed, fleet=fleet)
+    j.update(runner_group_name=None, runner_name=None)
+    return j
+
+
+class CancelledJobsAreLowerBounds(unittest.TestCase):
+    """A superci job that was slow and then cancelled must not look fast; Blacksmith's cancels are read the same way."""
+    T0 = 1_000_000.0
+
+    def good(self):
+        return fleet(spread_around(80, 2, 10), spread_around(1, 0.2, 10))
+
+    def test_a_started_job_cancelled_is_a_wall_sample_of_the_time_it_ran_and_keeps_its_real_queue_wait(self):
+        o = G.is_obs(gh_job(1, 1, 1, "cancelled", self.T0, self.T0 + 4, self.T0 + 304), {})
+        self.assertEqual((o.cancelled, o.ok, o.wall, o.queue), (True, False, 300.0, 4.0))
+
+    def test_a_job_cancelled_in_the_queue_is_a_queue_sample_of_created_to_completed_and_has_no_wall(self):
+        o = G.is_obs(queued_cancel(1, 1, self.T0, self.T0 + 120), {})
+        self.assertEqual((o.cancelled, o.wall, o.queue, o.fleet), (True, None, 120.0, "superci"))
+        self.assertEqual(G.wall_sample([o], None), [])
+
+    def test_a_rerun_attempt_cancelled_in_the_queue_has_no_real_queue_wait(self):
+        o = G.is_obs(queued_cancel(1, 1, self.T0, self.T0 + 120, attempt=2), {})
+        self.assertEqual((o.queue, o.wall), (None, None))
+
+    def test_a_skipped_job_and_a_cancelled_one_that_never_completed_are_not_observations(self):
+        self.assertIsNone(G.is_obs(gh_job(1, 1, 1, "skipped", self.T0, None, self.T0 + 1), {}))
+        self.assertIsNone(G.is_obs(gh_job(2, 1, 1, "cancelled", self.T0, self.T0 + 1, None), {}))
+
+    def test_five_fast_runs_and_slow_jobs_that_were_cancelled_fail_wall_p90(self):
+        fast = fleet(spread_around(80, 2, 5), spread_around(1, 0.2, 5))
+        self.assertEqual(judge(fast)["wall p90"].status, G.PASS)
+        slow = [obs(300.0, 1.0, cancelled=True) for _ in range(3)]
+        by = judge(fast + slow)
+        self.assertEqual(by["wall p90"].status, G.FAIL, by["wall p90"])
+        self.assertEqual(by["n (superci runs)"].value, "5", "a cancelled job is not a run")
+
+    def test_cancelled_jobs_that_ran_less_than_the_bar_do_not_fail_it(self):
+        S = self.good() + [obs(30.0, 1.0, cancelled=True) for _ in range(2)]
+        self.assertEqual(judge(S)["wall p90"].status, G.PASS)
+
+    def test_jobs_queued_and_cancelled_fail_queue_wait_p90(self):
+        S = self.good()
+        self.assertEqual(judge(S)["queue wait p90"].status, G.PASS)
+        waiting = [obs(None, 120.0, cancelled=True) for _ in range(3)]
+        by = judge(S + waiting)
+        self.assertEqual(by["queue wait p90"].status, G.FAIL, by["queue wait p90"])
+        self.assertEqual(by["wall p90"].status, G.PASS, "a job that never started has no wall time")
+
+    def test_the_same_cancels_on_blacksmith_move_its_bar_the_same_way(self):
+        slow = lambda f: [obs(300.0, 1.0, cancelled=True, fleet=f) for _ in range(8)]
+        S = self.good()
+        self.assertEqual(judge(S + slow("superci"), ceiling=None)["wall p90"].status, G.FAIL)
+        self.assertEqual(judge(S + slow("superci"), ceiling=None, base=B + slow("blacksmith"))["wall p90"].status, G.PASS,
+                         "Blacksmith's own slow cancels raise its p90 bar, so the fleets are measured alike")
+
+    def test_a_cancelled_job_is_never_a_failure_and_never_excuses_one(self):
+        S = self.good() + [obs(300.0, 1.0, cancelled=True)]
+        self.assertEqual(judge(S)["failures (superci)"].value.split()[0], "0")
+        sha = "z"
+        failed = obs(80.0, 1.0, ok=False, sha=sha, run=9001)
+        cancelled_b = obs(300.0, 1.0, cancelled=True, fleet="blacksmith", sha=sha)
+        self.assertFalse(G.excused(failed, [failed, cancelled_b]))
+        by = judge(self.good() + [failed], base=B + [cancelled_b])
+        self.assertEqual(by["failures (superci)"].value, "1 of 11")
+
+    def test_a_blacksmith_cancel_does_not_raise_its_failure_rate(self):
+        base = B + [obs(300.0, 1.0, cancelled=True, fleet="blacksmith") for _ in range(40)]
+        S = self.good() + [obs(80.0, 1.0, ok=False, run=7001), obs(80.0, 1.0, ok=False, run=7002)]
+        self.assertEqual(judge(S, base=base)["failures (superci)"].status, G.FAIL)
 
 
 class Flags(unittest.TestCase):
