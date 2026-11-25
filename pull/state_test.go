@@ -386,6 +386,9 @@ func TestAJobWithNeitherIDCountsAndIsNeverMergedWithAnother(t *testing.T) {
 	}
 	if n := s.Burst(t0.Add(time.Minute), testRule); n != 3 {
 		t.Fatalf("three jobs with no job id and no runner request id: burst %d, want 3", n)
+	}
+}
+
 var testRule = PoolRule{Quantile: 0.8, WindowMinutes: 30, HoldMinutes: 5, ReadySeconds: 22}
 
 // assigned is a message of JobAssigned as GitHub sends them: a job id, no runner request id, no queue time.

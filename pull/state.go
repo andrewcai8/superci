@@ -469,9 +469,6 @@ func (s *State) Observe(msg *scaleset.RunnerScaleSetMessage, now time.Time) {
 	for _, j := range msg.JobAssignedMessages {
 		s.arrived(j.JobMessageBase, now)
 	}
-	for _, j := range msg.JobAssignedMessages {
-		arrive(j.JobMessageBase)
-	}
 	for _, j := range msg.JobStartedMessages {
 		queued, ok := s.available[jobKey(j.JobMessageBase)]
 		if !j.QueueTime.IsZero() {
