@@ -85,25 +85,6 @@ func TestAJobCompletedOnAMachineAdoptedAfterARestartEndsIt(t *testing.T) {
 	}
 }
 
-// SEC-F1: EC2's reads are eventually consistent, so a grant waits for a listing begun well after the start.
-func TestAStartGrantsNothingUntilAListingBegunAfterTheGrace(t *testing.T) {
-	s := NewState("set", 0, 10, []string{"us-east-1", "us-east-2"}, t0)
-	s.Observe(stats(2, 0), t0)
-	s.Seen("us-east-1", machines(1, t0), t0.Add(5*time.Second), t0.Add(6*time.Second))
-	s.Seen("us-east-2", nil, t0.Add(5*time.Second), t0.Add(6*time.Second))
-	if v := ask(s, "i-0000", t0.Add(10*time.Second)); v != Wait {
-		t.Fatalf("a listing begun 5 s after the start may miss a tag written just before: %v, want Wait", v)
-	}
-	s.Seen("us-east-1", machines(1, t0), t0.Add(31*time.Second), t0.Add(32*time.Second))
-	if v := ask(s, "i-0000", t0.Add(33*time.Second)); v != Wait {
-		t.Fatalf("one region listed late enough, the other not: %v, want Wait", v)
-	}
-	s.Seen("us-east-2", nil, t0.Add(31*time.Second), t0.Add(32*time.Second))
-	if v := ask(s, "i-0000", t0.Add(33*time.Second)); v != Grant {
-		t.Fatalf("both regions listed after the grace: %v, want Grant", v)
-	}
-}
-
 // SEC-F1: a machine GitHub lists a runner of is issued, whatever its tags say, and its tag is written.
 func TestAMachineWithAListedRunnerIsIssuedAndTagged(t *testing.T) {
 	s := newState(0, 10)
@@ -244,9 +225,11 @@ func TestNoPoolRunnerIsTrimmedInTheFirstWindowAfterAStart(t *testing.T) {
 	}
 	s.Observe(stats(0, 0), t0.Add(time.Minute))
 	s.Surplus(t0.Add(2*time.Minute), 20*time.Second, 10*time.Minute, 100)
+	s.Observe(stats(0, 0), t0.Add(3*time.Minute))
 	if n := s.Surplus(t0.Add(3*time.Minute), 20*time.Second, 10*time.Minute, 100); n != 0 {
 		t.Fatalf("retired %d pool runners 3 minutes after a start", n)
 	}
+	s.Observe(stats(0, 0), t0.Add(11*time.Minute))
 	s.Surplus(t0.Add(11*time.Minute), 20*time.Second, 10*time.Minute, 100)
 	if n := s.Surplus(t0.Add(12*time.Minute), 20*time.Second, 10*time.Minute, 100); n == 0 {
 		t.Fatal("no surplus retired once the window has passed")
@@ -423,6 +406,8 @@ func TestShedEndsOnlyMachinesLongWaitingWithNoRunner(t *testing.T) {
 	old[3].Issued = true // issued before a restart, its runner not known yet
 	s.Seen("us-east-1", append(old, fresh...), t0, t0)
 	give(s, "i-0001", &Runner{ID: 5, Name: "set-i-0001", Issued: t0})
+	s.Observe(stats(5, 0), t0.Add(10*time.Minute))
+	s.Listed(map[string]ListedRunner{}, t0.Add(10*time.Minute))
 	got := s.Shed(t0.Add(10*time.Minute), 5)
 	if len(got) != 2 || got[0].ID == "i-0001" || got[1].ID == "i-0001" || got[0].ID == "i-0003" || got[1].ID == "i-0003" {
 		t.Fatalf("shed %v: want the two old machines never issued a runner, not the one with a runner, the issued one nor the new one", ids(got))

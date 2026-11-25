@@ -21,6 +21,7 @@ type Set struct {
 	id    int // GitHub's scale set id
 	state *State
 	fleet *SetFleet
+	drain bool // the config dropped it: it takes no job, and is deleted once it holds none
 }
 
 // Server answers the machines. A machine proves who it is with the identity document EC2 signed for it; the listener
@@ -28,13 +29,18 @@ type Set struct {
 type Server struct {
 	sets     map[string]*Set
 	budget   *Budget
-	verifier *Verifier
-	client   *scaleset.Client
-	refresh  func(ctx context.Context, region string)              // lists a region again, at most once a second
-	issue    func(ctx context.Context, m *Machine) error           // writes the machine's issued tag; nil once EC2 has it
-	notices  func(ctx context.Context, m *Machine, j JobRef) error // records on the machine the job a spot notice found
-	slots    chan struct{}                                         // bounds concurrent registrations
-	maxAge   func() time.Duration
+	verifier interface {
+		Verify(body []byte) (InstanceDocument, error)
+	}
+	client interface {
+		GenerateJitRunnerConfig(ctx context.Context, setting *scaleset.RunnerScaleSetJitRunnerSetting, scaleSetID int) (*scaleset.RunnerScaleSetJitRunnerConfig, error)
+	}
+	refresh func(ctx context.Context, region string)                // lists a region again, at most once a second
+	claim   func(ctx context.Context, instance, token string) error // Claims.Take: nil once the grant holds the machine's claim
+	issue   func(ctx context.Context, m *Machine) error             // writes the machine's issued tag; nil once EC2 has it
+	notices func(ctx context.Context, m *Machine, j JobRef) error   // records on the machine the job a spot notice found
+	slots   chan struct{}                                           // bounds concurrent registrations
+	maxAge  func() time.Duration
 }
 
 func (h *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -74,9 +80,9 @@ func (h *Server) machine(r *http.Request) (*Set, *Machine, error) {
 	return nil, nil, fmt.Errorf("instance %s is no machine of ours", doc.InstanceID)
 }
 
-// jit answers a machine's ask for its runner. A machine gets one runner, ever: the runner is registered, EC2 is told
-// the machine was issued it (its tag), and only then does the config leave. A config that cannot be recorded so never
-// leaves, and its machine gets none.
+// jit answers a machine's ask for its runner. A machine gets one runner, ever: its grant claims it (Claims), the
+// runner is registered, EC2 is told the machine was issued it (its tag), and only then does the config leave. A claim
+// another grant holds answers 410; a claim not known to be ours, or a config that cannot be recorded, never leaves.
 func (h *Server) jit(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	s, m, err := h.machine(r)
@@ -101,6 +107,22 @@ func (h *Server) jit(w http.ResponseWriter, r *http.Request) {
 	h.slots <- struct{}{}
 	defer func() { <-h.slots }()
 	name := runnerName(s.spec.Name, m.ID)
+	cctx, ccancel := context.WithTimeout(context.WithoutCancel(r.Context()), 10*time.Second)
+	err = h.claim(cctx, m.ID, s.state.Claim(m))
+	ccancel()
+	if err != nil {
+		h.budget.Done(time.Now(), Unused, 0)
+		slog.Error("claim", "set", s.spec.Name, "machine", m.ID, "elsewhere", errors.Is(err, ErrClaimed), "err", err.Error(), "ms", time.Since(started).Milliseconds())
+		if errors.Is(err, ErrClaimed) {
+			s.state.IssuedElsewhere(m)
+			w.WriteHeader(http.StatusGone)
+			return
+		}
+		s.state.Unissued(m)
+		w.Header().Set("Retry-After", "3")
+		w.WriteHeader(http.StatusTooManyRequests)
+		return
+	}
 	// A refusal comes back at once, not after the client's own waits: the machine is told to ask again, and the
 	// listener stops asking GitHub for a while.
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 15*time.Second)

@@ -48,6 +48,7 @@ const (
 	Made    Outcome = iota
 	Refused         // GitHub's limit on runners configured in 5 minutes
 	Failed
+	Unused // the grant registered nothing: its machine's claim was not its own
 )
 
 func NewBudget(c RegConfig, now time.Time) *Budget { return &Budget{c: c, refilled: now} }
