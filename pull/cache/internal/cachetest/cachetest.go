@@ -155,11 +155,17 @@ func (m *Mem) Head(_ context.Context, key string) (cache.Object, bool, error) {
 func (m *Mem) List(_ context.Context, prefix string, max int) ([]cache.Object, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	var out []cache.Object
+	var keys []string
 	for k := range m.objs {
-		if strings.HasPrefix(k, prefix) && len(out) < max {
-			out = append(out, m.object(k))
+		if strings.HasPrefix(k, prefix) {
+			keys = append(keys, k)
 		}
+	}
+	// S3 lists in key order, so a listing cut at max loses the keys that sort last.
+	sort.Strings(keys)
+	var out []cache.Object
+	for _, k := range keys[:min(len(keys), max)] {
+		out = append(out, m.object(k))
 	}
 	return out, nil
 }

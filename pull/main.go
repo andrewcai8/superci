@@ -37,6 +37,11 @@ import (
 //go:embed boot.sh
 var bootScript string
 
+// hydrateStop is the runner's job-started hook, which ends the hydration a machine still has running.
+//
+//go:embed hydrate-stop.sh
+var hydrateStop string
+
 func main() {
 	var (
 		configPath = flag.String("config", "/etc/superci-pull/config.json", "override file, decoded over the built-in config and reread when it changes")
@@ -296,7 +301,7 @@ func run(ctx context.Context, f flags) error {
 // (the oldest a pool machine may be, and the longest job after it), and its set's label, which names the hydration
 // manifest it reads.
 func bootData(c Config, listener, pin, label string) string {
-	return strings.NewReplacer("@LISTENER@", listener, "@PIN@", pin, "@LIFE_SECONDS@", strconv.Itoa(int(c.life().Seconds())), "@LABEL@", label).Replace(bootScript)
+	return strings.NewReplacer("@LISTENER@", listener, "@PIN@", pin, "@LIFE_SECONDS@", strconv.Itoa(int(c.life().Seconds())), "@LABEL@", label, "@HYDRATE_STOP@", strings.TrimSpace(hydrateStop)).Replace(bootScript)
 }
 
 // ensureScaleSet finds or makes the set at GitHub, in the deployment's runner group, with its labels: its name, and

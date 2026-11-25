@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -26,7 +27,12 @@ const (
 	workspace   = "/home/runner/_work/megpt-mono/megpt-mono"
 )
 
-var mainScope = cache.Scope{Name: "refs/heads/main"}
+var (
+	mainScope = cache.Scope{Name: "refs/heads/main"}
+	paths     = []string{"p"}
+	// entryVersion is where actions/cache keeps what a job saves from `path: p` on this image.
+	entryVersion = cache.Version(paths, cache.DefaultCompression)
+)
 
 // archive is a gzip tar of files named as actions/cache names them: relative to the workspace.
 func archive(t *testing.T, files map[string]string) []byte {
@@ -52,8 +58,15 @@ func archive(t *testing.T, files map[string]string) []byte {
 }
 
 func put(mem *cachetest.Mem, sc cache.Scope, key string, body []byte, at time.Time) {
-	mem.Set(cache.ObjectKey(hydrateRepo, sc, version, key, "main"), body, at)
+	putFrom(mem, sc, paths, key, body, at)
 }
+
+func putFrom(mem *cachetest.Mem, sc cache.Scope, from []string, key string, body []byte, at time.Time) {
+	mem.Set(cache.ObjectKey(hydrateRepo, sc, cache.Version(from, cache.DefaultCompression), key, "main"), body, at)
+}
+
+// at is where a finished entry is: its version, then its key.
+func at(root, key string) string { return filepath.Join(root, entryVersion, key) }
 
 func manifest(entries ...cache.ManifestEntry) cache.Manifest {
 	return cache.Manifest{Repository: hydrateRepo, Scopes: []string{"refs/heads/main"}, Workspace: workspace, Entries: entries}
@@ -77,12 +90,12 @@ func TestHydratesTheNewestMatchingEntryOfTheScopeWhereTheJobWouldRestoreIt(t *te
 	put(mem, cache.Scope{Name: "refs/pull/7/merge"}, "bun-modules-v1-Linux-X64-bun1.4.3-aura-hono-api-scripts-on-ddd", archive(t, map[string]string{"x": "pr"}), now.Add(2*time.Hour))
 	h := &cache.Hydrator{Reader: mem, DefaultBranch: "main", Root: root}
 
-	res := h.Run(context.Background(), manifest(cache.ManifestEntry{Key: "bun-modules-v1-Linux-X64-bun*-aura-hono-api-scripts-on-"}))
+	res := h.Run(context.Background(), manifest(cache.ManifestEntry{Paths: paths, Key: "bun-modules-v1-Linux-X64-bun*-aura-hono-api-scripts-on-"}))
 
 	if len(res) != 1 || res[0].Error != "" || res[0].Key != cur {
 		t.Fatalf("want main's newest root tree, not an older one, the Mind's or a pull request's: %+v", res)
 	}
-	got := filepath.Join(root, cur)
+	got := at(root, cur)
 	if s := read(t, filepath.Join(got, workspace, "aura-hono-api/node_modules/x")); s != "new" {
 		t.Fatalf("the tree holds %q", s)
 	}
@@ -101,7 +114,7 @@ func TestTheFirstScopeWithAMatchWinsAsAJobsRestoreReadsItsOwnScopeThenMains(t *t
 	put(mem, mainScope, "git-seed-v1-Linux-X64-3", archive(t, map[string]string{".git/HEAD": "main"}), now)
 	put(mem, mainScope, "mods-1", archive(t, map[string]string{"node_modules/x": "main"}), now)
 	h := &cache.Hydrator{Reader: mem, DefaultBranch: "main", AnyScope: true, Root: root}
-	m := manifest(cache.ManifestEntry{Key: "git-seed-v1-Linux-X64-"}, cache.ManifestEntry{Key: "mods-"})
+	m := manifest(cache.ManifestEntry{Paths: paths, Key: "git-seed-v1-Linux-X64-"}, cache.ManifestEntry{Paths: paths, Key: "mods-"})
 	m.Scopes = []string{branch.Name, "refs/heads/main"}
 
 	res := h.Run(context.Background(), m)
@@ -117,7 +130,7 @@ func TestAManifestNamingAScopeOtherThanMainsHydratesNothing(t *testing.T) {
 	put(mem, pr, "seed-1", archive(t, map[string]string{".git/HEAD": "pr"}), now)
 	put(mem, mainScope, "seed-0", archive(t, map[string]string{".git/HEAD": "main"}), now.Add(-time.Hour))
 	h := &cache.Hydrator{Reader: mem, DefaultBranch: "main", Root: root}
-	m := manifest(cache.ManifestEntry{Key: "seed-"})
+	m := manifest(cache.ManifestEntry{Paths: paths, Key: "seed-"})
 	m.Scopes = []string{pr.Name, "refs/heads/main"}
 
 	res := h.Run(context.Background(), m)
@@ -126,7 +139,7 @@ func TestAManifestNamingAScopeOtherThanMainsHydratesNothing(t *testing.T) {
 		t.Fatalf("a PR's save must never become what another machine's job starts from: %+v", res)
 	}
 	for _, k := range []string{"seed-1", "seed-0"} {
-		if _, err := os.Stat(filepath.Join(root, k)); !os.IsNotExist(err) {
+		if _, err := os.Stat(at(root, k)); !os.IsNotExist(err) {
 			t.Fatalf("nothing may be in place when a manifest names a PR scope (%s): %v", k, err)
 		}
 	}
@@ -137,12 +150,12 @@ func TestAnEntryThatFailsToUnpackIsNeverInPlace(t *testing.T) {
 	put(mem, mainScope, "seed-1", []byte("\x1f\x8bnot a gzip stream at all"), time.Now())
 	h := &cache.Hydrator{Reader: mem, DefaultBranch: "main", Root: root}
 
-	res := h.Run(context.Background(), manifest(cache.ManifestEntry{Key: "seed-"}))
+	res := h.Run(context.Background(), manifest(cache.ManifestEntry{Paths: paths, Key: "seed-"}))
 
 	if res[0].Error == "" {
 		t.Fatalf("a broken archive is an error: %+v", res)
 	}
-	if _, err := os.Stat(filepath.Join(root, "seed-1")); !os.IsNotExist(err) {
+	if _, err := os.Stat(at(root, "seed-1")); !os.IsNotExist(err) {
 		t.Fatalf("a failed entry must not be where a job looks: %v", err)
 	}
 }
@@ -154,12 +167,12 @@ func TestAnEntryStoppedByTheDeadlineIsNeverInPlace(t *testing.T) {
 	h := &cache.Hydrator{Reader: mem, DefaultBranch: "main", Root: root,
 		Checkout: func(context.Context, string) error { cancel(); return context.Canceled }}
 
-	res := h.Run(ctx, manifest(cache.ManifestEntry{Key: "seed-", Checkout: true}))
+	res := h.Run(ctx, manifest(cache.ManifestEntry{Paths: paths, Key: "seed-", Checkout: true}))
 
 	if res[0].Error == "" {
 		t.Fatalf("want an error, got %+v", res)
 	}
-	if _, err := os.Stat(filepath.Join(root, "seed-1")); !os.IsNotExist(err) {
+	if _, err := os.Stat(at(root, "seed-1")); !os.IsNotExist(err) {
 		t.Fatalf("an entry stopped before its checkout ended must not be where a job looks: %v", err)
 	}
 }
@@ -172,7 +185,7 @@ func TestEachMatchedEntryIsHydratedOnceAndOnlyCheckoutEntriesAreCheckedOut(t *te
 	h := &cache.Hydrator{Reader: mem, DefaultBranch: "main", Root: root,
 		Checkout: func(_ context.Context, dir string) error { checked = append(checked, dir); return nil }}
 
-	res := h.Run(context.Background(), manifest(cache.ManifestEntry{Key: "seed-", Checkout: true}, cache.ManifestEntry{Key: "s*d-"}, cache.ManifestEntry{Key: "mods-"}, cache.ManifestEntry{Key: "none-"}))
+	res := h.Run(context.Background(), manifest(cache.ManifestEntry{Paths: paths, Key: "seed-", Checkout: true}, cache.ManifestEntry{Paths: paths, Key: "s*d-"}, cache.ManifestEntry{Paths: paths, Key: "mods-"}, cache.ManifestEntry{Paths: paths, Key: "none-"}))
 
 	if res[0].Error != "" || res[2].Error != "" {
 		t.Fatalf("want seed and mods hydrated: %+v", res)
@@ -180,7 +193,7 @@ func TestEachMatchedEntryIsHydratedOnceAndOnlyCheckoutEntriesAreCheckedOut(t *te
 	if !strings.Contains(res[1].Error, "another entry") || res[3].Error != "no entry matches" {
 		t.Fatalf("want the duplicate and the miss reported: %+v", res)
 	}
-	if len(checked) != 1 || !strings.HasSuffix(checked[0], ".tmp-seed-9"+workspace) {
+	if len(checked) != 1 || !strings.HasSuffix(checked[0], ".tmp-"+entryVersion+"-seed-9"+workspace) {
 		t.Fatalf("want one checkout, in the seed's workspace before it is in place: %v", checked)
 	}
 }
@@ -220,12 +233,12 @@ func TestACheckedOutSeedLeavesAWorkTreeGitFindsClean(t *testing.T) {
 	put(mem, mainScope, "git-seed-v1-Linux-X64-1", seed, time.Now())
 	h := &cache.Hydrator{Reader: mem, DefaultBranch: "main", Root: root}
 
-	res := h.Run(context.Background(), manifest(cache.ManifestEntry{Key: "git-seed-v1-Linux-X64-", Checkout: true}))
+	res := h.Run(context.Background(), manifest(cache.ManifestEntry{Paths: paths, Key: "git-seed-v1-Linux-X64-", Checkout: true}))
 
 	if res[0].Error != "" {
 		t.Fatalf("%+v", res)
 	}
-	ws := filepath.Join(root, "git-seed-v1-Linux-X64-1", workspace)
+	ws := filepath.Join(at(root, "git-seed-v1-Linux-X64-1"), workspace)
 	if s := read(t, filepath.Join(ws, "d/a/f")); s != "" {
 		t.Fatalf("the work tree is checked out: %q", s)
 	}
@@ -238,7 +251,7 @@ func TestACheckedOutSeedLeavesAWorkTreeGitFindsClean(t *testing.T) {
 }
 
 func TestTheManifestIsCheckedBeforeAnythingIsRead(t *testing.T) {
-	ok := `{"repository":"1351063449","scopes":["refs/heads/main"],"workspace":"/home/runner/_work/r/r","entries":[{"key":"a-","checkout":true}]}`
+	ok := `{"repository":"1351063449","scopes":["refs/heads/main"],"workspace":"/home/runner/_work/r/r","entries":[{"key":"a-","paths":[".git"],"checkout":true}]}`
 	if _, err := cache.ParseManifest([]byte(ok)); err != nil {
 		t.Fatal(err)
 	}
@@ -246,10 +259,13 @@ func TestTheManifestIsCheckedBeforeAnythingIsRead(t *testing.T) {
 		strings.Replace(ok, `"checkout"`, `"chekout"`, 1),
 		strings.Replace(ok, `"1351063449"`, `"megpt-mono"`, 1),
 		strings.Replace(ok, `/home/runner/_work/r/r`, `_work/r/r`, 1),
-		strings.Replace(ok, `[{"key":"a-","checkout":true}]`, `[]`, 1),
+		strings.Replace(ok, `[{"key":"a-","paths":[".git"],"checkout":true}]`, `[]`, 1),
+		strings.Replace(ok, `"paths":[".git"],`, ``, 1),
+		strings.Replace(ok, `[".git"]`, `[""]`, 1),
+		strings.Replace(ok, `"entries"`, `"compression":"zstd long","entries"`, 1),
 		strings.Replace(ok, `"a-"`, `"a,b"`, 1),
 		strings.Replace(ok, `["refs/heads/main"]`, `[]`, 1),
-		strings.Replace(ok, `{"key":"a-","checkout":true}`, `{"key":"a-","python":"3.13"}`, 1),
+		strings.Replace(ok, `{"key":"a-","paths":[".git"],"checkout":true}`, `{"key":"a-","python":"3.13"}`, 1),
 	} {
 		if _, err := cache.ParseManifest([]byte(bad)); err == nil {
 			t.Errorf("accepted %s", bad)
@@ -289,5 +305,133 @@ func TestPythonIsInstalledIntoTheToolCacheAsSetupPythonInstallsIt(t *testing.T) 
 	}
 	if n := downloads.Load(); n != 1 {
 		t.Fatalf("a version the tool cache holds is not fetched again: %d downloads", n)
+	}
+}
+
+// listed is a Reader that says what it was asked to list.
+type listed struct {
+	*cachetest.Mem
+	mu       sync.Mutex
+	prefixes []string
+}
+
+func (l *listed) List(ctx context.Context, prefix string, max int) ([]cache.Object, error) {
+	l.mu.Lock()
+	l.prefixes = append(l.prefixes, prefix)
+	l.mu.Unlock()
+	return l.Mem.List(ctx, prefix, max)
+}
+
+func TestAnEntryIsItsScopeVersionAndKeyNotItsKeyAlone(t *testing.T) {
+	mem, root, now := cachetest.NewMem(), t.TempDir(), time.Now()
+	a, b := []string{"aura-hono-api/node_modules"}, []string{"aura-hono-api/mind/node_modules"}
+	putFrom(mem, mainScope, a, "bun-modules-1", archive(t, map[string]string{"x": "A"}), now.Add(-time.Hour))
+	putFrom(mem, mainScope, b, "bun-modules-1", archive(t, map[string]string{"x": "B"}), now)
+	h := &cache.Hydrator{Reader: mem, DefaultBranch: "main", Root: root}
+	m := manifest(cache.ManifestEntry{Key: "bun-modules-", Paths: a}, cache.ManifestEntry{Key: "bun-modules-", Paths: b}, cache.ManifestEntry{Key: "bun-modules-", Paths: []string{"elsewhere"}})
+
+	res := h.Run(context.Background(), m)
+
+	if res[0].Error != "" || res[1].Error != "" || res[2].Error != "no entry matches" {
+		t.Fatalf("want each path set its own entry, and none for a path set nothing was saved from: %+v", res)
+	}
+	for paths, want := range map[string]string{"A": filepath.Join(root, cache.Version(a, cache.DefaultCompression), "bun-modules-1"), "B": filepath.Join(root, cache.Version(b, cache.DefaultCompression), "bun-modules-1")} {
+		if s := read(t, filepath.Join(want, workspace, "x")); s != paths {
+			t.Fatalf("%s's directory holds %q", paths, s)
+		}
+	}
+}
+
+func TestTheVersionIsWhatActionsCacheNamesAnEntryOnTheRunnerImage(t *testing.T) {
+	// Read off main's bucket (Nov 25): the objects of these keys sit in these version directories.
+	for paths, want := range map[string]string{
+		".git":                            "e147b628583c5531a3df3c6023ec0bba34378b29ba54ba408f1613f67f53a817",
+		"aura-hono-api/mind/node_modules": "bc0252d31637939426fee46aa18cd3112b9769bdfcaa7e83f6cbd1ad3adfb58f",
+		"/home/runner/_work/_temp/harness-python": "a666248dce0b82ae9c1deb5180eaf65598b56ff1b558869a2f508bec22b1b866",
+	} {
+		if got := cache.Version([]string{paths}, cache.DefaultCompression); got != want {
+			t.Errorf("%s: version %s, want %s", paths, got, want)
+		}
+	}
+}
+
+func TestEachEntryIsListedUnderItsOwnVersionAndKeyPrefixAndTheNewestSurvivesALongList(t *testing.T) {
+	mem, root, now := cachetest.NewMem(), t.TempDir(), time.Now()
+	// More seeds than the daemon's 5,000-object listing holds: a listing in key order cut there loses the newest.
+	for i := 0; i < 5200; i++ {
+		put(mem, mainScope, fmt.Sprintf("git-seed-v1-Linux-X64-%06d", i), []byte("x"), now.Add(-time.Duration(5200-i)*time.Minute))
+	}
+	put(mem, mainScope, "git-seed-v1-Linux-X64-005200", archive(t, map[string]string{".git/HEAD": "newest"}), now)
+	putFrom(mem, mainScope, []string{"other"}, "mods-1", archive(t, map[string]string{"x": "other"}), now)
+	put(mem, mainScope, "mods-2", archive(t, map[string]string{"x": "mine"}), now)
+	l := &listed{Mem: mem}
+	h := &cache.Hydrator{Reader: l, DefaultBranch: "main", Root: root}
+
+	res := h.Run(context.Background(), manifest(cache.ManifestEntry{Key: "git-seed-v1-Linux-X64-", Paths: paths}, cache.ManifestEntry{Key: "mods-", Paths: paths}))
+
+	if res[0].Error != "" || res[0].Key != "git-seed-v1-Linux-X64-005200" || res[1].Error != "" || res[1].Key != "mods-2" {
+		t.Fatalf("want the newest seed past 5,000 listed before it, and the mods of this path set, not another's newer: %+v", res)
+	}
+	base := "v1/d/" + hydrateRepo + "/refs%2Fheads%2Fmain/" + entryVersion + "/"
+	slices := map[string]bool{base + "git-seed-v1-Linux-X64-": true, base + "mods-": true}
+	for _, p := range l.prefixes {
+		if !slices[p] {
+			t.Errorf("listed %q: want only an entry's version and key prefix", p)
+		}
+		delete(slices, p)
+	}
+	if len(slices) != 0 {
+		t.Errorf("never listed %v", slices)
+	}
+}
+
+func TestAnEntryIsReadInRangesOf64MiB(t *testing.T) {
+	mem, root := cachetest.NewMem(), t.TempDir()
+	body := make([]byte, 70<<20)
+	put(mem, mainScope, "big-1", body, time.Now())
+	h := &cache.Hydrator{Reader: mem, DefaultBranch: "main", Root: root,
+		Unpack: func(_ context.Context, r io.Reader, _ string) error { _, err := io.Copy(io.Discard, r); return err }}
+
+	res := h.Run(context.Background(), manifest(cache.ManifestEntry{Key: "big-", Paths: paths}))
+
+	if res[0].Error != "" {
+		t.Fatalf("%+v", res)
+	}
+	if mem.Opened != 2 {
+		t.Fatalf("a 70 MiB entry is two ranged reads of up to 64 MiB, not %d", mem.Opened)
+	}
+}
+
+func TestEntriesFinishedBeforeAStopStayInPlaceAndTheOneStoppedDoesNot(t *testing.T) {
+	mem, root, now := cachetest.NewMem(), t.TempDir(), time.Now()
+	put(mem, mainScope, "done-1", archive(t, map[string]string{"x": "y"}), now)
+	put(mem, mainScope, "slow-1", archive(t, map[string]string{"x": "y"}), now)
+	ctx, stop := context.WithCancel(context.Background())
+	h := &cache.Hydrator{Reader: mem, DefaultBranch: "main", Root: root,
+		Unpack: func(ctx context.Context, r io.Reader, dir string) error {
+			if strings.Contains(dir, "slow-1") {
+				for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+					if _, err := os.Stat(at(root, "done-1")); err == nil {
+						break
+					}
+				}
+				stop()
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			_, err := io.Copy(io.Discard, r)
+			return err
+		}}
+
+	res := h.Run(ctx, manifest(cache.ManifestEntry{Key: "done-", Paths: paths}, cache.ManifestEntry{Key: "slow-", Paths: paths}))
+
+	if res[0].Error != "" {
+		t.Fatalf("%+v", res)
+	}
+	if _, err := os.Stat(filepath.Join(at(root, "done-1"), workspace)); err != nil || res[1].Error == "" {
+		t.Fatalf("the stopped entry is an error: %+v", res)
+	}
+	if _, err := os.Stat(at(root, "slow-1")); !os.IsNotExist(err) {
+		t.Fatalf("a stopped entry must not be where a job looks: %v", err)
 	}
 }

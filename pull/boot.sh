@@ -17,13 +17,25 @@ PIN='@PIN@'
 T=$(curl -s -m 2 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600' http://169.254.169.254/latest/api/token)
 # The actions cache (pull/cache): starts its daemon from the region's cache bucket and wraps the runner's Node; a machine without the role runs on GitHub's own cache.
 CR=$(curl -s -m 2 -H "X-aws-ec2-metadata-token: $T" http://169.254.169.254/latest/meta-data/placement/region); PB=superci-pull-cache-243891825325-$CR; aws s3 cp --only-show-errors --region "$CR" "s3://$PB/bin/up.sh" - 2> /dev/null | PULLCACHE_BUCKET=$PB bash || :
-# Hydration (pull/README.md): with a manifest for this label, main's caches are unpacked before the machine asks for its runner, so no job sees half of them; its job takes them by rename.
-HM=/run/superci-hydrate.json; HR=/home/runner/hydrated
-if [ -x /usr/local/bin/pullcache ] && aws s3 cp --only-show-errors --region "$CR" "s3://$PB/bin/hydrate/@LABEL@.json" "$HM" 2> /dev/null; then
-  install -d -o runner -g runner "$HR"
-  timeout -k 5 110 runuser -u runner -- env HOME=/home/runner PULLCACHE_BUCKET="$PB" PULLCACHE_REGION="$CR" /usr/local/bin/pullcache hydrate -timeout 100s "$HM" "$HR" || :
-  printf '\nSUPERCI_HYDRATED=%s\n' "$HR" >> /home/runner/.env
-fi
+# Hydration (pull/README.md): with a manifest for this label, main's caches are unpacked in the background while the machine
+# asks for its runner and waits for its job, which takes them by rename. The runner's job-started hook stops it when the job starts.
+# The hydration is its own process group (setsid), whose leader's id is in $HR/.pid, so the hook ends all of it; it never blocks the machine.
+export HR=/home/runner/hydrated HM=/run/superci-hydrate.json PB CR
+install -d -o runner -g runner "$HR"
+cat > /home/runner/superci-hydrate-stop.sh << 'HOOK'
+@HYDRATE_STOP@
+HOOK
+chmod 755 /home/runner/superci-hydrate-stop.sh
+printf '\nSUPERCI_HYDRATED=%s\nACTIONS_RUNNER_HOOK_JOB_STARTED=%s\n' "$HR" /home/runner/superci-hydrate-stop.sh >> /home/runner/.env
+hydrate() {
+  echo $$ > "$HR/.pid"
+  if [ -x /usr/local/bin/pullcache ] && aws s3 cp --only-show-errors --region "$CR" "s3://$PB/bin/hydrate/@LABEL@.json" "$HM" 2> /dev/null; then
+    chown -R runner:runner "$HR"
+    timeout --foreground -k 5 110 runuser -u runner -- env HOME=/home/runner PULLCACHE_BUCKET="$PB" PULLCACHE_REGION="$CR" /usr/local/bin/pullcache hydrate -timeout 100s "$HM" "$HR" || :
+  fi
+  rm -f "$HR/.pid"
+}
+setsid bash -c "$(declare -f hydrate); hydrate" &
 DOC=$(curl -s -m 2 -H "X-aws-ec2-metadata-token: $T" http://169.254.169.254/latest/dynamic/instance-identity/rsa2048)
 call() { curl -s -k --pinnedpubkey "$PIN" -m 60 --data-binary "$DOC" -o "$2" -w '%{http_code}' "$L/$1"; }
 ( while sleep 5; do
