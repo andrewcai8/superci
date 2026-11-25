@@ -77,11 +77,11 @@ func TestAMarkIsWhatTheJanitorReadsBack(t *testing.T) {
 	o := cache.Object{Key: "v1/d/1/main/v1/hot", Modified: usesDay.Add(-72 * time.Hour)}
 	u.Hit(o.Key)
 	u.Wait()
-	got := cache.ReadMarks(listing(b.Mem, cache.MarkRoot)).LastUsed(o)
+	got := marksAt(b.Mem, usesDay).LastUsed(o)
 	if want := time.Date(2026, 11, 26, 0, 0, 0, 0, time.UTC); !got.Equal(want) {
 		t.Fatalf("last used %s, want the end of the day %s", got, want)
 	}
-	if other := cache.ReadMarks(listing(b.Mem, cache.MarkRoot)).LastUsed(cache.Object{Key: "v1/d/1/main/v1/cold", Modified: usesDay.Add(-time.Hour)}); !other.Equal(usesDay.Add(-time.Hour)) {
+	if other := marksAt(b.Mem, usesDay).LastUsed(cache.Object{Key: "v1/d/1/main/v1/cold", Modified: usesDay.Add(-time.Hour)}); !other.Equal(usesDay.Add(-time.Hour)) {
 		t.Fatalf("an entry with no marker was last used when it was saved, not %s", other)
 	}
 }
@@ -127,4 +127,9 @@ func TestAHitRestoreMarksTheEntryItReturnedAndAMissMarksNothing(t *testing.T) {
 	if keys := r.mem.Keys("a/"); len(keys) != 1 {
 		t.Fatalf("a miss left markers %v", keys)
 	}
+}
+
+func marksAt(m *cachetest.Mem, now time.Time) cache.Marks {
+	marks, _ := cache.ReadMarks(listing(m, cache.MarkRoot), now)
+	return marks
 }

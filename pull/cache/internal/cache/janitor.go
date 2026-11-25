@@ -187,7 +187,7 @@ func Janitor(ctx context.Context, st Pruner, p Policy, now time.Time, dry bool, 
 	if err != nil {
 		return Report{}, err
 	}
-	marks := ReadMarks(mobjs)
+	marks, junk := ReadMarks(mobjs, now)
 	plan := Plan(objs, marks, p, now)
 	if len(plan) > 0 {
 		// A listing has no save time, and a copy's LastModified is later than its save: before deleting, read the
@@ -200,10 +200,26 @@ func Janitor(ctx context.Context, st Pruner, p Policy, now time.Time, dry bool, 
 	rep := Report{Entries: len(objs), HeldMB: int(sum(objs) >> 20), Planned: len(plan), Dry: dry}
 	lg.Printf("janitor: %d entries, %d MB held, %d markers, cap %d MB, idle limit %s: %d to delete", rep.Entries, rep.HeldMB, len(mobjs), p.CapBytes>>20, p.MaxIdle, len(plan))
 	if dry {
+		for _, o := range junk {
+			lg.Printf("janitor: would delete %s (%d bytes): not a marker", o.Key, o.Size)
+		}
 		for _, v := range plan {
 			lg.Printf("janitor: would delete %s (%d MB, saved %s, last used %s): %s", v.Key, v.Size>>20, v.SaveTime().UTC().Format(time.RFC3339), v.LastUsed.UTC().Format(time.RFC3339), v.Reason)
 		}
 		return rep, nil
+	}
+	for len(junk) > 0 {
+		n := min(len(junk), 1000)
+		got, err := st.Delete(ctx, junk[:n])
+		for i, r := range got {
+			if r == Deleted {
+				lg.Printf("janitor: deleted %s (%d bytes): not a marker", junk[i].Key, junk[i].Size)
+			}
+		}
+		if err != nil {
+			return rep, err
+		}
+		junk = junk[n:]
 	}
 	for len(plan) > 0 {
 		n := min(len(plan), 1000)

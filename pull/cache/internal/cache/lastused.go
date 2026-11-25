@@ -36,24 +36,27 @@ func markHash(entryKey string) string {
 // entry counts as used until the day's end.
 type Marks map[string]time.Time
 
-// ReadMarks is the markers among objs, the listing of MarkRoot. An object that is not a marker is skipped.
-func ReadMarks(objs []Object) Marks {
+// ReadMarks is the markers among objs, the listing of MarkRoot, as of now. A marker is empty and dated no later than
+// now's UTC day: the machines' role can write under MarkRoot, so a marker dated ahead would keep an old entry
+// "used" for ever and push main's newest out first. Anything else there is junk, returned for the janitor to delete,
+// so nothing a job writes under MarkRoot outlives one janitor run or changes the ranking.
+func ReadMarks(objs []Object, now time.Time) (Marks, []Object) {
 	m := Marks{}
+	var junk []Object
+	today := now.UTC().Truncate(24 * time.Hour)
 	for _, o := range objs {
 		rest, ok := strings.CutPrefix(o.Key, MarkRoot)
 		hash, day, ok2 := strings.Cut(rest, "/")
-		if !ok || !ok2 || len(hash) != sha256.Size*2 {
-			continue
-		}
 		at, err := time.Parse(markDay, day)
-		if err != nil {
+		if !ok || !ok2 || len(hash) != sha256.Size*2 || err != nil || o.Size != 0 || at.After(today) {
+			junk = append(junk, o)
 			continue
 		}
 		if end := at.Add(24 * time.Hour); end.After(m[hash]) {
 			m[hash] = end
 		}
 	}
-	return m
+	return m, junk
 }
 
 // LastUsed is when the entry was last restored, or saved if that is later.
