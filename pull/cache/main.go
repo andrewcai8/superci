@@ -3,7 +3,7 @@
 //	pullcache serve    the cache service, on the machine's private address
 //	pullcache wrap D   put it in front of the runner's Node (D: the runner's externals folder)
 //	pullcache janitor  keep the bucket under a size
-//	pullcache hydrate M R   unpack the entries manifest M names under R, before the machine asks for its runner
+//	pullcache hydrate M R   unpack the entries manifest M names under R while the machine waits for its job; SIGTERM stops it
 //
 // As `node` (a wrapped Node) it becomes the real Node, with the job's cache service pointed here. As `bootstrap` it
 // is a Lambda function: the broker (PULLCACHE_LAMBDA=broker), which gives a job credentials to write its own scope,
@@ -16,11 +16,14 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -157,12 +160,14 @@ func janitor(lg *log.Logger, args []string) error {
 	return err
 }
 
-// hydrate unpacks a manifest's entries before the machine asks for its runner (boot.sh), with the machine's read-only
-// role. boot.sh runs it as the runner's user, so what it writes is the job's own. It stops at -timeout; an entry it
-// had not finished is left in a .tmp- directory no job takes. What became of each entry goes to <root>/.hydrated.json.
+// hydrate unpacks a manifest's entries while the machine waits for its job (boot.sh), with the machine's read-only
+// role. boot.sh runs it as the runner's user, so what it writes is the job's own. It stops at -timeout, and at
+// SIGTERM, which the runner's job-started hook sends so it never competes with the job; an entry it had not finished
+// is left in a .tmp- directory no job takes. What became of each entry goes to <root>/.hydrated.json.
 func hydrate(lg *log.Logger, args []string) error {
 	fs := flag.NewFlagSet("hydrate", flag.ExitOnError)
 	timeout := fs.Duration("timeout", 100*time.Second, "give up on what is not done by then")
+	jitter := fs.Duration("jitter", 3*time.Second, "wait a random time up to this before the first read, so a burst of machines does not read one prefix in the same second")
 	_ = fs.Parse(args)
 	if fs.NArg() != 2 {
 		return fmt.Errorf("usage: pullcache hydrate [-timeout d] <manifest> <root>")
@@ -179,18 +184,26 @@ func hydrate(lg *log.Logger, args []string) error {
 	if bucket == "" || region == "" {
 		return fmt.Errorf("PULLCACHE_BUCKET and PULLCACHE_REGION are not set")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+	defer stop()
+	ctx, cancel := context.WithTimeout(ctx, *timeout)
 	defer cancel()
 	st, err := s3store.New(ctx, bucket, bucket+"-stage", region, nil)
 	if err != nil {
 		return err
 	}
+	if *jitter > 0 {
+		select {
+		case <-time.After(rand.N(*jitter)):
+		case <-ctx.Done():
+		}
+	}
 	began := time.Now()
 	h := &cache.Hydrator{Reader: st, DefaultBranch: env("PULLCACHE_DEFAULT_BRANCH", "main"), AnyScope: os.Getenv("PULLCACHE_HYDRATE_ANY_SCOPE") == "1", Root: fs.Arg(1), Log: lg,
 		ToolCache: env("RUNNER_TOOL_CACHE", "/opt/hostedtoolcache"), Platform: cache.ThisPlatform()}
 	res := h.Run(ctx, m)
-	lg.Printf("hydrate: %d entries in %.1f s", len(res), time.Since(began).Seconds())
-	b, err := json.MarshalIndent(map[string]any{"seconds": time.Since(began).Seconds(), "entries": res}, "", "  ")
+	lg.Printf("hydrate: %d entries in %.1f s (stopped: %v)", len(res), time.Since(began).Seconds(), ctx.Err() != nil)
+	b, err := json.MarshalIndent(map[string]any{"seconds": time.Since(began).Seconds(), "stopped": ctx.Err() != nil, "entries": res}, "", "  ")
 	if err != nil {
 		return err
 	}

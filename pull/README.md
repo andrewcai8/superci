@@ -307,39 +307,51 @@ A machine idles in its set's pool until GitHub hands it its one job. With a mani
 of that time unpacking main's caches, so the job's setup takes them with a rename instead of a download and an untar.
 
 - **What.** `bin/hydrate/<label>.json` in the region's cache bucket (the machines' role reads only `bin/` and `v1/`).
-  Each entry is a restore key (`*` stands for any run of characters); the machine takes the newest entry that
-  matches in the first of `scopes` that has one, as a job's restore reads its own scope and then main's. `checkout` also checks out the git work tree
-  of the entry (a seed of `.git`), so a checkout over it writes only what its commit changes.
+  An entry is a cache entry's whole identity: its scope, its version and its key. `key` is a restore key (`*` stands
+  for any run of characters) and `paths` are the lines of the cache action's `path` input, as a job passes them: the
+  version is `sha256(paths + compression + "1.0" joined by "|")`, as `@actions/cache` makes it, and `compression` is
+  `zstd-without-long` on the runner image (read off main's bucket: the git seed's `.git` is version `e147b628…`). The
+  machine lists that version's keys under the restore key's literal prefix, in each of `scopes` in order (as a job's
+  restore reads its own scope and then main's), and takes the newest match. `checkout` also checks out the git work
+  tree of the entry (a seed of `.git`), so a checkout over it writes only what its commit changes.
 
   ```json
   {"repository": "1351063449", "scopes": ["refs/heads/main"], "workspace": "/home/runner/_work/megpt-mono/megpt-mono",
-   "entries": [{"key": "git-seed-v1-Linux-X64-", "checkout": true},
-               {"key": "bun-modules-v1-Linux-X64-bun*-aura-hono-api-scripts-on-"},
-               {"key": "bun-modules-v1-Linux-X64-bun*-aura-hono-api-mind-scripts-on-"},
-               {"key": "mind-python-v1-Linux-X64-"},
+   "entries": [{"key": "git-seed-v1-Linux-X64-", "paths": [".git"], "checkout": true},
+               {"key": "bun-modules-v1-Linux-X64-bun*-aura-hono-api-scripts-on-", "paths": ["aura-hono-api/node_modules"]},
+               {"key": "bun-modules-v1-Linux-X64-bun*-aura-hono-api-mind-scripts-on-", "paths": ["aura-hono-api/mind/node_modules"]},
+               {"key": "mind-python-v1-Linux-X64-", "paths": ["/home/runner/_work/_temp/harness-python"]},
                {"python": "3.13"}]}
   ```
   `python` installs that CPython into the machine's tool cache as actions/setup-python would, so a job's
   setup-python of that version finds it. Every scope must be the default branch's: only main's jobs write it, so no
   PR's save can become what another machine's job starts from. `pullcache hydrate` refuses any other scope unless
   `PULLCACHE_HYDRATE_ANY_SCOPE=1`, which only a dev listener's A/B sets.
-- **When.** `boot.sh` runs `pullcache hydrate` after the cache daemon starts and before it asks `/jit`, as the
-  `runner` user, for at most 100 s. The runner does not exist until it is done, so no job can see a half-unpacked
-  entry, and each entry is unpacked in `.tmp-<key>/` and renamed into place whole. `<root>/.hydrated.json` says what
-  became of each entry and how long it took.
-- **Where.** `/home/runner/hydrated/<key>/`, in which that directory stands for `/`: an archive's files are where
-  actions/cache would restore them, under that prefix. The runner's `.env` gives every job
-  `SUPERCI_HYDRATED=/home/runner/hydrated`. A job takes a path P of key K by `mv $SUPERCI_HYDRATED/K/P P` when it
-  restores K, and restores as before when it is not there (megpt-mono's `bun-install`, `mind-python-env` and
-  lint-test-backend's git seed steps do).
+- **When.** `boot.sh` registers the machine's runner at once (launch to runner online is what a plain machine's is)
+  and starts `pullcache hydrate` beside it, in its own process group, as the `runner` user, for at most 100 s. Hydration
+  never gates registration and a failure of it never blocks the machine. Each entry is unpacked in
+  `.tmp-<version>-<key>/` and renamed into place whole, so a job sees all of an entry or none of it, whenever it starts.
+  `<root>/.hydrated.json` says what became of each entry, how long it took and whether it was stopped.
+- **Stop.** The runner's `ACTIONS_RUNNER_HOOK_JOB_STARTED` is `hydrate-stop.sh`: when the job starts it ends the
+  whole hydration group (SIGTERM, then SIGKILL after 2 s), so hydration never competes with the job for CPU or disk.
+  The job takes the entries already in place and restores the rest itself. A hydrator that already ended leaves the hook
+  nothing to do.
+- **Burst.** An entry is read in ranges of 64 MiB, three ahead, and each machine waits a random 0 to 3 s before its first
+  read: a thousand machines make about 16 requests per GB each to one prefix, not 64.
+- **Where.** `/home/runner/hydrated/<version>/<key>/`, in which that directory stands for `/`: an archive's files are
+  where actions/cache would restore them, under that prefix. The runner's `.env` gives every job
+  `SUPERCI_HYDRATED=/home/runner/hydrated` (set whether or not a manifest exists, and empty without one). A job takes a path P saved
+  from the path set `S` under key K by `mv $SUPERCI_HYDRATED/<version of S>/K/P P`, where it computes the version as above from
+  the same `path` lines its own restore passes, and restores as before when it is not there (megpt-mono's `bun-install`,
+  `mind-python-env` and lint-test-backend's git seed steps do).
 - **Why it is safe.** It reads only S3, with the machine's read-only role, and only the manifest's scopes: main's
   entries are written only by main's jobs (the broker's per-job credentials), so nothing a pull request's job writes
   is hydrated anywhere. What a machine hydrates serves its one job; a machine runs one job, ever (Invariants).
-- **Cost.** A hydrated machine registers its runner later by the time hydration takes; the pool's `fill_seconds`
-  covers it, and a job past the pool waits that much longer and saves it in setup.
+- **Cost.** None at registration. A job that lands before an entry is in place restores it as it did. S3: about 1 GB of
+  GETs per machine (gateway endpoint, no transfer charge).
 - **Turn it on.** `aws --profile ci-runners s3 cp manifest.json s3://superci-pull-cache-243891825325-<region>/bin/hydrate/<label>.json`
-  for each region; machines launched afterwards hydrate. It needs this branch's listener (the label in each set's
-  user data) and its `pullcache` in `bin/`.
+  for each region; machines launched afterwards hydrate. It needs this branch's listener (the label and the hook in each
+  set's user data) and its `pullcache` in `bin/`.
 - **Turn it off.** Delete `bin/hydrate/<label>.json`; machines launched afterwards hydrate nothing. A job on a machine
   that hydrated nothing restores as it did.
 
