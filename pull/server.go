@@ -138,8 +138,7 @@ func (h *Server) jit(w http.ResponseWriter, r *http.Request) {
 	})
 	cfg, err := h.client.GenerateJitRunnerConfig(ctx, &scaleset.RunnerScaleSetJitRunnerSetting{Name: name}, s.id)
 	if err != nil {
-		var rl *scaleset.RateLimitError
-		refused := errors.As(err, &rl) || strings.Contains(err.Error(), "ConfigureTooManyRunners")
+		refused := refusedRegistration(err)
 		exists := errors.Is(err, scaleset.RunnerExistsError)
 		slog.Error("register", "set", s.spec.Name, "machine", m.ID, "runner", name, "refused", refused, "exists", exists, "err", err.Error(), "ms", time.Since(started).Milliseconds())
 		switch {
@@ -256,4 +255,10 @@ func Admin(status func() Status, healthy func() error, override func(set string,
 		w.WriteHeader(http.StatusNoContent)
 	})
 	return mux
+}
+
+// refusedRegistration says whether GitHub refused a registration for its organization-wide cap or its rate limit.
+func refusedRegistration(err error) bool {
+	var rl *scaleset.RateLimitError
+	return errors.As(err, &rl) || strings.Contains(err.Error(), "ConfigureTooManyRunners")
 }

@@ -843,12 +843,17 @@ func parallel[T any](items []T, f func(T)) {
 	wg.Wait()
 }
 
-// sampleOrg learns the organization's highest runner id from a listing when the budget asks for one (SampleDue). A
-// listing reads every page of the organization's runners (2,600 at a busy hour, 27 requests of the App's 5,000 an
-// hour, 10-15 s); its head is dated when it began, so two samples 61 s apart span 61 s however long each took.
+// sampleOrg learns the organization's highest runner id when the budget asks for one (SampleDue). It registers a probe
+// runner and removes it at once: runner ids are one sequence for the organization, so the probe's id is the head,
+// exact, for two calls to the Actions service. The probe is a registration like any other, inside the budget and
+// counted as ours. It never runs (no process holds it), so GitHub gives it no job, and one whose removal failed is an
+// orphan the lister removes. A listing of every organization runner is the fallback when the budget has no token or
+// the probe fails: 44 pages at 4,300 runners, so at one every 100 s about 1,600 of the App's 5,000 requests an hour,
+// which every listener of the App shares. A listing's head is dated when it began, so two samples 61 s apart span
+// 61 s however long each took.
 func (l *Listener) sampleOrg(ctx context.Context) {
 	began := time.Now()
-	if !l.budget.SampleDue(began) {
+	if !l.budget.SampleDue(began) || l.probeHead(ctx, began) {
 		return
 	}
 	id, err := l.rest.OrgHead(ctx)
@@ -858,6 +863,7 @@ func (l *Listener) sampleOrg(ctx context.Context) {
 		return
 	}
 	l.budget.Head(began, id)
+	slog.Info("org head", "source", "listing", "id", id, "ms", time.Since(began).Milliseconds())
 }
 
 // price refreshes the spot prices the spend accrues at.
@@ -880,6 +886,38 @@ func (l *Listener) price(ctx context.Context) {
 		}
 		l.spend.SetPrices(p)
 	}
+}
+
+// probeHead learns the organization's head from a probe runner of the first set it serves; it says whether it did.
+func (l *Listener) probeHead(ctx context.Context, now time.Time) bool {
+	var set *Set
+	for _, s := range l.sets {
+		if !s.drain {
+			set = s
+			break
+		}
+	}
+	if set == nil || !l.budget.Take(now, ForPool) {
+		return false
+	}
+	pctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	cfg, err := l.client.GenerateJitRunnerConfig(pctx, &scaleset.RunnerScaleSetJitRunnerSetting{Name: fmt.Sprintf("superci-probe-%d", now.UnixNano())}, set.id)
+	if err != nil {
+		outcome := Failed
+		if refusedRegistration(err) {
+			outcome = Refused
+		}
+		l.budget.Done(time.Now(), outcome, 0)
+		slog.Warn("org probe", "err", err.Error())
+		return false
+	}
+	l.budget.Done(time.Now(), Made, int64(cfg.Runner.ID))
+	slog.Info("org head", "source", "probe", "id", cfg.Runner.ID)
+	if err := l.client.RemoveRunner(pctx, int64(cfg.Runner.ID)); err != nil {
+		slog.Warn("org probe left a runner", "runner_id", cfg.Runner.ID, "err", err.Error())
+	}
+	return true
 }
 
 // setPools sets each set's hot pool: the operator's pin, or the burst the set's recent jobs ask for within the hour's
