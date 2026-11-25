@@ -24,6 +24,8 @@ type Budget struct {
 	refilled       time.Time
 	throttledUntil time.Time
 	throttleWait   time.Duration
+	sampleWait     time.Duration // after a failed sample of the organization's runner ids, doubling from 1 to 10 minutes
+	sampleNext     time.Time     // no sample before this
 	made, refused  int
 	failed         int
 }
@@ -61,6 +63,7 @@ func (b *Budget) window() time.Duration { return time.Duration(b.c.WindowS) * ti
 func (b *Budget) Head(at time.Time, id int64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.sampleWait, b.sampleNext = 0, time.Time{}
 	b.head(at, id)
 }
 
@@ -99,6 +102,9 @@ func (b *Budget) LastHead() time.Time {
 func (b *Budget) SampleDue(now time.Time) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if now.Before(b.sampleNext) {
+		return false
+	}
 	n := len(b.heads)
 	if n == 0 {
 		return true
@@ -108,6 +114,16 @@ func (b *Budget) SampleDue(now time.Time) bool {
 		wait = 61 * time.Second
 	}
 	return now.Sub(b.heads[n-1].at) >= wait
+}
+
+// SampleFailed holds off the next sample after one failed: a minute, doubling to ten while they keep failing. A sample
+// reads every page of the organization's runners (44 at 4,300 runners), and the App's rate limit is shared with the
+// push plane and every other listener, so a failure retried every tick would spend it.
+func (b *Budget) SampleFailed(now time.Time) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.sampleWait = min(10*time.Minute, max(time.Minute, 2*b.sampleWait))
+	b.sampleNext = now.Add(b.sampleWait)
 }
 
 // Estimate is the budget's view of the organization's registrations, each a rate a second over the last window.

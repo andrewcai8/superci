@@ -156,3 +156,34 @@ func TestTheSecondSampleComesAMinuteAfterTheFirst(t *testing.T) {
 		t.Fatal("not due 101 s after the last sample")
 	}
 }
+
+// A failed sample was retried every 5 s tick: on Nov 25 from 20:12 to 20:27Z, 180 listings of up to 41 pages each, on
+// the App's rate limit that the push plane and every other listener share.
+func TestAFailedSampleIsNotRetriedEveryTick(t *testing.T) {
+	b := NewBudget(reg(), t0)
+	if !b.SampleDue(t0) {
+		t.Fatal("no sample due at the start")
+	}
+	b.SampleFailed(t0)
+	if b.SampleDue(t0.Add(5 * time.Second)) {
+		t.Fatal("due 5 s after a failed sample")
+	}
+	if !b.SampleDue(t0.Add(time.Minute)) {
+		t.Fatal("not due a minute after one failed sample")
+	}
+	b.SampleFailed(t0.Add(time.Minute))
+	if b.SampleDue(t0.Add(2*time.Minute)) || !b.SampleDue(t0.Add(3*time.Minute)) {
+		t.Fatal("a second failure in a row does not wait two minutes")
+	}
+	for i := 0; i < 10; i++ {
+		b.SampleFailed(t0)
+	}
+	if b.SampleDue(t0.Add(9*time.Minute)) || !b.SampleDue(t0.Add(10*time.Minute)) {
+		t.Fatal("the wait does not stop doubling at ten minutes")
+	}
+	b.Head(t0.Add(10*time.Minute), 7_000_000)
+	b.Head(t0.Add(11*time.Minute+time.Second), 7_000_100)
+	if !b.SampleDue(t0.Add(13 * time.Minute)) {
+		t.Fatal("a sample that succeeded does not end the backoff")
+	}
+}
