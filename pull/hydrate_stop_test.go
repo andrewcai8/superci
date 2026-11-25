@@ -16,7 +16,8 @@ func groupAlive(pgid int) bool { return syscall.Kill(-pgid, 0) == nil }
 
 func runHook(t *testing.T, dir string) {
 	t.Helper()
-	cmd := exec.Command("bash", "hydrate-stop.sh")
+	// As the runner runs a hook: bash --noprofile --norc -e -o pipefail.
+	cmd := exec.Command("bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "hydrate-stop.sh")
 	cmd.Env = append(os.Environ(), "SUPERCI_HYDRATED="+dir)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("the hook must never fail the job: %v: %s", err, out)
