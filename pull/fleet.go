@@ -201,15 +201,30 @@ func (sr *setRegion) findPools(ctx context.Context, r *Region, types []string) e
 	if err != nil {
 		return err
 	}
-	for _, o := range offers.InstanceTypeOfferings {
-		if subnet, ok := r.subnets[aws.ToString(o.Location)]; ok {
-			sr.pools = append(sr.pools, ec2types.FleetLaunchTemplateOverridesRequest{InstanceType: o.InstanceType, SubnetId: aws.String(subnet)})
-		}
-	}
+	sr.pools = rankedPools(offers.InstanceTypeOfferings, r.subnets, types)
 	if len(sr.pools) == 0 {
 		return errors.New("no pools")
 	}
 	return nil
+}
+
+// rankedPools is each offered type in each zone with a default subnet, with the type's place in the size's list as
+// its priority (0 first). A fleet takes the first types that have capacity, so a size lists its types fastest first:
+// on Nov 25 a CPU-bound test step ran 62 s on c5a.xlarge, 50 s on c7i-flex.xlarge, 38 s on c7a.xlarge and c8i.xlarge,
+// and Blacksmith's 31 s needed c8a or m8a, whose spot pools are the smallest.
+func rankedPools(offers []ec2types.InstanceTypeOffering, subnets map[string]string, types []string) []ec2types.FleetLaunchTemplateOverridesRequest {
+	rank := make(map[string]int, len(types))
+	for i, t := range types {
+		rank[t] = i
+	}
+	var pools []ec2types.FleetLaunchTemplateOverridesRequest
+	for _, o := range offers {
+		if subnet, ok := subnets[aws.ToString(o.Location)]; ok {
+			pools = append(pools, ec2types.FleetLaunchTemplateOverridesRequest{InstanceType: o.InstanceType, SubnetId: aws.String(subnet),
+				Priority: aws.Float64(float64(rank[string(o.InstanceType)]))})
+		}
+	}
+	return pools
 }
 
 // chunk is the most capacity one CreateFleet asks for; a burst is a handful of these per region.
@@ -319,8 +334,8 @@ func (sf *SetFleet) createFleet(ctx context.Context, r *Region, n int, kind ec2t
 		Type:                        ec2types.FleetTypeInstant,
 		ClientToken:                 aws.String(token),
 		TargetCapacitySpecification: &ec2types.TargetCapacitySpecificationRequest{TotalTargetCapacity: aws.Int32(int32(n)), DefaultTargetCapacityType: kind},
-		SpotOptions:                 &ec2types.SpotOptionsRequest{AllocationStrategy: ec2types.SpotAllocationStrategyPriceCapacityOptimized},
-		OnDemandOptions:             &ec2types.OnDemandOptionsRequest{AllocationStrategy: ec2types.FleetOnDemandAllocationStrategyLowestPrice},
+		SpotOptions:                 &ec2types.SpotOptionsRequest{AllocationStrategy: ec2types.SpotAllocationStrategyCapacityOptimizedPrioritized},
+		OnDemandOptions:             &ec2types.OnDemandOptionsRequest{AllocationStrategy: ec2types.FleetOnDemandAllocationStrategyPrioritized},
 		LaunchTemplateConfigs: []ec2types.FleetLaunchTemplateConfigRequest{{
 			LaunchTemplateSpecification: &ec2types.FleetLaunchTemplateSpecificationRequest{LaunchTemplateId: aws.String(sr.template), Version: aws.String(sr.version)},
 			Overrides:                   sr.pools,

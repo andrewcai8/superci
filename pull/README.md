@@ -22,7 +22,8 @@ superci-pull: one process on one c7g.large, an Auto Scaling group of one in us-e
   sessions  : one message session per set; a message is acknowledged only after it is handled
   budget    : one registration budget for every set, inside what GitHub leaves the organization (below)
   launcher  : per set, desired = min(max, assigned + waiting + pool); launches desired - live as instant EC2 Fleets
-              of at most 250, price-capacity-optimized over the size's 17-18 types x every zone of us-east-1 that
+              of at most 250, capacity-optimized-prioritized over the size's 12 types (listed fastest first: c8a and
+              m8a, then c8i, m8i, c7a and m7a, then four older families for capacity) x every zone of us-east-1 that
               offers them (5 of 6: use1-az3 offers none) at weight 2 and of us-east-2 (3 of 3) at weight 1; a
               region's spot shortfall goes to the other, then on-demand, at most 10% of the last half hour's
               launches; a ClientToken on every call
