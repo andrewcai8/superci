@@ -1,7 +1,8 @@
 #!/bin/bash
 # The listener over SSH as release_test.sh needs it: the command runs here, its absolute paths moved under
 # $FAKE_HOST, sudo dropped, and systemd answering for one running listener whose executable is the installed binary.
-cmd=$(sed -e 's|sudo ||g' \
+# Only root reads /proc/<pid>/exe, so a redirect from it (opened by the unprivileged shell) is refused.
+cmd=$(sed -e 's|< /proc/\$p/exe|< /proc/self/denied|g' -e 's|sudo ||g' \
   -e 's|systemctl show -p MainPID --value superci-pull|echo 1|g' -e 's|/proc/\$p/exe|/usr/local/bin/superci-pull|g' \
   -e 's|systemctl restart superci-pull|true|g' -e 's|systemctl is-active superci-pull|echo active|g' \
   -e 's|/usr/local/bin/|@BIN@|g' -e 's|/tmp/|@TMP@|g' -e "s|@BIN@|$FAKE_HOST/usr/local/bin/|g" -e "s|@TMP@|$FAKE_HOST/tmp/|g" <<< "$*")

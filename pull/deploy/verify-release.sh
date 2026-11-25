@@ -51,7 +51,7 @@ if [ "$PART" = listener ] || [ "$PART" = all ]; then
     if [ "$($A ec2 describe-instances --region us-east-1 --filters Name=tag:Name,Values=superci-pull-listener Name=instance-state-name,Values=running --query 'length(Reservations[].Instances[])' --output text)" = 0 ]; then
       echo "note  no listener instance is running"
     else
-      read -r got rev < <(${SSH:-$here/ssh.sh} 'p=$(systemctl show -p MainPID --value superci-pull); echo "$(sudo sha256sum < /proc/$p/exe | cut -d" " -f1) $(sudo /proc/$p/exe -version 2>/dev/null || echo none)"')
+      read -r got rev < <(${SSH:-$here/ssh.sh} 'p=$(systemctl show -p MainPID --value superci-pull); echo "$(sudo sha256sum /proc/$p/exe | cut -d" " -f1 | grep . || echo none) $(sudo /proc/$p/exe -version 2>/dev/null || echo none)"')
       if [ "$got" = "$want" ] && [ "$rev" = "$commit" ]; then ok "listener runs $commit ($got)"; else fail "listener runs sha256 $got, -version ${rev:-none}; RELEASE.json says $want, $commit"; fi
     fi
   fi
