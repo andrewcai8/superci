@@ -390,6 +390,16 @@
         "val"
       ],
       "what": "the cache daemon finished a save; val is saved:<bytes>:<ms>:<key>"
+    },
+    "jit.claim": {
+      "src": "listener",
+      "fields": [
+        "set",
+        "inst",
+        "result",
+        "claim_ms"
+      ],
+      "what": "the claim a grant takes before it registers a runner (pull-fence): result is taken, refused (another grant holds it) or error (the claim store failed); claim_ms how long it took"
     }
   }
 }
