@@ -246,15 +246,15 @@ workload costs storage, which the cap bounds, not requests. Each further TB of c
 ## Deploy
 
 ```bash
-# the binaries, the functions' code and the machine start script go in each bucket's bin/ (any Linux host with Go
-# builds them; the function is the same program, named bootstrap, for arm64):
-cd pull/cache && for a in amd64 arm64; do CGO_ENABLED=0 GOOS=linux GOARCH=$a go build -trimpath -ldflags='-s -w' -o pullcache-linux-$a .; done
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -tags lambda.norpc -trimpath -ldflags='-s -w' -o bootstrap . && zip pullcache-lambda-arm64.zip bootstrap
-for r in us-east-1 us-east-2; do for f in pullcache-linux-amd64 pullcache-linux-arm64 pullcache-lambda-arm64.zip; do
-  aws --profile ci-runners s3 cp $f s3://superci-pull-cache-243891825325-$r/bin/$f --region $r; done
-  aws --profile ci-runners s3 cp deploy/machine-up.sh s3://superci-pull-cache-243891825325-$r/bin/up.sh --region $r; done
+pull/deploy/build.sh /tmp/release           # the daemons, the functions' code (the same program, named bootstrap) and the
+                                             # machine start script, built on a tagged instance, each carrying its commit
+pull/cache/deploy/release.sh /tmp/release    # to each bucket's bin/, with bin/RELEASE.json; a clean commit of main only
 pull/cache/deploy/up.sh                      # endpoints, buckets, roles, functions, schedules, in both regions; run again at will
 ```
+
+`pullcache version` prints the commit a daemon was built from, and `serve` and each function log it at start
+(`-X main.revision=<sha>`; `-trimpath` keeps it out of `go version -m`). `bin/RELEASE.json` names the commit, the build
+time and each file's sha256.
 
 `deploy/down.sh` removes the endpoints, functions, schedules and roles and keeps the buckets; `-buckets` removes those
 too.

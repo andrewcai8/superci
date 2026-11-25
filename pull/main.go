@@ -55,8 +55,13 @@ func main() {
 		noMetrics  = flag.Bool("no-metrics", false, "publish no CloudWatch metrics")
 		deleteSets = flag.Bool("delete-scale-sets", false, "delete every configured scale set and exit")
 		validate   = flag.Bool("validate", false, "check the override file named by -config over the built-in config, and exit")
+		version    = flag.Bool("version", false, "print the commit this binary was built from, and exit")
 	)
 	flag.Parse()
+	if *version {
+		fmt.Println(revision)
+		return
+	}
 	if *validate {
 		if _, err := LoadConfig(*configPath); err != nil {
 			fmt.Fprintf(os.Stderr, "invalid: %v\n", err)
@@ -66,6 +71,7 @@ func main() {
 		return
 	}
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+	slog.Info("start", "revision", revision)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	err := run(ctx, flags{*configPath, *publicIP, pairs(*groups), *listen, *admin, *tlsParam, *spendParam, *claims, *noMetrics, *deleteSets})
