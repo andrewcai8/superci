@@ -28,6 +28,7 @@ type rig struct {
 	mem    *cachetest.Mem
 	srv    *httptest.Server
 	log    *bytes.Buffer
+	uses   *cache.Uses
 }
 
 // Every request the actions client makes goes to rig.srv; the redirects a download answers with are not followed.
@@ -40,7 +41,8 @@ func newRig(t *testing.T) *rig {
 	mem.MinPart = 4
 	v := &cache.Verifier{JWKSURL: jwks.URL, Issuer: cache.GitHubIssuer}
 	r := &rig{t: t, signer: signer, mem: mem, log: &bytes.Buffer{}}
-	s := &cache.Server{Store: mem, Verify: v.Verify, DefaultBranch: "main", Log: log.New(r.log, "", 0)}
+	r.uses = &cache.Uses{Store: mem, Now: func() time.Time { return usesDay }}
+	s := &cache.Server{Store: mem, Verify: v.Verify, DefaultBranch: "main", Log: log.New(r.log, "", 0), Uses: r.uses}
 	r.srv = httptest.NewServer(s)
 	s.Base = r.srv.URL
 	t.Cleanup(r.srv.Close)

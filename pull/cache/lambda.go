@@ -46,9 +46,13 @@ func lambdaMain() {
 		if err != nil {
 			lg.Fatal(err)
 		}
+		idle, err := time.ParseDuration(env("PULLCACHE_MAX_IDLE", cache.DefaultMaxIdle.String()))
+		if err != nil {
+			lg.Fatal(err)
+		}
 		awslambda.Start(func(ctx context.Context) (string, error) {
-			n, freed, err := cache.Janitor(ctx, st, capGB<<30, false, lg)
-			return fmt.Sprintf("%d entries deleted, %d MB freed", n, freed>>20), err
+			rep, err := cache.Janitor(ctx, st, cache.Policy{CapBytes: capGB << 30, MaxIdle: idle}, time.Now(), false, lg)
+			return rep.String(), err
 		})
 	case "mirror":
 		m, err := newMirror(ctx, bucket, region, os.Getenv("PULLCACHE_PEER_BUCKET"), os.Getenv("PULLCACHE_PEER_REGION"))

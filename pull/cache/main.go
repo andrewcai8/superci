@@ -131,7 +131,8 @@ func serve(lg *log.Logger) error {
 	}
 	base := "http://" + l.Addr().String()
 	srv := &cache.Server{Store: st, Verify: verifier().Verify, DefaultBranch: env("PULLCACHE_DEFAULT_BRANCH", "main"), Base: base, Upstream: upstream, Log: lg,
-		Mark: cache.SpoolMarks(env("PULLCACHE_MARKS", "/run/superci-marks"), time.Now)}
+		Mark: cache.SpoolMarks(env("PULLCACHE_MARKS", "/run/superci-marks"), time.Now),
+		Uses: &cache.Uses{Store: st, Log: lg}}
 	if dir := os.Getenv("PULLCACHE_EXTERNALS"); dir != "" {
 		at := filepath.Join(dir, cache.AddressFile)
 		if err := os.WriteFile(at+".new", []byte(base), 0o644); err != nil {
@@ -150,7 +151,9 @@ func janitor(lg *log.Logger, args []string) error {
 	bucket := fs.String("bucket", os.Getenv("PULLCACHE_BUCKET"), "the bucket")
 	region := fs.String("region", os.Getenv("PULLCACHE_REGION"), "its region")
 	capGB := fs.Int64("cap-gb", defaultCapGB, "entries kept at most, in GB")
-	dry := fs.Bool("dry-run", false, "say what would go, delete nothing")
+	capMB := fs.Int64("cap-mb", 0, "entries kept at most, in MB (instead of -cap-gb, to see what a small cap would delete)")
+	idle := fs.Duration("max-idle", cache.DefaultMaxIdle, "an entry nobody restored for this long is deleted whatever the size (0: no limit)")
+	dry := fs.Bool("dry-run", false, "say what would go and why, delete nothing")
 	_ = fs.Parse(args)
 	if *bucket == "" || *region == "" {
 		return fmt.Errorf("-bucket and -region (or PULLCACHE_BUCKET and PULLCACHE_REGION) are needed")
@@ -159,12 +162,12 @@ func janitor(lg *log.Logger, args []string) error {
 	if err != nil {
 		return err
 	}
-	n, freed, err := cache.Janitor(context.Background(), st, *capGB<<30, *dry, lg)
-	if *dry {
-		lg.Printf("janitor: dry run, nothing deleted (%d entries, %d MB would go)", n, freed>>20)
-	} else {
-		lg.Printf("janitor: %d entries deleted, %d MB freed", n, freed>>20)
+	capBytes := *capGB << 30
+	if *capMB > 0 {
+		capBytes = *capMB << 20
 	}
+	rep, err := cache.Janitor(context.Background(), st, cache.Policy{CapBytes: capBytes, MaxIdle: *idle}, time.Now(), *dry, lg)
+	lg.Printf("janitor: %s", rep)
 	return err
 }
 
