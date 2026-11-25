@@ -107,6 +107,21 @@ func TestHydratesTheNewestMatchingEntryOfTheScopeWhereTheJobWouldRestoreIt(t *te
 	}
 }
 
+func TestAMirroredCopyOfAnOlderSaveIsNotTheNewest(t *testing.T) {
+	mem, root, now := cachetest.NewMem(), t.TempDir(), time.Now()
+	version := cache.Version(paths, cache.DefaultCompression)
+	put(mem, mainScope, "git-seed-v1-Linux-X64-2", archive(t, map[string]string{"x": "saved here, newer"}), now.Add(-time.Hour))
+	mem.SetCopy(cache.ObjectKey(hydrateRepo, mainScope, version, "git-seed-v1-Linux-X64-1", "main"),
+		archive(t, map[string]string{"x": "copied in, older"}), now.Add(-3*time.Hour), now)
+	h := &cache.Hydrator{Reader: mem, DefaultBranch: "main", Root: root}
+
+	res := h.Run(context.Background(), manifest(cache.ManifestEntry{Paths: paths, Key: "git-seed-v1-Linux-X64-"}))
+
+	if len(res) != 1 || res[0].Error != "" || res[0].Key != "git-seed-v1-Linux-X64-2" {
+		t.Fatalf("want the newest save, not a copy made later of an older one: %+v", res)
+	}
+}
+
 func TestTheFirstScopeWithAMatchWinsAsAJobsRestoreReadsItsOwnScopeThenMains(t *testing.T) {
 	mem, root, now := cachetest.NewMem(), t.TempDir(), time.Now()
 	branch := cache.Scope{Name: "refs/heads/ci/load"}

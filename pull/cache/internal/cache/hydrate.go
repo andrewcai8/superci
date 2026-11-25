@@ -257,35 +257,36 @@ func (h *Hydrator) lookup(ctx context.Context, m Manifest, e ManifestEntry, vers
 		if len(objs) >= hydrateMaxListed {
 			h.logf("hydrate: %q in scope %s listed its first %d keys only; keys sorting after them are not hydrated", e.Key, sc, hydrateMaxListed)
 		}
-		if obj, key, ok := newest(objs, base, e.pattern()); ok {
-			return obj, key, true, nil
+		matches, keys := matching(objs, base, e.pattern())
+		obj, ok, err := Newest(ctx, h.Reader, matches)
+		if err != nil {
+			return Object{}, "", false, fmt.Errorf("scope %s could not be read: %v", sc, err)
+		}
+		if ok {
+			return obj, keys[obj.Key], true, nil
 		}
 	}
 	return Object{}, "", false, nil
 }
 
-// newest is the entry under base (one version of one scope) whose key the pattern matches, the most recently
-// written, as the server's restore keys pick one.
-func newest(objs []Object, base string, pattern *regexp.Regexp) (Object, string, bool) {
-	var best *Object
-	var bestKey string
-	for i := range objs {
-		escaped, ok := strings.CutPrefix(objs[i].Key, base)
+// matching is each entry under base (one version of one scope) whose key the pattern matches, with that key; the
+// newest of them is taken as the server's restore keys take one, by save time (Newest).
+func matching(objs []Object, base string, pattern *regexp.Regexp) ([]Object, map[string]string) {
+	var out []Object
+	keys := map[string]string{}
+	for _, o := range objs {
+		escaped, ok := strings.CutPrefix(o.Key, base)
 		if !ok || strings.Contains(escaped, "/") {
 			continue
 		}
 		key, err := url.PathUnescape(escaped)
-		if err != nil || !pattern.MatchString(key) || objs[i].Size == 0 {
+		if err != nil || !pattern.MatchString(key) || o.Size == 0 {
 			continue
 		}
-		if best == nil || objs[i].Modified.After(best.Modified) || objs[i].Modified.Equal(best.Modified) && objs[i].Key > best.Key {
-			best, bestKey = &objs[i], key
-		}
+		out = append(out, o)
+		keys[o.Key] = key
 	}
-	if best == nil {
-		return Object{}, "", false
-	}
-	return *best, bestKey, true
+	return out, keys
 }
 
 // errUnpacked ends the read of an archive the unpack no longer reads: tar may stop at the archive's end-of-archive
