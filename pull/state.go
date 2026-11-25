@@ -25,9 +25,11 @@ type Machine struct {
 	Launched  time.Time
 	Seen      time.Time // last listed by DescribeInstances
 	Asked     time.Time // last asked for a runner (or adopted)
-	// Issued says a runner was issued to it. A machine gets one runner, ever: EC2 keeps the fact as the tag
-	// superci-pull-issued, written before the runner's config leaves the listener, so a restart reads it back.
+	// Issued says a runner was issued to it. A machine gets one runner, ever. The fence is its claim (Claims), made
+	// before its runner is registered; EC2's tag superci-pull-issued, written before the config leaves, is a hint a
+	// restart reads back.
 	Issued   bool
+	Claim    string  // the token of its grant's claim, kept while that grant may still go on; spent once it ends
 	Tagged   bool    // EC2 has the issued tag (it listed it, or accepted our write)
 	Issuing  bool    // its registration is in flight
 	Runner   *Runner // its runner, once known
@@ -60,9 +62,9 @@ type JobRef struct {
 	Runner      string
 }
 
-// grantGrace is how long after a start a listing must begin before a machine is granted a runner: EC2's reads are
-// eventually consistent, and a listing must show the issued tags the previous process wrote.
-const grantGrace = 30 * time.Second
+// pollLease is how long the queue's statistics stay GitHub's word after the message session last answered: twice
+// its long poll (50 s). Past it the session is lost, and nothing is launched or retired on what the statistics said.
+const pollLease = 100 * time.Second
 
 // State is everything the control loop knows about one scale set. One mutex: the listener goroutine, the launcher,
 // the reconciler and the HTTP handlers each hold it only to read or write these fields, never across a network call.
@@ -77,7 +79,8 @@ type State struct {
 	known    bool                 // the message session has given its statistics since this process started
 	listings map[string]time.Time // per configured region, when its last complete listing of machines began
 	machines map[string]*Machine
-	reserved map[string]int // per launch round, capacity asked of EC2 and not yet seen
+	gone     map[string]time.Time // machines issued (or being granted) that a listing dropped, so a re-adoption stays issued
+	reserved map[string]int       // per launch round, capacity asked of EC2 and not yet seen
 	rounds   int
 	boot     string
 
@@ -100,7 +103,7 @@ type State struct {
 }
 
 func NewState(set string, pool, max int, regions []string, now time.Time) *State {
-	s := &State{set: set, pool: pool, max: max, started: now, machines: map[string]*Machine{}, reserved: map[string]int{},
+	s := &State{set: set, pool: pool, max: max, started: now, machines: map[string]*Machine{}, gone: map[string]time.Time{}, reserved: map[string]int{},
 		boot: fmt.Sprintf("%x", now.UnixNano()), lastActivity: now, lastStart: now, polled: now, orphanSince: map[string]time.Time{},
 		available: map[string]time.Time{}, listings: map[string]time.Time{}}
 	for _, r := range regions {
@@ -124,19 +127,8 @@ func (s *State) ready() bool {
 	return true
 }
 
-// grantable says whether a machine may be granted its runner: the set is ready, and every region's last listing began
-// grantGrace after this process started, so it shows every issued tag written before.
-func (s *State) grantable() bool {
-	if !s.ready() {
-		return false
-	}
-	for _, at := range s.listings {
-		if at.Before(s.started.Add(grantGrace)) {
-			return false
-		}
-	}
-	return true
-}
+// leased says whether the message session answered within pollLease, so the statistics are current.
+func (s *State) leased(now time.Time) bool { return now.Sub(s.polled) <= pollLease }
 
 // desired is the supply GitHub's queue asks for: every job assigned to the scale set or waiting to be acquired by it,
 // less waiting jobs found stale, plus the hot pool (none while capped), at most max.
@@ -224,7 +216,7 @@ func (s *State) Noticed(id string) *JobRef {
 func (s *State) Deficit(now time.Time, limit int) (round string, n int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.capped || !s.ready() {
+	if s.capped || !s.ready() || !s.leased(now) {
 		return "", 0
 	}
 	n = min(s.desired()-s.live(), limit-s.unregistered())
@@ -300,11 +292,11 @@ const (
 )
 
 // Ask decides for a machine that asks for a runner. A machine gets one runner, ever, so no job inherits what another
-// left on it and no job can take a second runner: once one is issued (a fact EC2 keeps), every ask is answered End,
-// whoever on the machine asks. The ask is not proof of anything except that the asker does not run the runner, so
-// an idle runner is removed (fenced by GitHub) and its machine ends; a runner that took its job ends its machine when
-// the job completes. A machine never issued one is granted it only once the set is grantable, and only inside the
-// registration budget, ahead of the pool's when a job waits.
+// left on it and no job can take a second runner: once one is issued, every ask is answered End, whoever on the
+// machine asks. The ask is not proof of anything except that the asker does not run the runner, so an idle runner is
+// removed (fenced by GitHub) and its machine ends; a runner that took its job ends its machine when the job completes.
+// A machine this process knows of no runner for is granted one once the set is ready, inside the registration budget
+// (ahead of the pool's when a job waits); the grant goes on only if it wins the machine's claim (Claims).
 func (s *State) Ask(id string, now time.Time, b *Budget, maxAge time.Duration) Verdict {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -329,11 +321,9 @@ func (s *State) Ask(id string, now time.Time, b *Budget, maxAge time.Duration) V
 		return End
 	case !s.ready():
 		return Wait
-	case now.Sub(m.Launched) > maxAge || s.live() > s.desired():
+	case now.Sub(m.Launched) > maxAge || s.leased(now) && s.live() > s.desired():
 		m.Ending = true
 		return End
-	case !s.grantable():
-		return Wait
 	}
 	prio := ForPool
 	if s.waitingJobs() > s.idleRunners() {
@@ -346,11 +336,29 @@ func (s *State) Ask(id string, now time.Time, b *Budget, maxAge time.Duration) V
 	return Grant
 }
 
+// Claim is the token of a granted machine's claim: the one its grant made, when it made one, or a new one.
+func (s *State) Claim(m *Machine) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if m.Claim == "" {
+		m.Claim = newToken()
+	}
+	return m.Claim
+}
+
+// IssuedElsewhere settles a grant whose claim another grant holds (another process's, or one this process forgot):
+// the machine was issued its runner, so it gets none, and its end waits for proof (GitHub's word on its runner).
+func (s *State) IssuedElsewhere(m *Machine) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m.Issuing, m.Issued, m.Claim = false, true, ""
+}
+
 // Issue records the runner GitHub made for a machine once EC2 has its issued tag: the runner's config may leave now.
 func (s *State) Issue(m *Machine, r *Runner) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	m.Issuing, m.Issued, m.Tagged, m.Runner = false, true, true, r
+	m.Issuing, m.Issued, m.Tagged, m.Runner, m.Claim = false, true, true, r, ""
 	if m.Notice {
 		m.Retire = true
 	}
@@ -369,7 +377,7 @@ func (s *State) Unissued(m *Machine) {
 func (s *State) Withheld(m *Machine, r *Runner) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	m.Issuing, m.Issued = false, true
+	m.Issuing, m.Issued, m.Claim = false, true, ""
 	if r == nil {
 		m.Ending = true
 		return
@@ -549,8 +557,10 @@ func (s *State) TakeWaits() []float64 {
 
 // Seen merges one complete DescribeInstances listing of a region, begun at began: machines it lists are live (a new
 // one, met after a restart or launched by a call whose answer was lost, is adopted, with its issued tag); machines it
-// does not list, launched long enough ago for the listing to show them, are gone. It returns the jobs lost with them:
-// a machine gone while its runner held a job not reported complete (it died mid-job, before GitHub noticed).
+// does not list, launched long enough ago for the listing to show them, are gone. A gone machine that was issued a
+// runner, or was being granted one, stays issued for a day, should a later listing show it again. It returns the
+// jobs lost with them: a machine gone while its runner held a job not reported complete (it died mid-job, before
+// GitHub noticed).
 func (s *State) Seen(region string, listed []*Machine, began, now time.Time) (lost []JobRef) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -561,6 +571,9 @@ func (s *State) Seen(region string, listed []*Machine, began, now time.Time) (lo
 		m := s.machines[l.ID]
 		if m == nil {
 			l.Asked = now
+			if _, ok := s.gone[l.ID]; ok {
+				l.Issued = true
+			}
 			s.machines[l.ID] = l
 			if s.reserved[l.Round] > 0 {
 				s.reserved[l.Round]--
@@ -578,7 +591,15 @@ func (s *State) Seen(region string, listed []*Machine, began, now time.Time) (lo
 			if r := m.Runner; r != nil && r.Busy && !r.Done && r.Job != nil {
 				lost = append(lost, *r.Job)
 			}
+			if m.Issued || m.Issuing {
+				s.gone[id] = now
+			}
 			delete(s.machines, id)
+		}
+	}
+	for id, at := range s.gone {
+		if now.Sub(at) > 24*time.Hour {
+			delete(s.gone, id)
 		}
 	}
 	return lost
@@ -760,7 +781,7 @@ func (s *State) Surplus(now time.Time, hold, warmup time.Duration, limit int) in
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	excess := s.live() - s.desired()
-	if excess <= 0 || !s.ready() || now.Sub(s.started) < warmup {
+	if excess <= 0 || !s.ready() || !s.leased(now) || now.Sub(s.started) < warmup {
 		s.surplusSince = time.Time{}
 		return 0
 	}
@@ -829,13 +850,18 @@ func (s *State) Fenced(m *Machine, out Removal) {
 }
 
 // Shed ends up to n machines never issued a runner that have waited for one over three minutes, the longest-waiting
-// first: the registration budget cannot serve them soon, and a machine that waits is paid for.
+// first: the registration budget cannot serve them soon, and a machine that waits is paid for. Only once the set is
+// ready, and only a machine a runner listing of this process showed no runner of: after a start, EC2's tags may not
+// show yet that a machine was issued one.
 func (s *State) Shed(now time.Time, n int) []*Machine {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.ready() {
+		return nil
+	}
 	var waiting []*Machine
 	for _, m := range s.machines {
-		if !m.Ending && !m.Issued && !m.Issuing && m.Runner == nil && now.Sub(m.Launched) > 3*time.Minute {
+		if !m.Ending && !m.Issued && !m.Issuing && m.Runner == nil && m.Missed >= 1 && now.Sub(m.Launched) > 3*time.Minute {
 			waiting = append(waiting, m)
 		}
 	}
@@ -904,6 +930,14 @@ func (s *State) Running() []Machine {
 		out = append(out, *m)
 	}
 	return out
+}
+
+// Drained says whether a set being retired holds nothing more: it is ready, and has no machine and no launch in
+// flight (a busy runner is always on a machine EC2 lists), so deleting it at GitHub fails no job.
+func (s *State) Drained() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ready() && len(s.machines) == 0 && len(s.reserved) == 0
 }
 
 func (s *State) SetPool(n int)     { s.mu.Lock(); s.pool = n; s.mu.Unlock() }

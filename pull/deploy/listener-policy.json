@@ -180,6 +180,21 @@
       ]
     },
     {
+      "Sid": "Claims",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:GetObject"
+      ],
+      "Resource": "arn:aws:s3:::superci-pull-claims-243891825325/issued/*"
+    },
+    {
+      "Sid": "ClaimsBucket",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::superci-pull-claims-243891825325"
+    },
+    {
       "Sid": "Metrics",
       "Effect": "Allow",
       "Action": "cloudwatch:PutMetricData",

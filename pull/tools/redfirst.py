@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Undoes each fix of round 2 in a copy of pull/ and runs the test written for it, which must fail. A fix whose
+"""Undoes each fix of round 2 and of the fence round (audit E) in a copy of pull/ and runs the test written for it, which must fail. A fix whose
 test still passes without it is reported as NOT RED. Run it in pull/ where Go is installed:
 
   python3 tools/redfirst.py
@@ -15,8 +15,28 @@ MUTANTS = [
      "TestARestartNeverGivesAMachineASecondRunner"),
     ("SEC-F1 a completed job of an adopted machine is dropped", "state.go", f"r.Busy, r.Done = true, true\n{T}{T}{T}m.Ending = true", "r.Busy, r.Done = true, true",
      "TestAJobCompletedOnAMachineAdoptedAfterARestartEndsIt"),
-    ("SEC-F1 a grant does not wait for a listing after the grace", "state.go", "if at.Before(s.started.Add(grantGrace)) {", "if at.Before(s.started) {",
-     "TestAStartGrantsNothingUntilAListingBegunAfterTheGrace"),
+    ("E1 no claim before the registration", "server.go", "\tif err != nil {\n\t\th.budget.Done(time.Now(), Unused, 0)", "\tif false && err != nil {\n\t\th.budget.Done(time.Now(), Unused, 0)",
+     "TestAMachineGetsOneConfigEverAcrossRestartsForgettingAndASecondListener"),
+    ("E1 any grant may use a claim", "claims.go", "if string(holder) != token {", "if string(holder) == \"\" {",
+     "TestAMachineGetsOneConfigEverAcrossRestartsForgettingAndASecondListener"),
+    ("E1 a claim is the process's, not the grant's", "state.go", "\t\tm.Claim = newToken()", "\t\tm.Claim = s.boot", "TestAGrantThisProcessForgotCannotReuseItsClaim"),
+    ("E1 a grant forgets its claim after a lost answer", "state.go", "\tif m.Claim == \"\" {\n\t\tm.Claim = newToken()\n\t}", "\tm.Claim = newToken()",
+     "TestAGrantGoesOnAfterALostClaimAnswerOrAFailedRegistrationAndNothingLeavesWithoutItsClaim"),
+    ("E1 a machine claimed elsewhere ends at once", "state.go", "\tm.Issuing, m.Issued, m.Claim = false, true, \"\"\n}", "\tm.Issuing, m.Issued, m.Claim, m.Ending = false, true, \"\", true\n}",
+     "TestAMachineClaimedElsewhereIsCheckedWithGitHubNotEnded"),
+    ("E1 a dropped machine forgets it was issued", "state.go", "\t\t\t\tl.Issued = true\n", "", "TestAMachineAListingDroppedStaysIssued"),
+    ("E6 launches on a lost session", "state.go", "if s.capped || !s.ready() || !s.leased(now) {", "if s.capped || !s.ready() {",
+     "TestALostSessionLaunchesRetiresAndEndsNothingOnOldStatistics"),
+    ("E6 retires surplus on a lost session", "state.go", "!s.ready() || !s.leased(now) || now.Sub(s.started) < warmup", "!s.ready() || now.Sub(s.started) < warmup",
+     "TestALostSessionLaunchesRetiresAndEndsNothingOnOldStatistics"),
+    ("E6 ends surplus machines on a lost session", "state.go", "s.leased(now) && s.live() > s.desired()", "s.live() > s.desired()",
+     "TestALostSessionLaunchesRetiresAndEndsNothingOnOldStatistics"),
+    ("E7 Shed before the set is ready", "state.go", "\tif !s.ready() {\n\t\treturn nil\n\t}\n\tvar waiting []*Machine", "\tvar waiting []*Machine",
+     "TestShedWaitsForReadinessAndARunnerListing"),
+    ("E7 Shed with no runner listing", "state.go", " && m.Missed >= 1 && ", " && ", "TestShedWaitsForReadinessAndARunnerListing"),
+    ("E8 a failed tag batch is tried id by id", "tagger.go", "\tt.tag(ctx, r, part[:len(part)/2])\n\tt.tag(ctx, r, part[len(part)/2:])",
+     "\tfor i := range part {\n\t\tt.tag(ctx, r, part[i:i+1])\n\t}", "TestAFailedTagBatchIsSplitNotTriedIdByIdAlone"),
+    ("E9 a dropped set deleted with machines", "state.go", "len(s.machines) == 0 && ", "", "TestADroppedSetIsDeletedOnlyOnceItHoldsNothing"),
     ("SEC-F1 a listed runner does not mark its machine issued", "state.go", f"m.Issued = true\n{T}{T}{T}held[m] = true", "held[m] = true",
      "TestAMachineWithAListedRunnerIsIssuedAndTagged"),
     ("SEC-F2 a runner that never started is replaced", "state.go", f"{T}case r != nil && !r.Busy:\n{T}{T}m.Retire = true\n{T}{T}return End\n",

@@ -26,8 +26,9 @@ superci-pull: one process on one c7g.large, an Auto Scaling group of one in us-e
               offers them (5 of 6: use1-az3 offers none) at weight 2 and of us-east-2 (3 of 3) at weight 1; a
               region's spot shortfall goes to the other, then on-demand, at most 10% of the last half hour's
               launches; a ClientToken on every call
-  /jit      : POST with the machine's signed identity document; a runner only for a machine never issued one, and
-              its config leaves only after EC2 has the machine's superci-pull-issued tag
+  /jit      : POST with the machine's signed identity document; a runner only for a machine never issued one, only
+              once its grant has made the machine's claim (s3://superci-pull-claims-<account>/issued/<instance>),
+              and its config leaves only after EC2 has the machine's superci-pull-issued tag
   lister    : lists the group's runners every 30 s (3 s a page), on its own: a slow GitHub slows only it
   reconciler: every 10 s lists EC2; adopts, ends machines whose job completed, stuck, overdue or shed ones, retires
               surplus idle runners (RemoveRunner first), accrues spend, applies the caps; its GitHub calls run apart
@@ -46,7 +47,7 @@ issued its runner superci-pull-issued=<when>
 | --- | --- | --- |
 | Jobs waiting, assigned, running | GitHub's statistics on each message | the session's first statistics; until then, and until every region is listed, nothing launches or ends and no machine is granted a runner |
 | Machines | EC2 instances with the deployment's tag and a set's tag | the first listing of every region (machines are adopted) |
-| Whether a machine was ever issued a runner | the tag `superci-pull-issued`, written before the runner's config leaves; also any runner GitHub lists or a job message names after it | the listing; a grant waits for a listing begun 30 s after the start (EC2's reads are eventually consistent) |
+| Whether a machine was ever issued a runner | its claim `issued/<instance id>` in `superci-pull-claims-<account>`, made once (S3 create-if-absent) before its runner is registered; the tag `superci-pull-issued`, written before the config leaves, and any runner GitHub lists or a job message names after it are hints | the claim, which a grant must make (S3 is strongly consistent, EC2's tag reads are not); the listing's tags |
 | A machine's runner, busy or not | JobStarted and JobCompleted, GitHub's runner listing, and GitHub's answer for the runner's name | the messages GitHub redelivers, the listing, and a check by name |
 | A job a spot notice found running | the tag `superci-pull-noticed=<owner>/<repo>/<run>` | the tags of machines EC2 still lists (about an hour after a reclaim) |
 | Who a machine is | the instance identity document EC2 signed (PKCS7, RSA-2048), checked against AWS's certificate | the same |
@@ -68,9 +69,13 @@ issued its runner superci-pull-issued=<when>
   An ask is no proof of anything: anything on a machine can ask.
 - **We never take the organization's last registrations.** Registrations go only into what GitHub's cap leaves the
   rest of the organization, less a margin; when the organization is near the cap, our jobs wait, not Blacksmith's.
-- **A machine gets one runner, ever.** The runner is named `<set>-<instance id>`. The listener registers it, writes
-  the instance's `superci-pull-issued` tag, and only then lets the config leave; a tag it cannot write withholds the
-  config, and the machine ends. Every later ask, from the boot script that lost its answer or from a job that kept
+- **A machine gets one runner, ever.** The runner is named `<set>-<instance id>`. A grant first creates the
+  machine's claim, the S3 object `issued/<instance id>`, with `If-None-Match: *`: of every grant, across restarts,
+  forgotten listings and overlapping listeners, exactly one creates it (DDIA ch. 9, compare-and-set; ch. 8, a fencing
+  token). The object holds that grant's token, so only that grant goes on after a lost answer or a refused
+  registration. Then the listener registers the runner, writes the instance's `superci-pull-issued` tag, and only
+  then lets the config leave; a claim another grant holds answers 410, a claim not known to be ours answers 429, and
+  a tag it cannot write withholds the config, and the machine ends. Every later ask, from the boot script that lost its answer or from a job that kept
   the machine alive, is answered 410 with nothing, before and after any restart. A runner is never replaced: a
   machine that asks again holding an idle runner ends once GitHub removes the runner. No job inherits what another
   left on a machine, and no job can take a second runner from it.
@@ -151,8 +156,9 @@ read as no arrivals and shed the pool.
 
 Memory is 2 GiB per vCPU (c families) or 4 (m families). One set hands out about 15 jobs a second; `"split": K`
 runs a size as K sets (`superci-4cpu`, `superci-4cpu-2`, …), each carrying the size's label, and GitHub spreads the
-label's jobs across them (measured below). A split changes at the next start; sets the config no longer has are
-deleted at GitHub then, and a job one of their runners held fails, so shrink a split while the size is idle.
+label's jobs across them (measured below). A split changes at the next start. A set the config no longer has is
+drained first: its session asks for no job (max 0), its machines end as their jobs complete or as idle supply, and
+once it holds no machine it is deleted at GitHub, so no job fails.
 
 ### Lifetimes, spend and lost jobs
 
@@ -357,8 +363,9 @@ aws --profile ci-runners --region us-east-1 sns subscribe --topic-arn arn:aws:sn
 | superci-pull-launch-shortfall | EC2 started fewer machines than asked for 15 minutes running |
 | superci-pull-org-rate-unknown | the organization's rate unmeasured for 15 minutes |
 
-**Release.** Off-peak (before 13:00Z or after 01:00Z), since a release restarts the listener: jobs wait about 10 s,
-and grants wait 30 s more. `deploy/build.sh <out>` builds and tests on a tagged arm64 instance and terminates it;
+**Release.** Off-peak (before 13:00Z or after 01:00Z), since a release restarts the listener: jobs wait about 10 s.
+A listener that cannot reach its claims bucket does not start: run `deploy/up.sh` (it makes the bucket and grants
+the role) before the first release that has claims. `deploy/build.sh <out>` builds and tests on a tagged arm64 instance and terminates it;
 `deploy/release.sh <binary> [override.json] pull/deploy/ssh.sh` uploads to `s3://superci-pull-243891825325`
 (checking the override with the new binary on the listener first) and restarts the listener (a graceful stop closes
 its sessions, so the next opens at once).
@@ -414,7 +421,7 @@ whose message says "burst"); `bench/measure.py BRANCH SINCE UNTIL listener.jsonl
   never a public repository. The listener makes and keeps the group with the App's
   `organization_self_hosted_runners: write`, and acts only on its own group's sets.
 - **What a job can do.** A job is root on its machine, can read its identity document and its user data, and can
-  stop its power-off. It cannot get a second runner, from this listener or the next (the issued tag), and its
+  stop its power-off. It cannot get a second runner, from this listener or the next (the machine's claim), and its
   machine ends when its job completes. The machine's role reads the cache bucket and invokes the cache broker; it
   cannot write EC2 tags. Measured below (Round 2, live proof).
 - **What the listener can do.** Its role launches only from launch templates tagged `purpose=superci-pull`, only
@@ -465,8 +472,11 @@ one job), plus the pool. `SpendPerHourUSD` is the listener's live figure.
   the reclaim; a job whose machine was reclaimed with no notice, while the listener was down, stays failed.
 - **A machine issued a runner whose answer was lost** (the connection dropped after the tag was written) ends
   unused: one machine and one registration, never a second runner.
-- **EC2's tag reads are eventually consistent.** A grant waits for a listing begun 30 s after the start, which the
-  documented propagation (seconds) is well within.
+- **EC2's tag reads are eventually consistent.** No grant trusts them: the claim decides. A machine issued by a
+  previous process whose tag a listing does not show yet is granted, its grant finds the claim taken and answers 410,
+  and its end waits for GitHub's word on its runner.
+- **The statistics are a lease.** When the message session has not answered for 100 s (twice its long poll),
+  nothing is launched, no idle runner is retired as surplus and no machine is told to end as surplus.
 
 ## Measured (Nov 25 2026, megpt-mono)
 

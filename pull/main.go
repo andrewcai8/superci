@@ -30,6 +30,7 @@ import (
 	"github.com/actions/scaleset/listener"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 )
 
@@ -45,6 +46,7 @@ func main() {
 		admin      = flag.String("admin", "127.0.0.1:8080", "address of the operator's endpoint")
 		tlsParam   = flag.String("tls-param", "/superci-pull/tls", "SSM SecureString (us-east-1) holding the listener's TLS key")
 		spendParam = flag.String("spend-param", "/superci-pull/spend", "SSM parameter (us-east-1) holding today's and this month's spend")
+		claims     = flag.String("claims", "", "S3 bucket (us-east-1) of the machines' claims; superci-pull-claims-<account> by default")
 		noMetrics  = flag.Bool("no-metrics", false, "publish no CloudWatch metrics")
 		deleteSets = flag.Bool("delete-scale-sets", false, "delete every configured scale set and exit")
 		validate   = flag.Bool("validate", false, "check the override file named by -config over the built-in config, and exit")
@@ -61,7 +63,7 @@ func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	err := run(ctx, flags{*configPath, *publicIP, pairs(*groups), *listen, *admin, *tlsParam, *spendParam, *noMetrics, *deleteSets})
+	err := run(ctx, flags{*configPath, *publicIP, pairs(*groups), *listen, *admin, *tlsParam, *spendParam, *claims, *noMetrics, *deleteSets})
 	if err != nil && !errors.Is(err, context.Canceled) {
 		slog.Error("exit", "err", err.Error())
 		os.Exit(1)
@@ -73,6 +75,7 @@ type flags struct {
 	groups                map[string]string
 	listen, admin         string
 	tlsParam, spendParam  string
+	claims                string
 	noMetrics, deleteSets bool
 }
 
@@ -151,6 +154,16 @@ func run(ctx context.Context, f flags) error {
 		return err
 	}
 	ssmc := ssm.NewFromConfig(awsCfg)
+	// No grant goes on without its claim, so a listener that cannot reach the claims does not start.
+	bucket := f.claims
+	if bucket == "" {
+		bucket = "superci-pull-claims-" + cfg.Account
+	}
+	s3c := s3.NewFromConfig(awsCfg)
+	if _, err := s3c.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: &bucket}); err != nil {
+		return fmt.Errorf("claims bucket %s (deploy/up.sh makes it): %w", bucket, err)
+	}
+	claims := &Claims{store: s3c, bucket: bucket}
 	id, err := LoadIdentity(ctx, ssmc, f.tlsParam)
 	if err != nil {
 		return fmt.Errorf("tls identity: %w", err)
@@ -192,8 +205,13 @@ func run(ctx context.Context, f flags) error {
 		}
 		l.sets = append(l.sets, &Set{spec: spec, id: gid, state: NewState(spec.Name, 0, spec.Max, regions, now), fleet: sf})
 	}
-	if err := pruneScaleSets(ctx, client, group, specs); err != nil {
+	dropped, err := droppedScaleSets(ctx, client, group, specs)
+	if err != nil {
 		return fmt.Errorf("prune scale sets: %w", err)
+	}
+	for _, d := range dropped {
+		slog.Warn("draining scale set the config no longer has", "name", d.Name, "id", d.ID)
+		l.sets = append(l.sets, &Set{spec: SetSpec{Name: d.Name}, id: d.ID, state: NewState(d.Name, 0, 0, regions, now), drain: true})
 	}
 	refresh := l.refresher()
 	for _, r := range fleet.regions {
@@ -205,7 +223,7 @@ func run(ctx context.Context, f flags) error {
 	for _, s := range l.sets {
 		byName[s.spec.Name] = s
 	}
-	srv := &Server{sets: byName, budget: l.budget, verifier: verifier, client: client, refresh: refresh, issue: l.tagger.Issue, notices: fleet.TagNoticed,
+	srv := &Server{sets: byName, budget: l.budget, verifier: verifier, client: client, refresh: refresh, claim: claims.Take, issue: l.tagger.Issue, notices: fleet.TagNoticed,
 		slots: make(chan struct{}, max(1, cfg.Registration.Concurrency)), maxAge: l.maxAge}
 	go serve(ctx, &http.Server{Addr: f.listen, Handler: srv, ReadHeaderTimeout: 10 * time.Second}, &id)
 	go serve(ctx, &http.Server{Addr: f.admin, Handler: Admin(l.status, l.healthy, l.override)}, nil)
@@ -213,9 +231,21 @@ func run(ctx context.Context, f flags) error {
 	var sessions sync.WaitGroup
 	for _, s := range l.sets {
 		wake := make(chan struct{}, 1)
-		go l.launcher(ctx, s, wake)
+		sctx, stop := context.WithCancel(ctx)
+		defer stop()
+		if s.drain {
+			go l.drain(ctx, s, stop)
+		} else {
+			go l.launcher(ctx, s, wake)
+		}
 		sessions.Add(1)
-		go func() { defer sessions.Done(); errs <- listenSet(ctx, client, s, wake) }()
+		go func() {
+			defer sessions.Done()
+			// A drained set's session ends with the set; only the process's own end, or a failure, ends the process.
+			if err := listenSet(sctx, client, s, wake); sctx.Err() == nil || ctx.Err() != nil {
+				errs <- err
+			}
+		}()
 	}
 	go l.reconciler(ctx, refresh)
 	go l.lister(ctx)
@@ -317,22 +347,23 @@ func ensureScaleSet(ctx context.Context, client *scaleset.Client, group int, spe
 // ownSetName is the form of every set this listener makes: superci-<cpu>cpu, or superci-<cpu>cpu-<k> for a split.
 var ownSetName = regexp.MustCompile(`^superci-[0-9]+cpu(-[0-9]+)?$`)
 
-// pruneScaleSets deletes the sets of the deployment's runner group the config no longer has (a size removed, or a
-// split made smaller): one left at GitHub would keep taking a share of its label's jobs with no listener to run them.
-// Another deployment's sets are in its own group, so they are never touched. GitHub removes a deleted set's runners,
-// so a job one of them held fails; shrink a split while the size is idle, or re-run them.
-func pruneScaleSets(ctx context.Context, client *scaleset.Client, group int, specs []SetSpec) error {
+// droppedScaleSets finds the sets of the deployment's runner group the config no longer has (a size removed, or a
+// split made smaller): one left at GitHub would keep taking a share of its label's jobs with no listener to run them,
+// and deleting one fails the jobs it holds, so each is drained before it is deleted (drain). Another deployment's
+// sets are in its own group, so they are never touched.
+func droppedScaleSets(ctx context.Context, client *scaleset.Client, group int, specs []SetSpec) ([]scaleset.RunnerScaleSet, error) {
 	want := map[string]bool{}
 	for _, s := range specs {
 		want[s.Name] = true
 	}
 	sets, err := client.ListRunnerScaleSets(ctx, group)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	var dropped []scaleset.RunnerScaleSet
 	for _, s := range sets {
 		if ownSetName.MatchString(s.Name) && !want[s.Name] {
-			slog.Warn("deleting scale set the config no longer has", "name", s.Name, "id", s.ID, "err", errString(client.DeleteRunnerScaleSet(ctx, s.ID)))
+			dropped = append(dropped, s)
 		}
 	}
 	// A set of this form left in the Default group (an earlier build's) takes a share of its label's jobs with no
@@ -344,7 +375,30 @@ func pruneScaleSets(ctx context.Context, client *scaleset.Client, group int, spe
 			}
 		}
 	}
-	return nil
+	return dropped, nil
+}
+
+// drain retires a set the config dropped. Its session asks for no jobs (max 0) and acquires none, so no new job
+// goes to it; its machines end as the rest do (a completed job, an idle runner past the supply, a machine that gets
+// no runner). Once it holds no machine, so no runner of it can hold a job, it is deleted at GitHub and its session
+// ends.
+func (l *Listener) drain(ctx context.Context, s *Set, stop context.CancelFunc) {
+	for tick := time.NewTicker(30 * time.Second); ; {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+		if !s.state.Drained() {
+			continue
+		}
+		err := l.client.DeleteRunnerScaleSet(ctx, s.id)
+		slog.Warn("deleted drained scale set", "name", s.spec.Name, "id", s.id, "err", errString(err))
+		if err == nil || errors.Is(err, scaleset.NotFoundError) {
+			stop()
+			return
+		}
+	}
 }
 
 func labelNames(ls []scaleset.Label) []string {
@@ -424,7 +478,7 @@ func (s *scaler) Scale(ctx context.Context, msg *scaleset.RunnerScaleSetMessage)
 		default:
 		}
 	}()
-	if msg != nil && len(msg.JobAvailableMessages) > 0 {
+	if msg != nil && len(msg.JobAvailableMessages) > 0 && !s.set.drain {
 		ids := make([]int64, 0, len(msg.JobAvailableMessages))
 		for _, j := range msg.JobAvailableMessages {
 			ids = append(ids, j.RunnerRequestID)

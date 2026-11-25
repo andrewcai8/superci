@@ -57,6 +57,21 @@ if ! $A s3api head-bucket --bucket $BUCKET 2>/dev/null; then
 fi
 echo "release bucket: s3://$BUCKET"
 
+# The machines' claims (claims.go): issued/<instance id>, made once by the listener's role before a runner is
+# registered, never written over or deleted by anyone, expired 30 days on (long past any machine's life). Never turn
+# versioning on: a delete marker would free a claim.
+CLAIMS=$NAME-claims-$ACCOUNT
+if ! $A s3api head-bucket --bucket $CLAIMS 2>/dev/null; then
+  $A s3api create-bucket --region $PRIMARY --bucket $CLAIMS >/dev/null
+  $A s3api put-public-access-block --bucket $CLAIMS --public-access-block-configuration \
+    BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+  $A s3api put-bucket-tagging --bucket $CLAIMS --tagging 'TagSet=[{Key=purpose,Value=superci-pull}]'
+fi
+$A s3api put-bucket-lifecycle-configuration --bucket $CLAIMS --lifecycle-configuration \
+  '{"Rules":[{"ID":"ExpireClaims","Status":"Enabled","Filter":{"Prefix":"issued/"},"Expiration":{"Days":30}}]}' >/dev/null
+$A s3api put-bucket-policy --bucket $CLAIMS --policy "$(sed -e "s/@BUCKET@/$CLAIMS/g; s/@ACCOUNT@/$ACCOUNT/g" "$here/claims-policy.json")"
+echo "claims bucket: s3://$CLAIMS"
+
 if [ "$($A logs describe-log-groups --region $PRIMARY --log-group-name-prefix /superci-pull/listener --query 'length(logGroups)' --output text)" = 0 ]; then
   $A logs create-log-group --region $PRIMARY --log-group-name /superci-pull/listener --tags purpose=superci-pull
   $A logs put-retention-policy --region $PRIMARY --log-group-name /superci-pull/listener --retention-in-days 30

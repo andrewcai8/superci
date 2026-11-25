@@ -38,6 +38,9 @@ for p in /superci-pull/github-app /superci-pull/tls /superci-pull/spend; do
 done
 $A s3 rm --recursive --quiet s3://$NAME-$ACCOUNT && $A s3api delete-objects --bucket $NAME-$ACCOUNT --delete "$($A s3api list-object-versions --bucket $NAME-$ACCOUNT --query '{Objects: [Versions,DeleteMarkers][][].{Key:Key,VersionId:VersionId}}' --output json)" >/dev/null
 $A s3api delete-bucket --bucket $NAME-$ACCOUNT && echo "deleted bucket $NAME-$ACCOUNT"
+# The claims bucket refuses deletes until its policy goes.
+$A s3api delete-bucket-policy --bucket $NAME-claims-$ACCOUNT && $A s3 rm --recursive --quiet s3://$NAME-claims-$ACCOUNT &&
+  $A s3api delete-bucket --bucket $NAME-claims-$ACCOUNT && echo "deleted bucket $NAME-claims-$ACCOUNT"
 $A cloudwatch delete-alarms --region us-east-1 --alarm-names $($A cloudwatch describe-alarms --region us-east-1 --alarm-name-prefix superci-pull- --query 'MetricAlarms[].AlarmName' --output text) && echo "deleted alarms"
 $A sns delete-topic --region us-east-1 --topic-arn "arn:aws:sns:us-east-1:$ACCOUNT:superci-pull-alarms" && echo "deleted topic"
 $A iam remove-role-from-instance-profile --instance-profile-name $NAME --role-name $NAME

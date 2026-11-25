@@ -1,0 +1,13 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Sid": "TlsOnly", "Effect": "Deny", "Principal": "*", "Action": "s3:*",
+      "Resource": ["arn:aws:s3:::@BUCKET@", "arn:aws:s3:::@BUCKET@/*"], "Condition": { "Bool": { "aws:SecureTransport": "false" } } },
+    { "Sid": "ClaimsAreMadeOnce", "Effect": "Deny", "Principal": "*", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::@BUCKET@/*",
+      "Condition": { "Null": { "s3:if-none-match": "true" } } },
+    { "Sid": "ClaimsAreNeverDeleted", "Effect": "Deny", "Principal": "*", "Action": ["s3:DeleteObject", "s3:DeleteObjectVersion"],
+      "Resource": "arn:aws:s3:::@BUCKET@/*" },
+    { "Sid": "OnlyTheListenerClaims", "Effect": "Deny", "Principal": "*", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::@BUCKET@/*",
+      "Condition": { "ArnNotEquals": { "aws:PrincipalArn": "arn:aws:iam::@ACCOUNT@:role/superci-pull" } } }
+  ]
+}
