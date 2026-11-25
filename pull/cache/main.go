@@ -203,6 +203,14 @@ func hydrate(lg *log.Logger, args []string) error {
 		ToolCache: env("RUNNER_TOOL_CACHE", "/opt/hostedtoolcache"), Platform: cache.ThisPlatform()}
 	res := h.Run(ctx, m)
 	lg.Printf("hydrate: %d entries in %.1f s (stopped: %v)", len(res), time.Since(began).Seconds(), ctx.Err() != nil)
+	var ok, mb int64
+	for _, r := range res {
+		if r.Error == "" {
+			ok++
+			mb += r.MB
+		}
+	}
+	fmt.Printf("hydrated %d/%d entries %d MB\n", ok, len(res), mb)
 	b, err := json.MarshalIndent(map[string]any{"seconds": time.Since(began).Seconds(), "stopped": ctx.Err() != nil, "entries": res}, "", "  ")
 	if err != nil {
 		return err

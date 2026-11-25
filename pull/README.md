@@ -331,7 +331,10 @@ of that time unpacking main's caches, so the job's setup takes them with a renam
   and starts `pullcache hydrate` beside it, in its own process group, as the `runner` user, for at most 100 s. Hydration
   never gates registration and a failure of it never blocks the machine. Each entry is unpacked in
   `.tmp-<version>-<key>/` and renamed into place whole, so a job sees all of an entry or none of it, whenever it starts.
-  `<root>/.hydrated.json` says what became of each entry, how long it took and whether it was stopped.
+  `<root>/.hydrated.json` says what became of each entry, how long it took and whether it was stopped. When the
+  listener keeps the job timeline's spool of marks (`/run/superci-marks`), the machine posts `hydrate.start` and, when
+  hydration ends on its own, `hydrate.done` with `<entries ok>/<entries>:<MB>MB` as its value; a start with no done and a
+  `job.running` is a hydration the job stopped.
 - **Stop.** The runner's `ACTIONS_RUNNER_HOOK_JOB_STARTED` is `hydrate-stop.sh`: when the job starts it ends the
   whole hydration group (SIGTERM, then SIGKILL after 2 s), so hydration never competes with the job for CPU or disk.
   The job takes the entries already in place and restores the rest itself. A hydrator that already ended leaves the hook

@@ -28,10 +28,18 @@ HOOK
 chmod 755 /home/runner/superci-hydrate-stop.sh
 printf '\nSUPERCI_HYDRATED=%s\nACTIONS_RUNNER_HOOK_JOB_STARTED=%s\n' "$HR" /home/runner/superci-hydrate-stop.sh >> /home/runner/.env
 hydrate() {
+  local sp=/run/superci-marks t0 out val
+  us() { local n=${EPOCHREALTIME/[.,]/}; echo "$n"; }
+  # A mark for the job timeline (the spool of boot.sh's marks, when the listener keeps one): name=epoch=ms since the start[=value].
+  mark_hydrate() { local n=$1; [ -w "$sp" ] && printf '%s=%s.%s=%s%s\n' "$2" "${n:0:10}" "${n:10}" "$(( (n - t0) / 1000 ))" "${3:+=$3}" >> "$sp"; return 0; }
+  t0=$(us); mark_hydrate "$t0" hydrate.start
   echo $$ > "$HR/.pid"
   if [ -x /usr/local/bin/pullcache ] && aws s3 cp --only-show-errors --region "$CR" "s3://$PB/bin/hydrate/@LABEL@.json" "$HM" 2> /dev/null; then
     chown -R runner:runner "$HR"
-    timeout --foreground -k 5 110 runuser -u runner -- env HOME=/home/runner PULLCACHE_BUCKET="$PB" PULLCACHE_REGION="$CR" /usr/local/bin/pullcache hydrate -timeout 100s "$HM" "$HR" || :
+    out=$(timeout --foreground -k 5 110 runuser -u runner -- env HOME=/home/runner PULLCACHE_BUCKET="$PB" PULLCACHE_REGION="$CR" /usr/local/bin/pullcache hydrate -timeout 100s "$HM" "$HR" || :)
+    echo "$out"
+    val=$(printf '%s\n' "$out" | sed -n 's|^hydrated \([0-9]*\)/\([0-9]*\) entries \([0-9]*\) MB$|\1/\2:\3MB|p' | tail -1)
+    mark_hydrate "$(us)" hydrate.done "$val"
   fi
   rm -f "$HR/.pid"
 }
