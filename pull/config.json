@@ -3,6 +3,8 @@
   "org": "Authentic-Intelligence",
   "installation": 185173804,
   "app_param": "/superci-pull/github-app",
+  "deployment": "superci-pull",
+  "repositories": ["megpt-mono"],
   "regions": {
     "us-east-1": 2,
     "us-east-2": 1

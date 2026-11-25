@@ -14,6 +14,14 @@ func stats(assigned, available int) *scaleset.RunnerScaleSetMessage {
 	return &scaleset.RunnerScaleSetMessage{Statistics: &scaleset.RunnerScaleSetStatistic{TotalAssignedJobs: assigned, TotalAvailableJobs: available}}
 }
 
+// newState is a set of one region whose last listing began well after the process started: grantable once the
+// queue is known.
+func newState(pool, max int) *State {
+	s := NewState("set", pool, max, []string{"us-east-1"}, t0.Add(-2*time.Hour))
+	s.listings["us-east-1"] = t0.Add(-time.Hour)
+	return s
+}
+
 func machines(n int, at time.Time) []*Machine {
 	out := make([]*Machine, n)
 	for i := range out {
@@ -23,7 +31,7 @@ func machines(n int, at time.Time) []*Machine {
 }
 
 func TestABurstIsLaunchedOnceWhileItsCallsAreInFlight(t *testing.T) {
-	s := NewState("set", 2, 1200)
+	s := newState(2, 1200)
 	s.Observe(stats(0, 1000), t0)
 	round, n := s.Deficit(t0, 100000)
 	if n != 1002 {
@@ -36,7 +44,7 @@ func TestABurstIsLaunchedOnceWhileItsCallsAreInFlight(t *testing.T) {
 	for _, m := range got {
 		m.Round = round
 	}
-	s.Seen("us-east-1", got[:400], t0) // a listing shows part of the round before its call answers
+	s.Seen("us-east-1", got[:400], t0, t0) // a listing shows part of the round before its call answers
 	if live := s.Snapshot(t0).Live; live != 1002 {
 		t.Fatalf("live %d while the call is unanswered: a machine seen early is counted twice or not at all", live)
 	}
@@ -50,7 +58,7 @@ func TestABurstIsLaunchedOnceWhileItsCallsAreInFlight(t *testing.T) {
 }
 
 func TestTheCapBoundsTheSupply(t *testing.T) {
-	s := NewState("set", 0, 300)
+	s := newState(0, 300)
 	s.Observe(stats(1000, 0), t0)
 	if _, n := s.Deficit(t0, 100000); n != 300 {
 		t.Fatalf("deficit %d, want the cap", n)
@@ -58,13 +66,14 @@ func TestTheCapBoundsTheSupply(t *testing.T) {
 }
 
 func TestAMachineIsToldToEndOnceTheQueueNoLongerNeedsIt(t *testing.T) {
-	s := NewState("set", 1, 1200)
+	s := newState(1, 1200)
 	s.Observe(stats(3, 0), t0)
 	launch(s, machines(4, t0), t0)
 	for i := 0; i < 4; i++ {
 		if v := ask(s, fmt.Sprintf("i-%04d", i), t0); v != Grant {
 			t.Fatalf("machine %d: %v, want a runner while all four are needed", i, v)
 		}
+		s.Unissued(s.Machine(fmt.Sprintf("i-%04d", i)))
 	}
 	s.Observe(stats(1, 0), t0) // two jobs completed
 	if v := ask(s, "i-0000", t0); v != End {
@@ -82,7 +91,7 @@ func TestAMachineIsToldToEndOnceTheQueueNoLongerNeedsIt(t *testing.T) {
 }
 
 func TestWaitingJobsThatIdleRunnersIgnoreAreStale(t *testing.T) {
-	s := NewState("set", 0, 1200)
+	s := newState(0, 1200)
 	s.lastActivity = t0
 	s.Observe(&scaleset.RunnerScaleSetMessage{Statistics: &scaleset.RunnerScaleSetStatistic{TotalAssignedJobs: 3, TotalIdleRunners: 3}}, t0)
 	if stale := s.MarkStale(t0.Add(2*time.Minute), 3*time.Minute); stale != 0 {
@@ -104,46 +113,47 @@ func TestWaitingJobsThatIdleRunnersIgnoreAreStale(t *testing.T) {
 }
 
 func TestOnlyAMachineThatCanHoldNoJobIsStuck(t *testing.T) {
-	s := NewState("set", 0, 1200)
+	s := newState(0, 1200)
 	s.Observe(stats(4, 0), t0)
 	launch(s, machines(4, t0), t0)
 	issued := t0.Add(30 * time.Second)
-	busy := &Runner{ID: 1, Name: "set-i-0001-aa", Issued: issued, Busy: true}
-	listed := &Runner{ID: 2, Name: "set-i-0002-bb", Issued: issued}
-	gone := &Runner{ID: 3, Name: "set-i-0003-cc", Issued: issued, Busy: true, Done: true}
-	give(s, "i-0001", busy)
-	give(s, "i-0002", listed)
-	give(s, "i-0003", gone)
+	give(s, "i-0001", &Runner{ID: 1, Name: "set-i-0001", Issued: issued, Busy: true})
+	give(s, "i-0002", &Runner{ID: 2, Name: "set-i-0002", Issued: issued})
+	give(s, "i-0003", &Runner{ID: 3, Name: "set-i-0003", Issued: issued})
 
 	later := t0.Add(10 * time.Minute)
 	if ended, unlisted := s.Stuck(later, 5*time.Minute, 3*time.Minute); len(ended)+len(unlisted) != 0 {
 		t.Fatalf("before any listing, nothing is stuck: %v %v", ids(ended), ids(unlisted))
 	}
 	for i := 0; i < 3; i++ {
-		s.Listed(map[string]ListedRunner{"set-i-0002-bb": {ID: 2, Name: "set-i-0002-bb"}}, later.Add(time.Duration(i)*time.Minute))
+		s.Listed(map[string]ListedRunner{"set-i-0002": {ID: 2, Name: "set-i-0002"}}, later.Add(time.Duration(i)*time.Minute))
 	}
 	ended, unlisted := s.Stuck(later.Add(3*time.Minute), 5*time.Minute, 3*time.Minute)
 	if len(ended) != 1 || ended[0].ID != "i-0000" {
-		t.Fatalf("ended %v: want only the machine with no runner that three listings showed none of", ids(ended))
+		t.Fatalf("ended %v: want only the machine never issued a runner that three listings showed none of", ids(ended))
 	}
-	if len(unlisted) != 1 || unlisted[0].ID != "i-0003" {
-		t.Fatalf("to check %v: want only the machine whose finished runner the listings do not show (a busy one and a listed one stay)", ids(unlisted))
+	if got := ids(unlisted); len(got) != 2 || !(got[0] == "i-0001" && got[1] == "i-0003" || got[0] == "i-0003" && got[1] == "i-0001") {
+		t.Fatalf("to check %v: want both runners the listings do not show, busy or not, and not the listed one", got)
 	}
-	s.Gone(unlisted[0], unlisted[0].Runner, false)
+	s.Checked(s.Machine("i-0001"), Present, nil)
 	if snap := s.Snapshot(later); snap.Ending != 1 {
 		t.Fatalf("a runner GitHub still has keeps its machine: %+v", snap)
 	}
-	s.Gone(unlisted[0], unlisted[0].Runner, true)
+	s.Checked(s.Machine("i-0003"), Absent, nil)
 	if snap := s.Snapshot(later); snap.Ending != 2 {
 		t.Fatalf("a runner GitHub no longer has ends its machine: %+v", snap)
+	}
+	s.Checked(s.Machine("i-0002"), Unsure, nil)
+	if snap := s.Snapshot(later); snap.Ending != 2 {
+		t.Fatalf("a failed check ends nothing: %+v", snap)
 	}
 }
 
 func TestOneListingThatMissesAnIdleRunnerEndsNothing(t *testing.T) {
-	s := NewState("set", 1, 10)
+	s := newState(1, 10)
 	s.Observe(stats(0, 0), t0)
 	launch(s, machines(1, t0), t0)
-	give(s, "i-0000", &Runner{ID: 9, Name: "set-i-0000-aa", Issued: t0})
+	give(s, "i-0000", &Runner{ID: 9, Name: "set-i-0000", Issued: t0})
 	s.Listed(map[string]ListedRunner{}, t0.Add(10*time.Minute))
 	ended, unlisted := s.Stuck(t0.Add(10*time.Minute), 5*time.Minute, 3*time.Minute)
 	if len(ended) != 0 || len(unlisted) != 1 {
@@ -154,46 +164,57 @@ func TestOneListingThatMissesAnIdleRunnerEndsNothing(t *testing.T) {
 	}
 }
 
-func TestAMachineThatAskedLatelyIsNotStuck(t *testing.T) {
-	s := NewState("set", 0, 1200)
+func TestAMachineNeverIssuedThatAskedLatelyIsNotStuck(t *testing.T) {
+	s := newState(0, 1200)
 	s.Observe(stats(1, 0), t0)
 	launch(s, machines(1, t0), t0)
-	ask(s, "i-0000", t0.Add(9*time.Minute))
+	for i := 0; i < 3; i++ {
+		s.Listed(map[string]ListedRunner{}, t0.Add(time.Duration(2+i)*time.Minute))
+	}
+	if v := s.Ask("i-0000", t0.Add(9*time.Minute), closed(), 8*time.Hour); v != Wait {
+		t.Fatalf("an ask the budget cannot serve: %v, want Wait", v)
+	}
 	if ended, unlisted := s.Stuck(t0.Add(10*time.Minute), 5*time.Minute, 3*time.Minute); len(ended)+len(unlisted) != 0 {
 		t.Fatalf("stuck %v %v", ids(ended), ids(unlisted))
 	}
 }
 
-func TestSurplusTakesOnlyIdleRunnersAndOnlyAfterTheHold(t *testing.T) {
-	s := NewState("set", 0, 1200)
+func TestSurplusRetiresOnlyIdleRunnersAndOnlyAfterTheHold(t *testing.T) {
+	s := newState(0, 1200)
 	s.Observe(stats(3, 0), t0)
 	launch(s, machines(3, t0), t0)
-	give(s, "i-0000", &Runner{ID: 10, Name: "set-i-0000-aa", Issued: t0})
-	give(s, "i-0001", &Runner{ID: 11, Name: "set-i-0001-bb", Issued: t0, Busy: true})
-	give(s, "i-0002", &Runner{ID: 12, Name: "set-i-0002-cc", Issued: t0})
+	give(s, "i-0000", &Runner{ID: 10, Name: "set-i-0000", Issued: t0})
+	give(s, "i-0001", &Runner{ID: 11, Name: "set-i-0001", Issued: t0, Busy: true})
+	give(s, "i-0002", &Runner{ID: 12, Name: "set-i-0002", Issued: t0})
 	s.Observe(stats(1, 0), t0)
 	now := t0.Add(time.Minute)
-	if got := s.Surplus(now, 20*time.Second, 100); len(got) != 0 {
-		t.Fatalf("removed %v before the surplus lasted", ids(got))
+	if n := s.Surplus(now, 20*time.Second, 10*time.Minute, 100); n != 0 {
+		t.Fatalf("retired %d before the surplus lasted", n)
 	}
-	got := s.Surplus(now.Add(21*time.Second), 20*time.Second, 100)
+	if n := s.Surplus(now.Add(21*time.Second), 20*time.Second, 10*time.Minute, 100); n != 2 {
+		t.Fatalf("retired %d: want both idle runners", n)
+	}
+	got := s.ToFence(100)
 	if len(got) != 2 {
-		t.Fatalf("surplus %v: want both idle runners", ids(got))
+		t.Fatalf("to fence %v: want both idle runners", ids(got))
 	}
 	for _, m := range got {
 		if m.ID == "i-0001" {
 			t.Fatal("a busy runner was taken")
 		}
 	}
-	s.Removed(got[0], false) // GitHub refused: it took a job meanwhile
-	s.Removed(got[1], true)
-	if snap := s.Snapshot(now); snap.Ending != 1 || snap.Busy != 2 {
+	if again := s.ToFence(100); len(again) != 0 {
+		t.Fatalf("fenced twice at once: %v", ids(again))
+	}
+	s.Fenced(got[0], HeldJob) // GitHub refused: it took a job meanwhile
+	s.Fenced(got[1], Removed)
+	if snap := s.Snapshot(now); snap.Ending != 1 || snap.Busy != 2 || snap.Retiring != 0 {
 		t.Fatalf("after one refusal and one removal: %+v", snap)
 	}
 }
 
 func TestOnDemandStaysUnderItsShareOfLaunches(t *testing.T) {
-	s := NewState("set", 0, 1200)
+	s := newState(0, 1200)
 	if room := s.OnDemandRoom(0.1, 100, t0); room != 10 {
 		t.Fatalf("room %d of 100, want 10", room)
 	}
@@ -211,46 +232,40 @@ func TestOnDemandStaysUnderItsShareOfLaunches(t *testing.T) {
 }
 
 func TestStaleAndForeignRunnersAreOrphans(t *testing.T) {
-	s := NewState("set", 0, 1200)
+	s := newState(0, 1200)
 	s.Observe(stats(1, 0), t0)
 	launch(s, machines(1, t0), t0)
-	give(s, "i-0000", &Runner{ID: 2, Name: "set-i-0000-new", Issued: t0})
+	give(s, "i-0000", &Runner{ID: 2, Name: "set-i-0000", Issued: t0})
 	orphans := s.Listed(map[string]ListedRunner{
-		"set-i-0000-new": {ID: 2, Name: "set-i-0000-new"},
-		"set-i-0000-old": {ID: 1, Name: "set-i-0000-old"},
-		"set-i-gone-zz":  {ID: 3, Name: "set-i-gone-zz"},
+		"set-i-0000":    {ID: 2, Name: "set-i-0000"},
+		"set-i-0000-zz": {ID: 1, Name: "set-i-0000-zz"},
+		"set-i-gone":    {ID: 3, Name: "set-i-gone"},
 	}, t0)
 	if len(orphans) != 2 {
-		t.Fatalf("orphans %v: want the machine's old runner and the one of a machine not live", orphans)
+		t.Fatalf("orphans %v: want a second runner of the machine and the one of a machine not live", orphans)
 	}
 }
 
 func TestARestartAdoptsMachinesAndTheirRunners(t *testing.T) {
-	s := NewState("set", 0, 1200)
-	s.Seen("us-east-1", machines(2, t0), t0.Add(time.Hour))
-	s.Listed(map[string]ListedRunner{"set-i-0000-aa": {ID: 7, Name: "set-i-0000-aa", Busy: true}}, t0.Add(time.Hour))
-	if snap := s.Snapshot(t0.Add(time.Hour)); snap.Machines != 2 || snap.Busy != 1 || snap.Booting != 1 {
+	s := newState(0, 1200)
+	s.Seen("us-east-1", machines(2, t0), t0.Add(time.Hour), t0.Add(time.Hour))
+	s.Listed(map[string]ListedRunner{"set-i-0000": {ID: 7, Name: "set-i-0000", Busy: true}}, t0.Add(time.Hour))
+	if snap := s.Snapshot(t0.Add(time.Hour)); snap.Machines != 2 || snap.Busy != 1 || snap.Booting != 1 || snap.Issued != 1 {
 		t.Fatalf("adopted %+v", snap)
-	}
-	if ended, unlisted := s.Stuck(t0.Add(time.Hour+2*time.Minute), 5*time.Minute, 3*time.Minute); len(ended)+len(unlisted) != 0 {
-		t.Fatalf("adopted machines are given the quiet grace from adoption: %v %v", ids(ended), ids(unlisted))
 	}
 }
 
-func TestASpotNoticeReplacesTheMachineAndFencesOnlyAnIdleRunner(t *testing.T) {
-	s := NewState("set", 0, 1200)
+func TestASpotNoticeReplacesTheMachineAndRetiresOnlyAnIdleRunner(t *testing.T) {
+	s := newState(0, 1200)
 	s.Observe(stats(3, 0), t0)
 	launch(s, machines(3, t0), t0)
-	give(s, "i-0001", &Runner{ID: 11, Name: "set-i-0001-bb", Issued: t0})
-	give(s, "i-0002", &Runner{ID: 12, Name: "set-i-0002-cc", Issued: t0, Busy: true})
-	if _, r := s.Noticed("i-0000"); r != nil {
-		t.Fatal("a machine with no runner has nothing to fence")
+	give(s, "i-0001", &Runner{ID: 11, Name: "set-i-0001", Issued: t0})
+	give(s, "i-0002", &Runner{ID: 12, Name: "set-i-0002", Issued: t0, Busy: true})
+	for _, id := range []string{"i-0000", "i-0001", "i-0002"} {
+		s.Noticed(id)
 	}
-	if _, r := s.Noticed("i-0001"); r == nil || r.ID != 11 {
-		t.Fatalf("idle runner to remove: %v", r)
-	}
-	if _, r := s.Noticed("i-0002"); r != nil {
-		t.Fatal("a busy runner is not removed under its job")
+	if fence := s.ToFence(100); len(fence) != 1 || fence[0].ID != "i-0001" {
+		t.Fatalf("to fence %v: only the idle runner is removed, not the busy one under its job", ids(fence))
 	}
 	if _, n := s.Deficit(t0, 100000); n != 3 {
 		t.Fatalf("launched %d, want 3: no noticed machine is supply", n)
@@ -261,20 +276,43 @@ func TestASpotNoticeReplacesTheMachineAndFencesOnlyAnIdleRunner(t *testing.T) {
 	}
 }
 
+func TestJobsThatWaitWithNoneStartedAreStalled(t *testing.T) {
+	s := newState(0, 10)
+	s.Observe(stats(2, 0), t0)
+	if s.Stalled(t0.Add(9*time.Minute), 10*time.Minute) {
+		t.Fatal("stalled after 9 minutes")
+	}
+	if !s.Stalled(t0.Add(11*time.Minute), 10*time.Minute) {
+		t.Fatal("two jobs waited 11 minutes with none started: not stalled")
+	}
+	s.Observe(&scaleset.RunnerScaleSetMessage{JobStartedMessages: []*scaleset.JobStarted{{RunnerName: "set-i-none"}},
+		Statistics: &scaleset.RunnerScaleSetStatistic{TotalAssignedJobs: 2, TotalRunningJobs: 1}}, t0.Add(12*time.Minute))
+	if s.Stalled(t0.Add(13*time.Minute), 10*time.Minute) {
+		t.Fatal("a job started a minute ago: not stalled")
+	}
+	s.Observe(stats(0, 0), t0.Add(30*time.Minute))
+	if s.Stalled(t0.Add(45*time.Minute), 10*time.Minute) {
+		t.Fatal("nothing waits: not stalled")
+	}
+}
+
 // open is a budget that never refuses.
 func open() *Budget {
 	return NewBudget(RegConfig{Cap: 1e9, WindowS: 300, Margin: 0.2, PoolRate: 1e6, PoolShare: 1, BlindRate: 1e6}, t0.Add(-time.Hour))
 }
 
-func ask(s *State, id string, at time.Time) Verdict {
-	v, _ := s.Ask(id, at, open(), 8*time.Hour)
-	return v
+// closed is a budget that registers nothing.
+func closed() *Budget {
+	return NewBudget(RegConfig{Cap: 1, WindowS: 300, Margin: 0.2, BlindRate: 0}, t0.Add(-time.Hour))
 }
 
+func ask(s *State, id string, at time.Time) Verdict {
+	return s.Ask(id, at, open(), 8*time.Hour)
+}
+
+// give records a runner issued to a machine, as a registration whose tag EC2 accepted does.
 func give(s *State, id string, r *Runner) {
-	s.mu.Lock()
-	s.machines[id].Runner = r
-	s.mu.Unlock()
+	s.Issue(s.Machine(id), r)
 }
 
 func launch(s *State, ms []*Machine, at time.Time) {

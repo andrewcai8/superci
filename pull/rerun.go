@@ -3,36 +3,73 @@ package main
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 )
 
-// Rerunner runs again, once, each job lost with its machine: a job that completed on a machine AWS had given notice
-// it takes back (a spot reclaim), or one whose machine EC2 stopped listing before the job was reported complete. A
-// job GitHub reports a success is left alone. GitHub re-runs a job only once its whole run has completed, so a lost
-// job waits here until then. The list is in memory: a restart of the listener forgets the jobs it held, which then
-// stay failed for a person to re-run.
+// Rerunner runs again, once, each job a spot reclaim took: a job on a machine AWS gave notice it takes back, or on a
+// machine EC2 says a spot interruption terminated. It re-runs a job only on that proof, and only if GitHub concluded
+// the job failed, so a job that failed by itself, or that a person cancelled, is left as it ended. GitHub re-runs a
+// job only once its whole run has completed, so a lost job waits here until then. A start rebuilds the list from the
+// failed jobs of the last two hours (EC2 keeps the proof for about an hour after a machine ends).
 type Rerunner struct {
-	mu   sync.Mutex
-	rest *REST
-	lost map[string]lostJob // by runner name, so a job is run again at most once
+	mu    sync.Mutex
+	rest  *REST
+	proof func(ctx context.Context, ids []string) (map[string]bool, error) // which machines a spot reclaim ended
+	lost  map[string]lostJob                                               // by runner name, so a job is run again at most once
 }
 
 type lostJob struct {
 	JobRef
-	at   time.Time
-	done bool
+	at     time.Time
+	proven bool // a spot reclaim took its machine: AWS's notice, or EC2's state reason
+	done   bool
 }
 
-func NewRerunner(rest *REST) *Rerunner { return &Rerunner{rest: rest, lost: map[string]lostJob{}} }
+func NewRerunner(rest *REST, proof func(context.Context, []string) (map[string]bool, error)) *Rerunner {
+	return &Rerunner{rest: rest, proof: proof, lost: map[string]lostJob{}}
+}
 
-func (r *Rerunner) Add(j JobRef, now time.Time) {
+// Add records a job lost with its machine; proven when AWS's notice already says a spot reclaim took the machine.
+func (r *Rerunner) Add(j JobRef, now time.Time, proven bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, ok := r.lost[j.Runner]; !ok {
-		r.lost[j.Runner] = lostJob{JobRef: j, at: now}
-		slog.Warn("job lost with its machine", "owner", j.Owner, "repo", j.Repo, "run", j.RunID, "job", j.Name, "runner", j.Runner)
+	if old, ok := r.lost[j.Runner]; ok {
+		if proven && !old.proven {
+			old.proven = true
+			r.lost[j.Runner] = old
+		}
+		return
 	}
+	r.lost[j.Runner] = lostJob{JobRef: j, at: now, proven: proven}
+	slog.Warn("job lost with its machine", "owner", j.Owner, "repo", j.Repo, "run", j.RunID, "job", j.Name, "runner", j.Runner, "proven", proven)
+}
+
+// Rebuild adds the failed jobs of each repository's runs of the last two hours that ran on a set's runner, after a
+// start forgot the list; each is re-run only once EC2 proves a spot reclaim took its machine.
+func (r *Rerunner) Rebuild(ctx context.Context, repos []string, now time.Time) {
+	for _, repo := range repos {
+		jobs, err := r.rest.FailedJobs(ctx, repo, now.Add(-2*time.Hour), "superci-")
+		if err != nil {
+			slog.Error("rebuild lost jobs", "repo", repo, "err", err.Error())
+			continue
+		}
+		for _, j := range jobs {
+			r.Add(j, now, false)
+		}
+		slog.Info("rebuilt lost jobs", "repo", repo, "failed_on_sets", len(jobs))
+	}
+}
+
+// instanceOf is the machine a runner is named after: <set>-<instance id>[-<suffix>].
+func instanceOf(runner string) string {
+	i := strings.Index(runner, "-i-")
+	if i < 0 {
+		return ""
+	}
+	id, _, _ := strings.Cut(runner[i+3:], "-")
+	return "i-" + id
 }
 
 func (r *Rerunner) Run(ctx context.Context) {
@@ -42,29 +79,61 @@ func (r *Rerunner) Run(ctx context.Context) {
 			return
 		case <-tick.C:
 		}
-		r.mu.Lock()
-		var todo []lostJob
-		for name, j := range r.lost {
-			switch {
-			case j.done && time.Since(j.at) > 24*time.Hour, time.Since(j.at) > 8*time.Hour:
-				delete(r.lost, name)
-			case !j.done:
-				todo = append(todo, j)
+		r.pass(ctx)
+	}
+}
+
+// pass proves or drops each unproven lost job, and re-runs the proven ones whose run has completed.
+func (r *Rerunner) pass(ctx context.Context) {
+	r.mu.Lock()
+	var todo []lostJob
+	var unproven []string
+	for name, j := range r.lost {
+		switch {
+		case j.done && time.Since(j.at) > 24*time.Hour, time.Since(j.at) > 8*time.Hour:
+			delete(r.lost, name)
+		case !j.done:
+			todo = append(todo, j)
+			if !j.proven {
+				unproven = append(unproven, instanceOf(j.Runner))
 			}
 		}
-		r.mu.Unlock()
-		for _, j := range todo {
-			if r.settle(ctx, j) {
-				r.mu.Lock()
-				j.done = true
-				r.lost[j.Runner] = j
-				r.mu.Unlock()
-			}
+	}
+	r.mu.Unlock()
+	reclaimed := map[string]bool{}
+	if len(unproven) > 0 {
+		var err error
+		if reclaimed, err = r.proof(ctx, unproven); err != nil {
+			slog.Error("spot reclaim proof", "err", err.Error())
+			return
+		}
+	}
+	for _, j := range todo {
+		if !j.proven && !reclaimed[instanceOf(j.Runner)] {
+			slog.Info("lost job not re-run: no spot reclaim took its machine", "run", j.RunID, "job", j.Name, "runner", j.Runner)
+			r.settled(j)
+			continue
+		}
+		j.proven = true
+		if r.settle(ctx, j) {
+			r.settled(j)
+		} else {
+			r.mu.Lock()
+			r.lost[j.Runner] = j
+			r.mu.Unlock()
 		}
 	}
 }
 
-// settle re-runs a lost job once its run has completed, if it did not succeed. It says whether the job is settled.
+func (r *Rerunner) settled(j lostJob) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	j.done = true
+	r.lost[j.Runner] = j
+}
+
+// settle re-runs a lost job once its run has completed, if GitHub concluded it failed. It says whether the job is
+// settled.
 func (r *Rerunner) settle(ctx context.Context, j lostJob) bool {
 	completed, err := r.rest.RunCompleted(ctx, j.Owner, j.Repo, j.RunID)
 	if err != nil || !completed {
@@ -74,7 +143,7 @@ func (r *Rerunner) settle(ctx context.Context, j lostJob) bool {
 	if err != nil {
 		return false
 	}
-	if id == 0 || conclusion == "success" || conclusion == "skipped" {
+	if id == 0 || conclusion != "failure" {
 		slog.Info("lost job needs no re-run", "run", j.RunID, "job", j.Name, "conclusion", conclusion)
 		return true
 	}

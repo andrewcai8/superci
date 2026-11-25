@@ -1,0 +1,32 @@
+{
+  "start": "-PT6H",
+  "periodOverride": "inherit",
+  "widgets": [
+    {"type": "alarm", "x": 0, "y": 0, "width": 24, "height": 3, "properties": {"title": "Alarms", "alarms": [
+      "arn:aws:cloudwatch:us-east-1:243891825325:alarm:superci-pull-listener-down",
+      "arn:aws:cloudwatch:us-east-1:243891825325:alarm:superci-pull-jobs-stalled",
+      "arn:aws:cloudwatch:us-east-1:243891825325:alarm:superci-pull-queue-wait-p90",
+      "arn:aws:cloudwatch:us-east-1:243891825325:alarm:superci-pull-registration-refusals",
+      "arn:aws:cloudwatch:us-east-1:243891825325:alarm:superci-pull-registration-errors",
+      "arn:aws:cloudwatch:us-east-1:243891825325:alarm:superci-pull-orphans",
+      "arn:aws:cloudwatch:us-east-1:243891825325:alarm:superci-pull-spend-daily",
+      "arn:aws:cloudwatch:us-east-1:243891825325:alarm:superci-pull-spend-capped",
+      "arn:aws:cloudwatch:us-east-1:243891825325:alarm:superci-pull-launch-shortfall",
+      "arn:aws:cloudwatch:us-east-1:243891825325:alarm:superci-pull-org-rate-unknown"]}},
+    {"type": "metric", "x": 0, "y": 3, "width": 12, "height": 6, "properties": {"title": "Queue wait (s) of started jobs", "region": "us-east-1", "view": "timeSeries", "period": 60,
+      "metrics": [["superci-pull", "QueueWait", {"stat": "p50", "label": "p50"}], ["...", {"stat": "p90", "label": "p90"}], ["...", {"stat": "p99", "label": "p99"}], ["...", {"stat": "SampleCount", "label": "jobs started", "yAxis": "right"}]]}},
+    {"type": "metric", "x": 12, "y": 3, "width": 12, "height": 6, "properties": {"title": "Jobs waiting, per set", "region": "us-east-1", "view": "timeSeries", "period": 60,
+      "metrics": [[{"expression": "SEARCH('{superci-pull,Set} MetricName=\"JobsWaiting\"', 'Maximum', 60)", "id": "waiting"}], ["superci-pull", "StalledSets", {"stat": "Maximum", "label": "sets stalled", "yAxis": "right"}]]}},
+    {"type": "metric", "x": 0, "y": 9, "width": 12, "height": 6, "properties": {"title": "Machines and runners, per set", "region": "us-east-1", "view": "timeSeries", "period": 60,
+      "metrics": [[{"expression": "SEARCH('{superci-pull,Set} MetricName=\"Machines\"', 'Maximum', 60)", "id": "machines"}], [{"expression": "SEARCH('{superci-pull,Set} MetricName=\"IdleRunners\"', 'Maximum', 60)", "id": "idle"}], [{"expression": "SEARCH('{superci-pull,Set} MetricName=\"BusyRunners\"', 'Maximum', 60)", "id": "busy"}]]}},
+    {"type": "metric", "x": 12, "y": 9, "width": 12, "height": 6, "properties": {"title": "Registration rates (a second): GitHub's cap is 5 for the whole organization", "region": "us-east-1", "view": "timeSeries", "period": 60,
+      "metrics": [["superci-pull", "OrgRegistrationRate", {"stat": "Average"}], [".", "OthersRegistrationRate", {"stat": "Average"}], [".", "OurRegistrationRate", {"stat": "Average"}], [".", "SpareRegistrationRate", {"stat": "Average"}]],
+      "annotations": {"horizontal": [{"value": 4, "label": "4/s: the cap less the 20% margin"}]}}},
+    {"type": "metric", "x": 0, "y": 15, "width": 12, "height": 6, "properties": {"title": "Registrations a minute", "region": "us-east-1", "view": "timeSeries", "period": 60, "stat": "Sum",
+      "metrics": [["superci-pull", "Registrations"], [".", "RegistrationRefusals"], [".", "RegistrationErrors"], [".", "LaunchShortfall"], [".", "Orphans", {"stat": "Maximum"}]]}},
+    {"type": "metric", "x": 12, "y": 15, "width": 12, "height": 6, "properties": {"title": "Spend (USD): today against the daily cap, and the hour", "region": "us-east-1", "view": "timeSeries", "period": 300, "stat": "Maximum",
+      "metrics": [["superci-pull", "SpendTodayUSD"], [".", "SpendDailyCapUSD"], [".", "SpendPerHourUSD", {"yAxis": "right"}], [".", "OnDemandShare", {"yAxis": "right"}]]}},
+    {"type": "log", "x": 0, "y": 21, "width": 24, "height": 6, "properties": {"title": "Listener warnings and errors", "region": "us-east-1", "view": "table",
+      "query": "SOURCE '/superci-pull/listener' | fields @timestamp, level, msg, set, machine, err | filter level in ['WARN', 'ERROR'] | sort @timestamp desc | limit 50"}}
+  ]
+}

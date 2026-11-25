@@ -31,23 +31,31 @@ type Region struct {
 	subnets map[string]string // zone -> default subnet
 }
 
-// Fleet is the machines of every scale set. Every instance carries the tags purpose=superci-pull and
-// superci-pull-set=<set>, which are all the reconciler needs to find them again.
+// Fleet is the machines of every scale set. Every instance carries the tags purpose=superci-pull,
+// superci-pull-deployment=<deployment> and superci-pull-set=<set>, which are all the reconciler needs to find them
+// again; a listener sees and ends only the machines of its own deployment. A machine issued its runner also carries
+// superci-pull-issued.
 type Fleet struct {
-	regions []*Region
+	regions    []*Region
+	deployment string
 }
+
+const (
+	tagDeployment = "superci-pull-deployment"
+	tagIssued     = "superci-pull-issued"
+)
 
 type ImageConfig struct {
 	Owner, Name, Pin string
 }
 
-func NewFleet(ctx context.Context, weights map[string]int, img ImageConfig) (*Fleet, error) {
+func NewFleet(ctx context.Context, deployment string, weights map[string]int, img ImageConfig) (*Fleet, error) {
 	names := make([]string, 0, len(weights))
 	for name := range weights {
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	f := &Fleet{}
+	f := &Fleet{deployment: deployment}
 	for _, name := range names {
 		cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(name))
 		if err != nil {
@@ -108,7 +116,8 @@ type setRegion struct {
 
 func (f *Fleet) AddSet(ctx context.Context, spec SetSpec, userData string, groups map[string]string) (*SetFleet, error) {
 	sf := &SetFleet{fleet: f, spec: spec, regions: map[string]*setRegion{},
-		tags: []ec2types.Tag{{Key: aws.String("purpose"), Value: aws.String("superci-pull")}, {Key: aws.String("superci-pull-set"), Value: aws.String(spec.Name)}}}
+		tags: []ec2types.Tag{{Key: aws.String("purpose"), Value: aws.String("superci-pull")}, {Key: aws.String(tagDeployment), Value: aws.String(f.deployment)},
+			{Key: aws.String("superci-pull-set"), Value: aws.String(spec.Name)}}}
 	for _, r := range f.regions {
 		sr := &setRegion{}
 		if err := sr.ensureTemplate(ctx, r, "superci-pull-"+spec.Name, userData, groups[r.Name], spec.DiskGB, sf.tags); err != nil {
@@ -369,11 +378,12 @@ func errString(err error) string {
 	return err.Error()
 }
 
-// Describe lists every scale set's machines that are starting or running in a region.
+// Describe lists every scale set's machines of this deployment that are starting or running in a region.
 func (f *Fleet) Describe(ctx context.Context, r *Region) ([]*Machine, error) {
 	var out []*Machine
 	p := ec2.NewDescribeInstancesPaginator(r.ec2, &ec2.DescribeInstancesInput{MaxResults: aws.Int32(1000), Filters: []ec2types.Filter{
 		{Name: aws.String("tag:purpose"), Values: []string{"superci-pull"}},
+		{Name: aws.String("tag:" + tagDeployment), Values: []string{f.deployment}},
 		{Name: aws.String("tag-key"), Values: []string{"superci-pull-set"}},
 		{Name: aws.String("instance-state-name"), Values: []string{"pending", "running"}},
 	}})
@@ -398,9 +408,51 @@ func (f *Fleet) Describe(ctx context.Context, r *Region) ([]*Machine, error) {
 						m.Round = aws.ToString(t.Value)
 					case "superci-pull-set":
 						m.Set = aws.ToString(t.Value)
+					case tagIssued:
+						m.Issued, m.Tagged = true, true
 					}
 				}
 				out = append(out, m)
+			}
+		}
+	}
+	return out, nil
+}
+
+// TagIssued records on EC2 that machines of a region were issued their runner. Every machine of one call gets the
+// same value (when), so a burst of issues is one call; EC2 allows only a few mutating calls a second.
+func (f *Fleet) TagIssued(ctx context.Context, r *Region, ids []string, when time.Time) error {
+	in := &ec2.CreateTagsInput{Resources: ids, Tags: []ec2types.Tag{{Key: aws.String(tagIssued), Value: aws.String(when.UTC().Format(time.RFC3339))}}}
+	var err error
+	for try := 0; try < 4; try++ {
+		if _, err = r.ec2.CreateTags(ctx, in); err == nil || !retryable(err) {
+			return err
+		}
+		time.Sleep(time.Duration(250*(try+1)) * time.Millisecond)
+	}
+	return err
+}
+
+// SpotReclaimed says which of the given machines EC2 reports terminated by a spot interruption. EC2 lists a
+// terminated instance for about an hour, so the proof must be read soon after the loss.
+func (f *Fleet) SpotReclaimed(ctx context.Context, ids []string) (map[string]bool, error) {
+	out := map[string]bool{}
+	for _, r := range f.regions {
+		for i := 0; i < len(ids); i += 200 {
+			p := ec2.NewDescribeInstancesPaginator(r.ec2, &ec2.DescribeInstancesInput{Filters: []ec2types.Filter{
+				{Name: aws.String("instance-id"), Values: ids[i:min(len(ids), i+200)]}}})
+			for p.HasMorePages() {
+				page, err := p.NextPage(ctx)
+				if err != nil {
+					return nil, err
+				}
+				for _, res := range page.Reservations {
+					for _, in := range res.Instances {
+						if in.StateReason != nil && strings.HasPrefix(aws.ToString(in.StateReason.Code), "Server.SpotInstance") {
+							out[aws.ToString(in.InstanceId)] = true
+						}
+					}
+				}
 			}
 		}
 	}

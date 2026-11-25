@@ -130,3 +130,29 @@ func TestThePoolLeavesHalfTheBurstToJobs(t *testing.T) {
 		t.Fatalf("pool took %d and jobs %d of a 12-token save: the pool stops at half the burst of 20 and leaves the rest to jobs", pool, jobs)
 	}
 }
+
+// OPS-4: the second sample of the organization's runner ids came 100 s after the first, so the budget was blind for
+// that long after every start.
+func TestTheSecondSampleComesAMinuteAfterTheFirst(t *testing.T) {
+	b := NewBudget(reg(), t0)
+	if !b.SampleDue(t0) {
+		t.Fatal("no sample due at the start")
+	}
+	b.Head(t0, 7_000_000)
+	if b.SampleDue(t0.Add(60 * time.Second)) {
+		t.Fatal("due a minute after the first: two heads must be 60 s apart")
+	}
+	if !b.SampleDue(t0.Add(61 * time.Second)) {
+		t.Fatal("not due 61 s after the first sample, while the rate is unknown")
+	}
+	b.Head(t0.Add(61*time.Second), 7_000_200)
+	if !b.Estimate(t0.Add(61 * time.Second)).Known {
+		t.Fatal("two heads 61 s apart do not make the rate known")
+	}
+	if b.SampleDue(t0.Add(130 * time.Second)) {
+		t.Fatal("due 69 s after the last sample with the rate known: want 100 s")
+	}
+	if !b.SampleDue(t0.Add(162 * time.Second)) {
+		t.Fatal("not due 101 s after the last sample")
+	}
+}

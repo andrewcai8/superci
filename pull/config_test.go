@@ -75,3 +75,24 @@ func TestTheOverrideFileReplacesOnlyWhatItNames(t *testing.T) {
 		t.Fatalf("override %+v", c)
 	}
 }
+
+// OPS-9: a typo in the override file was accepted, and an hourly array of the wrong length read as zeros.
+func TestAnOverrideWithATypoOrAShortHourlyArrayIsRefused(t *testing.T) {
+	dir := t.TempDir()
+	for name, body := range map[string]string{
+		"unknown field":   `{"daily_usdd": 50}`,
+		"short array":     `{"pools": {"superci-8cpu": {"floor": [5,5,5], "cap": [9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9]}}}`,
+		"long array":      `{"pools": {"superci-8cpu": {"floor": [5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5], "cap": [9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9]}}}`,
+		"unknown size":    `{"pools": {"superci-6cpu": {"floor": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0], "cap": [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]}}}`,
+		"two values":      `{"daily_usd": 50} {"daily_usd": 60}`,
+		"no repositories": `{"repositories": []}`,
+	} {
+		path := filepath.Join(dir, "config.json")
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadConfig(path); err == nil {
+			t.Fatalf("%s: accepted %s", name, body)
+		}
+	}
+}

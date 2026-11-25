@@ -47,8 +47,17 @@ func main() {
 		spendParam = flag.String("spend-param", "/superci-pull/spend", "SSM parameter (us-east-1) holding today's and this month's spend")
 		noMetrics  = flag.Bool("no-metrics", false, "publish no CloudWatch metrics")
 		deleteSets = flag.Bool("delete-scale-sets", false, "delete every configured scale set and exit")
+		validate   = flag.Bool("validate", false, "check the override file named by -config over the built-in config, and exit")
 	)
 	flag.Parse()
+	if *validate {
+		if _, err := LoadConfig(*configPath); err != nil {
+			fmt.Fprintf(os.Stderr, "invalid: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("valid: %s\n", *configPath)
+		return
+	}
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -85,18 +94,21 @@ type Listener struct {
 	modified   time.Time
 	pins       map[string]int // pool pinned by the operator per set, until the config file changes
 	sets       []*Set
+	group      int // the deployment's runner group at GitHub
 	fleet      *Fleet
+	tagger     *Tagger
 	budget     *Budget
 	spend      *Spend
 	rest       *REST
 	client     *scaleset.Client
 	rerun      *Rerunner
 	reconciled time.Time
-	strays     map[string]*Machine // machines of no configured set, by id
+	strays     map[string]*Machine // machines of the deployment of no configured set, by id
 	short      int                 // machines asked of EC2 and not started (capacity, quotas), since the metrics last took them
 }
 
-const group = 1 // the organization's Default runner group, which every repository may use
+// defaultGroup is the organization's Default runner group, where an earlier build made the sets.
+const defaultGroup = 1
 
 func run(ctx context.Context, f flags) error {
 	cfg, err := LoadConfig(f.configPath)
@@ -116,14 +128,21 @@ func run(ctx context.Context, f flags) error {
 		return err
 	}
 	specs := cfg.Sets()
+	rest := NewREST(app, cfg.Installation, cfg.Org)
+	group, err := rest.RunnerGroup(ctx, cfg.Deployment, cfg.Repositories)
+	if err != nil {
+		return fmt.Errorf("runner group %s: %w", cfg.Deployment, err)
+	}
+	slog.Info("runner group", "name", cfg.Deployment, "id", group, "repositories", cfg.Repositories)
 	if f.deleteSets {
 		for _, spec := range specs {
-			s, err := client.GetRunnerScaleSet(ctx, group, spec.Name)
-			if err != nil || s == nil {
-				slog.Info("no scale set to delete", "name", spec.Name, "err", errString(err))
-				continue
+			for _, g := range []int{group, defaultGroup} {
+				s, err := client.GetRunnerScaleSet(ctx, g, spec.Name)
+				if err != nil || s == nil {
+					continue
+				}
+				slog.Info("deleting scale set", "name", spec.Name, "id", s.ID, "group", g, "err", errString(client.DeleteRunnerScaleSet(ctx, s.ID)))
 			}
-			slog.Info("deleting scale set", "name", spec.Name, "id", s.ID, "err", errString(client.DeleteRunnerScaleSet(ctx, s.ID)))
 		}
 		return nil
 	}
@@ -140,21 +159,25 @@ func run(ctx context.Context, f flags) error {
 	if err != nil {
 		return err
 	}
-	fleet, err := NewFleet(ctx, cfg.Regions, ImageConfig{Owner: "135269210855", Name: "runs-on-v2.2-ubuntu24-full-x64-*", Pin: "20261102081424"})
+	fleet, err := NewFleet(ctx, cfg.Deployment, cfg.Regions, ImageConfig{Owner: "135269210855", Name: "runs-on-v2.2-ubuntu24-full-x64-*", Pin: "20261102081424"})
 	if err != nil {
 		return err
 	}
 	userData := bootData(cfg, fmt.Sprintf("https://%s%s", f.publicIP, f.listen), id.Pin)
 	now := time.Now()
-	l := &Listener{path: f.configPath, cfg: cfg, modified: modTime(f.configPath), pins: map[string]int{}, fleet: fleet,
-		budget: NewBudget(cfg.Registration, now), spend: NewSpend(cfg.DailyUSD, cfg.MonthlyUSD, specs, now),
-		rest: NewREST(app, cfg.Installation, cfg.Org), client: client, strays: map[string]*Machine{}, reconciled: now}
-	l.rerun = NewRerunner(l.rest)
+	l := &Listener{path: f.configPath, cfg: cfg, modified: modTime(f.configPath), pins: map[string]int{}, group: group, fleet: fleet,
+		tagger: NewTagger(ctx, fleet), budget: NewBudget(cfg.Registration, now), spend: NewSpend(cfg.DailyUSD, cfg.MonthlyUSD, specs, now),
+		rest: rest, client: client, strays: map[string]*Machine{}, reconciled: now}
+	l.rerun = NewRerunner(l.rest, fleet.SpotReclaimed)
 	if err := l.spend.Load(ctx, ssmc, f.spendParam); err != nil {
 		slog.Error("load spend", "err", err.Error())
 	}
+	regions := make([]string, 0, len(fleet.regions))
+	for _, r := range fleet.regions {
+		regions = append(regions, r.Name)
+	}
 	for _, spec := range specs {
-		gid, err := ensureScaleSet(ctx, client, spec)
+		gid, err := ensureScaleSet(ctx, client, group, spec)
 		if err != nil {
 			return fmt.Errorf("scale set %s: %w", spec.Name, err)
 		}
@@ -162,9 +185,9 @@ func run(ctx context.Context, f flags) error {
 		if err != nil {
 			return err
 		}
-		l.sets = append(l.sets, &Set{spec: spec, id: gid, state: NewState(spec.Name, 0, spec.Max), fleet: sf})
+		l.sets = append(l.sets, &Set{spec: spec, id: gid, state: NewState(spec.Name, 0, spec.Max, regions, now), fleet: sf})
 	}
-	if err := pruneScaleSets(ctx, client, specs); err != nil {
+	if err := pruneScaleSets(ctx, client, group, specs); err != nil {
 		return fmt.Errorf("prune scale sets: %w", err)
 	}
 	refresh := l.refresher()
@@ -177,7 +200,7 @@ func run(ctx context.Context, f flags) error {
 	for _, s := range l.sets {
 		byName[s.spec.Name] = s
 	}
-	srv := &Server{sets: byName, budget: l.budget, verifier: verifier, client: client, refresh: refresh,
+	srv := &Server{sets: byName, budget: l.budget, verifier: verifier, client: client, refresh: refresh, issue: l.tagger.Issue,
 		slots: make(chan struct{}, max(1, cfg.Registration.Concurrency)), maxAge: l.maxAge}
 	go serve(ctx, &http.Server{Addr: f.listen, Handler: srv, ReadHeaderTimeout: 10 * time.Second}, &id)
 	go serve(ctx, &http.Server{Addr: f.admin, Handler: Admin(l.status, l.healthy, l.override)}, nil)
@@ -190,8 +213,10 @@ func run(ctx context.Context, f flags) error {
 		go func() { defer sessions.Done(); errs <- listenSet(ctx, client, s, wake) }()
 	}
 	go l.reconciler(ctx, refresh)
+	go l.lister(ctx)
 	go every(ctx, 15*time.Second, func() { l.setPools(time.Now()) })
-	go every(ctx, 10*time.Second, func() { l.sampleOrg(ctx) })
+	l.sampleOrg(ctx)
+	go every(ctx, 5*time.Second, func() { l.sampleOrg(ctx) })
 	go every(ctx, 30*time.Minute, func() { l.price(ctx) })
 	go every(ctx, time.Minute, func() {
 		if err := l.spend.Save(ctx, ssmc, f.spendParam); err != nil {
@@ -210,6 +235,7 @@ func run(ctx context.Context, f flags) error {
 		})
 	}
 	if l.cfg.Rerun {
+		go l.rerun.Rebuild(ctx, cfg.Repositories, now)
 		go l.rerun.Run(ctx)
 	}
 	go l.price(ctx)
@@ -229,18 +255,15 @@ func run(ctx context.Context, f flags) error {
 	}
 }
 
-// bootData is a machine's user data: boot.sh with the listener's address and key, the longest a job may run, and the
-// longest a machine may live.
+// bootData is a machine's user data: boot.sh with the listener's address and key, and the longest a machine may live
+// (the oldest a pool machine may be, and the longest job after it).
 func bootData(c Config, listener, pin string) string {
-	job := (c.JobMinutes + c.MarginMin) * 60
-	life := int(c.MaxAgeHours*3600) + job
-	return strings.NewReplacer("@LISTENER@", listener, "@PIN@", pin, "@JOB_SECONDS@", strconv.Itoa(job),
-		"@LIFE_SECONDS@", strconv.Itoa(life)).Replace(bootScript)
+	return strings.NewReplacer("@LISTENER@", listener, "@PIN@", pin, "@LIFE_SECONDS@", strconv.Itoa(int(c.life().Seconds()))).Replace(bootScript)
 }
 
-// ensureScaleSet finds or makes the set at GitHub with its labels: its name, and the size's label when it is not the
-// size's first set.
-func ensureScaleSet(ctx context.Context, client *scaleset.Client, spec SetSpec) (int, error) {
+// ensureScaleSet finds or makes the set at GitHub, in the deployment's runner group, with its labels: its name, and
+// the size's label when it is not the size's first set. A set an earlier build made in the Default group is moved.
+func ensureScaleSet(ctx context.Context, client *scaleset.Client, group int, spec SetSpec) (int, error) {
 	labels := []scaleset.Label{{Name: spec.Name}}
 	if spec.Name != spec.Label {
 		labels = append(labels, scaleset.Label{Name: spec.Label})
@@ -248,6 +271,22 @@ func ensureScaleSet(ctx context.Context, client *scaleset.Client, spec SetSpec) 
 	s, err := client.GetRunnerScaleSet(ctx, group, spec.Name)
 	if err != nil {
 		return 0, err
+	}
+	if s == nil && group != defaultGroup {
+		old, err := client.GetRunnerScaleSet(ctx, defaultGroup, spec.Name)
+		if err != nil {
+			return 0, err
+		}
+		if old != nil {
+			old.RunnerGroupID, old.RunnerGroupName = group, ""
+			if s, err = client.UpdateRunnerScaleSet(ctx, old.ID, old); err != nil {
+				return 0, fmt.Errorf("move to runner group %d: %w", group, err)
+			}
+			slog.Info("moved scale set", "name", spec.Name, "id", s.ID, "group", s.RunnerGroupID)
+			if s.RunnerGroupID != group {
+				return 0, fmt.Errorf("moved to runner group %d, GitHub says %d", group, s.RunnerGroupID)
+			}
+		}
 	}
 	if s == nil {
 		s, err = client.CreateRunnerScaleSet(ctx, &scaleset.RunnerScaleSet{Name: spec.Name, RunnerGroupID: group, Labels: labels,
@@ -271,10 +310,11 @@ func ensureScaleSet(ctx context.Context, client *scaleset.Client, spec SetSpec) 
 // ownSetName is the form of every set this listener makes: superci-<cpu>cpu, or superci-<cpu>cpu-<k> for a split.
 var ownSetName = regexp.MustCompile(`^superci-[0-9]+cpu(-[0-9]+)?$`)
 
-// pruneScaleSets deletes the sets of ours the config no longer has (a size removed, or a split made smaller): one
-// left at GitHub would keep taking a share of its label's jobs with no listener to run them. GitHub removes a
-// deleted set's runners, so a job one of them held fails; shrink a split while the size is idle, or re-run them.
-func pruneScaleSets(ctx context.Context, client *scaleset.Client, specs []SetSpec) error {
+// pruneScaleSets deletes the sets of the deployment's runner group the config no longer has (a size removed, or a
+// split made smaller): one left at GitHub would keep taking a share of its label's jobs with no listener to run them.
+// Another deployment's sets are in its own group, so they are never touched. GitHub removes a deleted set's runners,
+// so a job one of them held fails; shrink a split while the size is idle, or re-run them.
+func pruneScaleSets(ctx context.Context, client *scaleset.Client, group int, specs []SetSpec) error {
 	want := map[string]bool{}
 	for _, s := range specs {
 		want[s.Name] = true
@@ -286,6 +326,15 @@ func pruneScaleSets(ctx context.Context, client *scaleset.Client, specs []SetSpe
 	for _, s := range sets {
 		if ownSetName.MatchString(s.Name) && !want[s.Name] {
 			slog.Warn("deleting scale set the config no longer has", "name", s.Name, "id", s.ID, "err", errString(client.DeleteRunnerScaleSet(ctx, s.ID)))
+		}
+	}
+	// A set of this form left in the Default group (an earlier build's) takes a share of its label's jobs with no
+	// listener; it is another deployment's to delete, or the operator's.
+	if old, err := client.ListRunnerScaleSets(ctx, defaultGroup); err == nil {
+		for _, s := range old {
+			if ownSetName.MatchString(s.Name) {
+				slog.Warn("a scale set of this form is in the Default runner group", "name", s.Name, "id", s.ID)
+			}
 		}
 	}
 	return nil
@@ -442,7 +491,7 @@ func (l *Listener) launcher(ctx context.Context, s *Set, wake chan struct{}) {
 }
 
 // refresher lists a region's machines of every set again, at most once a second per region however many ask, and
-// gives each set its own. Machines of no configured set are kept as strays.
+// gives each set its own. Machines of the deployment of no configured set are kept as strays.
 func (l *Listener) refresher() func(context.Context, string) {
 	var mu sync.Mutex
 	locks := map[string]*sync.Mutex{}
@@ -464,7 +513,10 @@ func (l *Listener) refresher() func(context.Context, string) {
 		if fresh || r == nil {
 			return
 		}
-		ms, err := l.fleet.Describe(ctx, r)
+		began := time.Now()
+		dctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		ms, err := l.fleet.Describe(dctx, r)
+		cancel()
 		if err != nil {
 			slog.Error("describe", "region", region, "err", err.Error())
 			return
@@ -475,11 +527,13 @@ func (l *Listener) refresher() func(context.Context, string) {
 			by[m.Set] = append(by[m.Set], m)
 		}
 		known := map[string]bool{}
+		var gone []JobRef
 		for _, s := range l.sets {
 			known[s.spec.Name] = true
-			for _, j := range s.state.Seen(region, by[s.spec.Name], now) {
-				l.rerun.Add(j, now)
-			}
+			gone = append(gone, s.state.Seen(region, by[s.spec.Name], began, now)...)
+		}
+		for _, j := range gone {
+			l.rerun.Add(j, now, false)
 		}
 		l.mu.Lock()
 		for id, m := range l.strays {
@@ -499,12 +553,52 @@ func (l *Listener) refresher() func(context.Context, string) {
 	}
 }
 
-// reconciler is the level-triggered loop: it lists EC2 and GitHub, adopts what it finds, removes stale runners, ends
-// stuck machines and surplus idle runners (fenced by GitHub's refusal to remove a runner that holds a job), ends
-// machines of no configured set, accrues the spend and applies its cap.
+// lister lists the runners of the deployment's group on its own, so a slow GitHub slows only it: every 30 s, or 3 s a
+// page for a big pool (at most 1,200 requests an hour). Each set learns its runners, and stale ones are removed.
+func (l *Listener) lister(ctx context.Context) {
+	for wait := time.Duration(0); ; {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(wait):
+		}
+		started := time.Now()
+		lctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+		runners, pages, err := l.rest.Runners(lctx, l.group, "superci-")
+		cancel()
+		wait = max(30*time.Second, time.Duration(pages)*3*time.Second) - time.Since(started)
+		if err != nil {
+			slog.Error("list runners", "err", err.Error())
+			wait = 10 * time.Second
+			continue
+		}
+		for _, s := range l.sets {
+			own := map[string]ListedRunner{}
+			for name, r := range runners {
+				if strings.HasPrefix(name, s.spec.Name+"-i-") {
+					own[name] = r
+				}
+			}
+			var stale []ListedRunner
+			for _, o := range s.state.Listed(own, started) {
+				if !o.Busy {
+					stale = append(stale, o)
+				}
+			}
+			parallel(stale, func(o ListedRunner) {
+				err := l.client.RemoveRunner(ctx, o.ID)
+				slog.Info("remove stale runner", "set", s.spec.Name, "runner", o.Name, "err", errString(err))
+			})
+		}
+	}
+}
+
+// reconciler is the level-triggered loop: it lists EC2, adopts what it finds, ends stuck, overdue and shed machines,
+// retires surplus idle runners and removes the retiring ones (fenced by GitHub's refusal to remove a runner that
+// holds a job), ends machines of no configured set, accrues the spend and applies its cap. Its calls to GitHub run on
+// their own, so a slow GitHub never stalls a pass; each machine has at most one of them in flight.
 func (l *Listener) reconciler(ctx context.Context, refresh func(context.Context, string)) {
-	var listed, logged time.Time
-	every := 30 * time.Second // between listings of the runners: 3 s a page, so a big pool costs at most 1,200 requests an hour
+	var logged time.Time
 	for tick := time.NewTicker(10 * time.Second); ; {
 		select {
 		case <-ctx.Done():
@@ -515,31 +609,7 @@ func (l *Listener) reconciler(ctx context.Context, refresh func(context.Context,
 		for _, r := range l.fleet.regions {
 			refresh(ctx, r.Name)
 		}
-		if now.Sub(listed) > every {
-			if runners, pages, err := l.rest.Runners(ctx, group, "superci-"); err != nil {
-				slog.Error("list runners", "err", err.Error())
-			} else {
-				listed, every = now, max(30*time.Second, time.Duration(pages)*3*time.Second)
-				for _, s := range l.sets {
-					own := map[string]ListedRunner{}
-					for name, r := range runners {
-						if strings.HasPrefix(name, s.spec.Name+"-i-") {
-							own[name] = r
-						}
-					}
-					var stale []ListedRunner
-					for _, o := range s.state.Listed(own, now) {
-						if !o.Busy {
-							stale = append(stale, o)
-						}
-					}
-					parallel(stale, func(o ListedRunner) {
-						err := l.client.RemoveRunner(ctx, o.ID)
-						slog.Info("remove stale runner", "set", s.spec.Name, "runner", o.Name, "err", errString(err))
-					})
-				}
-			}
-		}
+		cfg := l.config()
 		capped := l.spend.Over()
 		var running []Machine
 		var end []*Machine
@@ -558,6 +628,7 @@ func (l *Listener) reconciler(ctx context.Context, refresh func(context.Context,
 			}
 			slog.Warn("shed waiting machines", "waiting", waiting, "limit", limit, "shed", waiting-limit-excess)
 		}
+		window := time.Duration(max(1, cfg.Pool.WindowMinutes)) * time.Minute
 		for _, s := range l.sets {
 			s.state.SetCapped(capped)
 			if stale := s.state.MarkStale(now, 3*time.Minute); stale > 0 {
@@ -567,19 +638,29 @@ func (l *Listener) reconciler(ctx context.Context, refresh func(context.Context,
 			for _, m := range ended {
 				slog.Warn("stuck", "set", s.spec.Name, "machine", m.ID, "region", m.Region, "age_s", int(now.Sub(m.Launched).Seconds()))
 			}
-			l.checkGone(ctx, s, unlisted)
-			parallel(s.state.Surplus(now, 20*time.Second, 100), func(m *Machine) {
+			go l.check(ctx, s, unlisted)
+			for _, m := range s.state.Overdue(now, cfg.job(), l.maxAge(), cfg.life()) {
+				slog.Warn("overdue", "set", s.spec.Name, "machine", m.ID, "age_s", int(now.Sub(m.Launched).Seconds()))
+			}
+			s.state.Surplus(now, 20*time.Second, window, 100)
+			go parallel(s.state.ToFence(100), func(m *Machine) {
 				r := m.Runner
 				err := l.client.RemoveRunner(ctx, r.ID)
-				removed := err == nil || errors.Is(err, scaleset.RunnerNotFoundError) || errors.Is(err, scaleset.NotFoundError)
-				s.state.Removed(m, removed)
-				slog.Info("surplus", "set", s.spec.Name, "machine", m.ID, "runner", r.Name, "removed", removed, "err", errString(err))
+				out := removal(err)
+				s.state.Fenced(m, out)
+				slog.Info("retire", "set", s.spec.Name, "machine", m.ID, "runner", r.Name, "removed", out == Removed, "held_job", out == HeldJob, "err", errString(err))
 			})
 			end = append(end, s.state.ToEnd(now)...)
 			running = append(running, s.state.Running()...)
 			for _, j := range s.state.TakeLost() {
-				l.rerun.Add(j, now)
+				l.rerun.Add(j, now, true)
 			}
+			go parallel(s.state.Untagged(), func(m *Machine) {
+				if err := l.tagger.Issue(ctx, m); err != nil {
+					s.state.TagFailed(m)
+					slog.Error("issue tag", "set", s.spec.Name, "machine", m.ID, "err", err.Error())
+				}
+			})
 		}
 		l.mu.Lock()
 		for _, m := range l.strays {
@@ -590,7 +671,9 @@ func (l *Listener) reconciler(ctx context.Context, refresh func(context.Context,
 		}
 		l.mu.Unlock()
 		if len(end) > 0 {
-			l.fleet.Terminate(ctx, end, "ending")
+			tctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+			l.fleet.Terminate(tctx, end, "ending")
+			cancel()
 		}
 		l.spend.Accrue(now, running)
 		l.mu.Lock()
@@ -605,36 +688,56 @@ func (l *Listener) reconciler(ctx context.Context, refresh func(context.Context,
 				"failed", b.Failed, "throttled", b.Throttled, "spend_day", sp.DayUSD, "spend_month", sp.MonthUSD, "per_hour", sp.PerHour, "capped", sp.Capped)
 			for _, s := range l.sets {
 				snap := s.state.Snapshot(now)
-				slog.Info("state", "set", snap.Set, "desired", snap.Desired, "live", snap.Live, "inflight", snap.Inflight, "machines", snap.Machines,
-					"booting", snap.Booting, "idle", snap.Idle, "busy", snap.Busy, "ending", snap.Ending, "on_demand", snap.OnDemand,
-					"notices", snap.Notices, "pool", snap.Pool, "orphans", snap.Orphans, "stale_waiting", snap.StaleWaiting,
+				slog.Info("state", "set", snap.Set, "ready", snap.Ready, "desired", snap.Desired, "live", snap.Live, "inflight", snap.Inflight, "machines", snap.Machines,
+					"booting", snap.Booting, "idle", snap.Idle, "busy", snap.Busy, "issued", snap.Issued, "retiring", snap.Retiring, "ending", snap.Ending,
+					"on_demand", snap.OnDemand, "notices", snap.Notices, "pool", snap.Pool, "orphans", snap.Orphans, "stale_waiting", snap.StaleWaiting,
 					"s_assigned", snap.Stats.TotalAssignedJobs, "s_available", snap.Stats.TotalAvailableJobs, "s_running", snap.Stats.TotalRunningJobs)
 			}
 		}
 	}
 }
 
-// checkGone asks GitHub about each runner a listing did not show, at most 100 a pass: a runner GitHub no longer has
-// ends its machine, one it has was missed by the listing.
-func (l *Listener) checkGone(ctx context.Context, s *Set, ms []*Machine) {
+// check asks GitHub about each runner a listing did not show, at most 100 a pass (the rest wait for the next): by id,
+// or by the machine's runner name when a restart left the runner unknown. GitHub's word that it has no such runner
+// ends the machine; anything else keeps it.
+func (l *Listener) check(ctx context.Context, s *Set, ms []*Machine) {
 	for _, m := range ms[min(len(ms), 100):] {
-		s.state.Gone(m, m.Runner, false)
+		s.state.Checked(m, Unsure, nil)
 	}
 	parallel(ms[:min(len(ms), 100)], func(m *Machine) {
-		r := m.Runner
-		_, err := l.client.GetRunner(ctx, int(r.ID))
-		gone := errors.Is(err, scaleset.RunnerNotFoundError) || errors.Is(err, scaleset.NotFoundError)
-		s.state.Gone(m, r, gone)
-		if gone {
-			slog.Warn("stuck", "set", s.spec.Name, "machine", m.ID, "runner", r.Name, "why", "runner gone")
-		} else if err != nil {
-			slog.Info("runner check", "set", s.spec.Name, "runner", r.Name, "err", err.Error())
+		cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		c, found, err := Unsure, (*Runner)(nil), error(nil)
+		id, name := s.state.RunnerRef(m)
+		if id != 0 {
+			_, err = l.client.GetRunner(cctx, int(id))
+			switch {
+			case err == nil:
+				c = Present
+			case errors.Is(err, scaleset.RunnerNotFoundError), errors.Is(err, scaleset.NotFoundError):
+				c = Absent
+			}
+		} else {
+			var ref *scaleset.RunnerReference
+			ref, err = l.client.GetRunnerByName(cctx, name)
+			switch {
+			case err == nil && ref == nil:
+				c = Absent
+			case err == nil:
+				c, found = Present, &Runner{ID: int64(ref.ID), Name: ref.Name, Issued: time.Now()}
+			}
+		}
+		s.state.Checked(m, c, found)
+		switch c {
+		case Absent:
+			slog.Warn("stuck", "set", s.spec.Name, "machine", m.ID, "runner", name, "why", "runner gone")
+		case Unsure:
+			slog.Info("runner check", "set", s.spec.Name, "runner", name, "err", errString(err))
 		}
 	})
 }
 
-// parallel calls f on every item, 16 at a time, and returns when all are done: a reconcile pass that removes or
-// checks hundreds of runners (a pool shrinking at the end of a busy hour) stays well under the health check's minute.
+// parallel calls f on every item, 16 at a time, and returns when all are done.
 func parallel[T any](items []T, f func(T)) {
 	sem := make(chan struct{}, 16)
 	var wg sync.WaitGroup
@@ -649,11 +752,11 @@ func parallel[T any](items []T, f func(T)) {
 	wg.Wait()
 }
 
-// sampleOrg learns the organization's highest runner id from a listing when our own registrations have not told it
-// lately. A listing reads every page of the organization's runners (2,600 at a busy hour, 27 requests of the App's
-// 5,000 an hour), so it runs at most every 100 s.
+// sampleOrg learns the organization's highest runner id from a listing when the budget asks for one (SampleDue). A
+// listing reads every page of the organization's runners (2,600 at a busy hour, 27 requests of the App's 5,000 an
+// hour).
 func (l *Listener) sampleOrg(ctx context.Context) {
-	if time.Since(l.budget.LastHead()) < 100*time.Second {
+	if !l.budget.SampleDue(time.Now()) {
 		return
 	}
 	id, err := l.rest.OrgHead(ctx)
@@ -717,9 +820,7 @@ func (l *Listener) config() Config {
 	return l.cfg
 }
 
-func (l *Listener) maxAge() time.Duration {
-	return time.Duration(l.config().MaxAgeHours * float64(time.Hour))
-}
+func (l *Listener) maxAge() time.Duration { return l.config().maxAge() }
 
 func modTime(path string) time.Time {
 	if fi, err := os.Stat(path); err == nil {
@@ -796,6 +897,9 @@ func (l *Listener) metrics() Metrics {
 	m := Metrics{Budget: st.Budget, Spend: st.Spend, Sets: st.Sets}
 	for _, s := range l.sets {
 		m.Waits = append(m.Waits, s.state.TakeWaits()...)
+		if s.state.Stalled(now, 10*time.Minute) {
+			m.Stalled++
+		}
 	}
 	for _, s := range st.Sets {
 		m.Orphans += s.Orphans
@@ -811,18 +915,13 @@ func (l *Listener) metrics() Metrics {
 	return m
 }
 
-// healthy is false when a set's message session has not answered for three minutes (its long poll answers about
-// every minute) or the reconciler has not run for one.
+// healthy says whether the process is alive: its reconciler has finished a pass within the last minute. GitHub's and
+// EC2's slowness is not death (a replacement could not reach them either); a pass bounds its own EC2 calls, and its
+// GitHub calls run on their own.
 func (l *Listener) healthy() error {
-	now := time.Now()
-	for _, s := range l.sets {
-		if d := now.Sub(s.state.Polled()); d > 3*time.Minute {
-			return fmt.Errorf("%s: no answer from its message session for %s", s.spec.Name, d.Round(time.Second))
-		}
-	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if d := now.Sub(l.reconciled); d > time.Minute {
+	if d := time.Since(l.reconciled); d > time.Minute {
 		return fmt.Errorf("reconciler idle for %s", d.Round(time.Second))
 	}
 	return nil

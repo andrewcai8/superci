@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,8 +30,9 @@ type Server struct {
 	budget   *Budget
 	verifier *Verifier
 	client   *scaleset.Client
-	refresh  func(ctx context.Context, region string) // lists a region again, at most once a second
-	slots    chan struct{}                            // bounds concurrent registrations
+	refresh  func(ctx context.Context, region string)    // lists a region again, at most once a second
+	issue    func(ctx context.Context, m *Machine) error // writes the machine's issued tag; nil once EC2 has it
+	slots    chan struct{}                               // bounds concurrent registrations
 	maxAge   func() time.Duration
 }
 
@@ -74,6 +73,9 @@ func (h *Server) machine(r *http.Request) (*Set, *Machine, error) {
 	return nil, nil, fmt.Errorf("instance %s is no machine of ours", doc.InstanceID)
 }
 
+// jit answers a machine's ask for its runner. A machine gets one runner, ever: the runner is registered, EC2 is told
+// the machine was issued it (its tag), and only then does the config leave. A config that cannot be recorded so never
+// leaves, and its machine gets none.
 func (h *Server) jit(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	s, m, err := h.machine(r)
@@ -82,45 +84,25 @@ func (h *Server) jit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unknown machine", http.StatusForbidden)
 		return
 	}
-	// Its last runner took a job and ended: wait (a few seconds at most) until the queue reports that job complete,
-	// so that the decision counts it as gone.
-	for i := 0; i < 25 && !s.state.PreviousDone(m.ID); i++ {
-		time.Sleep(200 * time.Millisecond)
-	}
-	for attempt := 0; ; attempt++ {
-		verdict, old := s.state.Ask(m.ID, time.Now(), h.budget, h.maxAge())
-		switch verdict {
-		case Replace:
-			err := h.client.RemoveRunner(context.WithoutCancel(r.Context()), old.ID)
-			removed := err == nil || errors.Is(err, scaleset.RunnerNotFoundError) || errors.Is(err, scaleset.NotFoundError)
-			s.state.Replaced(m, old, removed)
-			slog.Info("replace runner", "set", s.spec.Name, "machine", m.ID, "runner", old.Name, "removed", removed, "err", errString(err))
-			if removed && attempt == 0 {
-				continue
-			}
-			fallthrough
-		case Wait:
-			w.Header().Set("Retry-After", "3")
-			w.WriteHeader(http.StatusTooManyRequests)
-			return
-		case End:
-			slog.Info("ask", "set", s.spec.Name, "machine", m.ID, "verdict", "end")
-			w.WriteHeader(http.StatusGone)
-			return
-		case Unknown:
-			http.Error(w, "unknown machine", http.StatusForbidden)
-			return
-		}
-		break
+	switch s.state.Ask(m.ID, time.Now(), h.budget, h.maxAge()) {
+	case Wait:
+		w.Header().Set("Retry-After", "3")
+		w.WriteHeader(http.StatusTooManyRequests)
+		return
+	case End:
+		slog.Info("ask", "set", s.spec.Name, "machine", m.ID, "verdict", "end")
+		w.WriteHeader(http.StatusGone)
+		return
+	case Unknown:
+		http.Error(w, "unknown machine", http.StatusForbidden)
+		return
 	}
 	h.slots <- struct{}{}
 	defer func() { <-h.slots }()
-	suffix := make([]byte, 2)
-	_, _ = rand.Read(suffix)
-	name := fmt.Sprintf("%s-%s-%s", s.spec.Name, m.ID, hex.EncodeToString(suffix))
+	name := runnerName(s.spec.Name, m.ID)
 	// A refusal comes back at once, not after the client's own waits: the machine is told to ask again, and the
 	// listener stops asking GitHub for a while.
-	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 15*time.Second)
 	defer cancel()
 	ctx = scaleset.WithRequestRetry(ctx, func(rc *scaleset.RetryConfig) {
 		rc.OnRateLimit = func(context.Context, *scaleset.RateLimitError) (time.Duration, bool) { return 0, false }
@@ -129,39 +111,67 @@ func (h *Server) jit(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		var rl *scaleset.RateLimitError
 		refused := errors.As(err, &rl) || strings.Contains(err.Error(), "ConfigureTooManyRunners")
-		slog.Error("register", "set", s.spec.Name, "machine", m.ID, "runner", name, "refused", refused, "err", err.Error(), "ms", time.Since(started).Milliseconds())
-		if refused {
+		exists := errors.Is(err, scaleset.RunnerExistsError)
+		slog.Error("register", "set", s.spec.Name, "machine", m.ID, "runner", name, "refused", refused, "exists", exists, "err", err.Error(), "ms", time.Since(started).Milliseconds())
+		switch {
+		case exists:
+			// GitHub holds a runner of this machine's name that was never handed out (an answer lost to a crash or a
+			// timeout): the machine gets none, and the runner is removed as an orphan once the machine ends.
+			h.budget.Done(time.Now(), Failed, 0)
+			s.state.Withheld(m, nil)
+			w.WriteHeader(http.StatusGone)
+		case refused:
 			h.budget.Done(time.Now(), Refused, 0)
+			s.state.Unissued(m)
 			w.Header().Set("Retry-After", "5")
 			w.WriteHeader(http.StatusTooManyRequests)
-			return
+		default:
+			h.budget.Done(time.Now(), Failed, 0)
+			s.state.Unissued(m)
+			http.Error(w, "registration failed", http.StatusServiceUnavailable)
 		}
-		h.budget.Done(time.Now(), Failed, 0)
-		http.Error(w, "registration failed", http.StatusServiceUnavailable)
 		return
 	}
 	now := time.Now()
 	h.budget.Done(now, Made, int64(cfg.Runner.ID))
-	s.state.Registered(m.ID, &Runner{ID: int64(cfg.Runner.ID), Name: name, Issued: now})
+	runner := &Runner{ID: int64(cfg.Runner.ID), Name: name, Issued: now}
+	tctx, tcancel := context.WithTimeout(context.WithoutCancel(r.Context()), 10*time.Second)
+	defer tcancel()
+	if err := h.issue(tctx, m); err != nil {
+		h.budget.Lost()
+		s.state.Withheld(m, runner)
+		slog.Error("issue", "set", s.spec.Name, "machine", m.ID, "runner", name, "runner_id", cfg.Runner.ID, "withheld", true, "err", err.Error())
+		w.WriteHeader(http.StatusGone)
+		return
+	}
+	s.state.Issue(m, runner)
 	slog.Info("register", "set", s.spec.Name, "machine", m.ID, "runner", name, "runner_id", cfg.Runner.ID, "ms", time.Since(started).Milliseconds())
 	w.Header().Set("Content-Type", "text/plain")
 	_, _ = w.Write([]byte(cfg.EncodedJITConfig))
 }
 
+// notice takes in a machine's word that AWS gave notice it takes the machine back. The machine is no longer supply;
+// an idle runner of it retires (the reconciler removes it before the machine ends).
 func (h *Server) notice(w http.ResponseWriter, r *http.Request) {
 	s, m, err := h.machine(r)
 	if err != nil {
 		http.Error(w, "unknown machine", http.StatusForbidden)
 		return
 	}
-	_, idle := s.state.Noticed(m.ID)
-	slog.Warn("spot notice", "set", s.spec.Name, "machine", m.ID, "region", m.Region, "type", m.Type, "az", m.AZ, "idle_runner", idle != nil)
+	s.state.Noticed(m.ID)
+	slog.Warn("spot notice", "set", s.spec.Name, "machine", m.ID, "region", m.Region, "type", m.Type, "az", m.AZ)
 	w.WriteHeader(http.StatusNoContent)
-	if idle != nil {
-		err := h.client.RemoveRunner(context.WithoutCancel(r.Context()), idle.ID)
-		removed := err == nil || errors.Is(err, scaleset.RunnerNotFoundError) || errors.Is(err, scaleset.NotFoundError)
-		s.state.Removed(m, removed)
-		slog.Info("noticed runner", "set", s.spec.Name, "machine", m.ID, "runner", idle.Name, "removed", removed, "err", errString(err))
+}
+
+// removal reads GitHub's answer to removing a runner: only GitHub's refusal for a runner that holds a job means busy.
+func removal(err error) Removal {
+	switch {
+	case err == nil, errors.Is(err, scaleset.RunnerNotFoundError), errors.Is(err, scaleset.NotFoundError):
+		return Removed
+	case errors.Is(err, scaleset.JobStillRunningError):
+		return HeldJob
+	default:
+		return NotSure
 	}
 }
 

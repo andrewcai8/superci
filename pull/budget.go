@@ -92,6 +92,23 @@ func (b *Budget) LastHead() time.Time {
 	return b.heads[len(b.heads)-1].at
 }
 
+// SampleDue says whether to learn the organization's highest runner id from a listing now: at once after a start, a
+// minute later (the rate needs two heads 60 s apart, so the budget is blind for about a minute, not two), and then
+// whenever neither a listing nor our own registrations have told it for 100 s.
+func (b *Budget) SampleDue(now time.Time) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	n := len(b.heads)
+	if n == 0 {
+		return true
+	}
+	wait := 100 * time.Second
+	if !b.estimate(now).Known {
+		wait = 61 * time.Second
+	}
+	return now.Sub(b.heads[n-1].at) >= wait
+}
+
 // Estimate is the budget's view of the organization's registrations, each a rate a second over the last window.
 type Estimate struct {
 	Known      bool    `json:"known"`
@@ -203,6 +220,10 @@ func (b *Budget) Done(now time.Time, outcome Outcome, runnerID int64) {
 		b.failed++
 	}
 }
+
+// Lost counts a registration GitHub made whose config was withheld (its issued tag could not be written): an error
+// like a failed registration, though it took the organization's registration.
+func (b *Budget) Lost() { b.mu.Lock(); b.failed++; b.mu.Unlock() }
 
 // BudgetSnapshot is the budget as the admin endpoint and the metrics report it.
 type BudgetSnapshot struct {

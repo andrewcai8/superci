@@ -2,16 +2,64 @@
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "Launch",
+      "Sid": "LaunchFromRunnerTemplates",
       "Effect": "Allow",
-      "Action": [
-        "ec2:CreateFleet",
-        "ec2:RunInstances",
-        "ec2:CreateLaunchTemplate",
-        "ec2:CreateLaunchTemplateVersion",
-        "ec2:ModifyLaunchTemplate"
-      ],
-      "Resource": "*"
+      "Action": ["ec2:CreateFleet", "ec2:RunInstances"],
+      "Resource": "arn:aws:ec2:*:243891825325:launch-template/*",
+      "Condition": { "StringEquals": { "aws:ResourceTag/purpose": "superci-pull" } }
+    },
+    {
+      "Sid": "LaunchTaggedMachines",
+      "Effect": "Allow",
+      "Action": ["ec2:CreateFleet", "ec2:RunInstances"],
+      "Resource": ["arn:aws:ec2:*:243891825325:instance/*", "arn:aws:ec2:*:243891825325:fleet/*"],
+      "Condition": { "StringEquals": { "aws:RequestTag/purpose": "superci-pull" } }
+    },
+    {
+      "Sid": "LaunchTheRunnersImage",
+      "Effect": "Allow",
+      "Action": ["ec2:CreateFleet", "ec2:RunInstances"],
+      "Resource": "arn:aws:ec2:*::image/*",
+      "Condition": { "StringEquals": { "ec2:Owner": ["135269210855", "243891825325"] } }
+    },
+    {
+      "Sid": "LaunchIntoOurSecurityGroups",
+      "Effect": "Allow",
+      "Action": ["ec2:CreateFleet", "ec2:RunInstances"],
+      "Resource": "arn:aws:ec2:*:243891825325:security-group/*",
+      "Condition": { "StringEquals": { "aws:ResourceTag/purpose": "superci-pull" } }
+    },
+    {
+      "Sid": "LaunchVolumesAndNetwork",
+      "Effect": "Allow",
+      "Action": ["ec2:CreateFleet", "ec2:RunInstances"],
+      "Resource": [
+        "arn:aws:ec2:*:243891825325:volume/*",
+        "arn:aws:ec2:*:243891825325:subnet/*",
+        "arn:aws:ec2:*:243891825325:network-interface/*",
+        "arn:aws:ec2:*:243891825325:spot-instances-request/*"
+      ]
+    },
+    {
+      "Sid": "MakeRunnerTemplates",
+      "Effect": "Allow",
+      "Action": "ec2:CreateLaunchTemplate",
+      "Resource": "arn:aws:ec2:*:243891825325:launch-template/*",
+      "Condition": { "StringEquals": { "aws:RequestTag/purpose": "superci-pull" } }
+    },
+    {
+      "Sid": "ChangeRunnerTemplates",
+      "Effect": "Allow",
+      "Action": ["ec2:CreateLaunchTemplateVersion", "ec2:ModifyLaunchTemplate", "ec2:DeleteLaunchTemplate"],
+      "Resource": "arn:aws:ec2:*:243891825325:launch-template/*",
+      "Condition": { "StringEquals": { "aws:ResourceTag/purpose": "superci-pull" } }
+    },
+    {
+      "Sid": "NeverTheListenersOwnTemplate",
+      "Effect": "Deny",
+      "Action": ["ec2:CreateFleet", "ec2:RunInstances", "ec2:CreateLaunchTemplateVersion", "ec2:ModifyLaunchTemplate", "ec2:DeleteLaunchTemplate"],
+      "Resource": "arn:aws:ec2:*:243891825325:launch-template/*",
+      "Condition": { "StringEquals": { "aws:ResourceTag/superci-pull-role": "listener" } }
     },
     {
       "Sid": "TagOnlyWhileCreating",
@@ -30,12 +78,19 @@
       }
     },
     {
+      "Sid": "TagAMachineIssued",
+      "Effect": "Allow",
+      "Action": "ec2:CreateTags",
+      "Resource": "arn:aws:ec2:*:243891825325:instance/*",
+      "Condition": {
+        "StringEquals": { "aws:ResourceTag/purpose": "superci-pull" },
+        "ForAllValues:StringEquals": { "aws:TagKeys": ["superci-pull-issued"] }
+      }
+    },
+    {
       "Sid": "EndOnlyOurs",
       "Effect": "Allow",
-      "Action": [
-        "ec2:TerminateInstances",
-        "ec2:DeleteLaunchTemplate"
-      ],
+      "Action": "ec2:TerminateInstances",
       "Resource": "*",
       "Condition": {
         "StringEquals": {

@@ -1,9 +1,10 @@
 #!/bin/bash
-# A superci-pull machine runs one job. It asks the listener for a just-in-time runner, proving who it is with the
-# identity document EC2 signed for it, runs the runner until it has taken its job, and powers off, which terminates
-# it; so no job runs on a machine another job has used. Told it is not needed (410), it powers off holding no runner,
-# so no job is lost with it. A job may run @JOB_SECONDS@ s (the longest job's timeout and a margin); the machine
-# powers off after @LIFE_SECONDS@ s whatever it is doing.
+# A superci-pull machine runs one job. It asks the listener for its one just-in-time runner, proving who it is with
+# the identity document EC2 signed for it, runs the runner until it has taken its job, and powers off, which
+# terminates it; so no job runs on a machine another job has used. Told it gets none (410), it powers off holding no
+# runner, so no job is lost with it. The listener ends the machine itself when its job completes, and bounds the job
+# from when it started and an idle runner by the machine's age; the machine also powers off after @LIFE_SECONDS@ s,
+# whatever it is doing.
 exec > >(tee /var/log/superci-pull.log > /dev/console) 2>&1
 ( sleep @LIFE_SECONDS@; poweroff ) > /dev/null 2>&1 &
 printf '%s\n' kernel.apparmor_restrict_unprivileged_userns=0 kernel.apparmor_restrict_unprivileged_unconfined=0 net.ipv4.ip_local_reserved_ports=50000-59999 > /etc/sysctl.d/99-superci.conf
@@ -31,7 +32,7 @@ while :; do
     200)
       export ACTIONS_RUNNER_INPUT_JITCONFIG=$(cat /run/superci-jit)
       rm -f /run/superci-jit
-      (cd /home/runner && timeout -s KILL @JOB_SECONDS@ sudo --preserve-env=ACTIONS_RUNNER_INPUT_JITCONFIG -u runner -H ./run.sh)
+      (cd /home/runner && sudo --preserve-env=ACTIONS_RUNNER_INPUT_JITCONFIG -u runner -H ./run.sh)
       break ;;
     410) break ;;
     429) sleep 3 ;;

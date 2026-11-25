@@ -4,9 +4,9 @@
 # templates, security groups, the key pair, the address, the parameters, the bucket, alarms and topic) and the
 # listener's role. Touches nothing else.
 #
-#   pull/deploy/down.sh <ssh command for the listener, e.g. "ssh -i key ec2-user@1.2.3.4">
+#   pull/deploy/down.sh [ssh command for the listener, pull/deploy/ssh.sh by default]
 set -uo pipefail
-SSH=${1:?ssh command for the listener}
+SSH=${1:-$(cd "$(dirname "$0")" && pwd)/ssh.sh}
 A="aws --profile ci-runners"
 NAME=superci-pull
 ACCOUNT=$($A sts get-caller-identity --query Account --output text)
@@ -32,7 +32,7 @@ done
 for a in $($A ec2 describe-addresses --region us-east-1 --filters Name=tag:purpose,Values=superci-pull --query 'Addresses[].AllocationId' --output text); do
   $A ec2 release-address --region us-east-1 --allocation-id "$a" && echo "released address $a"
 done
-$A ec2 delete-key-pair --region us-east-1 --key-name $NAME >/dev/null && echo "deleted key pair $NAME"
+$A ec2 delete-key-pair --region us-east-1 --key-name $NAME >/dev/null 2>&1 && echo "deleted key pair $NAME"
 for p in /superci-pull/github-app /superci-pull/tls /superci-pull/spend; do
   $A ssm delete-parameter --region us-east-1 --name $p && echo "deleted $p"
 done

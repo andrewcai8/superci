@@ -10,8 +10,8 @@ import (
 	"github.com/actions/scaleset"
 )
 
-// A Machine is one EC2 instance of a scale set. EC2 (its tags) says it exists; everything else here is derived from
-// EC2, GitHub and what the machine asked for, and is rebuilt by the reconciler after a restart.
+// A Machine is one EC2 instance of a scale set. EC2 (its tags) says it exists and whether it was ever issued a runner;
+// everything else here is derived from EC2, GitHub and what the machine asked for, and is rebuilt after a restart.
 type Machine struct {
 	ID        string
 	Set       string // its superci-pull-set tag
@@ -24,11 +24,18 @@ type Machine struct {
 	Launched  time.Time
 	Seen      time.Time // last listed by DescribeInstances
 	Asked     time.Time // last asked for a runner (or adopted)
-	Runner    *Runner   // the runner registered on it, while one is
-	Ending    bool      // told to end, or terminated: no longer supply
-	Ended     time.Time // when TerminateInstances was last asked for it
-	Notice    bool      // AWS gave notice that it takes this spot machine back
-	Missed    int       // complete listings in a row that showed no runner of it while it held none we know of
+	// Issued says a runner was issued to it. A machine gets one runner, ever: EC2 keeps the fact as the tag
+	// superci-pull-issued, written before the runner's config leaves the listener, so a restart reads it back.
+	Issued   bool
+	Tagged   bool    // EC2 has the issued tag (it listed it, or accepted our write)
+	Issuing  bool    // its registration is in flight
+	Runner   *Runner // its runner, once known
+	Retire   bool    // to end once its idle runner is removed (fenced by GitHub): surplus, a second ask, past its age
+	Checking bool    // GitHub is being asked whether its runner still exists
+	Ending   bool    // told to end, or terminated: no longer supply
+	Ended    time.Time
+	Notice   bool // AWS gave notice that it takes this spot machine back
+	Missed   int  // complete listings in a row that showed no runner of it while it was never issued one
 }
 
 // A Runner is one just-in-time registration, which takes one job.
@@ -36,11 +43,11 @@ type Runner struct {
 	ID       int64
 	Name     string
 	Issued   time.Time
-	Busy     bool // JobStarted seen, or GitHub lists it busy
-	Done     bool // JobCompleted seen: the machine will ask again
-	Listed   bool // in GitHub's last runner listing
+	Started  time.Time // when its job started (JobStarted); zero when unknown
+	Busy     bool      // JobStarted seen, or GitHub lists it busy
+	Done     bool      // JobCompleted seen
+	Listed   bool      // in GitHub's last runner listing, or found by a check
 	Removing bool
-	Checking bool    // asked GitHub whether it still exists, after a listing did not show it
 	Job      *JobRef // the job it took, from JobStarted
 }
 
@@ -52,22 +59,30 @@ type JobRef struct {
 	Runner      string
 }
 
+// grantGrace is how long after a start a listing must begin before a machine is granted a runner: EC2's reads are
+// eventually consistent, and a listing must show the issued tags the previous process wrote.
+const grantGrace = 30 * time.Second
+
 // State is everything the control loop knows about one scale set. One mutex: the listener goroutine, the launcher,
 // the reconciler and the HTTP handlers each hold it only to read or write these fields, never across a network call.
 type State struct {
 	mu       sync.Mutex
 	set      string
+	started  time.Time
 	stats    scaleset.RunnerScaleSetStatistic
 	pool     int
 	max      int
-	capped   bool // the spend cap is reached: no launches, no pool
-	known    bool // the message session has given its statistics since this process started
+	capped   bool                 // the spend cap is reached: no launches, no pool
+	known    bool                 // the message session has given its statistics since this process started
+	listings map[string]time.Time // per configured region, when its last complete listing of machines began
 	machines map[string]*Machine
 	reserved map[string]int // per launch round, capacity asked of EC2 and not yet seen
 	rounds   int
 	boot     string
 
 	lastActivity time.Time // last message that assigned or started a job
+	lastStart    time.Time // last job started
+	waitingSince time.Time // since when jobs have waited without a break
 	staleWaiting int       // waiting jobs the statistics still count though idle runners have not taken them
 	polled       time.Time // last answer of the message session, a message or an empty poll
 
@@ -83,11 +98,43 @@ type State struct {
 	allLaunched []time.Time
 }
 
-func NewState(set string, pool, max int) *State {
-	now := time.Now()
-	return &State{set: set, pool: pool, max: max, machines: map[string]*Machine{}, reserved: map[string]int{},
-		boot: fmt.Sprintf("%x", now.UnixNano()), lastActivity: now, polled: now, orphanSince: map[string]time.Time{},
-		available: map[int64]time.Time{}}
+func NewState(set string, pool, max int, regions []string, now time.Time) *State {
+	s := &State{set: set, pool: pool, max: max, started: now, machines: map[string]*Machine{}, reserved: map[string]int{},
+		boot: fmt.Sprintf("%x", now.UnixNano()), lastActivity: now, lastStart: now, polled: now, orphanSince: map[string]time.Time{},
+		available: map[int64]time.Time{}, listings: map[string]time.Time{}}
+	for _, r := range regions {
+		s.listings[r] = time.Time{}
+	}
+	return s
+}
+
+// ready says whether the set may decide anything: the queue is known and every region has been listed. Before then a
+// region not yet listed reads as no machines, which would launch all its demand again and make every runner of it an
+// orphan.
+func (s *State) ready() bool {
+	if !s.known {
+		return false
+	}
+	for _, at := range s.listings {
+		if at.IsZero() {
+			return false
+		}
+	}
+	return true
+}
+
+// grantable says whether a machine may be granted its runner: the set is ready, and every region's last listing began
+// grantGrace after this process started, so it shows every issued tag written before.
+func (s *State) grantable() bool {
+	if !s.ready() {
+		return false
+	}
+	for _, at := range s.listings {
+		if at.Before(s.started.Add(grantGrace)) {
+			return false
+		}
+	}
+	return true
 }
 
 // desired is the supply GitHub's queue asks for: every job assigned to the scale set or waiting to be acquired by it,
@@ -108,12 +155,16 @@ func (s *State) waitingJobs() int {
 func (s *State) idleRunners() int {
 	n := 0
 	for _, m := range s.machines {
-		if !m.Ending && m.Runner != nil && !m.Runner.Busy {
+		if supply(m) && m.Runner != nil && !m.Runner.Busy {
 			n++
 		}
 	}
 	return n
 }
+
+// supply says whether a machine counts toward the set's supply: not ending, not being taken back by AWS, and not
+// retiring.
+func supply(m *Machine) bool { return !m.Ending && !m.Notice && !m.Retire }
 
 // MarkStale finds jobs the statistics count as waiting that no idle runner has taken for a while. GitHub's counts
 // can keep a job a reassignment left behind; supply kept for it would never be used.
@@ -128,16 +179,15 @@ func (s *State) MarkStale(now time.Time, after time.Duration) (stale int) {
 	return s.staleWaiting
 }
 
-// live is the supply: machines not ending and not being taken back by AWS, and capacity asked for and not yet seen.
-// A machine a listing shows before its launch call answers settles one unit of its round's reservation, so it is
-// never counted twice.
+// live is the supply: machines that count (supply), and capacity asked for and not yet seen. A machine a listing shows
+// before its launch call answers settles one unit of its round's reservation, so it is never counted twice.
 func (s *State) live() int {
 	n := 0
 	for _, k := range s.reserved {
 		n += k
 	}
 	for _, m := range s.machines {
-		if !m.Ending && !m.Notice {
+		if supply(m) {
 			n++
 		}
 	}
@@ -145,33 +195,32 @@ func (s *State) live() int {
 }
 
 // Noticed takes in AWS's two minutes' notice for a spot machine: it is no longer supply, so another is launched at
-// once. With no runner it ends now; with an idle runner it returns that runner, to be removed (fenced) before the
-// machine ends; a busy runner keeps its machine until its job ends or AWS takes it.
-func (s *State) Noticed(id string) (m *Machine, idle *Runner) {
+// once. With no runner it ends now; with an idle runner it retires (the runner removed before the machine ends); a
+// busy runner keeps its machine until its job ends or AWS takes it.
+func (s *State) Noticed(id string) *Machine {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	m = s.machines[id]
+	m := s.machines[id]
 	if m == nil {
-		return nil, nil
+		return nil
 	}
 	m.Notice = true
 	switch r := m.Runner; {
-	case r == nil:
+	case r == nil && !m.Issuing && !m.Issued:
 		m.Ending = true
-	case !r.Busy && !r.Removing && r.ID != 0:
-		r.Removing = true
-		return m, r
+	case r != nil && !r.Busy:
+		m.Retire = true
 	}
-	return m, nil
+	return m
 }
 
 // Deficit reserves the capacity to launch now, under a new round's name. It launches no more than leaves limit of
 // the set's machines waiting for their runner at once (a machine that waits is paid for and does nothing), and none
-// while the spend cap holds or before the queue is known.
+// while the spend cap holds or before the set is ready.
 func (s *State) Deficit(now time.Time, limit int) (round string, n int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.capped || !s.known {
+	if s.capped || !s.ready() {
 		return "", 0
 	}
 	n = min(s.desired()-s.live(), limit-s.unregistered())
@@ -184,14 +233,14 @@ func (s *State) Deficit(now time.Time, limit int) (round string, n int) {
 	return round, n
 }
 
-// unregistered is the machines asked for or running that hold no runner yet.
+// unregistered is the machines asked for or running that wait for their runner: never issued one, or one in flight.
 func (s *State) unregistered() int {
 	n := 0
 	for _, k := range s.reserved {
 		n += k
 	}
 	for _, m := range s.machines {
-		if !m.Ending && m.Runner == nil {
+		if !m.Ending && !m.Issued && m.Runner == nil {
 			n++
 		}
 	}
@@ -240,106 +289,117 @@ func since(ts []time.Time, cut time.Time) []time.Time {
 type Verdict int
 
 const (
-	Grant   Verdict = iota // register a runner for it
-	End                    // it is not needed: it holds no runner, so it may end
-	Wait                   // ask again shortly: the budget is spent, or its last runner may still hold a job
-	Replace                // its last runner never started: remove that runner (fenced) before it gets another
+	Grant   Verdict = iota // register its one runner
+	End                    // it gets no runner: power off (whether the listener ends it is decided by proof)
+	Wait                   // ask again shortly: the budget is spent, or the set is not ready
 	Unknown                // not one of ours
 )
 
-// Ask decides for a machine that asks for a runner. A machine runs one job: once a runner of it has taken a job, it
-// gets no other (it ends), so no job inherits what the one before it left on the machine. It gets another runner
-// only for one that never started (GitHub no longer lists it, or removed it on our request), and while its runner
-// holds a job an ask (by anything on it that can read its identity) waits. A granted ask takes a registration from
-// the budget, ahead of the pool's when a job waits. Until the
-// message session has given the queue's statistics (after a restart, while a dead listener's session lapses), every
-// machine is told to wait: nothing is known to end it for, or to register for.
-func (s *State) Ask(id string, now time.Time, b *Budget, maxAge time.Duration) (Verdict, *Runner) {
+// Ask decides for a machine that asks for a runner. A machine gets one runner, ever, so no job inherits what another
+// left on it and no job can take a second runner: once one is issued (a fact EC2 keeps), every ask is answered End,
+// whoever on the machine asks. The ask is not proof of anything except that the asker does not run the runner, so
+// an idle runner is removed (fenced by GitHub) and its machine ends; a runner that took its job ends its machine when
+// the job completes. A machine never issued one is granted it only once the set is grantable, and only inside the
+// registration budget, ahead of the pool's when a job waits.
+func (s *State) Ask(id string, now time.Time, b *Budget, maxAge time.Duration) Verdict {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	m := s.machines[id]
 	if m == nil {
-		return Unknown, nil
+		return Unknown
 	}
 	m.Asked = now
-	if r := m.Runner; r != nil {
-		gone := !r.Listed && s.listedAt.Sub(r.Issued) > time.Minute
-		switch {
-		case r.Done || (r.Busy && gone):
-			m.Ending = true
-			return End, nil
-		case r.Busy || r.Removing:
-			return Wait, nil
-		case !gone:
-			r.Removing = true
-			return Replace, r
-		}
-	}
-	m.Runner = nil
-	if !s.known && !m.Ending && !m.Notice {
-		return Wait, nil
-	}
-	if m.Ending || m.Notice || now.Sub(m.Launched) > maxAge || s.live() > s.desired() {
+	switch r := m.Runner; {
+	case m.Issuing:
+		return Wait
+	case r != nil && r.Done:
 		m.Ending = true
-		return End, nil
+		return End
+	case r != nil && !r.Busy:
+		m.Retire = true
+		return End
+	case m.Issued || r != nil:
+		return End
+	case m.Ending || m.Notice:
+		m.Ending = true
+		return End
+	case !s.ready():
+		return Wait
+	case now.Sub(m.Launched) > maxAge || s.live() > s.desired():
+		m.Ending = true
+		return End
+	case !s.grantable():
+		return Wait
 	}
 	prio := ForPool
 	if s.waitingJobs() > s.idleRunners() {
 		prio = ForJob
 	}
 	if !b.Take(now, prio) {
-		return Wait, nil
+		return Wait
 	}
-	return Grant, nil
+	m.Issuing = true
+	return Grant
 }
 
-// Replaced settles the removal of a machine's runner that never started: removed, the machine holds none; refused,
-// it took a job meanwhile and is busy.
-func (s *State) Replaced(m *Machine, r *Runner, removed bool) {
+// Issue records the runner GitHub made for a machine once EC2 has its issued tag: the runner's config may leave now.
+func (s *State) Issue(m *Machine, r *Runner) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	r.Removing = false
-	if !removed {
-		r.Busy = true
+	m.Issuing, m.Issued, m.Tagged, m.Runner = false, true, true, r
+	if m.Notice {
+		m.Retire = true
+	}
+}
+
+// Unissued settles a grant GitHub registered nothing for: the machine may ask again.
+func (s *State) Unissued(m *Machine) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m.Issuing = false
+}
+
+// Withheld settles a registration whose config never left: its tag could not be written, or GitHub already holds a
+// runner of the machine's name that was never handed out. The machine gets none, ever, so it ends, after the runner,
+// when known, is removed.
+func (s *State) Withheld(m *Machine, r *Runner) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m.Issuing, m.Issued = false, true
+	if r == nil {
+		m.Ending = true
 		return
 	}
-	if m.Runner == r {
-		m.Runner = nil
-	}
+	m.Runner, m.Retire = r, true
 }
 
-// Registered records the runner GitHub made for a machine.
-func (s *State) Registered(id string, r *Runner) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if m := s.machines[id]; m != nil {
-		m.Runner = r
-	}
-}
+// runnerName is the name of a machine's one runner: <set>-<instance id>.
+func runnerName(set, instance string) string { return set + "-" + instance }
 
-// PreviousDone says whether the machine's last runner has been reported complete, so that the queue's statistics
-// already count its job as gone when the machine's next ask is decided.
-func (s *State) PreviousDone(id string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	m := s.machines[id]
-	return m == nil || m.Runner == nil || m.Runner.Done || !m.Runner.Busy
-}
-
-// machineOf finds the machine a runner is named after: <set>-<instance id>-<suffix>.
+// machineOf finds the machine a runner is named after: <set>-<instance id>, or <set>-<instance id>-<suffix> as an
+// earlier build named them.
 func (s *State) machineOf(runner string) *Machine {
 	rest, ok := strings.CutPrefix(runner, s.set+"-")
 	if !ok || !strings.HasPrefix(rest, "i-") {
 		return nil
 	}
-	if i := strings.LastIndexByte(rest, '-'); i > 0 {
-		return s.machines[rest[:i]]
+	id, _, _ := strings.Cut(rest[2:], "-")
+	return s.machines["i-"+id]
+}
+
+// runnerOf is the runner of a machine a job message names, adopted when the machine's runner is not known yet (after a
+// restart). Any runner named after a machine is its one runner, so the machine is issued.
+func runnerOf(m *Machine, name string, id int64, now time.Time) *Runner {
+	m.Issued = true
+	if m.Runner == nil {
+		m.Runner = &Runner{ID: id, Name: name, Issued: now, Listed: true}
 	}
-	return nil
+	return m.Runner
 }
 
 // Observe takes in one answer of the message session: its statistics, the jobs that arrived, and which runners
-// started and finished jobs (with how long each started job waited in the queue).
+// started and finished jobs (with how long each started job waited in the queue). A machine whose job completed ends:
+// the listener ends it, rather than trust what runs on it to.
 func (s *State) Observe(msg *scaleset.RunnerScaleSetMessage, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -372,19 +432,44 @@ func (s *State) Observe(msg *scaleset.RunnerScaleSetMessage, now time.Time) {
 			s.waits = append(s.waits, max(0, now.Sub(queued).Seconds()))
 		}
 		delete(s.available, j.RunnerRequestID)
-		if m := s.machineOf(j.RunnerName); m != nil && m.Runner != nil && m.Runner.Name == j.RunnerName {
-			m.Runner.Busy = true
-			m.Runner.Job = &JobRef{Owner: j.OwnerName, Repo: j.RepositoryName, RunID: j.WorkflowRunID, Name: j.JobDisplayName, Runner: j.RunnerName}
-		}
-	}
-	for _, j := range msg.JobCompletedMessages {
-		if m := s.machineOf(j.RunnerName); m != nil && m.Runner != nil && m.Runner.Name == j.RunnerName {
-			m.Runner.Busy, m.Runner.Done = true, true
-			if m.Notice && m.Runner.Job != nil {
-				s.lost = append(s.lost, *m.Runner.Job)
+		s.lastStart = now
+		if m := s.machineOf(j.RunnerName); m != nil {
+			if r := runnerOf(m, j.RunnerName, int64(j.RunnerID), now); r.Name == j.RunnerName {
+				r.Busy, m.Retire = true, false
+				if r.Started.IsZero() {
+					r.Started = now
+				}
+				r.Job = &JobRef{Owner: j.OwnerName, Repo: j.RepositoryName, RunID: j.WorkflowRunID, Name: j.JobDisplayName, Runner: j.RunnerName}
 			}
 		}
 	}
+	for _, j := range msg.JobCompletedMessages {
+		if m := s.machineOf(j.RunnerName); m != nil {
+			r := runnerOf(m, j.RunnerName, int64(j.RunnerID), now)
+			r.Busy, r.Done = true, true
+			m.Ending = true
+			if m.Notice && r.Job != nil {
+				s.lost = append(s.lost, *r.Job)
+			}
+		}
+	}
+	if s.waitingJobs() > 0 {
+		if s.waitingSince.IsZero() {
+			s.waitingSince = now
+		}
+	} else {
+		s.waitingSince = time.Time{}
+	}
+}
+
+// Stalled says whether jobs have waited for the set for over d with none started meanwhile.
+func (s *State) Stalled(now time.Time, d time.Duration) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.waitingJobs() <= 0 || s.waitingSince.IsZero() {
+		return false
+	}
+	return now.Sub(s.waitingSince) > d && now.Sub(s.lastStart) > d
 }
 
 // TakeLost hands over the jobs that completed on a machine AWS gave notice it takes back (whether each failed is
@@ -397,7 +482,8 @@ func (s *State) TakeLost() []JobRef {
 	return l
 }
 
-// ArrivalRate is the jobs a second that became available over the last window.
+// ArrivalRate is the jobs a second that became available over the last window, or over the time since this process
+// started when that is shorter (but at least a minute), so a restart does not read as no arrivals.
 func (s *State) ArrivalRate(now time.Time, window time.Duration) float64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -407,7 +493,7 @@ func (s *State) ArrivalRate(now time.Time, window time.Duration) float64 {
 			delete(s.available, id)
 		}
 	}
-	return float64(len(s.arrivals)) / window.Seconds()
+	return float64(len(s.arrivals)) / min(window, max(time.Minute, now.Sub(s.started))).Seconds()
 }
 
 // TakeWaits hands over the queue waits recorded since the last call.
@@ -419,13 +505,14 @@ func (s *State) TakeWaits() []float64 {
 	return w
 }
 
-// Seen merges one DescribeInstances listing of a region: machines it lists are live (a new one, met after a restart
-// or launched by a call whose answer was lost, is adopted); machines it does not list, launched long enough ago for
-// the listing to show them, are gone. It returns the jobs lost with them: a machine gone while its runner held a job
-// not reported complete (it died mid-job, before GitHub noticed).
-func (s *State) Seen(region string, listed []*Machine, now time.Time) (lost []JobRef) {
+// Seen merges one complete DescribeInstances listing of a region, begun at began: machines it lists are live (a new
+// one, met after a restart or launched by a call whose answer was lost, is adopted, with its issued tag); machines it
+// does not list, launched long enough ago for the listing to show them, are gone. It returns the jobs lost with them:
+// a machine gone while its runner held a job not reported complete (it died mid-job, before GitHub noticed).
+func (s *State) Seen(region string, listed []*Machine, began, now time.Time) (lost []JobRef) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.listings[region] = began
 	in := map[string]bool{}
 	for _, l := range listed {
 		in[l.ID] = true
@@ -439,6 +526,7 @@ func (s *State) Seen(region string, listed []*Machine, now time.Time) (lost []Jo
 			continue
 		}
 		m.IP, m.Type, m.AZ, m.Lifecycle, m.Seen = l.IP, l.Type, l.AZ, l.Lifecycle, now
+		m.Issued, m.Tagged = m.Issued || l.Issued, m.Tagged || l.Tagged
 		if m.Launched.IsZero() {
 			m.Launched = l.Launched
 		}
@@ -455,8 +543,9 @@ func (s *State) Seen(region string, listed []*Machine, now time.Time) (lost []Jo
 }
 
 // Listed merges GitHub's complete listing of the scale set's runners. A machine adopted after a restart learns its
-// runner here. It returns the listed runners that belong to no live machine, or are not its current runner: stale
-// registrations, to be removed (GitHub refuses to remove one that holds a job).
+// runner here (and a machine with a runner is issued, whatever its tags say). It returns the listed runners that
+// belong to no live machine, or are not its runner: stale registrations, to be removed (GitHub refuses to remove one
+// that holds a job). Until the set is ready it returns none: a runner of a region not yet listed is no orphan.
 func (s *State) Listed(runners map[string]ListedRunner, now time.Time) (orphans []ListedRunner) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -467,7 +556,6 @@ func (s *State) Listed(runners map[string]ListedRunner, now time.Time) (orphans 
 		}
 	}
 	held := map[*Machine]bool{}
-	stale := map[string]bool{}
 	for name, r := range runners {
 		m := s.machineOf(name)
 		switch {
@@ -475,10 +563,14 @@ func (s *State) Listed(runners map[string]ListedRunner, now time.Time) (orphans 
 			orphans = append(orphans, r)
 		case m.Runner == nil:
 			m.Runner = &Runner{ID: r.ID, Name: name, Issued: now, Busy: r.Busy, Listed: true}
+			m.Issued = true
 			held[m] = true
 		case m.Runner.Name == name:
 			m.Runner.Listed = true
 			m.Runner.Busy = m.Runner.Busy || r.Busy
+			if m.Runner.ID == 0 {
+				m.Runner.ID = r.ID
+			}
 			held[m] = true
 		default:
 			orphans = append(orphans, r)
@@ -486,12 +578,16 @@ func (s *State) Listed(runners map[string]ListedRunner, now time.Time) (orphans 
 	}
 	for _, m := range s.machines {
 		switch {
-		case held[m] || m.Runner != nil:
+		case held[m] || m.Runner != nil || m.Issued:
 			m.Missed = 0
 		case now.Sub(m.Launched) > time.Minute:
 			m.Missed++
 		}
 	}
+	if !s.ready() {
+		return nil
+	}
+	stale := map[string]bool{}
 	for _, o := range orphans {
 		stale[o.Name] = true
 		if _, ok := s.orphanSince[o.Name]; !ok {
@@ -525,69 +621,139 @@ func (s *State) Orphans(now time.Time) int {
 	return n
 }
 
-// Stuck finds machines that have not asked for a runner lately and are older than the boot grace. A machine that
-// holds no runner we know of, and of which three complete listings in a row showed none, ends now (a listing paged
-// while runners come and go can miss one, and after a restart a machine's runner is known only from listings). A
-// machine whose runner a listing made well after it was issued did not show is returned to be checked with GitHub
-// first (Gone). A runner seen taking a job and not seen finishing it always keeps its machine.
+// Stuck finds machines to end, and machines whose runner to check with GitHub first. A machine never issued a runner
+// that has not asked lately, of which three complete listings in a row showed none, ends. An issued machine whose
+// runner a listing made well after it was issued did not show (or, after a restart, whose runner no listing of this
+// process showed) is returned to be checked (Checked): its end needs GitHub's word that the runner is gone. Asking
+// keeps none of them, since anything on a machine can ask.
 func (s *State) Stuck(now time.Time, grace, quiet time.Duration) (ended, unlisted []*Machine) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.ready() {
+		return nil, nil
+	}
 	for _, m := range s.machines {
-		if m.Ending || now.Sub(m.Launched) < grace || now.Sub(m.Asked) < quiet {
+		if m.Ending || m.Issuing || m.Checking || now.Sub(m.Launched) < grace {
 			continue
 		}
 		switch r := m.Runner; {
-		case r == nil && m.Missed >= 3:
+		case !m.Issued && r == nil:
+			if m.Missed >= 3 && now.Sub(m.Asked) >= quiet {
+				m.Ending = true
+				ended = append(ended, m)
+			}
+		case r != nil && r.Done:
 			m.Ending = true
 			ended = append(ended, m)
-		case r != nil && !(r.Busy && !r.Done) && !r.Listed && !r.Checking && s.listedAt.Sub(r.Issued) > quiet:
-			r.Checking = true
+		case r == nil:
+			if s.listedAt.After(s.started) {
+				m.Checking = true
+				unlisted = append(unlisted, m)
+			}
+		case !r.Listed && s.listedAt.Sub(r.Issued) > quiet:
+			m.Checking = true
 			unlisted = append(unlisted, m)
 		}
 	}
 	return ended, unlisted
 }
 
-// Gone settles GitHub's answer about a runner a listing did not show: gone, its machine ends (it can hold no job);
-// there, it was missed and is kept.
-func (s *State) Gone(m *Machine, r *Runner, gone bool) {
+// Check is GitHub's answer about a runner a listing did not show.
+type Check int
+
+const (
+	Present Check = iota // GitHub has it: the listing missed it
+	Absent               // GitHub has no runner of the machine: it holds no job and gets none
+	Unsure               // the check failed: ask again on a later pass
+)
+
+// Checked settles a check: absent, the machine ends; present, its runner is kept (and learned, when found by name).
+func (s *State) Checked(m *Machine, c Check, found *Runner) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	r.Checking = false
-	if !gone {
-		r.Listed = true
-		return
-	}
-	if m.Runner == r {
+	m.Checking = false
+	switch c {
+	case Absent:
 		m.Ending = true
+	case Present:
+		if m.Runner == nil && found != nil {
+			m.Runner = found
+		}
+		if m.Runner != nil {
+			m.Runner.Listed = true
+		}
 	}
 }
 
-// Surplus is the idle runners to remove once the supply has exceeded what the queue asks for for a while (the
-// queue's statistics lag its messages by a moment). Each is fenced by GitHub, which refuses to remove a runner given
-// a job meanwhile, before its machine ends.
-func (s *State) Surplus(now time.Time, hold time.Duration, limit int) []*Machine {
+// Overdue ends what has outlived its bounds, whatever runs on the machine (a job on it may stop the machine's own
+// timers): a job running past jobMax since it started, a machine never issued a runner or holding an idle one past
+// idleMax (the idle runner removed first), and any machine past lifeMax.
+func (s *State) Overdue(now time.Time, jobMax, idleMax, lifeMax time.Duration) (ended []*Machine) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.ready() {
+		return nil
+	}
+	for _, m := range s.machines {
+		if m.Ending || m.Issuing {
+			continue
+		}
+		age := now.Sub(m.Launched)
+		switch r := m.Runner; {
+		case age > lifeMax, r != nil && r.Busy && !r.Started.IsZero() && now.Sub(r.Started) > jobMax,
+			r == nil && !m.Issued && age > idleMax:
+			m.Ending = true
+			ended = append(ended, m)
+		case r != nil && !r.Busy && age > idleMax:
+			m.Retire = true
+		}
+	}
+	return ended
+}
+
+// Surplus retires idle runners once the supply has exceeded what the queue asks for for a while (the queue's
+// statistics lag its messages by a moment), and not in the first warmup after a start, while the arrival rate (and so
+// the pool) is still being measured. It returns how many it retired; each is removed (ToFence) before its machine ends.
+func (s *State) Surplus(now time.Time, hold, warmup time.Duration, limit int) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	excess := s.live() - s.desired()
-	if excess <= 0 || !s.known {
+	if excess <= 0 || !s.ready() || now.Sub(s.started) < warmup {
 		s.surplusSince = time.Time{}
-		return nil
+		return 0
 	}
 	if s.surplusSince.IsZero() {
 		s.surplusSince = now
 	}
 	if now.Sub(s.surplusSince) < hold {
-		return nil
+		return 0
 	}
-	var out []*Machine
+	n := 0
 	for _, m := range s.machines {
-		if len(out) >= min(excess, limit) {
+		if n >= min(excess, limit) {
 			break
 		}
 		r := m.Runner
-		if !m.Ending && r != nil && !r.Busy && !r.Removing && r.ID != 0 && now.Sub(r.Issued) > hold {
+		if supply(m) && r != nil && !r.Busy && !r.Removing && r.ID != 0 && now.Sub(r.Issued) > hold {
+			m.Retire = true
+			n++
+		}
+	}
+	return n
+}
+
+// ToFence is the retiring machines whose idle runner to remove now, at most limit: GitHub refuses to remove a runner
+// that took a job meanwhile, which fences the machine's end.
+func (s *State) ToFence(limit int) []*Machine {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []*Machine
+	for _, m := range s.machines {
+		if len(out) >= limit {
+			break
+		}
+		r := m.Runner
+		if m.Retire && !m.Ending && r != nil && !r.Busy && !r.Removing && r.ID != 0 {
 			r.Removing = true
 			out = append(out, m)
 		}
@@ -595,14 +761,39 @@ func (s *State) Surplus(now time.Time, hold time.Duration, limit int) []*Machine
 	return out
 }
 
-// Shed ends up to n machines that hold no runner and have waited for one over three minutes, the longest-waiting
+// Removal is GitHub's answer to removing a runner.
+type Removal int
+
+const (
+	Removed Removal = iota // removed, or already gone
+	HeldJob                // refused: it holds a job
+	NotSure                // failed otherwise (a timeout, an outage): try again later
+)
+
+// Fenced settles the removal of a retiring machine's runner: removed, the machine ends; refused because it holds a
+// job, the runner is busy and the machine serves that job; failed otherwise, it is tried again.
+func (s *State) Fenced(m *Machine, out Removal) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if r := m.Runner; r != nil {
+		r.Removing = false
+		if out == HeldJob {
+			r.Busy, m.Retire = true, false
+		}
+	}
+	if out == Removed {
+		m.Ending = true
+	}
+}
+
+// Shed ends up to n machines never issued a runner that have waited for one over three minutes, the longest-waiting
 // first: the registration budget cannot serve them soon, and a machine that waits is paid for.
 func (s *State) Shed(now time.Time, n int) []*Machine {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var waiting []*Machine
 	for _, m := range s.machines {
-		if !m.Ending && m.Runner == nil && now.Sub(m.Launched) > 3*time.Minute {
+		if !m.Ending && !m.Issued && !m.Issuing && m.Runner == nil && now.Sub(m.Launched) > 3*time.Minute {
 			waiting = append(waiting, m)
 		}
 	}
@@ -612,21 +803,6 @@ func (s *State) Shed(now time.Time, n int) []*Machine {
 		m.Ending = true
 	}
 	return waiting
-}
-
-// Removed settles a fenced removal: removed, the machine ends; refused because it took a job, it is busy.
-func (s *State) Removed(m *Machine, removed bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if m.Runner != nil {
-		m.Runner.Removing = false
-		if !removed {
-			m.Runner.Busy = true
-		}
-	}
-	if removed {
-		m.Ending = true
-	}
 }
 
 // ToEnd is the ending machines to terminate now: each once, then again a minute on if EC2 still lists it.
@@ -641,6 +817,34 @@ func (s *State) ToEnd(now time.Time) []*Machine {
 		}
 	}
 	return out
+}
+
+// Untagged is the issued machines EC2 has no issued tag for (a runner adopted from GitHub or a job message): the tag
+// is written so a later start knows too.
+func (s *State) Untagged() []*Machine {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []*Machine
+	for _, m := range s.machines {
+		if m.Issued && !m.Tagged && !m.Ending {
+			m.Tagged = true
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// TagFailed undoes Untagged's mark for a machine whose tag could not be written, so the next pass tries again.
+func (s *State) TagFailed(m *Machine) { s.mu.Lock(); m.Tagged = false; s.mu.Unlock() }
+
+// RunnerRef is the id (0 when unknown) and name of a machine's runner.
+func (s *State) RunnerRef(m *Machine) (int64, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if r := m.Runner; r != nil {
+		return r.ID, r.Name
+	}
+	return 0, runnerName(s.set, m.ID)
 }
 
 func (s *State) Machine(id string) *Machine {
@@ -672,14 +876,17 @@ type Snapshot struct {
 	Pool         int                              `json:"pool"`
 	Max          int                              `json:"max"`
 	Capped       bool                             `json:"capped"`
+	Ready        bool                             `json:"ready"`
 	Desired      int                              `json:"desired"`
 	Live         int                              `json:"live"`
 	Inflight     int                              `json:"inflight"`
 	Machines     int                              `json:"machines"`
 	Ending       int                              `json:"ending"`
+	Retiring     int                              `json:"retiring"`
 	Booting      int                              `json:"booting"`
 	Idle         int                              `json:"idle"`
 	Busy         int                              `json:"busy"`
+	Issued       int                              `json:"issued"`
 	OnDemand     int                              `json:"on_demand"`
 	Notices      int                              `json:"notices"`
 	StaleWaiting int                              `json:"stale_waiting"`
@@ -694,18 +901,23 @@ func (s *State) Snapshot(now time.Time) Snapshot {
 	for _, k := range s.reserved {
 		inflight += k
 	}
-	out := Snapshot{Set: s.set, Stats: s.stats, Pool: s.pool, Max: s.max, Capped: s.capped, Desired: s.desired(), Live: s.live(),
+	out := Snapshot{Set: s.set, Stats: s.stats, Pool: s.pool, Max: s.max, Capped: s.capped, Ready: s.ready(), Desired: s.desired(), Live: s.live(),
 		Inflight: inflight, Machines: len(s.machines), StaleWaiting: s.staleWaiting, Orphans: orphans}
 	for _, m := range s.machines {
 		switch {
 		case m.Ending:
 			out.Ending++
-		case m.Runner == nil:
+		case m.Retire:
+			out.Retiring++
+		case m.Runner == nil && !m.Issued:
 			out.Booting++
-		case m.Runner.Busy:
+		case m.Runner == nil || m.Runner.Busy:
 			out.Busy++
 		default:
 			out.Idle++
+		}
+		if m.Issued {
+			out.Issued++
 		}
 		if m.Lifecycle == "on-demand" {
 			out.OnDemand++

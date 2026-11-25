@@ -1,16 +1,17 @@
 #!/bin/bash
 # Creates, or finds, every AWS resource superci-pull needs in account ci-runners, each tagged purpose=superci-pull:
 # the listener's role and instance profile, a pull-owned copy of the GitHub App credentials, the spend parameter, the
-# release bucket, the security groups of the listener (us-east-1) and of the runners (both regions), an SSH key pair,
-# the listener's Elastic IP, its launch template and its Auto Scaling group of one. Run again at will: it changes
-# nothing that exists except the launch template (a new version) and the role's policy. Prints ids, never a secret.
-# Release the binary (release.sh) before the group's first instance boots, and run alarms.sh for the alarms.
+# release bucket, the security groups of the listener (us-east-1) and of the runners (both regions), the listener's
+# Elastic IP, its launch template and its Auto Scaling group of one. Run again at will: it changes nothing that exists
+# except the launch template (a new version, the group's default) and the role's policy. Prints ids, never a secret.
+# No key pair: SSH takes a key made for each session (ssh.sh, EC2 Instance Connect) from the admin address only.
+# Release the binary (release.sh) before the group's first instance boots, and run alarms.sh for the alarms. A new
+# launch template version reaches the listener when its instance is next replaced (README, "Replace the listener").
 #
-#   pull/deploy/up.sh <admin-cidr> <ssh-public-key-file>
+#   pull/deploy/up.sh <admin-cidr>
 set -euo pipefail
 
 ADMIN_CIDR=${1:?admin CIDR for SSH, e.g. 203.0.113.7/32}
-SSH_PUB=${2:?ssh public key file}
 A="aws --profile ci-runners"
 PRIMARY=us-east-1
 REGIONS="us-east-1 us-east-2"
@@ -84,11 +85,6 @@ $A ec2 authorize-security-group-ingress --region $PRIMARY --group-id "$LSG" --pr
 $A ec2 authorize-security-group-ingress --region $PRIMARY --group-id "$LSG" --protocol tcp --port 22 --cidr "$ADMIN_CIDR" >/dev/null 2>&1 || true
 echo "listener security group: $LSG"
 
-if ! $A ec2 describe-key-pairs --region $PRIMARY --key-names $NAME >/dev/null 2>&1; then
-  $A ec2 import-key-pair --region $PRIMARY --key-name $NAME --public-key-material "fileb://$SSH_PUB" \
-    --tag-specifications "ResourceType=key-pair,Tags=[{$TAGS}]" >/dev/null
-fi
-
 ALLOC=$($A ec2 describe-addresses --region $PRIMARY --filters Name=tag:purpose,Values=superci-pull Name=tag:Name,Values=$NAME-listener --query 'Addresses[0].AllocationId' --output text)
 if [ "$ALLOC" = None ]; then
   ALLOC=$($A ec2 allocate-address --region $PRIMARY --domain vpc \
@@ -100,7 +96,7 @@ echo "listener address: $EIP ($ALLOC)"
 AMI=$($A ssm get-parameter --region $PRIMARY --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64 --query Parameter.Value --output text)
 USERDATA=$(sed -e "s|@BUCKET@|$BUCKET|; s|@EIP_ALLOC@|$ALLOC|; s|@EIP@|$EIP|; s|@RUNNER_SGS@|$RUNNER_SGS|" "$here/listener-boot.sh" | base64 -w0)
 DATA=$(cat <<JSON
-{"ImageId":"$AMI","InstanceType":"c7g.large","KeyName":"$NAME","IamInstanceProfile":{"Name":"$NAME"},
+{"ImageId":"$AMI","InstanceType":"c7g.large","IamInstanceProfile":{"Name":"$NAME"},
  "SecurityGroupIds":["$LSG"],"UserData":"$USERDATA",
  "MetadataOptions":{"HttpTokens":"required","HttpPutResponseHopLimit":1},
  "BlockDeviceMappings":[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":30,"VolumeType":"gp3","DeleteOnTermination":true}}],
@@ -119,7 +115,9 @@ else
   V=$($A ec2 create-launch-template-version --region $PRIMARY --launch-template-id "$LT" --launch-template-data "$DATA" --query LaunchTemplateVersion.VersionNumber --output text)
   $A ec2 modify-launch-template --region $PRIMARY --launch-template-id "$LT" --default-version "$V" >/dev/null
 fi
-echo "listener launch template: $LT"
+# The listener's role may change runner templates (purpose=superci-pull) but never this one (listener-policy.json).
+$A ec2 create-tags --region $PRIMARY --resources "$LT" --tags Key=superci-pull-role,Value=listener
+echo "listener launch template: $LT (superci-pull-role=listener)"
 
 SUBNETS=$($A ec2 describe-subnets --region $PRIMARY --filters Name=default-for-az,Values=true \
   Name=availability-zone,Values=us-east-1a,us-east-1b,us-east-1c,us-east-1d,us-east-1f --query 'Subnets[].SubnetId' --output text | tr '\t' ',')

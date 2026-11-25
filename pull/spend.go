@@ -14,7 +14,8 @@ import (
 
 // Spend is what the machines have cost today and this month (UTC), accrued every reconcile from each running
 // machine's price: its pool's spot price, or for on-demand (and a spot pool not yet priced) an estimate per vCPU,
-// plus its gp3 volume. It is an estimate made to cap the bill, not the bill. It survives a restart in an SSM
+// plus its gp3 volume and its public IPv4 address. Data transfer out is not counted. It is an estimate made to cap the
+// bill, not the bill. It survives a restart in an SSM
 // parameter. At either cap the listener launches nothing and keeps no pool, so the bill stops growing once the
 // running jobs end.
 type Spend struct {
@@ -35,6 +36,7 @@ const (
 	onDemandPerVCPUHour = 0.058            // m7a's list price, at the top of the types used
 	gp3PerGBHour        = 0.08 / 730       // storage
 	gp3ExtraPerHour     = 125 * 0.04 / 730 // 250 MB/s is 125 above the free 125; 3,000 IOPS are free
+	ipv4PerHour         = 0.005            // every machine has a public IPv4 address (the default subnets give one)
 )
 
 func NewSpend(daily, monthly float64, sets []SetSpec, now time.Time) *Spend {
@@ -70,7 +72,7 @@ func (s *Spend) price(m Machine) float64 {
 			p = v
 		}
 	}
-	return p + float64(spec.DiskGB)*gp3PerGBHour + gp3ExtraPerHour
+	return p + float64(spec.DiskGB)*gp3PerGBHour + gp3ExtraPerHour + ipv4PerHour
 }
 
 // Accrue adds the running machines' cost since the last accrual (at most five minutes of it, so a pause of the
