@@ -524,7 +524,11 @@ impl GitHub {
             ("GET", ["repos", o, n, "actions", "runs", id, "jobs"]) if format!("{o}/{n}") == REPO => {
                 let id: u64 = id.parse().ok()?;
                 let jobs: Vec<Value> = h.jobs.values().filter(|j| j["run_id"] == id).cloned().collect();
-                ok(200, json!({ "total_count": jobs.len(), "jobs": jobs }))
+                // (A page of them, as GitHub answers: 30 unless asked for up to 100.)
+                let arg = |k: &str| url.query_pairs().find(|(q, _)| q == k).and_then(|(_, v)| v.parse::<usize>().ok());
+                let (per, page) = (arg("per_page").unwrap_or(30).min(100), arg("page").unwrap_or(1).max(1));
+                let shown: Vec<Value> = jobs.iter().skip((page - 1) * per).take(per).cloned().collect();
+                ok(200, json!({ "total_count": jobs.len(), "jobs": shown }))
             }
             ("GET", ["repos", o, n, "actions", "runs"]) if format!("{o}/{n}") == REPO => {
                 let want = url.query_pairs().find(|(k, _)| k == "status").map(|(_, v)| v.into_owned()).unwrap_or_default();

@@ -247,13 +247,22 @@ pub async fn waiting_jobs(http: &dyn Http, api: &str, token: &str, repo: &str, s
 }
 
 /// The jobs that wait for a runner in a repository's runs of a status.
+/// The most pages of a run's jobs read (a hundred a page): GitHub runs at most 256 jobs of a matrix, and a run holds a
+/// few matrices.
+const WAITING_PAGES: u32 = 10;
+
 async fn waiting_in(http: &dyn Http, api: &str, token: &str, repo: &str, status: &str) -> Result<Vec<(serde_json::Value, bool)>> {
     let mut out = vec![];
     let runs = gh(http, api, "GET", &format!("/repos/{repo}/actions/runs?status={status}&per_page=10"), token, None).await?;
     for run in runs["workflow_runs"].as_array().into_iter().flatten() {
         let Some(id) = run["id"].as_u64() else { continue };
-        let jobs = gh(http, api, "GET", &format!("/repos/{repo}/actions/runs/{id}/jobs?per_page=50"), token, None).await?;
-        out.extend(jobs["jobs"].as_array().into_iter().flatten().filter(|j| j["status"] == "queued").map(|job| (job.clone(), run["repository"]["private"] == true)));
+        // (Every page of a run's jobs: a matrix's run has hundreds, and a job told of by no event may be on any.)
+        for page in 1..=WAITING_PAGES {
+            let jobs = gh(http, api, "GET", &format!("/repos/{repo}/actions/runs/{id}/jobs?filter=latest&per_page=100&page={page}"), token, None).await?;
+            let listed = jobs["jobs"].as_array().map_or(0, Vec::len);
+            out.extend(jobs["jobs"].as_array().into_iter().flatten().filter(|j| j["status"] == "queued").map(|job| (job.clone(), run["repository"]["private"] == true)));
+            if listed < 100 { break }
+        }
     }
     Ok(out)
 }

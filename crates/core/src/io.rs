@@ -124,6 +124,8 @@ pub trait Store {
     /// Moves records kept in an earlier layout of this store into its own, at most `budget` of them; whether none
     /// is left (most stores have only the one layout).
     async fn migrate(&self, budget: usize) -> Result<bool> { let _ = budget; Ok(true) }
+    /// Whether `list_last` reads the last records alone (DynamoDB's queries do), not every record under the prefix.
+    fn reads_last_alone(&self) -> bool { false }
 }
 
 /// `Store::swap` as two steps, read then written, for a store that has no write over what was read (one request at a
@@ -157,6 +159,7 @@ impl<T: Store + ?Sized> Store for &T {
     async fn get_many_stale(&self, keys: &[String]) -> Result<Vec<Option<String>>> { (**self).get_many_stale(keys).await }
     async fn expire(&self, now_ms: u64) -> Result<usize> { (**self).expire(now_ms).await }
     async fn migrate(&self, budget: usize) -> Result<bool> { (**self).migrate(budget).await }
+    fn reads_last_alone(&self) -> bool { (**self).reads_last_alone() }
 }
 
 #[async_trait(?Send)]
@@ -265,6 +268,9 @@ pub trait Timer {
     /// Leaves `what` to be done once the request at hand is answered: the runtime then gives it to the control
     /// plane's `later`. Whether it will; a runtime that cannot says no, and it is done before the answer.
     fn later(&self, _what: &str) -> bool { false }
+    /// Gives `what` to the control plane's `later` in a request of its own, which the runtime keeps until it is done
+    /// (many at once, none in the time of the one at hand). Whether it did; a runtime that cannot says no.
+    async fn hand_off(&self, _what: &str) -> bool { false }
 }
 
 /// Typed JSON values in a `Store`.

@@ -36,9 +36,26 @@ impl Http for Blocking {
         for (k, v) in &r.headers { if url == r.url || !k.eq_ignore_ascii_case("host") { builder = builder.header(k.as_str(), v.as_str()) } }
         let request = builder.body(r.body.clone()).map_err(|e| e.to_string())?;
         let mut response = if r.no_follow { &self.1 } else { &self.0 }.run(request).map_err(|e| format!("{} {}: {e}", r.method, r.url))?;
-        let headers = response.headers().iter().filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.to_string()))).collect();
-        Ok(Response { status: response.status().as_u16(), headers, body: response.body_mut().read_to_vec().map_err(|e| e.to_string())? })
+        let headers: Vec<(String, String)> = response.headers().iter().filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.to_string()))).collect();
+        let status = response.status().as_u16();
+        let body = response.body_mut().read_to_vec().map_err(|e| e.to_string())?;
+        if r.url.starts_with("https://api.github.com/") { github_rate(&r, status, &headers, &body) }
+        Ok(Response { status, headers, body })
     }
+}
+
+/// GitHub's word on what is left of an installation's (or the App's) requests this hour, as its last answer said it.
+static GITHUB_RATE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Kept for the sweep to say once a minute (see `invoke`), and said at once when little is left or GitHub refused.
+fn github_rate(r: &Request, status: u16, headers: &[(String, String)], body: &[u8]) {
+    let h = |n: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.as_str()).unwrap_or("");
+    let Ok(remaining) = h("x-ratelimit-remaining").parse::<u64>() else { return };
+    let said = format!("github rate: {} remaining {remaining} of {} (used {}, resets {})", h("x-ratelimit-resource"), h("x-ratelimit-limit"), h("x-ratelimit-used"), h("x-ratelimit-reset"));
+    if remaining < 1_000 || status == 403 || status == 429 || (status >= 400 && r.url.contains("generate-jitconfig")) {
+        eprintln!("superci: {said}; {} {} answered {status}: {}", r.method, r.url.split('?').next().unwrap_or_default(), String::from_utf8_lossy(&body[..body.len().min(200)]));
+    }
+    *GITHUB_RATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(said);
 }
 
 /// The function's own credentials (from its role, in the environment).
@@ -318,6 +335,7 @@ impl Store for Dynamo<'_> {
         Ok(all.split_off(all.len().saturating_sub(n)))
     }
     async fn get_many(&self, keys: &[String]) -> io::Result<Vec<Option<String>>> { self.read_many(keys, true).await }
+    fn reads_last_alone(&self) -> bool { true }
     /// Eventually consistent: half the price of `get_many`.
     async fn get_many_stale(&self, keys: &[String]) -> io::Result<Vec<Option<String>>> { self.read_many(keys, false).await }
     /// Moves what is left where a layout before kept it into each record's own partition, with its end (not over one
@@ -386,35 +404,74 @@ impl Timer for Scheduled<'_> {
         if ms > SOON_MS || self.function.is_empty() { return Ok(()) }
         let at = self.clock.now_ms() + ms;
         // (Nothing here fails what asked: the schedule's sweep comes within the minute whatever happens.)
-        if !self.store.put_if_absent(WAKING, at.to_string()).await.unwrap_or(false) {
-            let coming = self.store.get(WAKING).await.ok().flatten().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
-            if self.clock.now_ms() < coming + SOON_MS { return Ok(()) }
-            let _ = self.store.put(WAKING, at.to_string()).await;
-        }
-        let body = json!({ "superci": "wake", "at": at }).to_string();
-        let url = format!("https://lambda.{}.amazonaws.com/2015-03-31/functions/{}/invocations", self.region, self.function);
-        let headers = vec![("content-type".to_string(), "application/json".to_string()), ("x-amz-invocation-type".to_string(), "Event".to_string())];
-        let sent = match aws::sigv4("POST", &url, &headers, body.as_bytes(), &own_credentials(), self.region, "lambda", &aws::amz_date(now_ms())) {
-            Ok(signed) => { let mut r = Request::new("POST", &url).with_body(body); r.headers = signed; self.http.send(r).await.is_ok_and(|r| r.status < 300) }
-            Err(_) => false,
+        // The note of one on its way is read before it is written: every job that waits asks, and the note is one.
+        let read = self.store.get(WAKING).await;
+        let coming = read.as_ref().ok().cloned().flatten();
+        if coming.as_deref().and_then(|v| v.parse::<u64>().ok()).is_some_and(|c| self.clock.now_ms() < c + SOON_MS) { return Ok(()) }
+        // (Noted by another request meanwhile: its call is on its way.)
+        let noted = match (&read, coming.as_deref()) {
+            (Ok(_), Some(was)) => self.store.swap(WAKING, Some(was), at.to_string()).await.unwrap_or(false),
+            _ => self.store.put_if_absent(WAKING, at.to_string()).await.unwrap_or(false),
         };
-        if !sent { let _ = self.store.delete(WAKING).await; }
+        if !noted { return Ok(()) }
+        if !self.invoke_self(json!({ "superci": "wake", "at": at })).await { let _ = self.store.delete(WAKING).await; }
         Ok(())
     }
+    /// An invocation of its own, which Lambda keeps and calls again if it fails: what a sweep would otherwise do
+    /// one after another within its own time.
+    async fn hand_off(&self, what: &str) -> bool { !self.function.is_empty() && self.invoke_self(json!({ "superci": "later", "what": what })).await }
     /// A Lambda answers one request at a time: it simply waits.
     async fn pause(&self, ms: u64) { self.store.naps.nap(ms).await }
     /// Done by `main` once the answer is given: the function goes on running until it asks for its next request.
     fn later(&self, what: &str) -> bool { self.later.borrow_mut().push(what.to_string()); true }
 }
 
-/// The secrets under /superci/<id>/, read at most every 15 seconds.
-struct Secrets { at: Option<u64>, values: Vec<(String, String)> }
+impl Scheduled<'_> {
+    /// Calls the function with `event`, not waiting for it (Lambda queues the call): whether Lambda took it.
+    async fn invoke_self(&self, event: Value) -> bool {
+        let body = event.to_string();
+        let url = format!("https://lambda.{}.amazonaws.com/2015-03-31/functions/{}/invocations", self.region, self.function);
+        let headers = vec![("content-type".to_string(), "application/json".to_string()), ("x-amz-invocation-type".to_string(), "Event".to_string())];
+        match aws::sigv4("POST", &url, &headers, body.as_bytes(), &own_credentials(), self.region, "lambda", &aws::amz_date(now_ms())) {
+            Ok(signed) => { let mut r = Request::new("POST", &url).with_body(body); r.headers = signed; self.http.send(r).await.is_ok_and(|r| r.status < 300) }
+            Err(_) => false,
+        }
+    }
+}
+
+/// The secrets under /superci/<id>/, read at most every 15 seconds (`at`), and not asked again before `again_at`.
+struct Secrets { at: Option<u64>, again_at: u64, values: Vec<(String, String)> }
+
+/// How long a container that has no secrets yet asks Parameter Store again while it is throttled (it takes 40 reads a
+/// second for the whole account, and a burst starts hundreds of containers at once): well within Lambda's time.
+const SECRETS_WAIT_MS: u64 = 25_000;
 
 impl Secrets {
+    fn new() -> Secrets { Secrets { at: None, again_at: 0, values: vec![] } }
+
     /// `fresh`: a dashboard key not seen yet arrived (a new session just set it): read again now, at most every second.
-    async fn refresh(&mut self, http: &dyn Http, clock: &dyn Clock, region: &str, plane_id: &str, fresh: bool) -> io::Result<()> {
+    /// Throttled, a container that has read them goes on with what it read and asks again in two seconds; one that has
+    /// not waits and asks again.
+    async fn refresh(&mut self, http: &dyn Http, clock: &dyn Clock, naps: &dyn Naps, region: &str, plane_id: &str, fresh: bool) -> io::Result<()> {
         let within = if fresh { 1_000 } else { 15_000 };
-        if self.at.is_some_and(|t| clock.now_ms().saturating_sub(t) < within) { return Ok(()) }
+        let now = clock.now_ms();
+        if self.at.is_some_and(|t| now.saturating_sub(t) < within) || (self.at.is_some() && !fresh && now < self.again_at) { return Ok(()) }
+        let (began, mut most) = (now, 100u64);
+        loop {
+            match self.read(http, region, plane_id).await {
+                Ok(values) => { (self.values, self.at) = (values, Some(clock.now_ms())); return Ok(()) }
+                Err(e) if e.starts_with("ThrottlingException") && self.at.is_some() => { self.again_at = clock.now_ms() + 2_000; return Ok(()) }
+                Err(e) if e.starts_with("ThrottlingException") && clock.now_ms().saturating_sub(began) < SECRETS_WAIT_MS => {
+                    let r = superci_core::crypto::random_bytes(2);
+                    naps.nap(u16::from_le_bytes([r[0], r[1]]) as u64 % most + 1).await;
+                    most = (most * 2).min(2_000);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    async fn read(&self, http: &dyn Http, region: &str, plane_id: &str) -> io::Result<Vec<(String, String)>> {
         let (mut values, mut next) = (vec![], None::<String>);
         loop {
             let mut body = json!({ "Path": format!("/superci/{plane_id}/"), "Recursive": false, "WithDecryption": true, "MaxResults": 10 });
@@ -426,9 +483,7 @@ impl Secrets {
             next = v["NextToken"].as_str().map(str::to_string);
             if next.is_none() { break }
         }
-        self.values = values;
-        self.at = Some(clock.now_ms());
-        Ok(())
+        Ok(values)
     }
 }
 
@@ -492,7 +547,7 @@ async fn invoke(env: &Env<'_>, secrets: &mut Secrets, event: &Value, answer: &mu
     let unknown = bearer.len() >= 16;
     // A move's steps need what the dashboard wrote a moment ago (the App, GitLab): read fresh for them too.
     let moving = event["rawPath"].as_str().is_some_and(|p| p.starts_with("/move/"));
-    let refreshed = secrets.refresh(env.http, env.clock, env.region, env.plane_id, unknown || moving).await;
+    let refreshed = secrets.refresh(env.http, env.clock, env.naps, env.region, env.plane_id, unknown || moving).await;
     let config = (env.configure)(secrets, env.account_id);
     let store = Dynamo { http: env.http, table: env.table.to_string(), region: env.region.to_string(), layout: std::cell::Cell::new(None), naps: env.naps };
     let later = std::cell::RefCell::new(vec![]);
@@ -508,9 +563,12 @@ async fn invoke(env: &Env<'_>, secrets: &mut Secrets, event: &Value, answer: &mu
             let Some(token) = sweep_claim(&store, env.clock.now_ms()).await? else { return Ok(json!({ "swept": false })) };
             let done = plane.alarm().await.map(|_| json!({ "swept": true }));
             sweep_done(&store, &token).await;
+            if let Some(said) = GITHUB_RATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() { eprintln!("superci: {said}") }
             done
         };
         if event["superci"] == "sweep" { return sweep().await }
+        // What another invocation handed over (see `Timer::hand_off`): done here, in its own time.
+        if let (Some("later"), Some(what)) = (event["superci"].as_str(), event["what"].as_str()) { return plane.later("", what).await.map(|_| json!({ "done": true })) }
         // Its own call for a sweep sooner than the schedule's: the time is waited out here, then the sweep.
         if event["superci"] == "wake" {
             let at = event["at"].as_u64().unwrap_or(0);
@@ -541,7 +599,7 @@ fn main() {
     let plane_id = std::env::var("PLANE_ID").unwrap_or_default();
     let function = std::env::var("AWS_LAMBDA_FUNCTION_NAME").unwrap_or_default();
     let cache = Cache::default();
-    let mut secrets = Secrets { at: None, values: vec![] };
+    let mut secrets = Secrets::new();
     loop {
         let Ok(mut next) = runtime.get(&format!("http://{api}/2018-06-01/runtime/invocation/next")).call() else { continue };
         let id = next.headers().get("lambda-runtime-aws-request-id").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
@@ -1264,8 +1322,7 @@ mod tests {
         let started: Vec<String> = own.0.borrow().iter().filter_map(|c| c.strip_prefix("start ").map(str::to_string)).collect();
         assert!(started.iter().all(|m| held.contains(m)), "machines no record holds: {:?}", started.iter().filter(|m| !held.contains(*m)).collect::<Vec<_>>());
         block_on(plane.alarm()).unwrap();
-        let running: std::collections::BTreeSet<u64> = block_on(s.list("active:")).unwrap().into_iter()
-            .flat_map(|(_, v)| serde_json::from_str::<BTreeMap<String, u64>>(&v).unwrap().into_keys().filter_map(|id| id.parse().ok()).collect::<Vec<u64>>()).collect();
+        let running: std::collections::BTreeSet<u64> = block_on(s.list("active:")).unwrap().into_iter().filter_map(|(k, _)| k["active:".len()..].parse().ok()).collect();
         assert_eq!(running, ids.iter().copied().collect::<std::collections::BTreeSet<u64>>(), "what runs, once the sweep has been");
     }
 

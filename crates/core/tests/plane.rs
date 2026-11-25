@@ -2743,9 +2743,9 @@ impl Http for Untold {
         match r.url.strip_prefix("https://api.github.com/repos/acme/app/actions/runs") {
             Some("?status=queued&per_page=10") => { self.0.calls.borrow_mut().push(("GET".into(), r.url.clone(), String::new())); ok(serde_json::json!({ "workflow_runs": [{ "id": 90, "repository": { "private": true } }] })) }
             Some("?status=in_progress&per_page=10") => { self.0.calls.borrow_mut().push(("GET".into(), r.url.clone(), String::new())); ok(serde_json::json!({ "workflow_runs": [{ "id": 91, "repository": { "private": true } }] })) }
-            Some("/90/jobs?per_page=50") => ok(serde_json::json!({ "jobs": [job(9, "superci", "2026-09-21T14:11:20Z"), job(10, "ubuntu-latest", "2026-09-21T14:11:20Z"), job(11, "superci", "2026-09-21T14:13:10Z"), job(7, "superci", "2026-09-21T13:00:00Z"),
+            Some("/90/jobs?filter=latest&per_page=100&page=1") => ok(serde_json::json!({ "jobs": [job(9, "superci", "2026-09-21T14:11:20Z"), job(10, "ubuntu-latest", "2026-09-21T14:11:20Z"), job(11, "superci", "2026-09-21T14:13:10Z"), job(7, "superci", "2026-09-21T13:00:00Z"),
                 { "id": 12, "run_id": 90, "status": "in_progress", "labels": ["superci"], "created_at": "2026-09-21T14:11:20Z" }] })),
-            Some("/91/jobs?per_page=50") => ok(serde_json::json!({ "jobs": [job(13, "superci/cpu=2", "2026-09-21T14:11:20Z")] })),
+            Some("/91/jobs?filter=latest&per_page=100&page=1") => ok(serde_json::json!({ "jobs": [job(13, "superci/cpu=2", "2026-09-21T14:11:20Z")] })),
             _ => self.0.send(r).await,
         }
     }
@@ -8920,7 +8920,7 @@ fn a_start_that_cannot_read_what_it_weighs_waits_and_is_tried_again() {
     config.containers = true;
     let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
     block_on(plane.alarm()).unwrap();
-    store.refusing("get", "active:", 0);
+    store.refusing("list", "active:", 0);
     block_on(plane.handle(job_event("queued", 7, "acme/app", None)));
     let j = job(&store, 7);
     assert_eq!((j["state"].as_str(), j.get("retries").and_then(|r| r.as_u64()).unwrap_or(0)), (Some("waiting"), 0), "{j}");
@@ -8980,12 +8980,12 @@ fn what_follows_a_jobs_written_record_failing_fails_no_start_and_a_new_machine_i
     let withdrawn = || clouds.calls.borrow().iter().filter(|c| c.0 == "DELETE" && c.1.contains("/actions/runners/")).count();
     block_on(plane.alarm()).unwrap();
     // The write of the place's record of what runs refused, once.
-    store.refusing("swap", "active:", 0);
+    store.refusing("put", "active:", 0);
     block_on(plane.handle(job_event("queued", 7, "acme/app", None)));
     let j = job(&store, 7);
     assert_eq!((j["state"].as_str(), j.get("retries").and_then(|r| r.as_u64()).unwrap_or(0), withdrawn()), (Some("launched"), 0, 0), "{j}");
     block_on(plane.alarm()).unwrap();
-    assert!(store.0.borrow().iter().any(|(k, v)| k.starts_with("active:") && v.contains("\"7\"")), "the sweep puts it in: {:?}", store.0.borrow().iter().filter(|(k, _)| k.starts_with("active:")).collect::<Vec<_>>());
+    assert!(store.0.borrow().contains_key("active:7"), "the sweep puts it in: {:?}", store.0.borrow().iter().filter(|(k, _)| k.starts_with("active:")).collect::<Vec<_>>());
     // The read before the write that holds a new machine refused, once (the fourth read of the job's record in its start).
     store.refusing("get", "job:8", 3);
     block_on(plane.handle(job_event("queued", 8, "acme/app", None)));

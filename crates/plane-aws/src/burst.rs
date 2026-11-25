@@ -234,7 +234,7 @@ impl<'w> World<'w> {
 
     fn invocation(&'w self, call: Call) -> Task<'w> {
         let started = self.sim.now.get();
-        let warm = self.idle.borrow_mut().pop().unwrap_or_else(|| { self.cold.set(self.cold.get() + 1); Rc::new(Warm { secrets: RefCell::new(Secrets { at: None, values: vec![] }), cache: Cache::default() }) });
+        let warm = self.idle.borrow_mut().pop().unwrap_or_else(|| { self.cold.set(self.cold.get() + 1); Rc::new(Warm { secrets: RefCell::new(Secrets::new()), cache: Cache::default() }) });
         self.busy.set(self.busy.get() + 1);
         self.most.set(self.most.get().max(self.busy.get()));
         let (event, kind, retry, hook) = match call {
