@@ -207,6 +207,20 @@ resource tagged `purpose=superci-pull`.
 whose message says "burst"); `bench/measure.py BRANCH SINCE UNTIL listener.jsonl` measures it against the pass bar;
 `bench/orphans.py` lists orphaned machines and runners.
 
+## Cost
+
+Spot prices on Nov 25 2026 08:00Z (median of each size's 10 cheapest pools), with its gp3 volume, a machine-hour:
+2 vCPU $0.035, 4 vCPU $0.062, 8 vCPU $0.106, 16 vCPU $0.190, 32 vCPU $0.351.
+
+| | Per hour |
+| --- | --- |
+| The listener (c7g.large on-demand, 30 GB gp3, the Elastic IP's public address) | $0.08 |
+| Idle at the floors (1 machine each of 2, 4 and 8 vCPU; overnight, or with no jobs routed here) | $0.20 |
+| Idle at the busiest hour's caps (57, 119, 37, 6 and 3 machines), reached only when that hour's arrivals are all here | $15.5 |
+
+A busy hour costs what its jobs run for at those prices, plus about 30 s of boot and shutdown per job (a machine runs
+one job), plus the pool. `SpendPerHourUSD` is the listener's live figure.
+
 ## Measured (Nov 25 2026, megpt-mono)
 
 | Test | Run | Result |

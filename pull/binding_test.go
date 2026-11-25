@@ -204,3 +204,12 @@ func TestAJobThatEndsOnAMachineBeingTakenBackIsLost(t *testing.T) {
 		t.Fatalf("handed over twice: %+v", lost)
 	}
 }
+
+func TestAStartedJobsQueueWaitRunsFromWhenItBecameAvailable(t *testing.T) {
+	s := NewState("set", 0, 10)
+	s.Observe(&scaleset.RunnerScaleSetMessage{JobAvailableMessages: []*scaleset.JobAvailable{{JobMessageBase: scaleset.JobMessageBase{RunnerRequestID: 7}}}}, t0)
+	s.Observe(&scaleset.RunnerScaleSetMessage{JobStartedMessages: []*scaleset.JobStarted{{JobMessageBase: scaleset.JobMessageBase{RunnerRequestID: 7}}}}, t0.Add(6*time.Second))
+	if w := s.TakeWaits(); len(w) != 1 || w[0] != 6 {
+		t.Fatalf("waits %v, want one of 6 s", w)
+	}
+}

@@ -73,9 +73,10 @@ type State struct {
 	surplusSince time.Time            // since when the supply has exceeded the demand
 	orphanSince  map[string]time.Time // stale runners, by name, since first listed as such
 
-	arrivals    []time.Time // jobs that became available, for the pool's rate
-	lost        []JobRef    // jobs that ended on a machine AWS was taking back, for a re-run
-	waits       []float64   // queue waits (s) of jobs started since the metrics last took them
+	arrivals    []time.Time         // jobs that became available, for the pool's rate
+	available   map[int64]time.Time // when each waiting job became available, by runner request, for its queue wait
+	lost        []JobRef            // jobs that ended on a machine AWS was taking back, for a re-run
+	waits       []float64           // queue waits (s) of jobs started since the metrics last took them
 	odLaunched  []time.Time
 	allLaunched []time.Time
 }
@@ -83,7 +84,8 @@ type State struct {
 func NewState(set string, pool, max int) *State {
 	now := time.Now()
 	return &State{set: set, pool: pool, max: max, machines: map[string]*Machine{}, reserved: map[string]int{},
-		boot: fmt.Sprintf("%x", now.UnixNano()), lastActivity: now, polled: now, orphanSince: map[string]time.Time{}}
+		boot: fmt.Sprintf("%x", now.UnixNano()), lastActivity: now, polled: now, orphanSince: map[string]time.Time{},
+		available: map[int64]time.Time{}}
 }
 
 // desired is the supply GitHub's queue asks for: every job assigned to the scale set or waiting to be acquired by it,
@@ -351,17 +353,23 @@ func (s *State) Observe(msg *scaleset.RunnerScaleSetMessage, now time.Time) {
 		s.lastActivity = now
 		s.staleWaiting = 0
 	}
-	for range msg.JobAvailableMessages {
+	for _, j := range msg.JobAvailableMessages {
 		s.arrivals = append(s.arrivals, now)
+		queued := now
+		if !j.QueueTime.IsZero() && j.QueueTime.Before(now) {
+			queued = j.QueueTime
+		}
+		s.available[j.RunnerRequestID] = queued
 	}
 	for _, j := range msg.JobStartedMessages {
+		queued, ok := s.available[j.RunnerRequestID]
 		if !j.QueueTime.IsZero() {
-			started := now
-			if !j.RunnerAssignTime.IsZero() && j.RunnerAssignTime.After(j.QueueTime) {
-				started = j.RunnerAssignTime
-			}
-			s.waits = append(s.waits, max(0, started.Sub(j.QueueTime).Seconds()))
+			queued, ok = j.QueueTime, true
 		}
+		if ok {
+			s.waits = append(s.waits, max(0, now.Sub(queued).Seconds()))
+		}
+		delete(s.available, j.RunnerRequestID)
 		if m := s.machineOf(j.RunnerName); m != nil && m.Runner != nil && m.Runner.Name == j.RunnerName {
 			m.Runner.Busy = true
 			m.Runner.Job = &JobRef{Owner: j.OwnerName, Repo: j.RepositoryName, RunID: j.WorkflowRunID, Name: j.JobDisplayName, Runner: j.RunnerName}
@@ -392,6 +400,11 @@ func (s *State) ArrivalRate(now time.Time, window time.Duration) float64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.arrivals = since(s.arrivals, now.Add(-window))
+	for id, t := range s.available {
+		if now.Sub(t) > 7*time.Hour {
+			delete(s.available, id)
+		}
+	}
 	return float64(len(s.arrivals)) / window.Seconds()
 }
 
