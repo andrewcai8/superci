@@ -23,6 +23,12 @@ install -m 755 /tmp/superci-deploy/health.sh /usr/local/bin/superci-pull-health
 install -m 644 /tmp/superci-deploy/*.service /tmp/superci-deploy/*.timer /etc/systemd/system/
 aws s3 cp "s3://$BUCKET/config/config.json" /etc/superci-pull/config.json || echo '{}' > /etc/superci-pull/config.json
 chmod 644 /etc/superci-pull/config.json
+install -d -m 755 /var/log/superci-pull
+install -m 644 /tmp/superci-deploy/logrotate.conf /etc/logrotate.d/superci-pull
+install -m 644 /tmp/superci-deploy/cloudwatch-agent.json /etc/superci-pull/cloudwatch-agent.json
 echo "FLAGS=-public-ip=@EIP@ -security-groups=@RUNNER_SGS@" > /etc/superci-pull.env
 systemctl daemon-reload
 systemctl enable --now superci-pull.service superci-pull-sync.timer superci-pull-health.timer
+# The log shipper comes after the listener is serving (installing it takes about two minutes), and does not fail the boot.
+dnf install -y -q amazon-cloudwatch-agent &&
+  /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/etc/superci-pull/cloudwatch-agent.json || :

@@ -4,7 +4,13 @@
     {
       "Sid": "Launch",
       "Effect": "Allow",
-      "Action": ["ec2:CreateFleet", "ec2:RunInstances", "ec2:CreateLaunchTemplate", "ec2:CreateLaunchTemplateVersion", "ec2:ModifyLaunchTemplate"],
+      "Action": [
+        "ec2:CreateFleet",
+        "ec2:RunInstances",
+        "ec2:CreateLaunchTemplate",
+        "ec2:CreateLaunchTemplateVersion",
+        "ec2:ModifyLaunchTemplate"
+      ],
       "Resource": "*"
     },
     {
@@ -12,30 +18,60 @@
       "Effect": "Allow",
       "Action": "ec2:CreateTags",
       "Resource": "*",
-      "Condition": { "StringEquals": { "ec2:CreateAction": ["CreateFleet", "RunInstances", "CreateLaunchTemplate", "CreateLaunchTemplateVersion"] } }
+      "Condition": {
+        "StringEquals": {
+          "ec2:CreateAction": [
+            "CreateFleet",
+            "RunInstances",
+            "CreateLaunchTemplate",
+            "CreateLaunchTemplateVersion"
+          ]
+        }
+      }
     },
     {
       "Sid": "EndOnlyOurs",
       "Effect": "Allow",
-      "Action": ["ec2:TerminateInstances", "ec2:DeleteLaunchTemplate"],
+      "Action": [
+        "ec2:TerminateInstances",
+        "ec2:DeleteLaunchTemplate"
+      ],
       "Resource": "*",
-      "Condition": { "StringEquals": { "aws:ResourceTag/purpose": "superci-pull" } }
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/purpose": "superci-pull"
+        }
+      }
     },
     {
       "Sid": "TakeTheListenersAddress",
       "Effect": "Allow",
       "Action": "ec2:AssociateAddress",
       "Resource": "*",
-      "Condition": { "StringEquals": { "aws:ResourceTag/purpose": "superci-pull" } }
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/purpose": "superci-pull"
+        }
+      }
     },
     {
       "Sid": "Read",
       "Effect": "Allow",
       "Action": [
-        "ec2:DescribeInstances", "ec2:DescribeImages", "ec2:DescribeLaunchTemplates", "ec2:DescribeLaunchTemplateVersions",
-        "ec2:DescribeSubnets", "ec2:DescribeSecurityGroups", "ec2:DescribeVpcs", "ec2:DescribeInstanceTypeOfferings",
-        "ec2:DescribeSpotPriceHistory", "ec2:DescribeFleets", "ec2:DescribeFleetInstances", "ec2:DescribeInstanceTypes",
-        "ec2:DescribeAddresses", "autoscaling:DescribeAutoScalingInstances"
+        "ec2:DescribeInstances",
+        "ec2:DescribeImages",
+        "ec2:DescribeLaunchTemplates",
+        "ec2:DescribeLaunchTemplateVersions",
+        "ec2:DescribeSubnets",
+        "ec2:DescribeSecurityGroups",
+        "ec2:DescribeVpcs",
+        "ec2:DescribeInstanceTypeOfferings",
+        "ec2:DescribeSpotPriceHistory",
+        "ec2:DescribeFleets",
+        "ec2:DescribeFleetInstances",
+        "ec2:DescribeInstanceTypes",
+        "ec2:DescribeAddresses",
+        "autoscaling:DescribeAutoScalingInstances"
       ],
       "Resource": "*"
     },
@@ -48,7 +84,9 @@
     {
       "Sid": "Parameters",
       "Effect": "Allow",
-      "Action": ["ssm:GetParameter"],
+      "Action": [
+        "ssm:GetParameter"
+      ],
       "Resource": [
         "arn:aws:ssm:us-east-1:243891825325:parameter/superci-pull/github-app",
         "arn:aws:ssm:us-east-1:243891825325:parameter/superci-pull/tls",
@@ -58,7 +96,10 @@
     {
       "Sid": "KeepTlsKeyAndSpend",
       "Effect": "Allow",
-      "Action": ["ssm:PutParameter", "ssm:AddTagsToResource"],
+      "Action": [
+        "ssm:PutParameter",
+        "ssm:AddTagsToResource"
+      ],
       "Resource": [
         "arn:aws:ssm:us-east-1:243891825325:parameter/superci-pull/tls",
         "arn:aws:ssm:us-east-1:243891825325:parameter/superci-pull/spend"
@@ -67,22 +108,52 @@
     {
       "Sid": "Release",
       "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:ListBucket"],
-      "Resource": ["arn:aws:s3:::superci-pull-243891825325", "arn:aws:s3:::superci-pull-243891825325/*"]
+      "Action": [
+        "s3:GetObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::superci-pull-243891825325",
+        "arn:aws:s3:::superci-pull-243891825325/*"
+      ]
     },
     {
       "Sid": "Metrics",
       "Effect": "Allow",
       "Action": "cloudwatch:PutMetricData",
       "Resource": "*",
-      "Condition": { "StringEquals": { "cloudwatch:namespace": "superci-pull" } }
+      "Condition": {
+        "StringEquals": {
+          "cloudwatch:namespace": "superci-pull"
+        }
+      }
+    },
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogStream",
+        "logs:PutLogEvents",
+        "logs:DescribeLogStreams"
+      ],
+      "Resource": [
+        "arn:aws:logs:us-east-1:243891825325:log-group:/superci-pull/listener",
+        "arn:aws:logs:us-east-1:243891825325:log-group:/superci-pull/listener:*"
+      ]
     },
     {
       "Sid": "FleetAndSpotRoles",
       "Effect": "Allow",
       "Action": "iam:CreateServiceLinkedRole",
       "Resource": "*",
-      "Condition": { "StringEquals": { "iam:AWSServiceName": ["ec2fleet.amazonaws.com", "spot.amazonaws.com"] } }
+      "Condition": {
+        "StringEquals": {
+          "iam:AWSServiceName": [
+            "ec2fleet.amazonaws.com",
+            "spot.amazonaws.com"
+          ]
+        }
+      }
     }
   ]
 }

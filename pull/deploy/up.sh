@@ -56,6 +56,12 @@ if ! $A s3api head-bucket --bucket $BUCKET 2>/dev/null; then
 fi
 echo "release bucket: s3://$BUCKET"
 
+if [ "$($A logs describe-log-groups --region $PRIMARY --log-group-name-prefix /superci-pull/listener --query 'length(logGroups)' --output text)" = 0 ]; then
+  $A logs create-log-group --region $PRIMARY --log-group-name /superci-pull/listener --tags purpose=superci-pull
+  $A logs put-retention-policy --region $PRIMARY --log-group-name /superci-pull/listener --retention-in-days 30
+fi
+echo "listener log group: /superci-pull/listener (30 days)"
+
 sg() { # region name description -> id
   local vpc id
   vpc=$($A ec2 describe-vpcs --region "$1" --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text)

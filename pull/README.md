@@ -143,7 +143,8 @@ that profile in `deploy/listener-policy.json`. Nothing else in the listener know
 
 ```bash
 L=32.202.70.249; ssh ec2-user@$L               # SSH from the admin address up.sh allowed
-sudo journalctl -u superci-pull -o cat -f       # JSON events: message, fleet, register, ask, budget, state, terminate
+tail -f /var/log/superci-pull/listener.jsonl    # JSON events: message, fleet, register, ask, budget, state, terminate
+                                                # (also in CloudWatch Logs, group /superci-pull/listener, a stream per instance)
 curl -s localhost:8080/state | jq               # budget, spend, and per set: desired, live, idle, busy, pool, orphans
 curl -s localhost:8080/healthz                  # what the health timer checks
 ```
@@ -228,6 +229,7 @@ one job), plus the pool. `SpendPerHourUSD` is the listener's live figure.
 | Smoke, one job per size | 45568198731 | 5/5 succeeded; jobs on a pool runner (2, 4, 8 vCPU) waited 1 s, the 16 and 32 vCPU jobs (no pool) 16 and 17 s, from launch to a registered runner in 11-15 s; each ran on its size (c8a.large, c5a.xlarge, c5a.2xlarge, c7i-flex.4xlarge, c6a.8xlarge; `nproc` 2, 4, 8, 16, 32) |
 | Split, 40 jobs on `superci-4cpu` run as two sets | 45568606692 | GitHub gave 20 to `superci-4cpu` and 20 to `superci-4cpu-2`; 40/40 succeeded |
 | Crash mid-run, 30 jobs over every size | 45569779369 | `kill -9` of the process at 07:39:39, then the listener's instance terminated at 07:40:40: 30/30 succeeded; at +10 min, 0 orphaned machines, 0 orphaned runners, and `Orphans` 0 in every period |
+| Spot reclaim mid-job (AWS FIS `send-spot-instance-interruptions`, role `superci-pull-fis`) | 45573133090 | the notice reached the listener 25 s after it was sent; AWS took the machine 2 min later and GitHub failed the job (attempt 1); the listener re-ran it 5 s after the run completed, and attempt 2 succeeded on another machine |
 
 Crash details. systemd restarted the process in 5 s. GitHub refused its sessions as conflicts while the dead
 process's lapsed: 30 to 47 s per set. In that time the guard held every machine at Wait; no machine was told to end

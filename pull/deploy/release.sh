@@ -12,7 +12,7 @@ A="aws --profile ci-runners"
 B=s3://superci-pull-243891825325
 here=$(cd "$(dirname "$0")" && pwd)
 $A s3 cp --quiet "$BIN" $B/bin/superci-pull
-for f in superci-pull.service superci-pull-sync.service superci-pull-sync.timer superci-pull-health.service superci-pull-health.timer sync.sh health.sh; do
+for f in superci-pull.service superci-pull-sync.service superci-pull-sync.timer superci-pull-health.service superci-pull-health.timer sync.sh health.sh cloudwatch-agent.json logrotate.conf; do
   $A s3 cp --quiet "$here/$f" $B/deploy/$f
 done
 [ -n "$CONFIG" ] && $A s3 cp --quiet "$CONFIG" $B/config/config.json
