@@ -13,6 +13,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/big"
@@ -21,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/actions/scaleset"
@@ -144,14 +146,29 @@ func (h *Server) jit(w http.ResponseWriter, r *http.Request) {
 	suffix := make([]byte, 2)
 	_, _ = rand.Read(suffix)
 	name := fmt.Sprintf("%s-%s-%s", h.state.set, m.ID, hex.EncodeToString(suffix))
-	cfg, err := h.client.GenerateJitRunnerConfig(r.Context(), &scaleset.RunnerScaleSetJitRunnerSetting{Name: name}, h.setID)
+	// A refusal comes back at once, not after the client's own waits: the machine is told to ask again, and the
+	// listener stops asking GitHub for a while.
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	ctx = scaleset.WithRequestRetry(ctx, func(rc *scaleset.RetryConfig) {
+		rc.OnRateLimit = func(context.Context, *scaleset.RateLimitError) (time.Duration, bool) { return 0, false }
+	})
+	cfg, err := h.client.GenerateJitRunnerConfig(ctx, &scaleset.RunnerScaleSetJitRunnerSetting{Name: name}, h.setID)
 	if err != nil {
-		h.state.Registered(m.ID, nil, true)
-		slog.Error("register", "machine", m.ID, "runner", name, "err", err.Error(), "ms", time.Since(started).Milliseconds())
+		var rl *scaleset.RateLimitError
+		refused := errors.As(err, &rl) || strings.Contains(err.Error(), "ConfigureTooManyRunners")
+		slog.Error("register", "machine", m.ID, "runner", name, "refused", refused, "err", err.Error(), "ms", time.Since(started).Milliseconds())
+		if refused {
+			h.state.Registered(m.ID, nil, Refused, time.Now())
+			w.Header().Set("Retry-After", "5")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		h.state.Registered(m.ID, nil, Failed, time.Now())
 		http.Error(w, "registration failed", http.StatusServiceUnavailable)
 		return
 	}
-	h.state.Registered(m.ID, &Runner{ID: int64(cfg.Runner.ID), Name: name, Issued: time.Now()}, false)
+	h.state.Registered(m.ID, &Runner{ID: int64(cfg.Runner.ID), Name: name, Issued: time.Now()}, Made, time.Now())
 	slog.Info("register", "machine", m.ID, "runner", name, "runner_id", cfg.Runner.ID, "ms", time.Since(started).Milliseconds())
 	w.Header().Set("Content-Type", "text/plain")
 	_, _ = w.Write([]byte(cfg.EncodedJITConfig))

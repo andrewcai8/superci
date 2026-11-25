@@ -91,7 +91,7 @@ if len(sys.argv) > 2:
             e = json.loads(line)
         except ValueError:
             continue
-        t = ts(e.get("time", "").replace("Z", "+00:00")[:26] + "+00:00") if e.get("time") else None
+        t = ts(e["time"][:26] + "+00:00") if e.get("time") else None
         if e.get("msg") == "register":
             if e.get("err"):
                 errors += 1

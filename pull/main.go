@@ -38,7 +38,7 @@ func main() {
 		pool         = flag.Int("pool", 0, "idle runners kept ready beyond the queue's jobs")
 		regBudget    = flag.Int("reg-budget", 1400, "most runner registrations in any 5 minutes (GitHub refuses past 1,500 per org)")
 		odFraction   = flag.Float64("on-demand", 0.10, "most share of a half hour's launches that may be on-demand")
-		regions      = flag.String("regions", "us-east-1=2,us-east-2=1", "regions and the weight of each")
+		regions      = flag.String("regions", "us-east-1=1,us-east-2=1", "regions and the weight of each")
 		types        = flag.String("types", "c5.xlarge,c5a.xlarge,c6a.xlarge,c6i.xlarge,c7a.xlarge,c7i.xlarge,c7i-flex.xlarge,c8a.xlarge,c8i.xlarge,m5.xlarge,m5a.xlarge,m6a.xlarge,m6i.xlarge,m7a.xlarge,m7i.xlarge,m7i-flex.xlarge,m8a.xlarge,m8i.xlarge", "machine types, all of one size")
 		groups       = flag.String("security-groups", "", "runner security group of each region: us-east-1=sg-…,us-east-2=sg-…")
 		publicIP     = flag.String("public-ip", "", "this listener's public address, which machines reach")
@@ -47,6 +47,8 @@ func main() {
 		listen       = flag.String("listen", ":8443", "address of the machines' endpoint")
 		admin        = flag.String("admin", "127.0.0.1:8080", "address of the operator's endpoint")
 		jitSlots     = flag.Int("jit-concurrency", 64, "most runner registrations in flight at once")
+		regRate      = flag.Float64("reg-rate", 0, "registrations a second at most (0: unpaced), to leave GitHub's shared cap to the organization's other runners")
+		regBurst     = flag.Float64("reg-burst", 100, "registrations saved up when paced")
 		deleteSet    = flag.Bool("delete-scale-set", false, "delete the scale set and exit")
 	)
 	flag.Parse()
@@ -54,7 +56,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := run(ctx, options{*org, *installation, *appParam, *name, *maxRunners, *pool, *regBudget, *odFraction,
-		pairs(*regions), strings.Split(*types, ","), pairs(*groups), *publicIP, *maxMinutes, *stateDir, *listen, *admin, *jitSlots, *deleteSet}); err != nil && !errors.Is(err, context.Canceled) {
+		pairs(*regions), strings.Split(*types, ","), pairs(*groups), *publicIP, *maxMinutes, *stateDir, *listen, *admin, *jitSlots, *regRate, *regBurst, *deleteSet}); err != nil && !errors.Is(err, context.Canceled) {
 		slog.Error("exit", "err", err.Error())
 		os.Exit(1)
 	}
@@ -77,6 +79,8 @@ type options struct {
 	listen       string
 	admin        string
 	jitSlots     int
+	regRate      float64
+	regBurst     float64
 	deleteSet    bool
 }
 
@@ -142,6 +146,9 @@ func run(ctx context.Context, c options) error {
 		return err
 	}
 	state := NewState(c.name, c.pool, c.max, c.regBudget)
+	if c.regRate > 0 {
+		state.Pace(c.regRate, c.regBurst)
+	}
 	rest := NewREST(app, c.installation, c.org)
 	refresh := refresher(fleet, state)
 	for _, r := range fleet.regions {
@@ -241,9 +248,10 @@ func (s *scaler) poke() {
 }
 
 // launcher turns the deficit into fleet requests. A message wakes it; it waits a moment so a burst's messages make
-// one launch, and lets a few launches run at once, each reserving its capacity so none is asked for twice.
+// few launches, and lets several launches run at once (an instant fleet in us-east-1 can take half a minute to
+// answer). A launch takes its slot before it reserves its capacity, so the capacity it reserves is asked for at once.
 func launcher(ctx context.Context, state *State, fleet *Fleet, wake chan struct{}, odFraction float64) {
-	slots := make(chan struct{}, 4)
+	slots := make(chan struct{}, 16)
 	for {
 		select {
 		case <-ctx.Done():
@@ -252,11 +260,16 @@ func launcher(ctx context.Context, state *State, fleet *Fleet, wake chan struct{
 		case <-time.After(2 * time.Second):
 		}
 		time.Sleep(300 * time.Millisecond)
-		round, n := state.Deficit()
-		if n == 0 {
+		select {
+		case slots <- struct{}{}:
+		default:
 			continue
 		}
-		slots <- struct{}{}
+		round, n := state.Deficit(time.Now())
+		if n == 0 {
+			<-slots
+			continue
+		}
 		go func() {
 			defer func() { <-slots }()
 			now := time.Now()
@@ -334,6 +347,9 @@ func reconciler(ctx context.Context, state *State, fleet *Fleet, client *scalese
 				}
 			}
 		}
+		if stale := state.MarkStale(now, 3*time.Minute); stale > 0 {
+			slog.Warn("stale waiting jobs", "count", stale)
+		}
 		for _, m := range state.Stuck(now, 5*time.Minute, 3*time.Minute) {
 			slog.Warn("stuck", "machine", m.ID, "region", m.Region, "age_s", int(now.Sub(m.Launched).Seconds()))
 		}
@@ -349,6 +365,7 @@ func reconciler(ctx context.Context, state *State, fleet *Fleet, client *scalese
 		snap := state.Snapshot(now)
 		slog.Info("state", "desired", snap.Desired, "live", snap.Live, "inflight", snap.Inflight, "machines", snap.Machines,
 			"booting", snap.Booting, "idle", snap.Idle, "busy", snap.Busy, "ending", snap.Ending, "on_demand", snap.OnDemand,
-			"notices", snap.Notices, "regs_window", snap.RegsWindow, "max_regs_window", snap.MaxRegWindow, "total_regs", snap.TotalRegs, "reg_errors", snap.RegErrors)
+			"notices", snap.Notices, "regs_window", snap.RegsWindow, "max_regs_window", snap.MaxRegWindow, "total_regs", snap.TotalRegs, "reg_errors", snap.RegErrors,
+			"refused", snap.Refused, "pending", snap.Pending, "stale_waiting", snap.StaleWaiting)
 	}
 }
