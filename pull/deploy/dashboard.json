@@ -27,6 +27,14 @@
     {"type": "metric", "x": 12, "y": 15, "width": 12, "height": 6, "properties": {"title": "Spend (USD): today against the daily cap, and the hour", "region": "us-east-1", "view": "timeSeries", "period": 300, "stat": "Maximum",
       "metrics": [["superci-pull", "SpendTodayUSD"], [".", "SpendDailyCapUSD"], [".", "SpendPerHourUSD", {"yAxis": "right"}], [".", "OnDemandShare", {"yAxis": "right"}]]}},
     {"type": "log", "x": 0, "y": 21, "width": 24, "height": 6, "properties": {"title": "Listener warnings and errors", "region": "us-east-1", "view": "table",
-      "query": "SOURCE '/superci-pull/listener' | fields @timestamp, level, msg, set, machine, err | filter level in ['WARN', 'ERROR'] | sort @timestamp desc | limit 50"}}
+      "query": "SOURCE '/superci-pull/listener' | fields @timestamp, level, msg, set, machine, err | filter level in ['WARN', 'ERROR'] | sort @timestamp desc | limit 50"}},
+    {"type": "log", "x": 0, "y": 27, "width": 12, "height": 6, "properties": {"title": "Timeline: queue wait (s) per set, p50 and p90 of started jobs", "region": "us-east-1", "view": "table",
+      "query": "SOURCE '/superci-pull/listener' | filter msg = 'tl' and ev = 'job.started' | stats count(*) as jobs, pct(queue_ms, 50) / 1000 as p50_s, pct(queue_ms, 90) / 1000 as p90_s by set | sort set"}},
+    {"type": "log", "x": 12, "y": 27, "width": 12, "height": 6, "properties": {"title": "Timeline: queue wait (s) over time, p50 and p90", "region": "us-east-1", "view": "timeSeries",
+      "query": "SOURCE '/superci-pull/listener' | filter msg = 'tl' and ev = 'job.started' | stats pct(queue_ms, 50) / 1000 as p50_s, pct(queue_ms, 90) / 1000 as p90_s by bin(5m)"}},
+    {"type": "log", "x": 0, "y": 33, "width": 12, "height": 6, "properties": {"title": "Timeline: boot phases (s) on the machine, p50 and p90 (each phase ends at the mark named)", "region": "us-east-1", "view": "table",
+      "query": "SOURCE '/superci-pull/listener' | filter msg = 'tl' and ev in ['cache.start', 'cache.up', 'doc.got', 'jit.sent', 'jit.answered', 'runner.start', 'runner.online'] | stats count(*) as n, pct(dur_ms, 50) / 1000 as p50_s, pct(dur_ms, 90) / 1000 as p90_s by ev | sort p50_s desc"}},
+    {"type": "log", "x": 12, "y": 33, "width": 12, "height": 6, "properties": {"title": "Timeline: launch call and registration (s) per set, p50 and p90", "region": "us-east-1", "view": "table",
+      "query": "SOURCE '/superci-pull/listener' | filter msg = 'tl' and ev in ['machine.launched', 'jit.issued'] | stats pct(answer_ms, 50) / 1000 as launch_p50_s, pct(answer_ms, 90) / 1000 as launch_p90_s, pct(register_ms, 50) / 1000 as register_p50_s, pct(register_ms, 90) / 1000 as register_p90_s by set | sort set"}}
   ]
 }
