@@ -301,10 +301,11 @@ class GitHub:
     def job(self, job_id):
         return self.api(f"actions/jobs/{job_id}")
 
-    def run_jobs(self, run_id):
+    def run_jobs(self, run_id, attempts="latest"):
+        """The jobs of a run: those of its latest attempt, or (attempts="all") of every attempt."""
         out, page = [], 1
         while True:
-            d = self.api(f"actions/runs/{run_id}/jobs?per_page=100&filter=latest&page={page}")
+            d = self.api(f"actions/runs/{run_id}/jobs?per_page=100&filter={attempts}&page={page}")
             out += d["jobs"]
             if len(out) >= d["total_count"] or not d["jobs"]:
                 return out
