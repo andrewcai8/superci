@@ -11,6 +11,8 @@ SSH=${3:-}
 A="aws --profile ci-runners"
 [ "$($A sts get-caller-identity --query Account --output text)" = 243891825325 ] || { echo "refusing: not ci-runners" >&2; exit 1; }
 B=s3://superci-pull-243891825325
+# The listener refuses to start without its claims bucket (claims.go), so a release before up.sh made it is an outage.
+$A s3api get-bucket-policy --bucket superci-pull-claims-243891825325 --query Policy --output text | grep -q if-none-match || { echo "refusing: the claims bucket or its policy is missing; run pull/deploy/up.sh first" >&2; exit 1; }
 here=$(cd "$(dirname "$0")" && pwd)
 if [ -n "$CONFIG" ]; then
   [ -n "$SSH" ] || { echo "refusing: an override config is checked on the listener, so give its ssh command" >&2; exit 1; }

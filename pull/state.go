@@ -69,20 +69,21 @@ const pollLease = 100 * time.Second
 // State is everything the control loop knows about one scale set. One mutex: the listener goroutine, the launcher,
 // the reconciler and the HTTP handlers each hold it only to read or write these fields, never across a network call.
 type State struct {
-	mu       sync.Mutex
-	set      string
-	started  time.Time
-	stats    scaleset.RunnerScaleSetStatistic
-	pool     int
-	max      int
-	capped   bool                 // the spend cap is reached: no launches, no pool
-	known    bool                 // the message session has given its statistics since this process started
-	listings map[string]time.Time // per configured region, when its last complete listing of machines began
-	machines map[string]*Machine
-	gone     map[string]time.Time // machines issued (or being granted) that a listing dropped, so a re-adoption stays issued
-	reserved map[string]int       // per launch round, capacity asked of EC2 and not yet seen
-	rounds   int
-	boot     string
+	mu         sync.Mutex
+	set        string
+	started    time.Time
+	stats      scaleset.RunnerScaleSetStatistic
+	pool       int
+	max        int
+	capped     bool                 // the spend cap is reached: no launches, no pool
+	known      bool                 // the message session has given its statistics since this process started
+	emptySince time.Time            // when a retired set was first seen holding nothing (Drained)
+	listings   map[string]time.Time // per configured region, when its last complete listing of machines began
+	machines   map[string]*Machine
+	gone       map[string]time.Time // machines issued (or being granted) that a listing dropped, so a re-adoption stays issued
+	reserved   map[string]int       // per launch round, capacity asked of EC2 and not yet seen
+	rounds     int
+	boot       string
 
 	lastActivity time.Time // last message that assigned or started a job
 	lastStart    time.Time // last job started
@@ -932,13 +933,25 @@ func (s *State) Running() []Machine {
 	return out
 }
 
-// Drained says whether a set being retired holds nothing more: it is ready, and has no machine and no launch in
-// flight (a busy runner is always on a machine EC2 lists), so deleting it at GitHub fails no job.
-func (s *State) Drained() bool {
+// Drained says whether a set being retired holds nothing more, as of now: it is ready, it has no machine and no
+// launch in flight, and GitHub counts no runner and no job assigned or offered to it. That has held for a minute, so
+// one EC2 listing that misses a busy machine, or a job assigned but not yet started, never deletes the set under it.
+func (s *State) Drained(now time.Time) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.ready() && len(s.machines) == 0 && len(s.reserved) == 0
+	st := s.stats
+	if !s.ready() || len(s.machines) > 0 || len(s.reserved) > 0 || st.TotalRegisteredRunners > 0 || st.TotalAssignedJobs > 0 || st.TotalAvailableJobs > 0 {
+		s.emptySince = time.Time{}
+		return false
+	}
+	if s.emptySince.IsZero() {
+		s.emptySince = now
+	}
+	return now.Sub(s.emptySince) >= drainedFor
 }
+
+// drainedFor is how long a retired set must hold nothing before it is deleted: two of drain's ticks.
+const drainedFor = time.Minute
 
 func (s *State) SetPool(n int)     { s.mu.Lock(); s.pool = n; s.mu.Unlock() }
 func (s *State) SetMax(n int)      { s.mu.Lock(); s.max = n; s.mu.Unlock() }
