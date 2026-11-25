@@ -187,3 +187,16 @@ func TestAFailedSampleIsNotRetriedEveryTick(t *testing.T) {
 		t.Fatal("a sample that succeeded does not end the backoff")
 	}
 }
+
+func TestCountBetweenCountsTheHalfOpenWindow(t *testing.T) {
+	var ts []time.Time
+	for i := 1; i <= 5; i++ {
+		ts = append(ts, t0.Add(time.Duration(i)*time.Second))
+	}
+	at := func(s int) time.Time { return t0.Add(time.Duration(s) * time.Second) }
+	for _, tc := range []struct{ from, to, want int }{{1, 4, 3}, {0, 5, 5}, {5, 9, 0}, {-3, 0, 0}, {2, 2, 0}, {4, 1, 0}} {
+		if n := countBetween(ts, at(tc.from), at(tc.to)); n != tc.want {
+			t.Fatalf("(%d s, %d s]: %d, want %d", tc.from, tc.to, n, tc.want)
+		}
+	}
+}

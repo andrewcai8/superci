@@ -151,13 +151,25 @@ func (s *State) waitingJobs() int {
 }
 
 func (s *State) idleRunners() int {
-	n := 0
+	_, idle := s.supplyCounts()
+	return idle
+}
+
+// supplyCounts is live and idleRunners in one pass over the machines: every machine waiting for its runner asks every
+// 3 s, and each ask needs both.
+func (s *State) supplyCounts() (live, idle int) {
+	for _, k := range s.reserved {
+		live += k
+	}
 	for _, m := range s.machines {
-		if supply(m) && m.Runner != nil && !m.Runner.Busy {
-			n++
+		if supply(m) {
+			live++
+			if m.Runner != nil && !m.Runner.Busy {
+				idle++
+			}
 		}
 	}
-	return n
+	return live, idle
 }
 
 // supply says whether a machine counts toward the set's supply: not ending, not being taken back by AWS, and not
@@ -180,16 +192,8 @@ func (s *State) MarkStale(now time.Time, after time.Duration) (stale int) {
 // live is the supply: machines that count (supply), and capacity asked for and not yet seen. A machine a listing shows
 // before its launch call answers settles one unit of its round's reservation, so it is never counted twice.
 func (s *State) live() int {
-	n := 0
-	for _, k := range s.reserved {
-		n += k
-	}
-	for _, m := range s.machines {
-		if supply(m) {
-			n++
-		}
-	}
-	return n
+	live, _ := s.supplyCounts()
+	return live
 }
 
 // Noticed takes in AWS's two minutes' notice for a spot machine: it is no longer supply, so another is launched at
@@ -327,12 +331,15 @@ func (s *State) Ask(id string, now time.Time, b *Budget, maxAge time.Duration) V
 		return End
 	case !s.ready():
 		return Wait
-	case now.Sub(m.Launched) > maxAge || s.leased(now) && s.live() > s.desired():
+	}
+	live, idle := s.supplyCounts()
+	switch {
+	case now.Sub(m.Launched) > maxAge || s.leased(now) && live > s.desired():
 		m.Ending = true
 		return End
 	}
 	prio := ForPool
-	if s.waitingJobs() > s.idleRunners() {
+	if s.waitingJobs() > idle {
 		prio = ForJob
 	}
 	if !b.Take(now, prio) {

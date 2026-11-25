@@ -1,6 +1,7 @@
 package main
 
 import (
+	"sort"
 	"sync"
 	"time"
 )
@@ -222,7 +223,11 @@ func (b *Budget) Done(now time.Time, outcome Outcome, runnerID int64) {
 		for i < len(b.ours) && b.ours[i].Before(cut) {
 			i++
 		}
+		// Kept sorted for countBetween: registrations that ran at once report their times in any order.
 		b.ours = append(b.ours[i:], now)
+		for j := len(b.ours) - 1; j > 0 && b.ours[j].Before(b.ours[j-1]); j-- {
+			b.ours[j], b.ours[j-1] = b.ours[j-1], b.ours[j]
+		}
 		b.made++
 		b.throttleWait = 0
 		if runnerID > 0 {
@@ -261,11 +266,6 @@ func (b *Budget) Snapshot(now time.Time) BudgetSnapshot {
 
 // countBetween counts the times in (from, to] of a sorted slice.
 func countBetween(ts []time.Time, from, to time.Time) int {
-	n := 0
-	for _, t := range ts {
-		if t.After(from) && !t.After(to) {
-			n++
-		}
-	}
-	return n
+	after := func(t time.Time) int { return sort.Search(len(ts), func(i int) bool { return ts[i].After(t) }) }
+	return max(0, after(to)-after(from))
 }
