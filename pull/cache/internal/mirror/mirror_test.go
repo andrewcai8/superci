@@ -9,18 +9,25 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+
+	"superci-pull-cache/internal/cache"
 )
 
 // fakeS3 is both regions' buckets in memory, with S3's answers to the preconditions a copy sends.
 type fakeS3 struct {
 	mu      sync.Mutex
 	objects map[string][]byte // bucket + "/" + key
+	meta    map[string]map[string]string
+	at      map[string]time.Time
+	clock   time.Time
 	uploads map[string]map[int32][]byte
+	upMeta  map[string]map[string]string
 	next    int
 	// beforeComplete runs once, just before a multipart upload completes.
 	beforeComplete func()
@@ -29,7 +36,8 @@ type fakeS3 struct {
 }
 
 func newFake() *fakeS3 {
-	return &fakeS3{objects: map[string][]byte{}, uploads: map[string]map[int32][]byte{}}
+	return &fakeS3{objects: map[string][]byte{}, meta: map[string]map[string]string{}, at: map[string]time.Time{},
+		clock: time.Unix(1_800_000_000, 0), uploads: map[string]map[int32][]byte{}, upMeta: map[string]map[string]string{}}
 }
 
 func etag(b []byte) string { return fmt.Sprintf("%q", fmt.Sprintf("%x", md5.Sum(b))) }
@@ -39,7 +47,13 @@ func apiErr(c string) error { return &smithy.GenericAPIError{Code: c} }
 func (f *fakeS3) put(bucket, key string, b []byte) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.objects[bucket+"/"+key] = b
+	f.write(bucket+"/"+key, b, nil)
+}
+
+// write stores an object at the next tick of the bucket's clock, as S3 stamps LastModified.
+func (f *fakeS3) write(k string, b []byte, meta map[string]string) {
+	f.clock = f.clock.Add(time.Minute)
+	f.objects[k], f.meta[k], f.at[k] = b, meta, f.clock
 }
 
 func (f *fakeS3) get(bucket, key string) ([]byte, bool) {
@@ -71,7 +85,10 @@ func (f *fakeS3) HeadObject(_ context.Context, in *s3.HeadObjectInput, _ ...func
 	if !ok {
 		return nil, &types.NotFound{}
 	}
-	return &s3.HeadObjectOutput{ContentLength: aws.Int64(int64(len(b))), ETag: aws.String(etag(b))}, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	k := *in.Bucket + "/" + *in.Key
+	return &s3.HeadObjectOutput{ContentLength: aws.Int64(int64(len(b))), ETag: aws.String(etag(b)), Metadata: f.meta[k], LastModified: aws.Time(f.at[k])}, nil
 }
 
 func (f *fakeS3) CopyObject(_ context.Context, in *s3.CopyObjectInput, _ ...func(*s3.Options)) (*s3.CopyObjectOutput, error) {
@@ -84,7 +101,7 @@ func (f *fakeS3) CopyObject(_ context.Context, in *s3.CopyObjectInput, _ ...func
 	if _, ok := f.objects[*in.Bucket+"/"+*in.Key]; ok && aws.ToString(in.IfNoneMatch) == "*" {
 		return nil, apiErr("PreconditionFailed")
 	}
-	f.objects[*in.Bucket+"/"+*in.Key] = b
+	f.write(*in.Bucket+"/"+*in.Key, b, in.Metadata)
 	return &s3.CopyObjectOutput{}, nil
 }
 
@@ -94,6 +111,7 @@ func (f *fakeS3) CreateMultipartUpload(_ context.Context, in *s3.CreateMultipart
 	f.next++
 	id := fmt.Sprint(f.next)
 	f.uploads[id] = map[int32][]byte{}
+	f.upMeta[id] = in.Metadata
 	return &s3.CreateMultipartUploadOutput{UploadId: &id}, nil
 }
 
@@ -130,8 +148,8 @@ func (f *fakeS3) CompleteMultipartUpload(_ context.Context, in *s3.CompleteMulti
 	for _, p := range in.MultipartUpload.Parts {
 		all = append(all, f.uploads[*in.UploadId][*p.PartNumber]...)
 	}
+	f.write(*in.Bucket+"/"+*in.Key, all, f.upMeta[*in.UploadId])
 	delete(f.uploads, *in.UploadId)
-	f.objects[*in.Bucket+"/"+*in.Key] = all
 	return &s3.CompleteMultipartUploadOutput{}, nil
 }
 
@@ -234,5 +252,30 @@ func TestADeletedEntryIsNotCopied(t *testing.T) {
 	_, m, _ := setup(95)
 	if got, err := m.Copy(context.Background(), entry+"-gone"); err != nil || got != Gone {
 		t.Fatalf("copy: %v %v", got, err)
+	}
+}
+
+func TestACopyKeepsItsOriginalsSaveTime(t *testing.T) {
+	for _, size := range []int{7, 95} {
+		f, m, _ := setup(size)
+		saved := f.at["east-1/"+entry]
+		if got, err := m.Copy(context.Background(), entry); err != nil || got != Copied {
+			t.Fatalf("size %d: copy: %v %v", size, got, err)
+		}
+		k := "east-2/" + entry
+		if !f.at[k].After(saved) {
+			t.Fatalf("size %d: the copy's LastModified %v is not after the save %v (the test's clock is wrong)", size, f.at[k], saved)
+		}
+		if got := f.meta[k][cache.SavedMetadata]; got != saved.Format(time.RFC3339Nano) {
+			t.Fatalf("size %d: the copy says it was saved %q, the original was saved %v", size, got, saved)
+		}
+		// A copy of the copy (the peer's mirror answering the copy's own notice) still names the first save.
+		m2 := &Mirror{Src: f, Dst: f, SrcBucket: "east-2", DstBucket: "east-3", Prefix: "v1/d/", PartSize: 10, Parallel: 4}
+		if _, err := m2.Copy(context.Background(), entry); err != nil {
+			t.Fatal(err)
+		}
+		if got := f.meta["east-3/"+entry][cache.SavedMetadata]; got != saved.Format(time.RFC3339Nano) {
+			t.Fatalf("size %d: a copy of a copy says %q, not the first save %v", size, got, saved)
+		}
 	}
 }

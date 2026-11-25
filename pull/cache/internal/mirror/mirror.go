@@ -4,7 +4,8 @@
 // An entry is written once and never changed, so the two buckets cannot disagree about a key: a copy is completed
 // only with If-None-Match, and a key both regions saved keeps each region's own first save. The copy reads the one
 // version it began with (If-Match on its ETag), so an entry the janitor deleted and a job saved again mid-copy ends
-// the copy, never mixes two archives.
+// the copy, never mixes two archives. A copy keeps its original's save time (cache.SavedMetadata): its own
+// LastModified is when it was copied, and the newest of a restore key's matches goes by the save.
 package mirror
 
 import (
@@ -20,6 +21,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+
+	"superci-pull-cache/internal/cache"
 )
 
 // S3 is what a copy calls; *s3.Client is one.
@@ -94,14 +97,23 @@ func (m *Mirror) Copy(ctx context.Context, key string) (Outcome, error) {
 		return "", fmt.Errorf("head %s in %s: %w", key, m.SrcBucket, err)
 	}
 	size, etag := aws.ToInt64(src.ContentLength), aws.ToString(src.ETag)
+	saved := map[string]string{cache.SavedMetadata: savedOf(src).Format(time.RFC3339Nano)}
 	// (A copy source is URL-encoded: an entry's name has the scope's escapes in it, "%2F" among them.)
 	from := m.SrcBucket + "/" + (&url.URL{Path: key}).EscapedPath()
 	if size <= m.PartSize {
 		_, err := m.Dst.CopyObject(ctx, &s3.CopyObjectInput{Bucket: &m.DstBucket, Key: &key, CopySource: &from,
-			CopySourceIfMatch: &etag, IfNoneMatch: aws.String("*")})
+			CopySourceIfMatch: &etag, IfNoneMatch: aws.String("*"), MetadataDirective: types.MetadataDirectiveReplace, Metadata: saved})
 		return settle(err)
 	}
-	return m.parts(ctx, key, from, etag, size)
+	return m.parts(ctx, key, from, etag, size, saved)
+}
+
+// savedOf is when the source was saved: its own save time if it is a copy, else its LastModified.
+func savedOf(src *s3.HeadObjectOutput) time.Time {
+	if t, err := time.Parse(time.RFC3339Nano, src.Metadata[cache.SavedMetadata]); err == nil {
+		return t
+	}
+	return aws.ToTime(src.LastModified)
 }
 
 // settle names a single copy's end. Its two preconditions both answer 412: the peer has the key, or the source is
@@ -118,8 +130,8 @@ func settle(err error) (Outcome, error) {
 	return "", err
 }
 
-func (m *Mirror) parts(ctx context.Context, key, from, etag string, size int64) (Outcome, error) {
-	mp, err := m.Dst.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: &m.DstBucket, Key: &key})
+func (m *Mirror) parts(ctx context.Context, key, from, etag string, size int64, meta map[string]string) (Outcome, error) {
+	mp, err := m.Dst.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: &m.DstBucket, Key: &key, Metadata: meta})
 	if err != nil {
 		return "", err
 	}

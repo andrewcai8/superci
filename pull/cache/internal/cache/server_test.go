@@ -273,6 +273,24 @@ func TestForgedTokensAreRefused(t *testing.T) {
 	}
 }
 
+func TestRestoreKeysGoByTheSaveTimeAMirroredCopyKeeps(t *testing.T) {
+	r := newRig(t)
+	pr := r.token("77", "refs/pull/7/merge:rw", "refs/heads/main:r")
+	base := time.Now()
+	k := func(key string) string { return "v1/d/77/refs%2Fheads%2Fmain/" + version + "/" + key }
+	// Saved in this region an hour ago; an older seed saved three hours ago and copied in a minute ago.
+	r.mem.Set(k("git-seed-2"), []byte("saved here, newer"), base.Add(-time.Hour))
+	r.mem.SetCopy(k("git-seed-1"), []byte("copied in, older"), base.Add(-3*time.Hour), base.Add(-time.Minute))
+	if got := r.restore(pr, "git-seed-latest", "git-seed-"); got.matched != "git-seed-2" {
+		t.Fatalf("restore = %+v: a copy's later copy time made the older save the newest", got)
+	}
+	// A copy of a save newer than any here is the newest.
+	r.mem.SetCopy(k("git-seed-3"), []byte("copied in, newest"), base.Add(-30*time.Minute), base)
+	if got := r.restore(pr, "git-seed-latest", "git-seed-"); got.matched != "git-seed-3" || string(got.body) != "copied in, newest" {
+		t.Fatalf("restore = %+v: the newest save, copied in, is the match", got)
+	}
+}
+
 func TestRestoreKeysTakeTheNewestInTheFirstScopeThatHasOne(t *testing.T) {
 	r := newRig(t)
 	pr := r.token("77", "refs/pull/7/merge:rw", "refs/heads/main:r")

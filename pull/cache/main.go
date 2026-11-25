@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -253,6 +254,8 @@ func mirrorAll(lg *log.Logger, args []string) error {
 	if err != nil {
 		return err
 	}
+	// Oldest first, so the copies are made in the order of the saves.
+	sort.Slice(objs, func(i, j int) bool { return objs[i].Modified.Before(objs[j].Modified) })
 	counts := map[mirror.Outcome]int{}
 	for _, o := range objs {
 		out, err := m.Copy(ctx, o.Key)
