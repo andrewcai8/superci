@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -159,26 +160,16 @@ func (s *State) Noticed(id string) (m *Machine, idle *Runner) {
 	return m, nil
 }
 
-// Deficit reserves the capacity to launch now, under a new round's name. It launches no more machines than about
-// limit can be waiting for their runner at once (a machine that waits is paid for and does nothing), and none while
-// the spend cap holds.
+// Deficit reserves the capacity to launch now, under a new round's name. It launches no more than leaves limit of
+// the set's machines waiting for their runner at once (a machine that waits is paid for and does nothing), and none
+// while the spend cap holds or before the queue is known.
 func (s *State) Deficit(now time.Time, limit int) (round string, n int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.capped || !s.known {
 		return "", 0
 	}
-	n = s.desired() - s.live()
-	unregistered := 0
-	for _, k := range s.reserved {
-		unregistered += k
-	}
-	for _, m := range s.machines {
-		if !m.Ending && m.Runner == nil {
-			unregistered++
-		}
-	}
-	n = min(n, limit-unregistered)
+	n = min(s.desired()-s.live(), limit-s.unregistered())
 	if n <= 0 {
 		return "", 0
 	}
@@ -187,6 +178,22 @@ func (s *State) Deficit(now time.Time, limit int) (round string, n int) {
 	s.reserved[round] = n
 	return round, n
 }
+
+// unregistered is the machines asked for or running that hold no runner yet.
+func (s *State) unregistered() int {
+	n := 0
+	for _, k := range s.reserved {
+		n += k
+	}
+	for _, m := range s.machines {
+		if !m.Ending && m.Runner == nil {
+			n++
+		}
+	}
+	return n
+}
+
+func (s *State) Unregistered() int { s.mu.Lock(); defer s.mu.Unlock(); return s.unregistered() }
 
 // Launched ends a round's reservation: the machines EC2 started join the supply.
 func (s *State) Launched(round string, got []*Machine, now time.Time) {
@@ -528,6 +535,25 @@ func (s *State) Surplus(now time.Time, hold time.Duration, limit int) []*Machine
 		}
 	}
 	return out
+}
+
+// Shed ends up to n machines that hold no runner and have waited for one over three minutes, the longest-waiting
+// first: the registration budget cannot serve them soon, and a machine that waits is paid for.
+func (s *State) Shed(now time.Time, n int) []*Machine {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var waiting []*Machine
+	for _, m := range s.machines {
+		if !m.Ending && m.Runner == nil && now.Sub(m.Launched) > 3*time.Minute {
+			waiting = append(waiting, m)
+		}
+	}
+	sort.Slice(waiting, func(i, j int) bool { return waiting[i].Launched.Before(waiting[j].Launched) })
+	waiting = waiting[:min(n, len(waiting))]
+	for _, m := range waiting {
+		m.Ending = true
+	}
+	return waiting
 }
 
 // Removed settles a fenced removal: removed, the machine ends; refused because it took a job, it is busy.

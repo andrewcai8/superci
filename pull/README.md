@@ -206,3 +206,24 @@ resource tagged `purpose=superci-pull`.
 **Load test.** `bench/workflow.py` writes the workflow (a wave of mixed sizes per push, a matrix burst for a push
 whose message says "burst"); `bench/measure.py BRANCH SINCE UNTIL listener.jsonl` measures it against the pass bar;
 `bench/orphans.py` lists orphaned machines and runners.
+
+## Measured (Nov 25 2026, megpt-mono)
+
+| Test | Run | Result |
+| --- | --- | --- |
+| Smoke, one job per size | 45568198731 | 5/5 succeeded; jobs on a pool runner (2, 4, 8 vCPU) waited 1 s, the 16 and 32 vCPU jobs (no pool) 16 and 17 s, from launch to a registered runner in 11-15 s; each ran on its size (c8a.large, c5a.xlarge, c5a.2xlarge, c7i-flex.4xlarge, c6a.8xlarge; `nproc` 2, 4, 8, 16, 32) |
+| Split, 40 jobs on `superci-4cpu` run as two sets | 45568606692 | GitHub gave 20 to `superci-4cpu` and 20 to `superci-4cpu-2`; 40/40 succeeded |
+| Crash mid-run, 30 jobs over every size | 45569779369 | `kill -9` of the process at 07:39:39, then the listener's instance terminated at 07:40:40: 30/30 succeeded; at +10 min, 0 orphaned machines, 0 orphaned runners, and `Orphans` 0 in every period |
+
+Crash details. systemd restarted the process in 5 s. GitHub refused its sessions as conflicts while the dead
+process's lapsed: 30 to 47 s per set. In that time the guard held every machine at Wait; no machine was told to end
+and nothing launched (before the guard existed, the same crash ended 12 waiting machines). The Auto Scaling group
+noticed the terminated instance in 55 s and started a replacement, which took the Elastic IP and answered machines
+86 s after the termination, with all six sessions open at once (the dead ones had lapsed) and every machine adopted.
+A graceful restart opens every session 9 s after the stop, with no conflict.
+
+GitHub's registration cap binds the organization. The runner-id advance showed 2.9 to 5.3 registrations a second
+across the organization from 06:54 to 08:00Z (Blacksmith, the push plane and us), so at the 20% margin the spare
+rate was 0 to 1.1 a second. In 07:18-07:24Z megpt-mono started 1.93 jobs a second on runners (all Blacksmith) while
+runner ids advanced 3.83 a second, so about half of the organization's registrations are not megpt-mono's jobs
+(other repositories, or Blacksmith registering more runners than it runs jobs); which, I did not determine.

@@ -168,3 +168,18 @@ func TestUntilTheQueueIsKnownMachinesWaitAndNothingEndsOrLaunches(t *testing.T) 
 		t.Fatalf("after the statistics (three jobs for three machines): %v, want Grant", v)
 	}
 }
+
+func TestShedEndsOnlyMachinesLongWaitingWithNoRunner(t *testing.T) {
+	s := NewState("set", 0, 10)
+	old, fresh := machines(3, t0), machines(1, t0.Add(9*time.Minute))
+	fresh[0].ID = "i-new"
+	s.Seen("us-east-1", append(old, fresh...), t0)
+	s.Registered("i-0001", &Runner{ID: 5, Name: "set-i-0001-aa", Issued: t0})
+	got := s.Shed(t0.Add(10*time.Minute), 5)
+	if len(got) != 2 || got[0].ID == "i-0001" || got[1].ID == "i-0001" {
+		t.Fatalf("shed %v: want the two old machines with no runner, not the one with a runner nor the new one", ids(got))
+	}
+	if snap := s.Snapshot(t0.Add(10 * time.Minute)); snap.Ending != 2 {
+		t.Fatalf("ending %d", snap.Ending)
+	}
+}

@@ -395,7 +395,8 @@ func (s *scaler) Scale(ctx context.Context, msg *scaleset.RunnerScaleSetMessage)
 
 // launcher turns a set's deficit into fleet requests. A message wakes it; it waits a moment so a burst's messages make
 // few launches, and lets several launches run at once (an instant fleet in us-east-1 can take half a minute to
-// answer). It launches no more machines than the registration budget can serve in about a minute and a half.
+// answer). Across every set, no more machines wait for a runner than the registration budget can serve in about a
+// minute and a half.
 func (l *Listener) launcher(ctx context.Context, s *Set, wake chan struct{}) {
 	slots := make(chan struct{}, 16)
 	for {
@@ -413,6 +414,11 @@ func (l *Listener) launcher(ctx context.Context, s *Set, wake chan struct{}) {
 		}
 		now := time.Now()
 		limit := max(10, int(l.budget.Estimate(now).SpareRate*90))
+		for _, other := range l.sets {
+			if other != s {
+				limit -= other.state.Unregistered()
+			}
+		}
 		round, n := s.state.Deficit(now, limit)
 		if n == 0 {
 			<-slots
@@ -528,6 +534,21 @@ func (l *Listener) reconciler(ctx context.Context, refresh func(context.Context,
 		capped := l.spend.Over()
 		var running []Machine
 		var end []*Machine
+		// Machines launched for registrations the organization no longer leaves us wait paid for: past twice what the
+		// budget serves in 90 s (once the organization's rate is measured), the excess ends (it holds no runner).
+		est := l.budget.Estimate(now)
+		limit, waiting := max(10, int(est.SpareRate*90)), 0
+		for _, s := range l.sets {
+			waiting += s.state.Unregistered()
+		}
+		if excess := waiting - limit; est.Known && waiting > 2*limit {
+			for _, s := range l.sets {
+				shed := s.state.Shed(now, excess)
+				excess -= len(shed)
+				end = append(end, shed...)
+			}
+			slog.Warn("shed waiting machines", "waiting", waiting, "limit", limit, "shed", waiting-limit-excess)
+		}
 		for _, s := range l.sets {
 			s.state.SetCapped(capped)
 			if stale := s.state.MarkStale(now, 3*time.Minute); stale > 0 {
