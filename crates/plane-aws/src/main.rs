@@ -3,7 +3,7 @@
 //! under /superci/<id>/ in SSM Parameter Store, written by the dashboard; a schedule calls the sweep every minute,
 //! and the function calls itself for a sweep sooner than that (see `Scheduled`). Machines in this account are
 //! started with the function's own role, so AWS needs no OpenID Connect here.
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD;
@@ -58,7 +58,15 @@ const AGAIN: [&str; 6] = ["ThrottlingException", "ProvisionedThroughputExceededE
 /// day's in a partition of its own, as every job's end writes one). The layouts before are read where they kept a record until `migrate` has
 /// moved what is left, a little at each sweep (then `layout` says so): every record in the one partition `s` (before
 /// 0.19.0), then each kind whole in its own.
-struct Dynamo<'a> { http: &'a dyn Http, table: String, region: String, layout: std::cell::Cell<Option<u8>> }
+struct Dynamo<'a> { http: &'a dyn Http, table: String, region: String, layout: std::cell::Cell<Option<u8>>, naps: &'a dyn Naps }
+
+/// How a request waits before it asks again: the thread sleeps (a Lambda answers one request at a time).
+#[async_trait(?Send)]
+trait Naps { async fn nap(&self, ms: u64); }
+
+struct Sleeps;
+#[async_trait(?Send)]
+impl Naps for Sleeps { async fn nap(&self, ms: u64) { std::thread::sleep(Duration::from_millis(ms)) } }
 
 /// The kinds read and written for every job and every event, each spread over `BUCKETS` partitions.
 const SPREAD: [&str; 10] = ["job", "live", "recent", "runner", "hello", "shape", "glive", "cachem", "active", "day"];
@@ -116,7 +124,7 @@ impl Dynamo<'_> {
                 "application/x-amz-json-1.0", Some(&body), &own_credentials(), now_ms()).await {
                 Err(e) if AGAIN.iter().any(|kind| e.starts_with(kind)) => {
                     let r = superci_core::crypto::random_bytes(2);
-                    std::thread::sleep(std::time::Duration::from_millis(u16::from_le_bytes([r[0], r[1]]) as u64 % most_ms + 1));
+                    self.naps.nap(u16::from_le_bytes([r[0], r[1]]) as u64 % most_ms + 1).await;
                     most_ms = (most_ms * 2).min(5000);
                 }
                 done => return done,
@@ -345,7 +353,7 @@ const SOON_MS: u64 = 30_000;
 /// answer; that call waits out the time and sweeps (see `main`). One such call is on its way at a time, however
 /// many jobs ask (claimed in the table): a sweep is for every job, and asks for the next itself while any waits.
 /// Where it may not call itself (a role from before), the schedule does it, as it did.
-struct Scheduled<'a> { http: &'a dyn Http, store: &'a Dynamo<'a>, region: &'a str, function: &'a str,
+struct Scheduled<'a> { http: &'a dyn Http, store: &'a Dynamo<'a>, region: &'a str, function: &'a str, clock: &'a dyn Clock,
     /// What is to be done once the request at hand is answered (see `main`).
     later: &'a std::cell::RefCell<Vec<String>> }
 
@@ -358,29 +366,29 @@ const WAKING: &str = "aws:waking";
 /// Claims the sweep for this request (see `SWEEPING`): the claim, to give back once done, or none while another sweep is
 /// going. A claim older than a minute and a half is of a sweep that was cut off, taken over by one alone. (The claim not
 /// read, as when DynamoDB is throttled: an error, and no sweep. Two at once would each act on the jobs.)
-fn sweep_claim(store: &Dynamo, now: u64) -> io::Result<Option<String>> {
+async fn sweep_claim(store: &Dynamo<'_>, now: u64) -> io::Result<Option<String>> {
     let token = now.to_string();
-    if !block_on(store.put_if_absent(SWEEPING, token.clone()))? {
-        let held = block_on(store.get(SWEEPING))?;
+    if !store.put_if_absent(SWEEPING, token.clone()).await? {
+        let held = store.get(SWEEPING).await?;
         let since = held.as_deref().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
-        if now.saturating_sub(since) < 90_000 || !block_on(store.swap(SWEEPING, held.as_deref(), token.clone()))? { return Ok(None) }
+        if now.saturating_sub(since) < 90_000 || !store.swap(SWEEPING, held.as_deref(), token.clone()).await? { return Ok(None) }
     }
     Ok(Some(token))
 }
 
 /// A sweep's claim given back once it is done: only while it is still its own (one cut off, as far as another could tell,
 /// may end after that one took its claim over; the claim is that one's then).
-fn sweep_done(store: &Dynamo, token: &str) { let _ = block_on(store.delete_when(SWEEPING, token)); }
+async fn sweep_done(store: &Dynamo<'_>, token: &str) { let _ = store.delete_when(SWEEPING, token).await; }
 
 #[async_trait(?Send)]
 impl Timer for Scheduled<'_> {
     async fn wake_in(&self, ms: u64) -> io::Result<()> {
         if ms > SOON_MS || self.function.is_empty() { return Ok(()) }
-        let at = now_ms() + ms;
+        let at = self.clock.now_ms() + ms;
         // (Nothing here fails what asked: the schedule's sweep comes within the minute whatever happens.)
         if !self.store.put_if_absent(WAKING, at.to_string()).await.unwrap_or(false) {
             let coming = self.store.get(WAKING).await.ok().flatten().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
-            if now_ms() < coming + SOON_MS { return Ok(()) }
+            if self.clock.now_ms() < coming + SOON_MS { return Ok(()) }
             let _ = self.store.put(WAKING, at.to_string()).await;
         }
         let body = json!({ "superci": "wake", "at": at }).to_string();
@@ -394,24 +402,24 @@ impl Timer for Scheduled<'_> {
         Ok(())
     }
     /// A Lambda answers one request at a time: it simply waits.
-    async fn pause(&self, ms: u64) { std::thread::sleep(Duration::from_millis(ms)) }
+    async fn pause(&self, ms: u64) { self.store.naps.nap(ms).await }
     /// Done by `main` once the answer is given: the function goes on running until it asks for its next request.
     fn later(&self, what: &str) -> bool { self.later.borrow_mut().push(what.to_string()); true }
 }
 
 /// The secrets under /superci/<id>/, read at most every 15 seconds.
-struct Secrets { at: Option<Instant>, values: Vec<(String, String)> }
+struct Secrets { at: Option<u64>, values: Vec<(String, String)> }
 
 impl Secrets {
     /// `fresh`: a dashboard key not seen yet arrived (a new session just set it): read again now, at most every second.
-    fn refresh(&mut self, http: &Blocking, region: &str, plane_id: &str, fresh: bool) -> io::Result<()> {
-        let within = if fresh { Duration::from_secs(1) } else { Duration::from_secs(15) };
-        if self.at.is_some_and(|t| t.elapsed() < within) { return Ok(()) }
+    async fn refresh(&mut self, http: &dyn Http, clock: &dyn Clock, region: &str, plane_id: &str, fresh: bool) -> io::Result<()> {
+        let within = if fresh { 1_000 } else { 15_000 };
+        if self.at.is_some_and(|t| clock.now_ms().saturating_sub(t) < within) { return Ok(()) }
         let (mut values, mut next) = (vec![], None::<String>);
         loop {
             let mut body = json!({ "Path": format!("/superci/{plane_id}/"), "Recursive": false, "WithDecryption": true, "MaxResults": 10 });
             if let Some(n) = &next { body["NextToken"] = json!(n) }
-            let v = block_on(aws::json_call(http, "POST", &format!("https://ssm.{region}.amazonaws.com/"), region, "ssm", Some("AmazonSSM.GetParametersByPath"), "application/x-amz-json-1.1", Some(&body), &own_credentials(), now_ms()))?;
+            let v = aws::json_call(http, "POST", &format!("https://ssm.{region}.amazonaws.com/"), region, "ssm", Some("AmazonSSM.GetParametersByPath"), "application/x-amz-json-1.1", Some(&body), &own_credentials(), now_ms()).await?;
             for p in v["Parameters"].as_array().into_iter().flatten() {
                 if let (Some(n), Some(val)) = (p["Name"].as_str(), p["Value"].as_str()) { values.push((n.rsplit('/').next().unwrap_or(n).to_string(), val.to_string())) }
             }
@@ -419,7 +427,7 @@ impl Secrets {
             if next.is_none() { break }
         }
         self.values = values;
-        self.at = Some(Instant::now());
+        self.at = Some(clock.now_ms());
         Ok(())
     }
 }
@@ -468,6 +476,62 @@ fn converter(api: &str) -> ! {
     }
 }
 
+/// What one invocation is run with: where it is, what it reaches the world through, and the container it runs in (its
+/// secrets as last read, its cache). Lambda gives `main` these; the burst harness gives its own (see `burst`).
+struct Env<'a> {
+    http: &'a dyn Http, clock: &'a dyn Clock, naps: &'a dyn Naps, region: &'a str, table: &'a str, plane_id: &'a str, function: &'a str,
+    account_id: &'a str, cache: &'a Cache, containers: Option<&'a dyn superci_core::io::Containers>, configure: &'a dyn Fn(&Secrets, &str) -> Config,
+}
+
+/// One invocation: its answer, given to `answer` as soon as it is known, then what was left for after it.
+async fn invoke(env: &Env<'_>, secrets: &mut Secrets, event: &Value, answer: &mut dyn FnMut(io::Result<Value>)) {
+    // Whoever comes with a key (the dashboard, a command) gets the settings as they are now, not as they
+    // were up to fifteen seconds ago: a change is seen at once, and the next one starts from it. A key not
+    // known yet is a new session's, set a moment ago. Webhooks and the sweep carry none, and use what was read.
+    let bearer = event["headers"]["authorization"].as_str().and_then(|a| a.strip_prefix("Bearer ")).unwrap_or_default();
+    let unknown = bearer.len() >= 16;
+    // A move's steps need what the dashboard wrote a moment ago (the App, GitLab): read fresh for them too.
+    let moving = event["rawPath"].as_str().is_some_and(|p| p.starts_with("/move/"));
+    let refreshed = secrets.refresh(env.http, env.clock, env.region, env.plane_id, unknown || moving).await;
+    let config = (env.configure)(secrets, env.account_id);
+    let store = Dynamo { http: env.http, table: env.table.to_string(), region: env.region.to_string(), layout: std::cell::Cell::new(None), naps: env.naps };
+    let later = std::cell::RefCell::new(vec![]);
+    let timer = Scheduled { http: env.http, store: &store, region: env.region, function: env.function, clock: env.clock, later: &later };
+    let plane = ControlPlane { store: &store, http: env.http, clock: env.clock, timer: &timer, config: &config, cache: env.cache, containers: env.containers };
+    let outcome: io::Result<Value> = async {
+        refreshed?;
+        // One sweep at a time: the schedule's and the function's own could otherwise each start a machine for
+        // the same waiting job. One that finds another going leaves it to that one (which asks for the next
+        // itself); a note older than a minute and a half is of a sweep that was cut off, taken over by one alone.
+        // (The note not read, as when DynamoDB is throttled: no sweep. Two at once would each act on the jobs.)
+        let sweep = || async {
+            let Some(token) = sweep_claim(&store, env.clock.now_ms()).await? else { return Ok(json!({ "swept": false })) };
+            let done = plane.alarm().await.map(|_| json!({ "swept": true }));
+            sweep_done(&store, &token).await;
+            done
+        };
+        if event["superci"] == "sweep" { return sweep().await }
+        // Its own call for a sweep sooner than the schedule's: the time is waited out here, then the sweep.
+        if event["superci"] == "wake" {
+            let at = event["at"].as_u64().unwrap_or(0);
+            env.naps.nap(at.saturating_sub(env.clock.now_ms()).min(SOON_MS)).await;
+            let _ = store.delete(WAKING).await;
+            return sweep().await
+        }
+        Ok(response(plane.handle(request(event)).await))
+    }.await;
+    answer(outcome);
+    // What was left for after the answer (a queued job's machine: GitHub has its answer, and AWS is asked now).
+    // The function runs on until it asks for its next request, and takes no other meanwhile.
+    let url = request(event).url;
+    // (One thing done may leave another: each in its turn, until none is left.)
+    loop {
+        let next = { let mut left = later.borrow_mut(); if left.is_empty() { None } else { Some(left.remove(0)) } };
+        let Some(what) = next else { break };
+        if let Err(e) = plane.later(&url, &what).await { eprintln!("superci: {what}: {e}") }
+    }
+}
+
 fn main() {
     let api = std::env::var("AWS_LAMBDA_RUNTIME_API").expect("runs in AWS Lambda");
     if std::env::var("SUPERCI_CONVERTER").is_ok_and(|v| v == "1") { converter(&api) }
@@ -483,56 +547,19 @@ fn main() {
         let id = next.headers().get("lambda-runtime-aws-request-id").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
         let account_id = next.headers().get("lambda-runtime-invoked-function-arn").and_then(|v| v.to_str().ok()).and_then(|a| a.split(':').nth(4)).unwrap_or_default().to_string();
         let event: Value = next.body_mut().read_json().unwrap_or_default();
-        // Whoever comes with a key (the dashboard, a command) gets the settings as they are now, not as they
-        // were up to fifteen seconds ago: a change is seen at once, and the next one starts from it. A key not
-        // known yet is a new session's, set a moment ago. Webhooks and the sweep carry none, and use what was read.
-        let bearer = event["headers"]["authorization"].as_str().and_then(|a| a.strip_prefix("Bearer ")).unwrap_or_default();
-        let unknown = bearer.len() >= 16;
-        // A move's steps need what the dashboard wrote a moment ago (the App, GitLab): read fresh for them too.
-        let moving = event["rawPath"].as_str().is_some_and(|p| p.starts_with("/move/"));
-        let refreshed = secrets.refresh(&http, &region, &plane_id, unknown || moving);
-        let config = config(&secrets, &account_id);
-        let store = Dynamo { http: &http, table: table.clone(), region: region.clone(), layout: std::cell::Cell::new(None) };
-        let later = std::cell::RefCell::new(vec![]);
-        let timer = Scheduled { http: &http, store: &store, region: &region, function: &function, later: &later };
-        let plane = ControlPlane { store: &store, http: &http, clock: &SystemClock, timer: &timer, config: &config, cache: &cache, containers: None };
-        let outcome: io::Result<Value> = (|| {
-            refreshed?;
-            // One sweep at a time: the schedule's and the function's own could otherwise each start a machine for
-            // the same waiting job. One that finds another going leaves it to that one (which asks for the next
-            // itself); a note older than a minute and a half is of a sweep that was cut off, taken over by one alone.
-            // (The note not read, as when DynamoDB is throttled: no sweep. Two at once would each act on the jobs.)
-            let sweep = || -> io::Result<Value> {
-                let Some(token) = sweep_claim(&store, now_ms())? else { return Ok(json!({ "swept": false })) };
-                let done = block_on(plane.alarm()).map(|_| json!({ "swept": true }));
-                sweep_done(&store, &token);
-                done
+        let env = Env { http: &http, clock: &SystemClock, naps: &Sleeps, region: &region, table: &table, plane_id: &plane_id, function: &function, account_id: &account_id,
+            cache: &cache, containers: None, configure: &config };
+        block_on(invoke(&env, &mut secrets, &event, &mut |outcome| {
+            let _ = match outcome {
+                Ok(v) => runtime.post(&format!("http://{api}/2018-06-01/runtime/invocation/{id}/response")).send_json(v),
+                Err(e) => { eprintln!("superci: {e}"); runtime.post(&format!("http://{api}/2018-06-01/runtime/invocation/{id}/error")).send_json(json!({ "errorMessage": e, "errorType": "superci" })) }
             };
-            if event["superci"] == "sweep" { return sweep() }
-            // Its own call for a sweep sooner than the schedule's: the time is waited out here, then the sweep.
-            if event["superci"] == "wake" {
-                let at = event["at"].as_u64().unwrap_or(0);
-                std::thread::sleep(Duration::from_millis(at.saturating_sub(now_ms()).min(SOON_MS)));
-                let _ = block_on(store.delete(WAKING));
-                return sweep()
-            }
-            Ok(response(block_on(plane.handle(request(&event)))))
-        })();
-        let _ = match outcome {
-            Ok(v) => runtime.post(&format!("http://{api}/2018-06-01/runtime/invocation/{id}/response")).send_json(v),
-            Err(e) => { eprintln!("superci: {e}"); runtime.post(&format!("http://{api}/2018-06-01/runtime/invocation/{id}/error")).send_json(json!({ "errorMessage": e, "errorType": "superci" })) }
-        };
-        // What was left for after the answer (a queued job's machine: GitHub has its answer, and AWS is asked now).
-        // The function runs on until it asks for its next request, and takes no other meanwhile.
-        let url = request(&event).url;
-        // (One thing done may leave another: each in its turn, until none is left.)
-        loop {
-            let next = { let mut left = later.borrow_mut(); if left.is_empty() { None } else { Some(left.remove(0)) } };
-            let Some(what) = next else { break };
-            if let Err(e) = block_on(plane.later(&url, &what)) { eprintln!("superci: {what}: {e}") }
-        }
+        }));
     }
 }
+
+#[cfg(test)]
+mod burst;
 
 #[cfg(test)]
 mod tests {
@@ -542,6 +569,7 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::collections::BTreeMap;
+    use std::time::Instant;
 
     /// DynamoDB in memory: items by (partition, key), with the calls the store makes. It answers a page of two items at
     /// a time (so the store pages), leaves some keys of a batch for later the first time, and says it is throttled
@@ -673,7 +701,7 @@ mod tests {
         }
     }
 
-    fn store(fake: &FakeDynamo) -> Dynamo<'_> { Dynamo { http: fake, table: "superci-plane-t".into(), region: "us-east-1".into(), layout: std::cell::Cell::new(None) } }
+    fn store(fake: &FakeDynamo) -> Dynamo<'_> { Dynamo { http: fake, table: "superci-plane-t".into(), region: "us-east-1".into(), layout: std::cell::Cell::new(None), naps: &Sleeps } }
 
     /// Lambda taking (or refusing) the function's calls to itself; DynamoDB as above.
     #[derive(Default)]
@@ -692,7 +720,7 @@ mod tests {
         fake.items.borrow_mut().insert(("layout".into(), "layout".into()), json!({ "p": { "S": "layout" }, "k": { "S": "layout" }, "v": { "S": "kinds" } }));
         let s = store(&fake);
         let (lambda, later) = (Lambda::default(), RefCell::new(vec![]));
-        let timer = Scheduled { http: &lambda, store: &s, region: "us-east-1", function: "superci-plane-t", later: &later };
+        let timer = Scheduled { http: &lambda, store: &s, region: "us-east-1", function: "superci-plane-t", clock: &SystemClock, later: &later };
         // Later than half a minute: the schedule's minute does it.
         block_on(timer.wake_in(60_000)).unwrap();
         assert!(lambda.called.borrow().is_empty());
@@ -716,7 +744,7 @@ mod tests {
         block_on(timer.wake_in(1_000)).unwrap();
         assert_eq!(block_on(s.get(WAKING)).unwrap(), None);
         // A function with no name (not on Lambda) calls nothing; what is left for later is kept for after the answer.
-        let none = Scheduled { http: &lambda, store: &s, region: "us-east-1", function: "", later: &later };
+        let none = Scheduled { http: &lambda, store: &s, region: "us-east-1", function: "", clock: &SystemClock, later: &later };
         block_on(none.wake_in(1_000)).unwrap();
         assert_eq!(lambda.called.borrow().len(), 3);
         assert!(timer.later("start job:1"));
@@ -939,7 +967,7 @@ mod tests {
         fake.items.borrow_mut().insert(("layout".into(), "layout".into()), json!({ "p": { "S": "layout" }, "k": { "S": "layout" }, "v": { "S": "kinds" } }));
         let s = store(&fake);
         let (lambda, later) = (Lambda::default(), RefCell::new(vec![]));
-        let timer = Scheduled { http: &lambda, store: &s, region: "us east-1", function: "superci-plane-t", later: &later };
+        let timer = Scheduled { http: &lambda, store: &s, region: "us east-1", function: "superci-plane-t", clock: &SystemClock, later: &later };
         block_on(timer.wake_in(1_000)).unwrap();
         assert!(lambda.called.borrow().is_empty());
         assert_eq!(block_on(s.get(WAKING)).unwrap(), None);
@@ -1278,13 +1306,13 @@ mod tests {
         fake.items.borrow_mut().insert(("layout".into(), "layout".into()), json!({ "p": { "S": "layout" }, "k": { "S": "layout" }, "v": { "S": "spread" } }));
         let s = store(&fake);
         let t = 1_790_000_000_000;
-        let first = sweep_claim(&s, t).unwrap().expect("none going");
-        assert!(sweep_claim(&s, t + 30_000).unwrap().is_none(), "one going");
-        let second = sweep_claim(&s, t + 91_000).unwrap().expect("the first cut off, as far as can be told");
-        sweep_done(&s, &first);
+        let first = block_on(sweep_claim(&s, t)).unwrap().expect("none going");
+        assert!(block_on(sweep_claim(&s, t + 30_000)).unwrap().is_none(), "one going");
+        let second = block_on(sweep_claim(&s, t + 91_000)).unwrap().expect("the first cut off, as far as can be told");
+        block_on(sweep_done(&s, &first));
         assert_eq!(block_on(s.get(SWEEPING)).unwrap(), Some(second.clone()), "the second's claim kept");
-        assert!(sweep_claim(&s, t + 92_000).unwrap().is_none(), "no third beside the second");
-        sweep_done(&s, &second);
-        assert!(sweep_claim(&s, t + 93_000).unwrap().is_some(), "free once the second is done");
+        assert!(block_on(sweep_claim(&s, t + 92_000)).unwrap().is_none(), "no third beside the second");
+        block_on(sweep_done(&s, &second));
+        assert!(block_on(sweep_claim(&s, t + 93_000)).unwrap().is_some(), "free once the second is done");
     }
 }

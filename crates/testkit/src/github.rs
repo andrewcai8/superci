@@ -441,7 +441,8 @@ impl GitHub {
             // The App uninstalled (docs.github.com/rest/apps/apps#delete-an-installation-for-the-authenticated-app).
             ("DELETE", ["app", "installations", id]) if *id == INSTALLATION.to_string() => { h.uninstalled = true; Some(Response::new(204, "text/plain", "")) }
             // The App's deliveries: newest first, each without what was sent and answered; one whole; sent again.
-            ("GET", ["app", "hook", "deliveries"]) => ok(200, Value::Array(h.deliveries.iter().rev().map(|d| { let mut d = d.clone(); let o = d.as_object_mut().unwrap(); o.remove("request"); o.remove("response"); d }).collect())),
+            // (A page of 100 at most, as GitHub answers `per_page=100`: what is older is on the pages after it.)
+            ("GET", ["app", "hook", "deliveries"]) => ok(200, Value::Array(h.deliveries.iter().rev().take(100).map(|d| { let mut d = d.clone(); let o = d.as_object_mut().unwrap(); o.remove("request"); o.remove("response"); d }).collect())),
             ("GET", ["app", "hook", "deliveries", id]) => match h.deliveries.iter().find(|d| d["id"].to_string() == *id) { Some(d) => ok(200, d.clone()), None => ok(404, json!({ "message": "Not Found", "status": "404" })) },
             ("POST", ["app", "hook", "deliveries", id, "attempts"]) => { let id: u64 = id.parse().ok()?; h.attempts.push(id); ok(202, json!({})) }
             // The runner image maker's public list of builds, as GitHub served it (`fixtures/aws/public/image-list.jsonl`).
