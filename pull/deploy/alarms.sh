@@ -36,6 +36,8 @@ alarm registration-errors "A runner registration failed other than by GitHub's c
   RegistrationErrors Sum GreaterThanThreshold 0 300 1 1 notBreaching
 alarm queue-wait-p90 "Jobs on superci waited over 60 s at p90 in two 5-minute periods running" \
   QueueWait p90 GreaterThanThreshold 60 300 2 2 notBreaching
+alarm pool-at-floor "A set's pool has stayed at the hour's floor for 5 minutes while more of its jobs waited than it had idle runners: the pool reads no arrivals" \
+  PoolsAtFloor Minimum GreaterThanOrEqualToThreshold 1 60 5 5 notBreaching
 alarm orphans "Machines told to end still running, runners whose removal keeps failing, or machines of no configured set, for 10 minutes" \
   Orphans Maximum GreaterThanThreshold 0 300 2 2 notBreaching
 math spend-daily "Today's estimated spend passed 80% of the daily cap the listener runs with: at the cap it launches nothing and CI on superci stops until 00:00 UTC" \

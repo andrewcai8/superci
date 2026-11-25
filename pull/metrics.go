@@ -26,6 +26,7 @@ type Metrics struct {
 	Failed  int       // registrations that failed otherwise this minute
 	Short   int       // machines asked of EC2 this minute that did not start (capacity, quotas)
 	Stalled int       // sets whose jobs have waited 10 minutes with none started
+	AtFloor int       // sets whose pool is at the hour's floor while more jobs wait than it has idle runners
 }
 
 func publish(ctx context.Context, cw *cloudwatch.Client, m Metrics, now time.Time) {
@@ -49,6 +50,7 @@ func publish(ctx context.Context, cw *cloudwatch.Client, m Metrics, now time.Tim
 		d("SpendCapped", b2f(m.Spend.Capped), cwtypes.StandardUnitCount),
 		d("SpendDailyCapUSD", m.Spend.DailyCap, cwtypes.StandardUnitNone),
 		d("StalledSets", float64(m.Stalled), cwtypes.StandardUnitCount),
+		d("PoolsAtFloor", float64(m.AtFloor), cwtypes.StandardUnitCount),
 	}
 	if m.Budget.Known {
 		data = append(data, d("OrgRegistrationRate", m.Budget.OrgRate, cwtypes.StandardUnitCountSecond),

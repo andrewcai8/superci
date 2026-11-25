@@ -52,6 +52,7 @@ func main() {
 		tlsParam   = flag.String("tls-param", "/superci-pull/tls", "SSM SecureString (us-east-1) holding the listener's TLS key")
 		spendParam = flag.String("spend-param", "/superci-pull/spend", "SSM parameter (us-east-1) holding today's and this month's spend")
 		claims     = flag.String("claims", "", "S3 bucket (us-east-1) of the machines' claims; superci-pull-claims-<account> by default")
+		poolParam  = flag.String("pool-param", "/superci-pull/pool", "SSM parameter (us-east-1) holding each set's burst and launch times across a restart")
 		noMetrics  = flag.Bool("no-metrics", false, "publish no CloudWatch metrics")
 		deleteSets = flag.Bool("delete-scale-sets", false, "delete every configured scale set and exit")
 		validate   = flag.Bool("validate", false, "check the override file named by -config over the built-in config, and exit")
@@ -74,7 +75,7 @@ func main() {
 	slog.Info("start", "revision", revision)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	err := run(ctx, flags{*configPath, *publicIP, pairs(*groups), *listen, *admin, *tlsParam, *spendParam, *claims, *noMetrics, *deleteSets})
+	err := run(ctx, flags{*configPath, *publicIP, pairs(*groups), *listen, *admin, *tlsParam, *spendParam, *claims, *poolParam, *noMetrics, *deleteSets})
 	if err != nil && !errors.Is(err, context.Canceled) {
 		slog.Error("exit", "err", err.Error())
 		os.Exit(1)
@@ -87,6 +88,7 @@ type flags struct {
 	listen, admin         string
 	tlsParam, spendParam  string
 	claims                string
+	poolParam             string
 	noMetrics, deleteSets bool
 }
 
@@ -225,6 +227,9 @@ func run(ctx context.Context, f flags) error {
 		slog.Warn("draining scale set the config no longer has", "name", d.Name, "id", d.ID)
 		l.sets = append(l.sets, &Set{spec: SetSpec{Name: d.Name}, id: d.ID, state: NewState(d.Name, 0, 0, regions, now), drain: true})
 	}
+	if err := loadPools(ctx, ssmc, f.poolParam, l.sets, cfg.Pool.window(), now); err != nil {
+		slog.Error("load pools", "err", err.Error())
+	}
 	refresh := l.refresher()
 	for _, r := range fleet.regions {
 		refresh(ctx, r.Name)
@@ -266,6 +271,9 @@ func run(ctx context.Context, f flags) error {
 	go every(ctx, time.Minute, func() {
 		if err := l.spend.Save(ctx, ssmc, f.spendParam); err != nil {
 			slog.Error("save spend", "err", err.Error())
+		}
+		if err := savePools(ctx, ssmc, f.poolParam, l.sets, time.Now()); err != nil {
+			slog.Error("save pools", "err", err.Error())
 		}
 	})
 	go every(ctx, 30*time.Second, l.watchConfig)
@@ -979,10 +987,16 @@ func (l *Listener) metrics() Metrics {
 	now := time.Now()
 	st := l.status()
 	m := Metrics{Budget: st.Budget, Spend: st.Spend, Sets: st.Sets}
-	for _, s := range l.sets {
+	cfg := l.config()
+	for i, s := range l.sets {
 		m.Waits = append(m.Waits, s.state.TakeWaits()...)
 		if s.state.Stalled(now, 10*time.Minute) {
 			m.Stalled++
+		}
+		snap := st.Sets[i]
+		waiting := snap.Stats.TotalAssignedJobs - snap.Stats.TotalRunningJobs + snap.Stats.TotalAvailableJobs
+		if floor, _ := cfg.PoolBounds(s.spec, now); !s.drain && snap.Pool <= floor && waiting > snap.Idle {
+			m.AtFloor++
 		}
 	}
 	for _, s := range st.Sets {
