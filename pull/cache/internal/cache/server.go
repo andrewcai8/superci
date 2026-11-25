@@ -41,6 +41,8 @@ type Server struct {
 	Upstream *url.URL
 	Log      *log.Logger
 	Now      func() time.Time
+	// Mark, when set, is told each restore and save, for the job timeline (SpoolMarks).
+	Mark func(name string, ms int64, kind string, bytes int64, key string)
 	// ReadChunk and ReadAhead set how a large read of an entry is split (see stream); zero is the default.
 	ReadChunk int64
 	ReadAhead int
@@ -233,6 +235,7 @@ func (s *Server) restore(w http.ResponseWriter, ctx context.Context, a Access, r
 	}
 	if !found {
 		s.logf("restore %q: not found", req.Key)
+		s.mark("cache.restore", 0, "miss", 0, req.Key)
 		miss()
 		return
 	}
@@ -418,6 +421,7 @@ func (s *Server) finish(w http.ResponseWriter, ctx context.Context, a Access, re
 		u.done = true
 		wire := u.last.Sub(u.first).Seconds()
 		s.logf("save %q: saved %d MB; blocks in %.1f s (%.0f MB/s), joined in %.1f s", req.Key, total>>20, wire, rate(total, wire), s.now().Sub(began).Seconds())
+		s.mark("cache.save", int64((wire+s.now().Sub(began).Seconds())*1000), "saved", total, req.Key)
 		reply(w, 200, map[string]any{"ok": true, "entry_id": "1"})
 	}
 	// The blocks are of no use now, whichever way it ended. (Off this goroutine: it holds u.mu, and findUpload takes
@@ -510,6 +514,7 @@ func (s *Server) served(d *download, began time.Time, n int64) {
 		d.logged = true
 		secs := s.now().Sub(d.first).Seconds()
 		s.logf("restore %q: sent %d MB in %.1f s (%.0f MB/s) as %d reads, at most %d at once", d.name, size>>20, secs, rate(size, secs), d.ranges, d.peak)
+		s.mark("cache.restore", int64(secs*1000), "hit", size, d.name)
 	}
 }
 

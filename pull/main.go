@@ -142,6 +142,7 @@ func run(ctx context.Context, f flags) error {
 		return fmt.Errorf("runner group %s: %w", cfg.Deployment, err)
 	}
 	slog.Info("runner group", "name", cfg.Deployment, "id", group, "repositories", cfg.Repositories)
+	tlStart(cfg.Deployment, time.Now())
 	if f.deleteSets {
 		for _, spec := range specs {
 			for _, g := range []int{group, defaultGroup} {
@@ -494,8 +495,10 @@ func (s *scaler) Scale(ctx context.Context, msg *scaleset.RunnerScaleSetMessage)
 			return fmt.Errorf("acquire jobs: %w", err)
 		}
 		slog.Info("acquired", "set", s.set.spec.Name, "asked", len(ids), "got", len(got))
+		tlAcquired(s.set.spec.Name, got, time.Now())
 	}
 	s.set.state.Observe(msg, time.Now())
+	tlMessage(s.set.spec.Name, msg, time.Now())
 	if msg == nil {
 		return nil
 	}
@@ -541,6 +544,7 @@ func (l *Listener) launcher(ctx context.Context, s *Set, wake chan struct{}) {
 			<-slots
 			continue
 		}
+		tlDecision(s.state.Snapshot(now), round, n, limit, l.budget.Estimate(now).SpareRate, now)
 		go func() {
 			defer func() { <-slots }()
 			now := time.Now()
@@ -694,6 +698,7 @@ func (l *Listener) reconciler(ctx context.Context, refresh func(context.Context,
 				end = append(end, shed...)
 			}
 			slog.Warn("shed waiting machines", "waiting", waiting, "limit", limit, "shed", waiting-limit-excess)
+			tlRetiredAll(end, "shed", now)
 		}
 		window := time.Duration(max(1, cfg.Pool.WindowMinutes)) * time.Minute
 		for _, s := range l.sets {
@@ -704,10 +709,12 @@ func (l *Listener) reconciler(ctx context.Context, refresh func(context.Context,
 			ended, unlisted := s.state.Stuck(now, 5*time.Minute, 3*time.Minute)
 			for _, m := range ended {
 				slog.Warn("stuck", "set", s.spec.Name, "machine", m.ID, "region", m.Region, "age_s", int(now.Sub(m.Launched).Seconds()))
+				tlRetired(s.spec.Name, m, "stuck", now)
 			}
 			go l.check(ctx, s, unlisted)
 			for _, m := range s.state.Overdue(now, cfg.job(), l.maxAge(), cfg.life()) {
 				slog.Warn("overdue", "set", s.spec.Name, "machine", m.ID, "age_s", int(now.Sub(m.Launched).Seconds()))
+				tlRetired(s.spec.Name, m, "overdue", now)
 			}
 			s.state.Surplus(now, 20*time.Second, window, 100)
 			go parallel(s.state.ToFence(100), func(m *Machine) {
@@ -716,6 +723,7 @@ func (l *Listener) reconciler(ctx context.Context, refresh func(context.Context,
 				out := removal(err)
 				s.state.Fenced(m, out)
 				slog.Info("retire", "set", s.spec.Name, "machine", m.ID, "runner", r.Name, "removed", out == Removed, "held_job", out == HeldJob, "err", errString(err))
+				tlRetired(s.spec.Name, m, "retire", time.Now())
 			})
 			end = append(end, s.state.ToEnd(now)...)
 			running = append(running, s.state.Running()...)
@@ -759,6 +767,7 @@ func (l *Listener) reconciler(ctx context.Context, refresh func(context.Context,
 					"booting", snap.Booting, "idle", snap.Idle, "busy", snap.Busy, "issued", snap.Issued, "retiring", snap.Retiring, "ending", snap.Ending,
 					"on_demand", snap.OnDemand, "notices", snap.Notices, "pool", snap.Pool, "orphans", snap.Orphans, "stale_waiting", snap.StaleWaiting,
 					"s_assigned", snap.Stats.TotalAssignedJobs, "s_available", snap.Stats.TotalAvailableJobs, "s_running", snap.Stats.TotalRunningJobs)
+				tlPoolTarget(snap, now)
 			}
 		}
 	}

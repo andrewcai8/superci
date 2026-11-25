@@ -1,0 +1,395 @@
+{
+  "version": 1,
+  "line": "One JSON line of the listener's log, in CloudWatch group /superci-pull/listener: {\"msg\":\"tl\",\"v\":1,\"ev\":<name>,\"t\":<event time, RFC 3339 UTC>,\"t_ms\":<the same in epoch milliseconds>,\"boot\":<the listener process>,\"eid\":<unique to the line>,<fields>}. Append-only: one line per fact, written where the fact happens, with no counter or aggregate. t is when the fact happened by the clock of its source; the log's own time is when it was written. The log ships at least once, so a reader keeps one line of each eid, and takes the first of each (inst, name) for a machine's mark, which a machine resends until the listener answers. Fields are only ever added; a reader ignores the ones it does not know, and v changes when a field's meaning does. Every table and number the timeline tool prints is derived from these lines and the GitHub API, and can be rebuilt from them.",
+  "keys": {
+    "job": "rr (runner request id, per scale set) joins every listener event of one job; run and name tie it to GitHub's REST job",
+    "machine": "inst (EC2 instance id) joins every event of one machine; a job meets its machine at job.started (runner = <set>-<inst>)",
+    "process": "boot names the listener process that wrote the line; listener.start opens a boot"
+  },
+  "events": {
+    "job.available": {
+      "src": "listener",
+      "fields": [
+        "set",
+        "rr",
+        "run",
+        "job",
+        "name",
+        "repo",
+        "labels",
+        "queue_time"
+      ],
+      "what": "GitHub never sends this to this listener (0 of 7,023 messages on Nov 25); kept for a listener that is sent it"
+    },
+    "job.acquired": {
+      "src": "listener",
+      "fields": [
+        "set",
+        "rr"
+      ],
+      "what": "AcquireJobs answered for the job"
+    },
+    "job.assigned": {
+      "src": "listener",
+      "fields": [
+        "set",
+        "rr",
+        "run",
+        "job",
+        "name",
+        "repo",
+        "labels",
+        "queue_time",
+        "assign_time"
+      ],
+      "what": "the listener's first sight of a job: GitHub assigned it to the set; t is when the listener saw it, queue_time is GitHub's"
+    },
+    "job.started": {
+      "src": "listener",
+      "fields": [
+        "set",
+        "rr",
+        "run",
+        "job",
+        "name",
+        "repo",
+        "runner",
+        "runner_id",
+        "inst",
+        "queue_time",
+        "assign_time",
+        "runner_assign_time",
+        "queue_ms"
+      ],
+      "what": "the runner took the job; queue_ms is the listener's view of the wait since GitHub queued it"
+    },
+    "job.completed": {
+      "src": "listener",
+      "fields": [
+        "set",
+        "rr",
+        "run",
+        "job",
+        "name",
+        "repo",
+        "runner",
+        "runner_id",
+        "inst",
+        "result",
+        "finish_time"
+      ],
+      "what": "the runner finished the job"
+    },
+    "machine.launched": {
+      "src": "listener",
+      "fields": [
+        "set",
+        "inst",
+        "region",
+        "az",
+        "type",
+        "lifecycle",
+        "round",
+        "step",
+        "requested",
+        "answer_ms"
+      ],
+      "what": "EC2 answered the CreateFleet that started the machine; requested is when the call began"
+    },
+    "machine.ended": {
+      "src": "listener",
+      "fields": [
+        "inst",
+        "region",
+        "why"
+      ],
+      "what": "the listener asked EC2 to terminate the machine"
+    },
+    "machine.notice": {
+      "src": "listener",
+      "fields": [
+        "set",
+        "inst",
+        "region",
+        "az",
+        "type"
+      ],
+      "what": "AWS gave notice it takes the spot machine back"
+    },
+    "jit.ask": {
+      "src": "listener",
+      "fields": [
+        "set",
+        "inst",
+        "verdict"
+      ],
+      "what": "the machine's first ask for its runner (the identity document posted); verdict is wait while the registration budget or readiness holds it"
+    },
+    "jit.issued": {
+      "src": "listener",
+      "fields": [
+        "set",
+        "inst",
+        "runner",
+        "runner_id",
+        "register_ms"
+      ],
+      "what": "the runner was registered, tagged and its config left"
+    },
+    "jit.refused": {
+      "src": "listener",
+      "fields": [
+        "set",
+        "inst",
+        "why",
+        "register_ms",
+        "waited_ms",
+        "polls"
+      ],
+      "what": "no config left: end (told 410), exists, refused (GitHub's cap), failed, withheld"
+    },
+    "boot.start": {
+      "src": "machine",
+      "fields": [
+        "inst",
+        "set",
+        "skew_ms",
+        "val",
+        "dur_ms"
+      ],
+      "what": "boot.sh began; val is the OS uptime in seconds"
+    },
+    "cache.start": {
+      "src": "machine",
+      "fields": [
+        "inst",
+        "set",
+        "skew_ms",
+        "dur_ms"
+      ],
+      "what": "the cache daemon's setup began"
+    },
+    "cache.up": {
+      "src": "machine",
+      "fields": [
+        "inst",
+        "set",
+        "skew_ms",
+        "dur_ms"
+      ],
+      "what": "the cache daemon's setup ended"
+    },
+    "doc.got": {
+      "src": "machine",
+      "fields": [
+        "inst",
+        "set",
+        "skew_ms",
+        "dur_ms"
+      ],
+      "what": "the identity document was read from the metadata service"
+    },
+    "jit.sent": {
+      "src": "machine",
+      "fields": [
+        "inst",
+        "set",
+        "skew_ms",
+        "dur_ms"
+      ],
+      "what": "the first ask for the runner left the machine"
+    },
+    "jit.answered": {
+      "src": "machine",
+      "fields": [
+        "inst",
+        "set",
+        "skew_ms",
+        "val",
+        "dur_ms"
+      ],
+      "what": "the machine got a final answer to its ask; val is the HTTP code"
+    },
+    "runner.start": {
+      "src": "machine",
+      "fields": [
+        "inst",
+        "set",
+        "skew_ms",
+        "dur_ms"
+      ],
+      "what": "run.sh was started"
+    },
+    "runner.online": {
+      "src": "machine",
+      "fields": [
+        "inst",
+        "set",
+        "skew_ms",
+        "dur_ms"
+      ],
+      "what": "the runner printed Listening for Jobs"
+    },
+    "job.running": {
+      "src": "machine",
+      "fields": [
+        "inst",
+        "set",
+        "skew_ms",
+        "dur_ms"
+      ],
+      "what": "the runner printed Running job"
+    },
+    "job.done": {
+      "src": "machine",
+      "fields": [
+        "inst",
+        "set",
+        "skew_ms",
+        "dur_ms"
+      ],
+      "what": "the runner printed the job's result"
+    },
+    "runner.exit": {
+      "src": "machine",
+      "fields": [
+        "inst",
+        "set",
+        "skew_ms",
+        "val",
+        "dur_ms"
+      ],
+      "what": "run.sh returned; val is its exit status"
+    },
+    "poweroff": {
+      "src": "machine",
+      "fields": [
+        "inst",
+        "set",
+        "skew_ms",
+        "dur_ms"
+      ],
+      "what": "boot.sh powered the machine off"
+    },
+    "ec2.state": {
+      "src": "ec2",
+      "fields": [
+        "inst",
+        "state"
+      ],
+      "what": "EC2's state-change notification (pending, running, shutting-down, terminated), in group /superci-pull/ec2-state of each region (run deploy/timeline.sh), time to the second"
+    },
+    "jit.granted": {
+      "src": "listener",
+      "fields": [
+        "set",
+        "inst",
+        "waited_ms",
+        "polls"
+      ],
+      "what": "the ask that was granted: the registration token wait ended; waited_ms since its first ask, polls the asks it took (the machine asks every 3 s)"
+    },
+    "listener.start": {
+      "src": "listener",
+      "fields": [
+        "pid",
+        "build",
+        "deployment"
+      ],
+      "what": "a listener process began; every later line carries its boot"
+    },
+    "launch.decision": {
+      "src": "listener",
+      "fields": [
+        "set",
+        "round",
+        "n",
+        "limit",
+        "spare_rate",
+        "desired",
+        "live",
+        "inflight",
+        "booting",
+        "idle",
+        "busy",
+        "pool",
+        "assigned",
+        "available"
+      ],
+      "what": "why a launch round asked EC2 for n machines: the set's snapshot, and the limit the registration budget left across the sets"
+    },
+    "pool.target": {
+      "src": "listener",
+      "fields": [
+        "set",
+        "pool",
+        "desired",
+        "live",
+        "idle",
+        "booting",
+        "busy",
+        "burst",
+        "q",
+        "l_eff",
+        "floor",
+        "cap",
+        "chosen"
+      ],
+      "what": "a set's pool and what it holds, every state log; the burst..chosen fields are the pool rule's, added by pull-wait"
+    },
+    "machine.retired": {
+      "src": "listener",
+      "fields": [
+        "set",
+        "inst",
+        "why",
+        "age_ms"
+      ],
+      "what": "the listener ends a machine on its own judgment: stuck, overdue, retire (idle runner removed), shed"
+    },
+    "hydrate.start": {
+      "src": "machine",
+      "fields": [
+        "inst",
+        "set",
+        "skew_ms",
+        "dur_ms",
+        "val"
+      ],
+      "what": "pre-hydration of the machine's caches (pull-prehydrate): began"
+    },
+    "hydrate.done": {
+      "src": "machine",
+      "fields": [
+        "inst",
+        "set",
+        "skew_ms",
+        "dur_ms",
+        "val"
+      ],
+      "what": "pre-hydration of the machine's caches (pull-prehydrate): ended; val is bytes:entries"
+    },
+    "cache.restore": {
+      "src": "machine",
+      "fields": [
+        "inst",
+        "set",
+        "skew_ms",
+        "dur_ms",
+        "val"
+      ],
+      "what": "the cache daemon served a restore; val is hit:<bytes>:<ms>:<key> or miss:0:0:<key>, the key percent-encoded"
+    },
+    "cache.save": {
+      "src": "machine",
+      "fields": [
+        "inst",
+        "set",
+        "skew_ms",
+        "dur_ms",
+        "val"
+      ],
+      "what": "the cache daemon finished a save; val is saved:<bytes>:<ms>:<key>"
+    }
+  }
+}

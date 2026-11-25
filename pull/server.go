@@ -53,6 +53,8 @@ func (h *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.jit(w, r)
 	case "/notice":
 		h.notice(w, r)
+	case "/mark":
+		h.mark(w, r)
 	default:
 		http.NotFound(w, r)
 	}
@@ -91,7 +93,9 @@ func (h *Server) jit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unknown machine", http.StatusForbidden)
 		return
 	}
-	switch s.state.Ask(m.ID, time.Now(), h.budget, h.maxAge()) {
+	verdict := s.state.Ask(m.ID, time.Now(), h.budget, h.maxAge())
+	tlAsk(s.spec.Name, m.ID, verdict, started)
+	switch verdict {
 	case Wait:
 		w.Header().Set("Retry-After", "3")
 		w.WriteHeader(http.StatusTooManyRequests)
@@ -140,15 +144,18 @@ func (h *Server) jit(w http.ResponseWriter, r *http.Request) {
 		case exists:
 			// GitHub holds a runner of this machine's name that was never handed out (an answer lost to a crash or a
 			// timeout): the machine gets none, and the runner is removed as an orphan once the machine ends.
+			tlRefused(s.spec.Name, m.ID, "exists", started, time.Now())
 			h.budget.Done(time.Now(), Failed, 0)
 			s.state.Withheld(m, nil)
 			w.WriteHeader(http.StatusGone)
 		case refused:
+			tlRefused(s.spec.Name, m.ID, "refused", started, time.Now())
 			h.budget.Done(time.Now(), Refused, 0)
 			s.state.Unissued(m)
 			w.Header().Set("Retry-After", "5")
 			w.WriteHeader(http.StatusTooManyRequests)
 		default:
+			tlRefused(s.spec.Name, m.ID, "failed", started, time.Now())
 			h.budget.Done(time.Now(), Failed, 0)
 			s.state.Unissued(m)
 			http.Error(w, "registration failed", http.StatusServiceUnavailable)
@@ -164,11 +171,13 @@ func (h *Server) jit(w http.ResponseWriter, r *http.Request) {
 		h.budget.Lost()
 		s.state.Withheld(m, runner)
 		slog.Error("issue", "set", s.spec.Name, "machine", m.ID, "runner", name, "runner_id", cfg.Runner.ID, "withheld", true, "err", err.Error())
+		tlRefused(s.spec.Name, m.ID, "withheld", started, time.Now())
 		w.WriteHeader(http.StatusGone)
 		return
 	}
 	s.state.Issue(m, runner)
 	slog.Info("register", "set", s.spec.Name, "machine", m.ID, "runner", name, "runner_id", cfg.Runner.ID, "ms", time.Since(started).Milliseconds())
+	tlIssued(s.spec.Name, m.ID, name, cfg.Runner.ID, started, time.Now())
 	w.Header().Set("Content-Type", "text/plain")
 	_, _ = w.Write([]byte(cfg.EncodedJITConfig))
 }
@@ -184,6 +193,7 @@ func (h *Server) notice(w http.ResponseWriter, r *http.Request) {
 	}
 	job := s.state.Noticed(m.ID)
 	slog.Warn("spot notice", "set", s.spec.Name, "machine", m.ID, "region", m.Region, "type", m.Type, "az", m.AZ)
+	tlNotice(s.spec.Name, m, time.Now())
 	w.WriteHeader(http.StatusNoContent)
 	if job != nil && h.notices != nil {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 10*time.Second)

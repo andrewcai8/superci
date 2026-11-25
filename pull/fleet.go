@@ -303,6 +303,7 @@ func (sf *SetFleet) ask(ctx context.Context, r *Region, n int, kind ec2types.Def
 			ms, errs, err := sf.createFleet(ctx, r, k, kind, token, round)
 			slog.Info("fleet", "set", sf.spec.Name, "region", r.Name, "step", step, "round", round, "part", part, "asked", k, "got", len(ms),
 				"ms", time.Since(started).Milliseconds(), "errors", errs, "err", errString(err), "token", token)
+			tlLaunched(sf.spec.Name, round, step, started, ms)
 			mu.Lock()
 			got = append(got, ms...)
 			mu.Unlock()
@@ -535,6 +536,7 @@ func (f *Fleet) Terminate(ctx context.Context, ms []*Machine, why string) {
 			k := min(len(ids), 500)
 			_, err := r.ec2.TerminateInstances(ctx, &ec2.TerminateInstancesInput{InstanceIds: ids[:k]})
 			slog.Info("terminate", "region", r.Name, "why", why, "count", k, "err", errString(err))
+			tlEnded(r.Name, why, ids[:k], time.Now())
 			ids = ids[k:]
 		}
 	}

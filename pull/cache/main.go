@@ -123,7 +123,8 @@ func serve(lg *log.Logger) error {
 		return err
 	}
 	base := "http://" + l.Addr().String()
-	srv := &cache.Server{Store: st, Verify: verifier().Verify, DefaultBranch: env("PULLCACHE_DEFAULT_BRANCH", "main"), Base: base, Upstream: upstream, Log: lg}
+	srv := &cache.Server{Store: st, Verify: verifier().Verify, DefaultBranch: env("PULLCACHE_DEFAULT_BRANCH", "main"), Base: base, Upstream: upstream, Log: lg,
+		Mark: cache.SpoolMarks(env("PULLCACHE_MARKS", "/run/superci-marks"), time.Now)}
 	if dir := os.Getenv("PULLCACHE_EXTERNALS"); dir != "" {
 		at := filepath.Join(dir, cache.AddressFile)
 		if err := os.WriteFile(at+".new", []byte(base), 0o644); err != nil {

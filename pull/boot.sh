@@ -6,6 +6,24 @@
 # from when it started and an idle runner by the machine's age; the machine also powers off after @LIFE_SECONDS@ s,
 # whatever it is doing.
 exec > >(tee /var/log/superci-pull.log > /dev/console) 2>&1
+# Marks for the job timeline (pull/events.go): the moments of this machine's own clock the listener cannot see. Each is a
+# line of name=epoch=ms since the previous mark[=value] in a spool (the cache daemon appends its own), and a sender posts
+# the lines the listener has not taken to /mark with the identity document, as the ask for the runner does, so the machine
+# needs no credential for them. A line stays in the spool until the listener answers 204, so a listener restart loses none.
+SP=/run/superci-marks
+: > $SP
+echo 0 > $SP.sent
+mark() { local now=${EPOCHREALTIME/[.,]/}; printf '%s\n' "$1=${now:0:10}.${now:10}=$(( ( now - ${last:-$now} ) / 1000 ))${2:+=$2}" >> $SP; last=$now; }
+send() {
+  local took n m code
+  took=$(cat $SP.sent); n=$(wc -l < $SP)
+  [ "$n" -gt "$took" ] || return 0
+  n=$(( n < took + 20 ? n : took + 20 ))
+  m=$(sed -n "$((took + 1)),${n}p" $SP | paste -sd,)
+  code=$(curl -s -k --pinnedpubkey "$PIN" -m 10 -H "X-Superci-Marks: $m" -H "X-Superci-Sent: $(date +%s.%N)" --data-binary "$DOC" -o /dev/null -w '%{http_code}' "$L/mark")
+  [ "$code" = 204 ] && echo "$n" > $SP.sent
+}
+mark boot.start "$(cut -d' ' -f1 /proc/uptime)"
 ( sleep @LIFE_SECONDS@; poweroff ) > /dev/null 2>&1 &
 printf '%s\n' kernel.apparmor_restrict_unprivileged_userns=0 kernel.apparmor_restrict_unprivileged_unconfined=0 net.ipv4.ip_local_reserved_ports=50000-59999 > /etc/sysctl.d/99-superci.conf
 sysctl -eqp /etc/sysctl.d/99-superci.conf || :
@@ -16,7 +34,9 @@ L='@LISTENER@'
 PIN='@PIN@'
 T=$(curl -s -m 2 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600' http://169.254.169.254/latest/api/token)
 # The actions cache (pull/cache): starts its daemon from the region's cache bucket and wraps the runner's Node; a machine without the role runs on GitHub's own cache.
+mark cache.start
 CR=$(curl -s -m 2 -H "X-aws-ec2-metadata-token: $T" http://169.254.169.254/latest/meta-data/placement/region); PB=superci-pull-cache-243891825325-$CR; aws s3 cp --only-show-errors --region "$CR" "s3://$PB/bin/up.sh" - 2> /dev/null | PULLCACHE_BUCKET=$PB bash || :
+mark cache.up
 # Hydration (pull/README.md): with a manifest for this label, main's caches are unpacked in the background while the machine
 # asks for its runner and waits for its job, which takes them by rename. The runner's job-started hook stops it when the job starts.
 # The hydration is its own process group (setsid), whose leader's id is in $HR/.pid, so the hook ends all of it; it never blocks the machine.
@@ -46,6 +66,9 @@ hydrate() {
 }
 setsid bash -c "$(declare -f hydrate); hydrate" &
 DOC=$(curl -s -m 2 -H "X-aws-ec2-metadata-token: $T" http://169.254.169.254/latest/dynamic/instance-identity/rsa2048)
+mark doc.got
+( while sleep 1; do send; done ) > /dev/null 2>&1 &
+SENDER=$!
 call() { curl -s -k --pinnedpubkey "$PIN" -m 60 --data-binary "$DOC" -o "$2" -w '%{http_code}' "$L/$1"; }
 ( while sleep 5; do
     [ "$(curl -s -m 2 -o /dev/null -w '%{http_code}' -H "X-aws-ec2-metadata-token: $T" http://169.254.169.254/latest/meta-data/spot/instance-action)" = 200 ] || continue
@@ -54,18 +77,33 @@ call() { curl -s -k --pinnedpubkey "$PIN" -m 60 --data-binary "$DOC" -o "$2" -w 
 umask 077
 fails=0
 while :; do
+  [ -n "${asked:-}" ] || mark jit.sent
+  asked=1
   code=$(call jit /run/superci-jit)
   echo "superci-pull: jit $code at $(date -u +%T.%N)"
   case $code in
     200)
+      mark jit.answered 200
       export ACTIONS_RUNNER_INPUT_JITCONFIG=$(cat /run/superci-jit)
       rm -f /run/superci-jit
-      (cd /home/runner && sudo --preserve-env=ACTIONS_RUNNER_INPUT_JITCONFIG -u runner -H ./run.sh)
+      mark runner.start
+      (cd /home/runner && sudo --preserve-env=ACTIONS_RUNNER_INPUT_JITCONFIG -u runner -H ./run.sh) 2>&1 | while IFS= read -r line; do
+        printf '%s\n' "$line"
+        case $line in
+          *'Listening for Jobs'*) mark runner.online ;;
+          *'Running job:'*) mark job.running ;;
+          *' completed with result'*) mark job.done ;;
+        esac
+      done
+      mark runner.exit "${PIPESTATUS[0]}"
       break ;;
-    410) break ;;
+    410) mark jit.answered 410; break ;;
     429) sleep 3 ;;
     # The listener unreachable (a restart, a replacement) for 15 minutes: no runner is held, so ending loses nothing.
     *) fails=$((fails + 1)); [ $fails -ge 300 ] && break; sleep 3 ;;
   esac
 done
+mark poweroff
+kill "$SENDER" 2> /dev/null
+for _ in 1 2 3; do send; [ "$(cat $SP.sent)" = "$(wc -l < $SP)" ] && break; done
 poweroff
