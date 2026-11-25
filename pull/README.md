@@ -168,6 +168,21 @@ Why this rule, measured on Nov 25 2026 (`tools/wait/`):
   push's jobs arrive together. A stopped or hibernated spot pool cannot be started reliably: a stopped spot machine
   is pinned to its type and zone, and 7 starts in 7 over 3 minutes were refused for capacity.
 
+The quantile is the cost dial (`tools/wait/curve.py`, the weekday model, launch times as measured for plain machines).
+A push's slowest job of a size is the most a required check of that push waits for a machine:
+
+| quantile | idle $ a day | job wait p50 / p90 | push's slowest job p50 / p90 | pushes all warm |
+| ---: | ---: | --- | --- | ---: |
+| 0.80 | 278 | 2.0 / 8.9 | 2.0 / 13.3 | 68% |
+| 0.85 | 319 | 2.0 / 5.9 | 2.0 / 11.0 | 75% |
+| **0.88** | **350** | **2.0 / 3.5** | **2.0 / 9.5** | **79%** |
+| 0.90 | 377 | 2.0 / 2.0 | 2.0 / 8.1 | 82% |
+| 0.93 | 422 | 2.0 / 2.0 | 2.0 / 5.4 | 86% |
+| 0.95 | 461 | 2.0 / 2.0 | 2.0 / 2.5 | 90% |
+
+A push's jobs arrive together, so it is warm more often than independent jobs would be. With hydration before the ask
+(launch 38 s median) the same push bar needs 0.93, at $510 a day.
+
 ### Sizes and split
 
 | Label | Types | Max machines | Disk |
