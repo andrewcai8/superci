@@ -27,6 +27,8 @@ type Machine struct {
 	Ordered   time.Time // when this process asked EC2 for it; zero for a machine adopted after a start
 	Seen      time.Time // last listed by DescribeInstances
 	Asked     time.Time // last asked for a runner (or adopted)
+	FirstAsk  time.Time // first asked for a runner, by this process
+	Asks      int       // asks for a runner, by this process
 	// Issued says a runner was issued to it. A machine gets one runner, ever. The fence is its claim (Claims), made
 	// before its runner is registered; EC2's tag superci-pull-issued, written before the config leaves, is a hint a
 	// restart reads back.
@@ -316,6 +318,10 @@ func (s *State) Ask(id string, now time.Time, b *Budget, maxAge time.Duration) V
 		return Unknown
 	}
 	m.Asked = now
+	if m.FirstAsk.IsZero() {
+		m.FirstAsk = now
+	}
+	m.Asks++
 	switch r := m.Runner; {
 	case m.Issuing:
 		return Wait
@@ -380,6 +386,13 @@ func (s *State) Issue(m *Machine, r *Runner) {
 	if m.Notice {
 		m.Retire = true
 	}
+}
+
+// Asking is when a machine first asked for its runner and how many times it has asked, for the register event.
+func (s *State) Asking(m *Machine) (first time.Time, asks int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return m.FirstAsk, m.Asks
 }
 
 // Unissued settles a grant GitHub registered nothing for: the machine may ask again.

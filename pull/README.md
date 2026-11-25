@@ -96,8 +96,10 @@ from a listing of the organization's runners (every 100 s at most). Everyone els
 - The spare rate is `cap x (1 - margin) / window - others' rate`: with the defaults (1,500, 20%, 300 s) we register
   only into what keeps the organization as a whole under 4 a second; when the others alone reach 4, we register none.
 - A registration also needs the window's estimated use, plus those in flight, under `cap x (1 - margin / 2)`.
-- A registration a waiting job needs comes first. A pool registration leaves half the saved-up burst to jobs and
-  keeps to its own pace (`pool_rate`, and `pool_share` of the spare).
+- A registration a waiting job needs comes first. A pool registration leaves half the saved-up burst (30 s of the
+  spare rate) to jobs and keeps to its own pace (`pool_rate` 5, and `pool_share` 0.9 of the spare). A pool runner is
+  a job's registration made ahead of it: every job takes one, so the pool's pace must keep up with the jobs (2 to 5
+  a second at full rollout); 0.5 a second left the pool empty after every burst.
 - GitHub's refusal stops every registration for 5 s, doubling to a minute while it keeps refusing.
 - Until the rate is measured (about 75 s after a start: two listings 61 s apart, each dated when it began) the
   listener registers at `blind_rate` (0.3/s) at most.

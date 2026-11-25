@@ -68,8 +68,8 @@ func TestTheSpareRateBoundsRegistrations(t *testing.T) {
 			b.Done(at, Made, 0)
 		}
 	}
-	if made < 50 || made > 63 {
-		t.Fatalf("made %d in a minute with 1/s spare: want about 60 (and the burst of 10 at most)", made)
+	if made < 50 || made > 93 {
+		t.Fatalf("made %d in a minute with 1/s spare: want about 60 (and the burst of 30 at most)", made)
 	}
 }
 
@@ -114,7 +114,7 @@ func TestARefusalStopsRegistrationsForAWhileAndLongerEachTime(t *testing.T) {
 
 func TestThePoolLeavesHalfTheBurstToJobs(t *testing.T) {
 	b := NewBudget(reg(), t0.Add(6*time.Minute))
-	heads(b, 2, 6*time.Minute) // 2/s spare: a burst of 20
+	heads(b, 2, 6*time.Minute) // 2/s spare: a burst of 60
 	at := t0.Add(6*time.Minute + 6*time.Second)
 	pool := 0
 	for b.Take(at, ForPool) {
@@ -127,7 +127,7 @@ func TestThePoolLeavesHalfTheBurstToJobs(t *testing.T) {
 		b.Done(at, Made, 0)
 	}
 	if pool > 2 || jobs < 9 {
-		t.Fatalf("pool took %d and jobs %d of a 12-token save: the pool stops at half the burst of 20 and leaves the rest to jobs", pool, jobs)
+		t.Fatalf("pool took %d and jobs %d of a 12-token save: the pool stops at half the burst of 60 and leaves the rest to jobs", pool, jobs)
 	}
 }
 

@@ -178,7 +178,9 @@ func (h *Server) jit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.state.Issue(m, runner)
-	slog.Info("register", "set", s.spec.Name, "machine", m.ID, "runner", name, "runner_id", cfg.Runner.ID, "ms", time.Since(started).Milliseconds())
+	first, asks := s.state.Asking(m)
+	slog.Info("register", "set", s.spec.Name, "machine", m.ID, "runner", name, "runner_id", cfg.Runner.ID, "ms", time.Since(started).Milliseconds(),
+		"waited_ms", started.Sub(first).Milliseconds(), "asks", asks)
 	tlIssued(s.spec.Name, m.ID, name, cfg.Runner.ID, started, time.Now())
 	w.Header().Set("Content-Type", "text/plain")
 	_, _ = w.Write([]byte(cfg.EncodedJITConfig))
