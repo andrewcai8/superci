@@ -153,7 +153,8 @@
         "arn:aws:ssm:us-east-1:243891825325:parameter/superci-pull/github-app",
         "arn:aws:ssm:us-east-1:243891825325:parameter/superci-pull/tls",
         "arn:aws:ssm:us-east-1:243891825325:parameter/superci-pull/spend",
-        "arn:aws:ssm:us-east-1:243891825325:parameter/superci-pull/pool"
+        "arn:aws:ssm:us-east-1:243891825325:parameter/superci-pull/pool",
+        "arn:aws:ssm:us-east-1:243891825325:parameter/superci-pull/pool/*"
       ]
     },
     {
@@ -166,7 +167,8 @@
       "Resource": [
         "arn:aws:ssm:us-east-1:243891825325:parameter/superci-pull/tls",
         "arn:aws:ssm:us-east-1:243891825325:parameter/superci-pull/spend",
-        "arn:aws:ssm:us-east-1:243891825325:parameter/superci-pull/pool"
+        "arn:aws:ssm:us-east-1:243891825325:parameter/superci-pull/pool",
+        "arn:aws:ssm:us-east-1:243891825325:parameter/superci-pull/pool/*"
       ]
     },
     {

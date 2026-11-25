@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Undoes each fix of round 2 and of the fence round (audit E) in a copy of pull/ and runs the test written for it, which must fail. A fix whose
+"""Undoes each fix of round 2, of the fence round (audit E) and of the wait round (F1 to F4) in a copy of pull/ and runs the test written for it, which must fail. A fix whose
 test still passes without it is reported as NOT RED. Run it in pull/ where Go is installed:
 
-  python3 tools/redfirst.py
+  python3 tools/redfirst.py [name fragment ...]   # only the mutants whose name holds one of them
 """
 import os, shutil, subprocess, sys, tempfile
 
@@ -43,11 +43,11 @@ MUTANTS = [
      f"{T}case r != nil && !r.Busy:\n{T}{T}m.Runner = nil\n", "TestARunnerThatNeverStartedIsNeverReplaced"),
     ("OPS-2 no stall is reported", "state.go", "return now.Sub(s.waitingSince) > d && now.Sub(s.lastStart) > d", "return false",
      "TestJobsThatWaitWithNoneStartedAreStalled"),
-    ("OPS-3 the pool reads no arrivals", "state.go", f"{T}return n\n}}\n\n// Carried", f"{T}return 0\n}}\n\n// Carried", "TestARestartDoesNotReadAsNoArrivals"),
-    ("the pool shrinks at once", "state.go", f"{T}for _, h := range s.held {{\n{T}{T}n = max(n, h.n)\n{T}}}\n{T}if now", f"{T}if now", "TestThePoolShrinksOnlyAfterTheHold"),
+    ("OPS-3 the pool reads no arrivals", "state.go", f"{T}return max(n, s.carriedIn(now, r))\n}}\n\n// carriedIn", f"{T}return 0\n}}\n\n// carriedIn", "TestARestartDoesNotReadAsNoArrivals"),
+    ("the pool shrinks at once", "state.go", f"{T}for _, h := range s.held {{\n{T}{T}n = max(n, h.n)\n{T}}}\n{T}return max(n, s.carriedIn", f"{T}return max(n, s.carriedIn", "TestThePoolShrinksOnlyAfterTheHold"),
     ("the launch time is ready_seconds for ever", "state.go", "if len(s.launches) < 8 {", "if true {", "TestThePoolIsSizedForTheSetsOwnLaunchTime"),
     ("the launch time counts the budget's wait", "state.go", f"{T}{T}ready := m.FirstAsk\n", f"{T}{T}ready := r.Issued\n", "TestTheLaunchTimeEndsAtTheMachinesFirstAsk"),
-    ("a restart forgets the carried burst", "state.go", f"{T}{T}n = max(n, s.carried)\n", "", "TestARestartStartsFromTheBurstTheLastListenerCarried"),
+    ("a restart forgets the carried burst", "state.go", "return max(n, s.carriedIn(now, r))\n}", "return n\n}", "TestARestartStartsFromTheBurstTheLastListenerCarried"),
     ("OPS-3 pool slack trimmed in the first window", "state.go", " || now.Sub(s.started) < warmup", "", "TestNoPoolRunnerIsTrimmedInTheFirstWindowAfterAStart"),
     ("arrivals and queue waits only from JobAvailable", "state.go", f"{T}for _, j := range msg.JobAssignedMessages {{\n{T}{T}s.arrived(j.JobMessageBase, now)\n{T}}}\n", "",
      "TestAJobAssignedWithNoJobAvailableArrivesAndIsTimed"),
@@ -75,11 +75,37 @@ MUTANTS = [
      "TestASpotNoticeRecordsTheJobAndARestartReadsItBack"),
     ("OPS-13 a finished runner is checked as stuck", "state.go", f"r.Busy, r.Done = true, true\n{T}{T}{T}m.Ending = true", "r.Busy, r.Done = true, true",
      "TestAFinishedRunnerEndsItsMachineAndIsNeverChecked"),
+    ("F1 a carried burst is dropped from the next save", "state.go", f"{T}c.Burst = max(c.Burst, s.carriedIn(now, r))\n", "", "TestACarriedBurstIsSavedAgainWhileItHolds"),
+    ("F1 a carried burst never ends", "state.go", "if now.Sub(s.started) < r.window() {\n\t\treturn s.carried", "if true {\n\t\treturn s.carried",
+     "TestACarriedBurstIsSavedAgainWhileItHolds"),
+    ("F2 every deployment saves to one parameter", "carry.go", 'return strings.TrimRight(prefix, "/") + "/" + deployment', 'return strings.TrimRight(prefix, "/")',
+     "TestTwoDeploymentsSavingDoNotEraseEachOther"),
+    ("F2 every deployment saves to one parameter (name)", "carry.go", 'return strings.TrimRight(prefix, "/") + "/" + deployment', 'return strings.TrimRight(prefix, "/")',
+     "TestEachDeploymentHasItsOwnPoolParameter"),
+    ("F3 a probe's removal shares the stopping listener's context", "main.go", "rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)", "rctx, cancel := context.WithTimeout(ctx, 10*time.Second)",
+     "TestAProbeIsRemovedEvenWhenTheListenerIsStopping"),
+    ("F3 a probe is never removed", "main.go", "if err := c.RemoveRunner(rctx, int64(cfg.Runner.ID)); err != nil {", "if err := func() error { _ = rctx; return nil }(); err != nil {",
+     "TestAProbeIsRemovedOnceItGaveTheHead"),
+    ("F3 the lister sweeps no leaked probe", "main.go", "leaked := leakedProbes(runners, now, grace)", "var leaked []ListedRunner",
+     "TestAProbeWhoseRemovalFailedIsSweptOnceItIsOldEnough"),
+    ("F3 the sweep takes a probe still inside its grace", "main.go", "if now.Sub(time.Unix(0, ns)) > grace {", "if now.Sub(time.Unix(0, ns)) > 0 {",
+     "TestAProbeWhoseRemovalFailedIsSweptOnceItIsOldEnough"),
+    ("F3 the sweep takes any runner but a probe's", "main.go", 'if !strings.HasPrefix(name, probePrefix) || err != nil || r.Busy {', 'if err != nil && !strings.HasPrefix(name, probePrefix) {',
+     "TestTheSweepKeepsWhatIsNotAnOldProbe"),
+    ("F3 the sweep takes a busy probe", "main.go", "|| err != nil || r.Busy {", "|| err != nil {", "TestTheSweepKeepsWhatIsNotAnOldProbe"),
+    ("F4 a save older than the window is resumed", "carry.go", f"{T}if now.Sub(saved.At) > window {{\n{T}{T}return nil\n{T}}}\n", "",
+     "TestLoadingResumesOnlyWhatWasSavedWithinTheWindow"),
+    ("F4 a save keeps no burst", "carry.go", "saved.Sets[s.spec.Name] = s.state.Carry(now, rule)", "saved.Sets[s.spec.Name] = Carried{}",
+     "TestABurstSurvivesRestartsThroughTheSavedParameter"),
+    ("F4 a first start with nothing saved fails", "carry.go", f"{T}if errors.As(err, &missing) {{\n{T}{T}return nil\n{T}}}\n", f"{T}if errors.As(err, &missing) {{\n{T}{T}return err\n{T}}}\n",
+     "TestLoadingWithNothingSavedStartsFromTheFloor"),
 ]
 
 here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 bad = 0
 for name, path, old, new, test in MUTANTS:
+    if sys.argv[1:] and not any(a in name for a in sys.argv[1:]):
+        continue
     with tempfile.TemporaryDirectory() as tmp:
         dst = os.path.join(tmp, "pull")
         shutil.copytree(here, dst)

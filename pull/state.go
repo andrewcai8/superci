@@ -626,10 +626,16 @@ func (s *State) Burst(now time.Time, r PoolRule) int {
 	for _, h := range s.held {
 		n = max(n, h.n)
 	}
+	return max(n, s.carriedIn(now, r))
+}
+
+// carriedIn is the burst the last listener saw while this one is within its first window: after it, the jobs this
+// listener has seen say what the pool needs.
+func (s *State) carriedIn(now time.Time, r PoolRule) int {
 	if now.Sub(s.started) < r.window() {
-		n = max(n, s.carried)
+		return s.carried
 	}
-	return n
+	return 0
 }
 
 // Carried is what a set's pool keeps across a restart: the burst it was sized for and its launch times.
@@ -638,8 +644,9 @@ type Carried struct {
 	Launches []int64 `json:"launches_ms"`
 }
 
-// Carry is the set's pool as the next listener should start from it.
-func (s *State) Carry() Carried {
+// Carry is the set's pool as the next listener should start from it: the largest burst it holds, the one the last
+// listener carried included while that still holds (else a start with no arrivals yet would save its raw 0 over it).
+func (s *State) Carry(now time.Time, r PoolRule) Carried {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	c := Carried{Launches: make([]int64, len(s.launches))}
@@ -649,6 +656,7 @@ func (s *State) Carry() Carried {
 	for _, h := range s.held {
 		c.Burst = max(c.Burst, h.n)
 	}
+	c.Burst = max(c.Burst, s.carriedIn(now, r))
 	return c
 }
 

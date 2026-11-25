@@ -33,9 +33,12 @@ ssh_run() {
 }
 
 CLAIMS=superci-pull-claims-243891825325-$NAME
+# A listener keeps its pools in <prefix>/<its deployment>; a dev listener's prefix is its own, never production's.
+POOLP=/superci-pull-dev/pool
 
 # The claims bucket (the machine's one-runner fence) is the deployment's own, and so is the right to write the listener's log
-# group: inline policies per dev listener on the role superci-pull-dev, which the production role does not share.
+# group and its pool parameter: inline policies per dev listener on the role superci-pull-dev, which the production role
+# does not share.
 claims() {
   $A s3api head-bucket --bucket $CLAIMS 2> /dev/null || {
     $A s3api create-bucket --bucket $CLAIMS --region us-east-1 > /dev/null
@@ -43,6 +46,7 @@ claims() {
     $A s3api put-bucket-tagging --bucket $CLAIMS --tagging 'TagSet=[{Key=purpose,Value=superci-pull-dev}]'
   }
   $A iam put-role-policy --role-name superci-pull-dev --policy-name superci-pull-claims-$NAME --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"s3:PutObject\",\"s3:GetObject\"],\"Resource\":\"arn:aws:s3:::$CLAIMS/issued/*\"},{\"Effect\":\"Allow\",\"Action\":\"s3:ListBucket\",\"Resource\":\"arn:aws:s3:::$CLAIMS\"}]}"
+  $A iam put-role-policy --role-name superci-pull-dev --policy-name superci-pull-pool-$NAME --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"ssm:GetParameter\",\"ssm:PutParameter\"],\"Resource\":\"arn:aws:ssm:us-east-1:243891825325:parameter$POOLP/*\"}]}"
   $A iam put-role-policy --role-name superci-pull-dev --policy-name superci-pull-logs-$NAME --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["logs:CreateLogStream","logs:PutLogEvents","logs:DescribeLogStreams"],"Resource":["arn:aws:logs:us-east-1:243891825325:log-group:/superci-pull/listener","arn:aws:logs:us-east-1:243891825325:log-group:/superci-pull/listener:*"]}]}'
 }
 
@@ -50,7 +54,7 @@ case $cmd in
   push)
     ssh_run 'sudo systemctl stop superci-pull; sudo tee /usr/local/bin/superci-pull > /dev/null && sudo chmod 755 /usr/local/bin/superci-pull' < "${3:?binary}"
     claims
-    ssh_run "sudo sed -i 's|^FLAGS=.*-claims=[^ ]*|&|; /-claims=/! s|\$| -claims=$CLAIMS|' /etc/superci-pull.env && sudo systemctl start superci-pull"
+    ssh_run "sudo sed -i 's|^FLAGS=.*-claims=[^ ]*|&|; /-claims=/! s|\$| -claims=$CLAIMS|; /-pool-param=/! s|\$| -pool-param=$POOLP|' /etc/superci-pull.env && sudo systemctl start superci-pull"
     ssh_run 'sudo cat /etc/superci-pull.env; sudo systemctl is-active superci-pull'
     ;;
   up)
@@ -73,7 +77,7 @@ case $cmd in
     ssh_run 'sudo tee /etc/superci-pull/config.json > /dev/null' < "$OVERRIDE"
     ssh_run 'sudo /usr/local/bin/superci-pull -validate -config /etc/superci-pull/config.json'
     claims
-    ssh_run "sudo tee /etc/superci-pull.env > /dev/null" <<< "FLAGS=-public-ip=$IP -security-groups=${RUNNERS%,} -tls-param=/superci-pull-dev/tls -spend-param=/superci-pull-dev/spend -claims=$CLAIMS"
+    ssh_run "sudo tee /etc/superci-pull.env > /dev/null" <<< "FLAGS=-public-ip=$IP -security-groups=${RUNNERS%,} -tls-param=/superci-pull-dev/tls -spend-param=/superci-pull-dev/spend -pool-param=$POOLP -claims=$CLAIMS"
     ssh_run 'sudo tee /etc/systemd/system/superci-pull.service > /dev/null' < "$here/superci-pull.service"
     ssh_run 'sudo tee /etc/superci-pull-agent.json > /dev/null' < "$here/cloudwatch-agent.json"
     ssh_run 'sudo systemctl daemon-reload && sudo systemctl enable --now superci-pull.service'

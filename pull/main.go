@@ -52,7 +52,7 @@ func main() {
 		tlsParam   = flag.String("tls-param", "/superci-pull/tls", "SSM SecureString (us-east-1) holding the listener's TLS key")
 		spendParam = flag.String("spend-param", "/superci-pull/spend", "SSM parameter (us-east-1) holding today's and this month's spend")
 		claims     = flag.String("claims", "", "S3 bucket (us-east-1) of the machines' claims; superci-pull-claims-<account> by default")
-		poolParam  = flag.String("pool-param", "/superci-pull/pool", "SSM parameter (us-east-1) holding each set's burst and launch times across a restart")
+		poolParam  = flag.String("pool-param", "/superci-pull/pool", "SSM parameter prefix (us-east-1); the deployment keeps each set's burst and launch times across a restart in <prefix>/<deployment>")
 		noMetrics  = flag.Bool("no-metrics", false, "publish no CloudWatch metrics")
 		deleteSets = flag.Bool("delete-scale-sets", false, "delete every configured scale set and exit")
 		validate   = flag.Bool("validate", false, "check the override file named by -config over the built-in config, and exit")
@@ -121,6 +121,7 @@ type Listener struct {
 	reconciled time.Time
 	strays     map[string]*Machine // machines of the deployment of no configured set, by id
 	short      int                 // machines asked of EC2 and not started (capacity, quotas), since the metrics last took them
+	leaked     int                 // probe runners found registered past their grace, since the metrics last took them
 }
 
 // defaultGroup is the organization's Default runner group, where an earlier build made the sets.
@@ -227,7 +228,8 @@ func run(ctx context.Context, f flags) error {
 		slog.Warn("draining scale set the config no longer has", "name", d.Name, "id", d.ID)
 		l.sets = append(l.sets, &Set{spec: SetSpec{Name: d.Name}, id: d.ID, state: NewState(d.Name, 0, 0, regions, now), drain: true})
 	}
-	if err := loadPools(ctx, ssmc, f.poolParam, l.sets, cfg.Pool.window(), now); err != nil {
+	poolParam := poolParamName(f.poolParam, cfg.Deployment)
+	if err := loadPools(ctx, ssmc, poolParam, l.sets, cfg.Pool.window(), now); err != nil {
 		slog.Error("load pools", "err", err.Error())
 	}
 	refresh := l.refresher()
@@ -272,7 +274,7 @@ func run(ctx context.Context, f flags) error {
 		if err := l.spend.Save(ctx, ssmc, f.spendParam); err != nil {
 			slog.Error("save spend", "err", err.Error())
 		}
-		if err := savePools(ctx, ssmc, f.poolParam, l.sets, time.Now()); err != nil {
+		if err := savePools(ctx, ssmc, poolParam, l.sets, time.Now(), l.config().Pool); err != nil {
 			slog.Error("save pools", "err", err.Error())
 		}
 	})
@@ -657,6 +659,11 @@ func (l *Listener) lister(ctx context.Context) {
 			wait = 10 * time.Second
 			continue
 		}
+		if n := sweepProbes(ctx, l.client, runners, started, probeGrace); n > 0 {
+			l.mu.Lock()
+			l.leaked += n
+			l.mu.Unlock()
+		}
 		for _, s := range l.sets {
 			own := map[string]ListedRunner{}
 			for name, r := range runners {
@@ -888,36 +895,82 @@ func (l *Listener) price(ctx context.Context) {
 	}
 }
 
+// probePrefix names the probe runners: the time of the registration, in nanoseconds, follows it.
+const probePrefix = "superci-probe-"
+
+// probeGrace is how long a probe runner may stay registered before the lister takes it for a leak: the probe removes
+// itself within seconds, so one this old failed to.
+const probeGrace = 3 * time.Minute
+
+// registrar is the part of the scale set client a probe uses.
+type registrar interface {
+	GenerateJitRunnerConfig(ctx context.Context, setting *scaleset.RunnerScaleSetJitRunnerSetting, scaleSetID int) (*scaleset.RunnerScaleSetJitRunnerConfig, error)
+	RemoveRunner(ctx context.Context, runnerID int64) error
+}
+
 // probeHead learns the organization's head from a probe runner of the first set it serves; it says whether it did.
 func (l *Listener) probeHead(ctx context.Context, now time.Time) bool {
-	var set *Set
 	for _, s := range l.sets {
 		if !s.drain {
-			set = s
-			break
+			return probeOrgHead(ctx, l.client, l.budget, s.id, now)
 		}
 	}
-	if set == nil || !l.budget.Take(now, ForPool) {
+	return false
+}
+
+// probeOrgHead registers a probe runner in the scale set, takes its id as the head and removes it. The removal has a
+// context of its own, so a slow registration or a shutdown does not leave the probe registered (a leak the lister
+// would sweep, but a registration it counts against the organization's cap until then).
+func probeOrgHead(ctx context.Context, c registrar, b *Budget, setID int, now time.Time) bool {
+	if !b.Take(now, ForPool) {
 		return false
 	}
-	pctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	cfg, err := l.client.GenerateJitRunnerConfig(pctx, &scaleset.RunnerScaleSetJitRunnerSetting{Name: fmt.Sprintf("superci-probe-%d", now.UnixNano())}, set.id)
+	gctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	cfg, err := c.GenerateJitRunnerConfig(gctx, &scaleset.RunnerScaleSetJitRunnerSetting{Name: fmt.Sprintf("%s%d", probePrefix, now.UnixNano())}, setID)
+	cancel()
 	if err != nil {
 		outcome := Failed
 		if refusedRegistration(err) {
 			outcome = Refused
 		}
-		l.budget.Done(time.Now(), outcome, 0)
+		b.Done(time.Now(), outcome, 0)
 		slog.Warn("org probe", "err", err.Error())
 		return false
 	}
-	l.budget.Done(time.Now(), Made, int64(cfg.Runner.ID))
+	b.Done(time.Now(), Made, int64(cfg.Runner.ID))
 	slog.Info("org head", "source", "probe", "id", cfg.Runner.ID)
-	if err := l.client.RemoveRunner(pctx, int64(cfg.Runner.ID)); err != nil {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	if err := c.RemoveRunner(rctx, int64(cfg.Runner.ID)); err != nil {
 		slog.Warn("org probe left a runner", "runner_id", cfg.Runner.ID, "err", err.Error())
 	}
 	return true
+}
+
+// leakedProbes picks the probe runners of a listing of the deployment's group that were registered more than grace
+// before now and hold no job. A probe's name carries its registration time; a name that does not parse is none of ours.
+func leakedProbes(runners map[string]ListedRunner, now time.Time, grace time.Duration) []ListedRunner {
+	var out []ListedRunner
+	for name, r := range runners {
+		ns, err := strconv.ParseInt(strings.TrimPrefix(name, probePrefix), 10, 64)
+		if !strings.HasPrefix(name, probePrefix) || err != nil || r.Busy {
+			continue
+		}
+		if now.Sub(time.Unix(0, ns)) > grace {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// sweepProbes removes the leaked probe runners of a listing and says how many it found.
+func sweepProbes(ctx context.Context, c registrar, runners map[string]ListedRunner, now time.Time, grace time.Duration) int {
+	leaked := leakedProbes(runners, now, grace)
+	parallel(leaked, func(o ListedRunner) {
+		err := c.RemoveRunner(ctx, o.ID)
+		slog.Warn("remove leaked probe runner", "runner", o.Name, "err", errString(err))
+	})
+	return len(leaked)
 }
 
 // setPools sets each set's hot pool: the operator's pin, or the burst the set's recent jobs ask for within the hour's
@@ -1047,6 +1100,7 @@ func (l *Listener) metrics() Metrics {
 		}
 	}
 	m.Short, l.short = l.short, 0
+	m.Orphans, l.leaked = m.Orphans+l.leaked, 0
 	l.mu.Unlock()
 	return m
 }
