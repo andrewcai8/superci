@@ -21,9 +21,10 @@ pullcache serve   one process per machine, on the machine's private address (sys
    v   (S3 gateway endpoint in the machine's VPC: no NAT, no data charge)
 S3, in the machine's region        entries: v1/<d|r>/<repository id>/<scope>/<version>/<key>   one object each
                                    blocks:  u/<repository id>/<scope>/<upload id>/<block>      stage bucket
+                                   marks:   a/<sha256 of the entry's name>/<yyyymmdd>           empty; the entry was restored that UTC day
 broker (Lambda, per region)        job token -> credentials for that scope's two prefixes, an hour at a time
 mirror (Lambda, per save of main)  copies the default branch's new entry into the other region's bucket, written once
-janitor (Lambda, every 15 min)     deletes the oldest entries past the region's cap; the only role that can
+janitor (Lambda, every 15 min)     deletes entries nobody restores, and superseded and least recently used ones past the cap; the only role that can
 ```
 
 ### Scope, as GitHub's cache has it
@@ -62,19 +63,56 @@ Entries are never changed once written. The scope of `main` is class `d`, every 
 | What | Rule | Where it is set |
 | --- | --- | --- |
 | Class `r` (pull requests, merge-queue batches, other branches) | gone 3 days after it was saved | `deploy/lifecycle.json` |
-| Class `d` (the default branch) | gone 7 days after it was saved | `deploy/lifecycle.json` |
-| Size | the janitor function, every 15 minutes in each region, deletes class `r` then class `d`, oldest first, until the region holds at most `CAP_GB` (1,000 GB) | `deploy/up.sh` (`CAP_GB=`) |
+| Class `d` (the default branch) | no age rule in S3: the janitor deletes an entry nobody has restored for `MAX_IDLE` (30 days), however big the bucket | `deploy/up.sh` (`MAX_IDLE=`) |
+| Size | the janitor function, every 15 minutes in each region, deletes until the region holds at most `CAP_GB` (1,000 GB): superseded entries first, then other scopes' entries, then the default branch's, each the least recently restored first (below) | `deploy/up.sh` (`CAP_GB=`) |
+| Markers of use | gone 35 days after they were written | `deploy/lifecycle.json` |
 | An upload's blocks | deleted at finish, with the job's own credentials; the stage bucket expires anything left after a day | `deploy/lifecycle-stage.json` |
 | Old versions, delete markers | versioning is suspended, so a deleted entry frees its bytes at once; versions from before that expire a day after they became old | `deploy/lifecycle.json` |
 
-Age is from the save, not the last use: an entry in use is saved again, by one job, when it expires. The age rules
-bound the cost of a quiet week and the janitor bounds a busy hour. The janitor runs as its own role, the only one that
-can delete an entry (`ListBucket` and `DeleteObject` on `v1/`, nothing else). An extra terabyte of retention costs
-about $23 a month, so the cap is where hit rate is bought: at the assumed 10 TB of saves a day, 2 TB in all keeps a
-pull request's entry about five hours, and the default branch's for as long as other scopes' entries are there to go
-first. Neither bound is tuned to megpt-mono's real save volume, which is not known yet: read `save ... saved N MB` in
-the daemon's log for a few days and set `CAP_GB` from it (`pullcache janitor -cap-gb N -dry-run` says what a cap
-would delete).
+An entry in use is never old. The default branch's entries used to expire 30 days after their save however hot they
+were, and the janitor deleted oldest save first: on the day a key that every job restores expired, every job missed
+at once and each tried to upload 0.3 to 0.5 GB that write-once refused (a stampede), and superseded entries, which
+nothing restores, were kept as long as the hot ones. Now the order is by use, and nothing but the janitor decides it.
+
+**Last use.** A restore that returns an entry has the daemon write an empty object `a/<sha256 of the entry's name>/<yyyymmdd>`
+(`cache.MarkKey`), once per entry per UTC day: the daemon remembers the markers it wrote, asks the bucket (a HEAD, a
+tenth of a write's price) before it writes one, and creates it only if it is absent (`If-None-Match: *`). However many
+jobs and machines restore a hot entry, its day is one write and a read per machine, so no key is hot (the hash leads the
+name, so the markers of the hot entries spread over the bucket's partitions). A marker is a hint, not a fact a restore
+depends on: a lost, late or forged one changes what is evicted first and never what a restore returns, so the daemon
+writes it beside the restore and a failure only logs. A day is the finest a marker says, and it counts as the day's end
+(an entry is never called less used than it was). An entry no marker names was last used when it was saved.
+
+**Superseded.** An entry's key is a name and the hashes of its inputs, and a changed lockfile saves a new key of the same
+name. The *family* of a key is the key without its trailing hash segments (`cache.Family`: 8 or more lowercase hex digits,
+which covers digests, run ids and dates, or a base64 text of 16 or more characters that holds a digit or one of `+/=_`;
+the first segment always stays). In the production buckets on Nov 25:
+
+| Key | Family |
+| --- | --- |
+| `git-seed-v1-Linux-X64-45662624410` | `git-seed-v1-Linux-X64` |
+| `acid-vp-deps-v1-Linux-X64-2503440cae4c07a2-bd71c5201090...` | `acid-vp-deps-v1-Linux-X64` |
+| `bun-modules-v1-Linux-X64-bun1.4.3-aura-hono-api-scripts-on-91ff91ba...` | `bun-modules-v1-Linux-X64-bun1.4.3-aura-hono-api-scripts-on` |
+| `bun-+NUKu9E/U4apAe78eSCZvQ/GSdc=` | `bun` |
+| `uv-toolcache-v1-Linux-X64-uv0.13.9`, `apt-Linux-X64-playwright-chromium-2026-W48` | themselves (a version or a week is not a hash) |
+
+Entries of one family in one (class, repository, scope, version) are ranked by save time, and the newest is kept. Any
+other is superseded when nobody restored it after the newest was saved: a family that is too wide for its name (two live
+caches that share it) loses nothing it still restores, and a key that is not a hash is its own family, so nothing is
+ever called superseded on a guess about a name. Save time is the object's `LastModified`, the notion the mirror uses:
+its copy into the other region is seconds after the save, so both regions agree on which entry is newest.
+
+**The delete.** The janitor lists the entries and the markers, computes the plan as a function of that listing alone
+(`cache.Plan`, so two runs over one listing agree, and a run over what a run left deletes nothing), and deletes each
+entry with the ETag it listed (`DeleteObjects` with each object's `ETag`; S3 answers `PreconditionFailed` for an entry a
+job saved again since, which stays, and `NoSuchKey` for one another janitor deleted first). Janitors may run at once, or
+one again after a failed run. The janitor runs as its own role, the only one that can delete an entry (`ListBucket` and
+`DeleteObject` on `v1/`, nothing else). An extra terabyte of retention costs about $23 a month, so the cap is where hit
+rate is bought: at the assumed 10 TB of saves a day, 2 TB in all keeps a pull request's entry about five hours, and the
+default branch's for as long as other scopes' entries are there to go first. The cap is not tuned to megpt-mono's real
+save volume, which is not known yet: read `save ... saved N MB` in the daemon's log for a few days and set `CAP_GB` from
+it. `pullcache janitor -cap-gb N -dry-run` (or `-cap-mb`) lists what a cap would delete, one line each with its reason and
+last use, with list rights and nothing else.
 
 ### Two regions
 
@@ -113,7 +151,7 @@ Nov 25 2026, and was not run.
 | Scope rules per ref | in the plane, from GitHub's `ac` claim | not checked | its README says the cache is scoped to the repository; per ref not documented | in the daemon, from `ac`, in the object name |
 | What it needs besides S3 | the push plane's control plane and key-value store, which this fleet does not have, and which is being retired | RunsOn's server | a database every machine can reach (SQLite is per machine) and a server | nothing |
 | Data path | a download is proxied by the machine | S3 | optional signed storage URLs | a download is proxied by the machine, 16 MiB reads in parallel |
-| Eviction | LRU by size, per repository, in the plane's index | S3 lifecycle | age and size, in the server | S3 lifecycle by class, plus a size janitor |
+| Eviction | LRU by size, per repository, in the plane's index | S3 lifecycle | age and size, in the server | superseded first, then least recently used by a daily marker, in a size janitor; S3 lifecycle only for pull requests |
 | Run cost besides S3 | the plane's functions and store | a license from EUR 300 a year | a server and a database | none |
 
 `pullcache` wins because it needs nothing to run but the bucket and two small functions. The old plane's cache was a
@@ -187,7 +225,8 @@ the gateway endpoint and in-region transfer $0. The workload below is **assumed*
 | Restores: 120,000 x 1 GB = 60 ranged reads of 16 MiB each | 7.2 million GET | $2.90 |
 | Saves: 10,000 x 1 GB in 32 MiB blocks = 30 block PUTs, 30 UploadPartCopy, create, complete, one DeleteObjects | 630,000 | $3.15 |
 | Broker: at most one call per saving job per hour, 256 MB for about 0.1 s | about 10,000 | under $0.01 |
-| Janitor: 96 runs a region, a listing of a few thousand entries and a batch delete each | about 400 | under $0.01 |
+| Janitor: 96 runs a region, a listing of a few thousand entries and markers and a batch delete each | about 400 | under $0.01 |
+| Markers: a HEAD per machine and entry restored a day, one write per entry a day | under 150,000 | under $0.10 |
 | **Requests** | | **about $8 a day, $240 a month** |
 
 Storage is the janitor's cap: 1,000 GB a region, 2 TB in all, plus what 15 minutes of saves add before the next run
@@ -253,6 +292,11 @@ pullcache janitor -bucket B -region R -cap-gb 1000 -dry-run   # with list rights
   the refusal names the token's `iss` and `kid`. Watch `journalctl -u pullcache` there once (`SEAM.md`, Check).
 - The janitor deleting under load. It ran on the schedule and deleted to its cap in the proof, not against a bucket
   of millions of entries; its listing reads at most 5 million entries a run.
+- Eviction by use in production. The unit tests run the plan over a simulated bucket and the S3 tests (set
+  `PULLCACHE_TEST_BUCKET` to a bucket of yours ending in `-pull-evict`, and its region) run the conditional delete, the
+  marker write and the whole janitor against S3. The janitor's dry run on Nov 25 read buckets with no markers yet, a
+  day old, so it ranked by save time; no machine has written a marker, and the machines' role needs the `Mark` statement
+  of `deploy/up.sh` first.
 - The broker's credentials being renewed after an hour inside one long save; the SDK's credential cache asks again
   five minutes before they run out, and no save in the proof lasted that long.
 - A job in a container (`container:`). The wrapped Node is reached through the runner's externals at `/__e` and the

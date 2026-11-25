@@ -42,8 +42,9 @@ type Store struct {
 }
 
 var (
-	_ cache.Store  = (*Store)(nil)
-	_ cache.Pruner = (*Store)(nil)
+	_ cache.Store     = (*Store)(nil)
+	_ cache.Pruner    = (*Store)(nil)
+	_ cache.MarkStore = (*Store)(nil)
 )
 
 // New is the bucket as this process's role reaches it. issue may be nil where nothing is saved (the janitor).
@@ -114,9 +115,55 @@ func (s *Store) Open(ctx context.Context, key, etag string, start, end int64) (i
 	return out.Body, nil
 }
 
-// Delete is the janitor's: entries, with its own role (the only one that may delete one).
-func (s *Store) Delete(ctx context.Context, keys []string) error {
-	return deleteKeys(ctx, s.c, s.bucket, keys)
+// Delete is the janitor's: entries, with its own role (the only one that may delete one). Each object goes only if
+// it is still the version listed (its ETag), so an entry a job saved again after the listing is left, and the
+// answer says for each what happened. A batch of up to 1,000 is one request; a failure of the request itself, or of
+// one object for a reason that is neither, is the error, and the answers so far are returned with it.
+func (s *Store) Delete(ctx context.Context, objs []cache.Object) ([]cache.Removal, error) {
+	got := make([]cache.Removal, 0, len(objs))
+	for len(objs) > 0 {
+		n := min(len(objs), 1000)
+		ids := make([]types.ObjectIdentifier, n)
+		at := map[string]int{}
+		for i, o := range objs[:n] {
+			ids[i] = types.ObjectIdentifier{Key: aws.String(o.Key), ETag: aws.String(o.ETag)}
+			at[o.Key] = i
+		}
+		out, err := s.c.DeleteObjects(ctx, &s3.DeleteObjectsInput{Bucket: &s.bucket, Delete: &types.Delete{Objects: ids, Quiet: aws.Bool(true)}})
+		if err != nil {
+			return got, err
+		}
+		batch := make([]cache.Removal, n)
+		var first error
+		for _, e := range out.Errors {
+			switch c := aws.ToString(e.Code); c {
+			case "PreconditionFailed":
+				batch[at[aws.ToString(e.Key)]] = cache.Changed
+			case "NoSuchKey":
+				batch[at[aws.ToString(e.Key)]] = cache.Gone
+			default:
+				if first == nil {
+					first = fmt.Errorf("%s not deleted: %s %s", aws.ToString(e.Key), c, aws.ToString(e.Message))
+				}
+			}
+		}
+		got = append(got, batch...)
+		if first != nil {
+			return got, first
+		}
+		objs = objs[n:]
+	}
+	return got, nil
+}
+
+// CreateMark writes an entry's marker of use, with the machine's role: an empty object that is created only if
+// there is none (the day's marker is written once; a second write is a refusal this answers with nil).
+func (s *Store) CreateMark(ctx context.Context, key string) error {
+	_, err := s.c.PutObject(ctx, &s3.PutObjectInput{Bucket: &s.bucket, Key: &key, Body: bytes.NewReader(nil), ContentLength: aws.Int64(0), IfNoneMatch: aws.String("*")})
+	if c := code(err); c == "PreconditionFailed" || c == "ConditionalRequestConflict" {
+		return nil
+	}
+	return err
 }
 
 func deleteKeys(ctx context.Context, c *s3.Client, bucket string, keys []string) error {

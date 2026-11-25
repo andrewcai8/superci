@@ -2,16 +2,18 @@
 # Creates, or finds, what the pull fleet's cache needs in account ci-runners, in us-east-1 and us-east-2, each
 # tagged purpose=superci-pull-cache. In each region: an S3 gateway endpoint in the default VPC (the machines' VPC;
 # traffic to the bucket never leaves the region and costs no data transfer); an entries bucket (private, encrypted,
-# versioning suspended, expiring by age, written once per key) and a stage bucket for an upload's blocks; the broker
+# versioning suspended, its entries kept by use, written once per key) and a stage bucket for an upload's blocks; the broker
 # function, which gives a job credentials to write its own scope; and the janitor function, run every 15 minutes,
-# which keeps the entries under a size; and the mirror function, which copies each entry the default branch saves
-# into the other region's bucket, written once there too. Once: the machines' role and instance profile (read the entries, call the
-# broker, write nothing), the writer role the broker narrows per job, and the broker's and janitor's own roles.
+# which keeps the entries under a size and deletes the ones nobody restores; and the mirror function, which copies
+# each entry the default branch saves into the other region's bucket, written once there too. Once: the machines'
+# role and instance profile (read the entries, call the broker, write only the markers of use under a/), the writer
+# role the broker narrows per job, and the broker's and janitor's own roles.
 # Run again at will: it changes nothing that exists but the policies, settings and code, which it writes anew.
 # Prints ids, never a secret.
 #
 #   pull/cache/deploy/up.sh          the functions' code is bin/pullcache-lambda-arm64.zip in each region's bucket
 #   CAP_GB=1000                      what the janitor keeps of a region's entries at most
+#   MAX_IDLE=720h                    an entry nobody restored for this long is deleted whatever the size
 #   ISSUER=<iss>                     the issuer the job tokens carry, where it is not GitHub's (https://token.actions.githubusercontent.com):
 #                                    kept in each bucket's bin/issuer, which the broker (set here) and every machine's daemon (read by
 #                                    machine-up.sh at boot) both take, so the two agree and a later run without ISSUER keeps it.
@@ -29,6 +31,7 @@ BROKER=superci-pull-cache-broker
 JANITOR=superci-pull-cache-janitor
 MIRROR=superci-pull-cache-mirror
 CAP_GB=${CAP_GB:-1000}
+MAX_IDLE=${MAX_IDLE:-720h}
 here=$(cd "$(dirname "$0")" && pwd)
 bucket() { echo "superci-pull-cache-$ACCOUNT-$1"; }
 arn() { echo "arn:aws:iam::$ACCOUNT:role/$1"; }
@@ -106,13 +109,16 @@ role() { # name trust-document policy-file
 logs() { echo "{ \"Sid\": \"Logs\", \"Effect\": \"Allow\", \"Action\": [\"logs:CreateLogStream\", \"logs:PutLogEvents\"], \"Resource\": [\"arn:aws:logs:us-east-1:$ACCOUNT:log-group:/aws/lambda/$1:*\", \"arn:aws:logs:us-east-2:$ACCOUNT:log-group:/aws/lambda/$1:*\"] }"; }
 
 # The machines: read the program and the entries, list the entries (S3 answers a missing key with 403 instead of
-# 404 to a role without ListBucket), and call the broker. No write anywhere: a job's step can take these.
+# 404 to a role without ListBucket), call the broker, and write the marker of use of an entry they restore (a/, an
+# empty object per entry per day, read only by the janitor as a hint of what to evict last). A job's step can take
+# these, and what it could do with them is keep an entry alive or let one go first: no entry is ever written.
 cat > "$tmp/machine.json" <<JSON
 {
   "Version": "2012-10-17",
   "Statement": [
     { "Sid": "Read", "Effect": "Allow", "Action": "s3:GetObject",
-      "Resource": ["arn:aws:s3:::$B1/bin/*", "arn:aws:s3:::$B2/bin/*", "arn:aws:s3:::$B1/v1/*", "arn:aws:s3:::$B2/v1/*"] },
+      "Resource": ["arn:aws:s3:::$B1/bin/*", "arn:aws:s3:::$B2/bin/*", "arn:aws:s3:::$B1/v1/*", "arn:aws:s3:::$B2/v1/*", "arn:aws:s3:::$B1/a/*", "arn:aws:s3:::$B2/a/*"] },
+    { "Sid": "Mark", "Effect": "Allow", "Action": "s3:PutObject", "Resource": ["arn:aws:s3:::$B1/a/*", "arn:aws:s3:::$B2/a/*"] },
     { "Sid": "List", "Effect": "Allow", "Action": "s3:ListBucket", "Resource": ["arn:aws:s3:::$B1", "arn:aws:s3:::$B2"] },
     { "Sid": "Broker", "Effect": "Allow", "Action": "lambda:InvokeFunction",
       "Resource": ["arn:aws:lambda:us-east-1:$ACCOUNT:function:$BROKER", "arn:aws:lambda:us-east-2:$ACCOUNT:function:$BROKER"] }
@@ -148,6 +154,8 @@ for _ in 1 2 3 4 5 6; do # (a new role is not at once a principal another role's
 done
 $A iam get-role --role-name $WRITER >/dev/null
 
+# The janitor lists entries and markers and deletes entries, each only if it is still the version it listed (a
+# conditional delete: DeleteObject, with the ETag).
 cat > "$tmp/janitor.json" <<JSON
 { "Version": "2012-10-17", "Statement": [
     { "Sid": "List", "Effect": "Allow", "Action": "s3:ListBucket", "Resource": ["arn:aws:s3:::$B1", "arn:aws:s3:::$B2"] },
@@ -207,12 +215,12 @@ for r in $REGIONS; do
   iss=$($A s3 cp --only-show-errors --region "$r" "s3://$b/bin/issuer" - 2>/dev/null || true)
   issuer=""; [ -n "$iss" ] && { issuer=",PULLCACHE_ISSUER=$iss"; echo "issuer $r: $iss"; }
   function_up $BROKER "$r" "Variables={PULLCACHE_LAMBDA=broker,PULLCACHE_BUCKET=$b,PULLCACHE_STAGE_BUCKET=$b-stage,PULLCACHE_WRITER_ROLE=$(arn $WRITER),PULLCACHE_DEFAULT_BRANCH=main$jwks$issuer}" 256 10 || continue
-  function_up $JANITOR "$r" "Variables={PULLCACHE_LAMBDA=janitor,PULLCACHE_BUCKET=$b,PULLCACHE_CAP_GB=$CAP_GB}" 1024 600 || continue
+  function_up $JANITOR "$r" "Variables={PULLCACHE_LAMBDA=janitor,PULLCACHE_BUCKET=$b,PULLCACHE_CAP_GB=$CAP_GB,PULLCACHE_MAX_IDLE=$MAX_IDLE}" 1024 600 || continue
   rule=$($A events put-rule --region "$r" --name $JANITOR --schedule-expression 'rate(15 minutes)' --tags "$TAGS" --query RuleArn --output text)
   $A lambda add-permission --region "$r" --function-name $JANITOR --statement-id events --action lambda:InvokeFunction \
     --principal events.amazonaws.com --source-arn "$rule" >/dev/null 2>&1 || true
   $A events put-targets --region "$r" --rule $JANITOR --targets "Id=janitor,Arn=arn:aws:lambda:$r:$ACCOUNT:function:$JANITOR" >/dev/null
-  echo "janitor $r: every 15 minutes, cap $CAP_GB GB"
+  echo "janitor $r: every 15 minutes, cap $CAP_GB GB, idle limit $MAX_IDLE"
   peer=us-east-2; [ "$r" = us-east-2 ] && peer=us-east-1
   function_up $MIRROR "$r" "Variables={PULLCACHE_LAMBDA=mirror,PULLCACHE_BUCKET=$b,PULLCACHE_PEER_BUCKET=$(bucket $peer),PULLCACHE_PEER_REGION=$peer}" 256 300 || continue
   $A lambda add-permission --region "$r" --function-name $MIRROR --statement-id s3 --action lambda:InvokeFunction --principal s3.amazonaws.com \

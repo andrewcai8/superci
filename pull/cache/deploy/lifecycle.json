@@ -1,7 +1,7 @@
 {
   "Rules": [
     { "ID": "other-scopes", "Status": "Enabled", "Filter": { "Prefix": "v1/r/" }, "Expiration": { "Days": 3 } },
-    { "ID": "default-branch", "Status": "Enabled", "Filter": { "Prefix": "v1/d/" }, "Expiration": { "Days": 7 } },
+    { "ID": "entry-markers", "Status": "Enabled", "Filter": { "Prefix": "a/" }, "Expiration": { "Days": 35 } },
     { "ID": "old-versions", "Status": "Enabled", "Filter": { "Prefix": "" }, "NoncurrentVersionExpiration": { "NoncurrentDays": 1 } },
     { "ID": "unfinished-uploads", "Status": "Enabled", "Filter": { "Prefix": "" }, "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 1 } },
     { "ID": "delete-markers", "Status": "Enabled", "Filter": { "Prefix": "" }, "Expiration": { "ExpiredObjectDeleteMarker": true } }
