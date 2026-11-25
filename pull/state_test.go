@@ -337,8 +337,8 @@ func TestAJobAssignedWithNoJobAvailableArrivesAndIsTimed(t *testing.T) {
 		base := scaleset.JobMessageBase{RunnerRequestID: int64(i + 1), QueueTime: queued}
 		s.Observe(&scaleset.RunnerScaleSetMessage{JobAssignedMessages: []*scaleset.JobAssigned{{JobMessageBase: base}, {JobMessageBase: base}}}, t0)
 	}
-	if r := s.ArrivalRate(t0.Add(time.Minute), 10*time.Minute); r != 0.1 {
-		t.Fatalf("rate %v, want 60 jobs (each assigned twice, counted once) over 10 minutes", r)
+	if n := s.Burst(t0.Add(time.Minute), testRule); n != 49 {
+		t.Fatalf("burst %d, want 49: 60 jobs at once (each assigned twice, counted once), the 80th percentile's 49th", n)
 	}
 	s.Observe(&scaleset.RunnerScaleSetMessage{JobStartedMessages: []*scaleset.JobStarted{{JobMessageBase: scaleset.JobMessageBase{RunnerRequestID: 7}}}}, t0.Add(2*time.Second))
 	if w := s.TakeWaits(); len(w) != 1 || w[0] != 6 {
@@ -356,8 +356,8 @@ func TestAJobAssignedWithoutAnOfferSizesThePool(t *testing.T) {
 			JobID: fmt.Sprintf("job-%d", i), ScaleSetAssignTime: t0}})
 	}
 	s.Observe(msg, t0.Add(time.Second))
-	if r := s.ArrivalRate(t0.Add(time.Minute), time.Minute); r != 0.5 {
-		t.Fatalf("30 jobs assigned at once: rate %v a second, want 0.5 (30 in the minute)", r)
+	if n := s.Burst(t0.Add(time.Minute), testRule); n != 25 {
+		t.Fatalf("30 jobs assigned at once: burst %d, want 25 (the 80th percentile job is the 25th)", n)
 	}
 	s.Observe(&scaleset.RunnerScaleSetMessage{JobStartedMessages: []*scaleset.JobStarted{{JobMessageBase: scaleset.JobMessageBase{JobID: "job-3"}}}}, t0.Add(5*time.Second))
 	if w := s.TakeWaits(); len(w) != 1 || w[0] != 5 {
@@ -374,8 +374,8 @@ func TestARedeliveredBacklogKeepsItsOwnTimes(t *testing.T) {
 			JobID: fmt.Sprintf("job-%d", i), ScaleSetAssignTime: t0.Add(-time.Duration(30-i) * 20 * time.Second)}})
 	}
 	s.Observe(msg, t0)
-	if r := s.ArrivalRate(t0, time.Minute); r != 0.05 {
-		t.Fatalf("30 jobs assigned 20 s apart, delivered at once: rate %v, want 0.05 (the 3 of the last minute)", r)
+	if n := s.Burst(t0, testRule); n != 2 {
+		t.Fatalf("30 jobs assigned 20 s apart, delivered at once: burst %d, want 2 (a job and the one 20 s before, within 22 s)", n)
 	}
 }
 
@@ -384,7 +384,50 @@ func TestAJobWithNeitherIDCountsAndIsNeverMergedWithAnother(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		s.Observe(&scaleset.RunnerScaleSetMessage{JobAssignedMessages: []*scaleset.JobAssigned{{}}}, t0)
 	}
-	if r := s.ArrivalRate(t0.Add(time.Minute), time.Minute); r != 0.05 {
-		t.Fatalf("three jobs with no job id and no runner request id: rate %v, want 0.05 (3 in the minute)", r)
+	if n := s.Burst(t0.Add(time.Minute), testRule); n != 3 {
+		t.Fatalf("three jobs with no job id and no runner request id: burst %d, want 3", n)
+var testRule = PoolRule{Quantile: 0.8, WindowMinutes: 30, HoldMinutes: 5, ReadySeconds: 22}
+
+// assigned is a message of JobAssigned as GitHub sends them: a job id, no runner request id, no queue time.
+func assigned(s *State, at time.Time, ids ...int64) {
+	msg := &scaleset.RunnerScaleSetMessage{}
+	for _, id := range ids {
+		msg.JobAssignedMessages = append(msg.JobAssignedMessages, &scaleset.JobAssigned{JobMessageBase: scaleset.JobMessageBase{JobID: fmt.Sprintf("job-%d", id)}})
+	}
+	s.Observe(msg, at)
+}
+
+func TestThePoolIsSizedForTheSetsOwnLaunchTime(t *testing.T) {
+	s := NewState("set", 0, 100, []string{"us-east-1"}, t0)
+	for i := 0; i < 60; i++ {
+		assigned(s, t0.Add(time.Duration(i)*5*time.Second), int64(i))
+	}
+	now := t0.Add(5 * time.Minute)
+	if n := s.Burst(now, testRule); n != 5 {
+		t.Fatalf("a job every 5 s, no launch measured: burst %d, want 5 (those within ready_seconds, 22)", n)
+	}
+	for i := 0; i < 8; i++ {
+		m := &Machine{ID: fmt.Sprintf("i-%04d", i), Set: "set", Region: "us-east-1"}
+		s.Launched(fmt.Sprintf("r-%d", i), []*Machine{m}, now)
+		s.Issue(m, &Runner{ID: int64(i + 1), Name: runnerName("set", m.ID), Issued: now.Add(6 * time.Second)})
+	}
+	held := PoolRule{Quantile: 0.8, WindowMinutes: 30, HoldMinutes: 0, ReadySeconds: 22}
+	if n := s.Burst(now.Add(time.Second), held); n != 2 {
+		t.Fatalf("launches measured at 6 s: burst %d, want 2 (a job and the one 5 s before)", n)
+	}
+}
+
+func TestThePoolShrinksOnlyAfterTheHold(t *testing.T) {
+	s := NewState("set", 0, 100, []string{"us-east-1"}, t0)
+	assigned(s, t0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+	rule := PoolRule{Quantile: 0.8, WindowMinutes: 1, HoldMinutes: 5, ReadySeconds: 22}
+	if n := s.Burst(t0.Add(time.Second), rule); n != 9 {
+		t.Fatalf("10 jobs at once: burst %d, want 9 (the 80th percentile job is the 9th)", n)
+	}
+	if n := s.Burst(t0.Add(3*time.Minute), rule); n != 9 {
+		t.Fatalf("3 minutes on, the jobs out of the window: burst %d, want the 9 held", n)
+	}
+	if n := s.Burst(t0.Add(7*time.Minute), rule); n != 0 {
+		t.Fatalf("past the hold: burst %d, want 0", n)
 	}
 }

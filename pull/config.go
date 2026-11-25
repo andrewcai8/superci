@@ -57,7 +57,7 @@ type SizeConfig struct {
 }
 
 // PoolConfig bounds one size's hot pool by the hour of the day (UTC): never fewer idle runners than floor, never more
-// than cap. Between them the pool follows the size's own arrivals (PoolRule).
+// than cap. Between them the pool follows the bursts of the size's own jobs (PoolRule).
 type PoolConfig struct {
 	Floor Hours `json:"floor"`
 	Cap   Hours `json:"cap"`
@@ -78,15 +78,21 @@ func (h *Hours) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-// PoolRule sizes a pool from what arrives: enough idle runners to cover the arrivals of fill seconds (the time a new
-// machine takes to bring a runner), times factor, over the last window. Lead is how far ahead the next hour's bounds
-// apply, so a busy hour's pool is registered slowly before it starts.
+// PoolRule sizes a pool from the bursts a set's jobs come in (State.Burst): the pool that would have given a ready
+// runner to the quantile of the jobs of the last window, given how long a launch takes to bring one (measured from the
+// set's own launches; ready_seconds until there are enough), and no smaller than the largest of the last hold. Lead
+// is how far ahead the next hour's bounds apply, so a busy hour's pool is registered slowly before it starts.
 type PoolRule struct {
-	FillSeconds   float64 `json:"fill_seconds"`
-	Factor        float64 `json:"factor"`
+	Quantile      float64 `json:"quantile"`
 	WindowMinutes int     `json:"window_minutes"`
+	HoldMinutes   int     `json:"hold_minutes"`
+	ReadySeconds  float64 `json:"ready_seconds"`
 	LeadMinutes   int     `json:"lead_minutes"`
 }
+
+func (r PoolRule) window() time.Duration { return time.Duration(max(1, r.WindowMinutes)) * time.Minute }
+func (r PoolRule) hold() time.Duration   { return time.Duration(r.HoldMinutes) * time.Minute }
+func (r PoolRule) ready() time.Duration  { return time.Duration(r.ReadySeconds * float64(time.Second)) }
 
 // RegConfig is GitHub's organization-wide cap on runner registrations and the share of it this listener leaves alone.
 type RegConfig struct {
@@ -174,6 +180,9 @@ func (c Config) validate() error {
 	if r := c.Registration; r.Cap <= 0 || r.WindowS <= 0 || r.Margin < 0 || r.Margin >= 1 || r.PoolShare < 0 || r.PoolShare > 1 {
 		return errors.New("config: registration needs cap, window_s, a margin in [0, 1) and a pool_share in [0, 1]")
 	}
+	if p := c.Pool; p.Quantile <= 0 || p.Quantile > 1 || p.ReadySeconds <= 0 || p.HoldMinutes < 0 {
+		return errors.New("config: pool needs a quantile in (0, 1], ready_seconds above 0 and hold_minutes of 0 or more")
+	}
 	if c.JobMinutes <= 0 || c.MaxAgeHours <= 0 {
 		return errors.New("config: job_minutes and max_age_hours must be positive")
 	}
@@ -239,9 +248,8 @@ func (c Config) PoolBounds(spec SetSpec, t time.Time) (floor, top int) {
 	return share(floor), max(share(floor), share(top))
 }
 
-// PoolTarget is the pool a set keeps given its recent arrival rate (jobs a second).
-func (c Config) PoolTarget(spec SetSpec, t time.Time, rate float64) int {
+// PoolTarget is the pool a set keeps given the burst its recent jobs ask for (State.Burst), within the hour's bounds.
+func (c Config) PoolTarget(spec SetSpec, t time.Time, burst int) int {
 	floor, top := c.PoolBounds(spec, t)
-	want := int(math.Ceil(rate * c.Pool.FillSeconds * c.Pool.Factor))
-	return min(top, max(floor, want))
+	return min(top, max(floor, burst))
 }
