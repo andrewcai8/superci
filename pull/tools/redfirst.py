@@ -29,7 +29,7 @@ MUTANTS = [
      "TestALostSessionLaunchesRetiresAndEndsNothingOnOldStatistics"),
     ("E6 retires surplus on a lost session", "state.go", "!s.ready() || !s.leased(now) || now.Sub(s.started) < warmup", "!s.ready() || now.Sub(s.started) < warmup",
      "TestALostSessionLaunchesRetiresAndEndsNothingOnOldStatistics"),
-    ("E6 ends surplus machines on a lost session", "state.go", "s.leased(now) && s.live() > s.desired()", "s.live() > s.desired()",
+    ("E6 ends surplus machines on a lost session", "state.go", "s.leased(now) && live > s.desired()", "live > s.desired()",
      "TestALostSessionLaunchesRetiresAndEndsNothingOnOldStatistics"),
     ("E7 Shed before the set is ready", "state.go", "\tif !s.ready() {\n\t\treturn nil\n\t}\n\tvar waiting []*Machine", "\tvar waiting []*Machine",
      "TestShedWaitsForReadinessAndARunnerListing"),
