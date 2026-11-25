@@ -1,18 +1,14 @@
 #!/bin/bash
-# A superci-pull machine: it asks the listener for a just-in-time runner, proving who it is with the identity document
-# EC2 signed for it, runs the runner until it has taken one job, and asks again, until the listener says it is not
-# needed (410); then it powers off, which terminates it. It holds no runner when it ends, so no job is lost with it.
-# A job may run @JOB_SECONDS@ s (the longest job's timeout and a margin); the machine powers off after @LIFE_SECONDS@ s
-# whatever it is doing (the listener gives no runner to a machine past its age, so that is a job's length past it).
+# A superci-pull machine runs one job. It asks the listener for a just-in-time runner, proving who it is with the
+# identity document EC2 signed for it, runs the runner until it has taken its job, and powers off, which terminates
+# it; so no job runs on a machine another job has used. Told it is not needed (410), it powers off holding no runner,
+# so no job is lost with it. A job may run @JOB_SECONDS@ s (the longest job's timeout and a margin); the machine
+# powers off after @LIFE_SECONDS@ s whatever it is doing.
 exec > >(tee /var/log/superci-pull.log > /dev/console) 2>&1
 ( sleep @LIFE_SECONDS@; poweroff ) > /dev/null 2>&1 &
 printf '%s\n' kernel.apparmor_restrict_unprivileged_userns=0 kernel.apparmor_restrict_unprivileged_unconfined=0 net.ipv4.ip_local_reserved_ports=50000-59999 > /etc/sysctl.d/99-superci.conf
 sysctl -eqp /etc/sysctl.d/99-superci.conf || :
 usermod -aG docker runner 2> /dev/null || :
-# Every job sees these (the runner reads its .env): the actions cache's endpoint, when one is configured.
-cat >> /home/runner/.env << 'ENV'
-@CACHE_ENV@
-ENV
 # First reads from a new volume are slow one at a time: the runner's own files are read 64 at a time first.
 find /home/runner/bin -type f -print0 2> /dev/null | xargs -0 -r -P 64 -n 16 cat &> /dev/null
 L='@LISTENER@'
@@ -31,14 +27,10 @@ while :; do
   echo "superci-pull: jit $code at $(date -u +%T.%N)"
   case $code in
     200)
-      fails=0
       export ACTIONS_RUNNER_INPUT_JITCONFIG=$(cat /run/superci-jit)
       rm -f /run/superci-jit
       (cd /home/runner && timeout -s KILL @JOB_SECONDS@ sudo --preserve-env=ACTIONS_RUNNER_INPUT_JITCONFIG -u runner -H ./run.sh)
-      overran=$?
-      unset ACTIONS_RUNNER_INPUT_JITCONFIG
-      [ $overran = 124 ] && break
-      rm -rf /home/runner/_work/* 2> /dev/null ;;
+      break ;;
     410) break ;;
     429) sleep 3 ;;
     # The listener unreachable (a restart, a replacement) for 15 minutes: no runner is held, so ending loses nothing.

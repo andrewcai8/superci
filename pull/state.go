@@ -235,10 +235,11 @@ const (
 	Unknown                // not one of ours
 )
 
-// Ask decides for a machine that asks for a runner. A machine gets a runner only when it holds none that could take
-// or hold a job: its last one was reported complete, or GitHub no longer lists it, or it never started and GitHub
-// removed it. So a second ask while a job runs on the machine (by anything on it that can read its identity) gets no
-// runner. A granted ask takes a registration from the budget, ahead of the pool's when a job waits. Until the
+// Ask decides for a machine that asks for a runner. A machine runs one job: once a runner of it has taken a job, it
+// gets no other (it ends), so no job inherits what the one before it left on the machine. It gets another runner
+// only for one that never started (GitHub no longer lists it, or removed it on our request), and while its runner
+// holds a job an ask (by anything on it that can read its identity) waits. A granted ask takes a registration from
+// the budget, ahead of the pool's when a job waits. Until the
 // message session has given the queue's statistics (after a restart, while a dead listener's session lapses), every
 // machine is told to wait: nothing is known to end it for, or to register for.
 func (s *State) Ask(id string, now time.Time, b *Budget, maxAge time.Duration) (Verdict, *Runner) {
@@ -249,13 +250,15 @@ func (s *State) Ask(id string, now time.Time, b *Budget, maxAge time.Duration) (
 		return Unknown, nil
 	}
 	m.Asked = now
-	if r := m.Runner; r != nil && !r.Done {
+	if r := m.Runner; r != nil {
 		gone := !r.Listed && s.listedAt.Sub(r.Issued) > time.Minute
 		switch {
-		case gone:
+		case r.Done || (r.Busy && gone):
+			m.Ending = true
+			return End, nil
 		case r.Busy || r.Removing:
 			return Wait, nil
-		default:
+		case !gone:
 			r.Removing = true
 			return Replace, r
 		}

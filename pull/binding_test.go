@@ -22,8 +22,8 @@ func TestASecondAskWhileAJobRunsGetsNoRunner(t *testing.T) {
 	}
 	s.Observe(&scaleset.RunnerScaleSetMessage{JobCompletedMessages: []*scaleset.JobCompleted{{RunnerName: "set-i-0000-aa"}},
 		Statistics: &scaleset.RunnerScaleSetStatistic{TotalAssignedJobs: 1}}, t0)
-	if v := ask(s, "i-0000", t0.Add(2*time.Minute)); v != Grant {
-		t.Fatalf("the first ask after its job completed: %v, want Grant", v)
+	if v := ask(s, "i-0000", t0.Add(2*time.Minute)); v != End {
+		t.Fatalf("an ask after its job completed: %v, want End (a machine runs one job, though a job still waits)", v)
 	}
 }
 
@@ -59,7 +59,7 @@ func TestARunnerThatNeverStartedIsRemovedBeforeAnother(t *testing.T) {
 	}
 }
 
-func TestABusyRunnerGitHubNoLongerListsIsGone(t *testing.T) {
+func TestABusyRunnerGitHubNoLongerListsEndsItsMachine(t *testing.T) {
 	s := NewState("set", 0, 10)
 	s.Observe(stats(1, 0), t0)
 	launch(s, machines(1, t0), t0)
@@ -69,8 +69,19 @@ func TestABusyRunnerGitHubNoLongerListsIsGone(t *testing.T) {
 		t.Fatalf("a listing too soon after it was issued proves nothing: %v", v)
 	}
 	s.Listed(map[string]ListedRunner{}, t0.Add(2*time.Minute))
+	if v := ask(s, "i-0000", t0.Add(2*time.Minute)); v != End {
+		t.Fatalf("its job's completion was missed, and GitHub has deleted the runner: %v, want End (its job is over)", v)
+	}
+}
+
+func TestARunnerThatNeverStartedAndIsGoneLeavesTheMachineFree(t *testing.T) {
+	s := NewState("set", 0, 10)
+	s.Observe(stats(1, 0), t0)
+	launch(s, machines(1, t0), t0)
+	s.Registered("i-0000", &Runner{ID: 5, Name: "set-i-0000-aa", Issued: t0})
+	s.Listed(map[string]ListedRunner{}, t0.Add(2*time.Minute))
 	if v := ask(s, "i-0000", t0.Add(2*time.Minute)); v != Grant {
-		t.Fatalf("its job's completion was missed, and GitHub has deleted the runner: %v, want Grant", v)
+		t.Fatalf("a runner that never took a job and GitHub no longer lists: %v, want Grant", v)
 	}
 }
 

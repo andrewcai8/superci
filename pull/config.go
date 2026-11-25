@@ -18,7 +18,7 @@ var builtinConfig []byte
 // Config is everything an operator may change. The built-in file holds the defaults; the override file, when it
 // exists, is decoded over them, so it names only what it changes (a "pools" entry replaces that size's whole entry).
 // The listener rereads the override file when it changes: pools, caps and limits apply at once; sizes, splits, types,
-// disks, regions and cache variables apply at the next start.
+// disks and regions apply at the next start.
 type Config struct {
 	Account      string                `json:"account"`
 	Org          string                `json:"org"`
@@ -36,7 +36,6 @@ type Config struct {
 	MarginMin    int                   `json:"margin_minutes"`
 	MaxAgeHours  float64               `json:"max_age_hours"`
 	Rerun        bool                  `json:"rerun_lost_jobs"`
-	CacheEnv     map[string]string     `json:"cache_env"`
 }
 
 // SizeConfig is one runner size: the label jobs ask for is its key (superci-<cpu>cpu).

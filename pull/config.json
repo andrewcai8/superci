@@ -87,6 +87,5 @@
   "job_minutes": 360,
   "margin_minutes": 30,
   "max_age_hours": 8,
-  "rerun_lost_jobs": true,
-  "cache_env": {}
+  "rerun_lost_jobs": true
 }

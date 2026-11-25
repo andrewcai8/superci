@@ -143,10 +143,7 @@ func run(ctx context.Context, f flags) error {
 	if err != nil {
 		return err
 	}
-	userData, err := bootData(cfg, fmt.Sprintf("https://%s%s", f.publicIP, f.listen), id.Pin)
-	if err != nil {
-		return err
-	}
+	userData := bootData(cfg, fmt.Sprintf("https://%s%s", f.publicIP, f.listen), id.Pin)
 	now := time.Now()
 	l := &Listener{path: f.configPath, cfg: cfg, modified: modTime(f.configPath), pins: map[string]int{}, fleet: fleet,
 		budget: NewBudget(cfg.Registration, now), spend: NewSpend(cfg.DailyUSD, cfg.MonthlyUSD, specs, now),
@@ -231,26 +228,13 @@ func run(ctx context.Context, f flags) error {
 	}
 }
 
-// bootData is a machine's user data: boot.sh with the listener's address and key, the longest a job may run, the
-// longest a machine may live, and the cache's variables for every job.
-func bootData(c Config, listener, pin string) (string, error) {
-	keys := make([]string, 0, len(c.CacheEnv))
-	for k := range c.CacheEnv {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	var env []string
-	for _, k := range keys {
-		v := c.CacheEnv[k]
-		if strings.ContainsAny(k+v, "\n\r'") || k == "" || strings.ContainsAny(k, "= ") {
-			return "", fmt.Errorf("cache_env %q: one line, no quote, a name without = or space", k)
-		}
-		env = append(env, k+"="+v)
-	}
+// bootData is a machine's user data: boot.sh with the listener's address and key, the longest a job may run, and the
+// longest a machine may live.
+func bootData(c Config, listener, pin string) string {
 	job := (c.JobMinutes + c.MarginMin) * 60
 	life := int(c.MaxAgeHours*3600) + job
 	return strings.NewReplacer("@LISTENER@", listener, "@PIN@", pin, "@JOB_SECONDS@", strconv.Itoa(job),
-		"@LIFE_SECONDS@", strconv.Itoa(life), "@CACHE_ENV@", strings.Join(env, "\n")).Replace(bootScript), nil
+		"@LIFE_SECONDS@", strconv.Itoa(life)).Replace(bootScript)
 }
 
 // ensureScaleSet finds or makes the set at GitHub with its labels: its name, and the size's label when it is not the

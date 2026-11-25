@@ -135,7 +135,7 @@ func (sr *setRegion) ensureTemplate(ctx context.Context, r *Region, name, userDa
 		SecurityGroupIds:                  []string{group},
 		InstanceInitiatedShutdownBehavior: ec2types.ShutdownBehaviorTerminate,
 		MetadataOptions: &ec2types.LaunchTemplateInstanceMetadataOptionsRequest{HttpTokens: ec2types.LaunchTemplateHttpTokensStateRequired,
-			HttpPutResponseHopLimit: aws.Int32(2), HttpEndpoint: ec2types.LaunchTemplateInstanceMetadataEndpointStateEnabled},
+			HttpPutResponseHopLimit: aws.Int32(1), HttpEndpoint: ec2types.LaunchTemplateInstanceMetadataEndpointStateEnabled},
 		BlockDeviceMappings: []ec2types.LaunchTemplateBlockDeviceMappingRequest{{DeviceName: aws.String(r.root), Ebs: &ec2types.LaunchTemplateEbsBlockDeviceRequest{
 			VolumeSize: aws.Int32(int32(diskGB)), VolumeType: ec2types.VolumeTypeGp3, Iops: aws.Int32(3000), Throughput: aws.Int32(250), DeleteOnTermination: aws.Bool(true)}}},
 		TagSpecifications: []ec2types.LaunchTemplateTagSpecificationRequest{{ResourceType: ec2types.ResourceTypeInstance, Tags: tags}, {ResourceType: ec2types.ResourceTypeVolume, Tags: tags}},
