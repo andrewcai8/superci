@@ -56,6 +56,7 @@ MILESTONES = [
     ("jit.sent", "document to first ask", "machine"),
     ("jit.ask", "ask to listener", "network"),
     ("jit.granted", "registration token wait (budget, readiness, 3 s polling)", "listener"),
+    ("jit.claimed", "identity claim (S3 conditional write)", "listener"),
     ("jit.issued", "GitHub registration and issued tag", "listener"),
     ("jit.answered", "config to machine", "network"),
     ("runner.start", "machine to run.sh", "machine"),
@@ -167,6 +168,10 @@ def machine_milestones(tl, events, created):
         e = first(mine, name)
         if e:
             m[name] = e["t"]
+    c = first(mine, "jit.claim")
+    if c:
+        m["jit.claimed"] = c["t"]
+        tl.attrs["claim"] = c.get("result")
     bs = first(mine, "boot.start")
     if bs and bs.get("val"):
         try:
@@ -207,7 +212,9 @@ def build(job, events):
         m["job.started"] = started
     if tl.fleet == "superci":
         machine_milestones(tl, events, created)
-    chain = [x for x, _, _ in MILESTONES] if tl.fleet == "superci" else list(API_ONLY)
+    # a listener from before the claim (pull-fence) wrote no jit.claim, and its jobs do not owe the milestone
+    claims = any(e["ev"] == "jit.claim" for e in events)
+    chain = [x for x, _, _ in MILESTONES if claims or x != "jit.claimed"] if tl.fleet == "superci" else list(API_ONLY)
     pos = {x: i for i, x in enumerate(chain)}
     known_pre = [x for x in chain if x not in ("job.queued", "listener.seen") and m.get(x) is not None and created is not None and m[x] < created - 1]
     cut = max((ORDER[x] for x in known_pre), default=-1)
@@ -468,7 +475,7 @@ def show_job(tl):
     j = tl.job
     print(f"job {tl.id}  {tl.name}  run {tl.run}  {tl.fleet}  label {tl.label}  runner {tl.runner}")
     a = tl.attrs
-    bits = [f"{k}={a[k]}" for k in ("region", "az", "type", "lifecycle", "pool", "ask_verdict", "register_ms", "clock_offset_ms", "clock_corrected", "end_why") if a.get(k) is not None]
+    bits = [f"{k}={a[k]}" for k in ("region", "az", "type", "lifecycle", "pool", "ask_verdict", "claim", "register_ms", "clock_offset_ms", "clock_corrected", "end_why") if a.get(k) is not None]
     print("  " + "  ".join(bits) if bits else "  (no machine attributes: api only)")
     if tl.wall is None:
         print("  job has not completed")

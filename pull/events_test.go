@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"os"
 	"strconv"
@@ -81,6 +82,9 @@ func TestListenerEventsMatchSchema(t *testing.T) {
 		tlAsk("superci-4cpu", "i-0abc", Wait, now.Add(3*time.Second))
 		tlAsk("superci-4cpu", "i-0abc", Grant, now.Add(6*time.Second))
 		tlAsk("superci-4cpu", "i-0def", End, now)
+		tlClaim("superci-4cpu", "i-0abc", nil, now.Add(-30*time.Millisecond), now)
+		tlClaim("superci-4cpu", "i-0abc", ErrClaimed, now, now)
+		tlClaim("superci-4cpu", "i-0abc", errors.New("s3 down"), now, now)
 		tlStart("superci-pull", now)
 		snap := Snapshot{Set: "superci-4cpu", Pool: 2, Desired: 5}
 		tlDecision(snap, "r-1", 3, 10, 0.5, now)
@@ -122,6 +126,15 @@ func TestListenerEventsMatchSchema(t *testing.T) {
 			t.Errorf("eid %v repeats or boot is not this process's: %v", l["eid"], l)
 		}
 		eids[l["eid"]] = true
+	}
+	var results []any
+	for _, l := range lines {
+		if l["ev"] == "jit.claim" {
+			results = append(results, l["result"])
+		}
+	}
+	if len(results) != 3 || results[0] != "taken" || results[1] != "refused" || results[2] != "error" {
+		t.Errorf("claims: %v", results)
 	}
 	for _, l := range lines {
 		if l["ev"] == "jit.granted" && (l["waited_ms"] != float64(6000) || l["polls"] != float64(3)) {

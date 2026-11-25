@@ -50,7 +50,7 @@ ec2, machine, network, runner).
 | --- | --- |
 | `job.assigned` (first sight; GitHub sends JobAssigned, never JobAvailable), `job.acquired`, `job.started`, `job.completed` | `scaler.Scale` (`main.go`), through `tlMessage` |
 | `machine.launched`, `machine.ended` | `SetFleet.ask`, `Fleet.Terminate` (`fleet.go`) |
-| `jit.ask`, `jit.granted` (token wait), `jit.issued`, `jit.refused`, `machine.notice` | `Server.jit`, `Server.notice` (`server.go`) |
+| `jit.ask`, `jit.granted` (token wait), `jit.claim` (the fence's claim: taken, refused, error), `jit.issued`, `jit.refused`, `machine.notice` | `Server.jit`, `Server.notice` (`server.go`) |
 | `launch.decision`, `pool.target`, `machine.retired`, `listener.start` | the launcher and reconciler (`main.go`) |
 | `boot.start`, `cache.start`, `cache.up`, `doc.got`, `jit.sent`, `jit.answered`, `runner.*`, `job.running`, `job.done`, `poweroff` | `boot.sh` on the machine, through a spool and `/mark` |
 | `hydrate.start`, `hydrate.done` | pull-prehydrate, as marks (names are taken already) |

@@ -92,6 +92,20 @@ class Build(unittest.TestCase):
         self.assertAlmostEqual(tl.unexplained, 0)
 
 
+class Claim(unittest.TestCase):
+    def test_a_listener_without_the_claim_owes_no_milestone_and_one_with_it_does(self):
+        tl = T.build(job(), cold_events())
+        self.assertNotIn("identity claim (S3 conditional write)", [p[0] for p in tl.phases])
+        self.assertEqual(tl.gaps, [])
+        withclaim = cold_events() + [ev("jit.claim", 13.4, result="taken", claim_ms=300)]
+        tl = T.build(job(), withclaim)
+        self.assertIn("identity claim (S3 conditional write)", [p[0] for p in tl.phases])
+        self.assertEqual(tl.attrs["claim"], "taken")
+        self.assertEqual(tl.gaps, [])
+        missing = cold_events() + [dict(ev="jit.claim", t=T0 + 99, inst="i-other", result="taken")]
+        self.assertTrue(T.build(job(), missing).gaps)
+
+
 class Machine(unittest.TestCase):
     def test_a_clock_off_by_seconds_is_moved_onto_the_listeners(self):
         events = cold_events()
@@ -137,7 +151,7 @@ class Schema(unittest.TestCase):
             schema = json.load(f)
         self.assertEqual(schema["version"], T.SCHEMA_VERSION)
         names = set(schema["events"])
-        for name in T.MACHINE_MARKS + ("poweroff", "jit.ask", "jit.granted", "jit.issued", "machine.ended", "machine.launched", "job.assigned", "job.started", "job.completed", "ec2.state"):
+        for name in T.MACHINE_MARKS + ("poweroff", "jit.ask", "jit.granted", "jit.claim", "jit.issued", "machine.ended", "machine.launched", "job.assigned", "job.started", "job.completed", "ec2.state"):
             self.assertIn(name, names)
 
 

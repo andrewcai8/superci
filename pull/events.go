@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -175,6 +176,19 @@ func tlAsk(set, inst string, v Verdict, now time.Time) {
 // tlIssued writes that a machine's runner was registered and its config left; started is when its ask arrived.
 func tlIssued(set, inst, runner string, runnerID int, started, now time.Time) {
 	tl("jit.issued", now, "set", set, "inst", inst, "runner", runner, "runner_id", runnerID, "register_ms", now.Sub(started).Milliseconds())
+}
+
+// tlClaim writes the claim a grant takes before it registers a runner (the fence): taken, refused (another grant holds
+// it) or error (the claim store could not be read or written); claim_ms is how long the claim took.
+func tlClaim(set, inst string, err error, started, now time.Time) {
+	result := "taken"
+	switch {
+	case errors.Is(err, ErrClaimed):
+		result = "refused"
+	case err != nil:
+		result = "error"
+	}
+	tl("jit.claim", now, "set", set, "inst", inst, "result", result, "claim_ms", now.Sub(started).Milliseconds())
 }
 
 // tlRefused writes that no config left for a machine's ask: exists, refused (GitHub's cap), failed or withheld.

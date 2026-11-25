@@ -112,8 +112,10 @@ func (h *Server) jit(w http.ResponseWriter, r *http.Request) {
 	defer func() { <-h.slots }()
 	name := runnerName(s.spec.Name, m.ID)
 	cctx, ccancel := context.WithTimeout(context.WithoutCancel(r.Context()), 10*time.Second)
+	claimStart := time.Now()
 	err = h.claim(cctx, m.ID, s.state.Claim(m))
 	ccancel()
+	tlClaim(s.spec.Name, m.ID, err, claimStart, time.Now())
 	if err != nil {
 		h.budget.Done(time.Now(), Unused, 0)
 		slog.Error("claim", "set", s.spec.Name, "machine", m.ID, "elsewhere", errors.Is(err, ErrClaimed), "err", err.Error(), "ms", time.Since(started).Milliseconds())
