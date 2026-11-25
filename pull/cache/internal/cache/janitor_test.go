@@ -217,6 +217,42 @@ func TestAMarkerDatedAheadCountsForNothingAndIsDeleted(t *testing.T) {
 	}
 }
 
+// deniedUnderMarks refuses every delete under MarkRoot, as a role without DeleteObject on a/* would.
+type deniedUnderMarks struct{ sized }
+
+func (d deniedUnderMarks) Delete(ctx context.Context, objs []cache.Object) ([]cache.Removal, error) {
+	for _, o := range objs {
+		if strings.HasPrefix(o.Key, cache.MarkRoot) {
+			return nil, fmt.Errorf("AccessDenied: %s", o.Key)
+		}
+	}
+	return d.sized.Delete(ctx, objs)
+}
+
+func TestJunkThatCannotBeDeletedNeverStopsEviction(t *testing.T) {
+	m := cachetest.NewMem()
+	oldSeed := plant(m, entry(main, "git-seed-v1-Linux-X64-10000000001", gib, ago(30*hour)))
+	newSeed := plant(m, entry(main, "git-seed-v1-Linux-X64-10000000002", gib, ago(hour)))
+	m.Set(cache.MarkRoot+"x", make([]byte, 8), ago(hour))
+
+	rep, err := cache.Janitor(context.Background(), deniedUnderMarks{sized{m, gib}}, cache.Policy{CapBytes: gib, MaxIdle: 30 * day}, t0, false, log.New(&tape{}, "", 0))
+	if err != nil || rep.Deleted != 1 {
+		t.Fatalf("one planted object under a/ stopped eviction: report %+v, %v", rep, err)
+	}
+	if left := m.Keys("v1/"); !reflect.DeepEqual(left, []string{newSeed.Key}) {
+		t.Fatalf("left %v, want only the newest seed (old %s)", left, oldSeed.Key)
+	}
+}
+
+func TestAMarkerOfTomorrowFromAClockAheadStillCounts(t *testing.T) {
+	o := entry(main, "tool-a", gib, ago(20*day))
+	tomorrow := t0.Add(day)
+	marks, junk := cache.ReadMarks([]cache.Object{{Key: cache.MarkKey(o.Key, tomorrow)}}, t0)
+	if len(junk) != 0 || !marks.LastUsed(o).After(t0) {
+		t.Fatalf("a marker one day ahead is a use, not junk: junk %v, last used %s", junk, marks.LastUsed(o))
+	}
+}
+
 func TestAnEntryInUseOutlivesTheOldThirtyDays(t *testing.T) {
 	hot := entry(main, "uv-toolcache-v1-uv0.13.9", gib, ago(45*day))
 	idle := entry(main, "uv-toolcache-v1-uv0.12.0", gib, ago(31*day))
