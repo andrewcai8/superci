@@ -101,7 +101,7 @@ type State struct {
 
 	arrivals    []time.Time          // jobs that arrived, for the pool's rate
 	available   map[string]time.Time // when each waiting job was queued, by jobKey, for its queue wait
-	launches    []time.Duration      // launch call to registered runner, of the set's last machines
+	launches    []time.Duration      // launch call to first ask, of the set's last machines
 	held        []heldPool           // the bursts of the last hold, newest last
 	carried     int                  // the burst the last listener saw, held for the first window after a start
 	lost        []JobRef             // jobs that ended on a machine AWS was taking back, for a re-run
@@ -380,7 +380,11 @@ func (s *State) Issue(m *Machine, r *Runner) {
 	defer s.mu.Unlock()
 	m.Issuing, m.Issued, m.Tagged, m.Runner, m.Claim = false, true, true, r, ""
 	if !m.Ordered.IsZero() {
-		s.launches = append(s.launches, r.Issued.Sub(m.Ordered))
+		ready := m.FirstAsk
+		if ready.IsZero() {
+			ready = r.Issued
+		}
+		s.launches = append(s.launches, ready.Sub(m.Ordered))
 		s.launches = s.launches[max(0, len(s.launches)-launchSamples):]
 	}
 	if m.Notice {
@@ -575,9 +579,10 @@ type heldPool struct {
 	n  int
 }
 
-// launchTime is how long a launch takes to bring a registered runner: the 90th percentile of the set's last launches
-// (from the launch call to the runner's registration, boot and any wait for the registration budget included), or
-// def until it has eight.
+// launchTime is how long a launch takes to bring a machine that can take a runner: the 90th percentile of the set's
+// last launches, from the launch call to the machine's first ask (its boot), or def until it has eight. The wait for
+// the registration budget is left out: it is a rate the pool cannot buy ahead, and counting it fed back (a longer
+// launch time sized a larger pool, whose registrations lengthened the wait; 244 s measured on a dev set).
 func (s *State) launchTime(def time.Duration) time.Duration {
 	if len(s.launches) < 8 {
 		return def
