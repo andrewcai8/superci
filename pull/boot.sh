@@ -20,6 +20,7 @@ CR=$(curl -s -m 2 -H "X-aws-ec2-metadata-token: $T" http://169.254.169.254/lates
 # Hydration (pull/README.md): with a manifest for this label, main's caches are unpacked in the background while the machine
 # asks for its runner and waits for its job, which takes them by rename. The runner's job-started hook stops it when the job starts.
 # The hydration is its own process group (setsid), whose leader's id is in $HR/.pid, so the hook ends all of it; it never blocks the machine.
+# It drops to the runner user with setpriv, which execs in place (runuser forks and may start a session of its own, out of the hook's reach).
 export HR=/home/runner/hydrated HM=/run/superci-hydrate.json PB CR
 install -d -o runner -g runner "$HR"
 cat > /home/runner/superci-hydrate-stop.sh << 'HOOK'
@@ -36,7 +37,7 @@ hydrate() {
   echo $$ > "$HR/.pid"
   if [ -x /usr/local/bin/pullcache ] && aws s3 cp --only-show-errors --region "$CR" "s3://$PB/bin/hydrate/@LABEL@.json" "$HM" 2> /dev/null; then
     chown -R runner:runner "$HR"
-    out=$(timeout --foreground -k 5 110 runuser -u runner -- env HOME=/home/runner PULLCACHE_BUCKET="$PB" PULLCACHE_REGION="$CR" /usr/local/bin/pullcache hydrate -timeout 100s "$HM" "$HR" || :)
+    out=$(timeout --foreground -k 5 110 setpriv --reuid=runner --regid=runner --init-groups -- env HOME=/home/runner PULLCACHE_BUCKET="$PB" PULLCACHE_REGION="$CR" /usr/local/bin/pullcache hydrate -timeout 100s "$HM" "$HR" || :)
     echo "$out"
     val=$(printf '%s\n' "$out" | sed -n 's|^hydrated \([0-9]*\)/\([0-9]*\) entries \([0-9]*\) MB$|\1/\2:\3MB|p' | tail -1)
     mark_hydrate "$(us)" hydrate.done "$val"

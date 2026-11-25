@@ -114,7 +114,7 @@ func TestAMachineRegistersAtOnceAndHydratesInTheBackgroundUnderAHookThatStopsIt(
 }
 
 // This runs boot.sh's hydrate() as a machine's user data holds it, with the machine's paths and commands replaced by a
-// sandbox's: aws, runuser and chown are stubs and pullcache is a script that says what it hydrated.
+// sandbox's: aws, setpriv and chown are stubs and pullcache is a script that says what it hydrated.
 func TestTheHydrationPostsItsStartAndEndAsTimelineMarksAndEndsWithItsPidFileGone(t *testing.T) {
 	cfg, err := LoadConfig("")
 	if err != nil {
@@ -138,7 +138,7 @@ func TestTheHydrationPostsItsStartAndEndAsTimelineMarksAndEndsWithItsPidFileGone
 		}
 	}
 	stub("aws", `cp "$@" 2>/dev/null; echo '{}' > "${@: -1}"`)
-	stub("runuser", `shift 3; exec "$@"`)
+	stub("setpriv", `shift 4; exec "$@"`)
 	stub("chown", `true`)
 	stub("pullcache", `echo "hydrate: log line on stderr" >&2; echo "hydrated 4/5 entries 1210 MB"`)
 	spool, hr := filepath.Join(dir, "marks"), filepath.Join(dir, "hydrated")
