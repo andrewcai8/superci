@@ -706,7 +706,7 @@ func (l *Listener) reconciler(ctx context.Context, refresh func(context.Context,
 			slog.Warn("shed waiting machines", "waiting", waiting, "limit", limit, "shed", waiting-limit-excess)
 			tlRetiredAll(end, "shed", now)
 		}
-		window := time.Duration(max(1, cfg.Pool.WindowMinutes)) * time.Minute
+		window := cfg.Pool.window()
 		for _, s := range l.sets {
 			s.state.SetCapped(capped)
 			if stale := s.state.MarkStale(now, 3*time.Minute); stale > 0 {
@@ -772,7 +772,8 @@ func (l *Listener) reconciler(ctx context.Context, refresh func(context.Context,
 				slog.Info("state", "set", snap.Set, "ready", snap.Ready, "desired", snap.Desired, "live", snap.Live, "inflight", snap.Inflight, "machines", snap.Machines,
 					"booting", snap.Booting, "idle", snap.Idle, "busy", snap.Busy, "issued", snap.Issued, "retiring", snap.Retiring, "ending", snap.Ending,
 					"on_demand", snap.OnDemand, "notices", snap.Notices, "pool", snap.Pool, "orphans", snap.Orphans, "stale_waiting", snap.StaleWaiting,
-					"s_assigned", snap.Stats.TotalAssignedJobs, "s_available", snap.Stats.TotalAvailableJobs, "s_running", snap.Stats.TotalRunningJobs)
+					"s_assigned", snap.Stats.TotalAssignedJobs, "s_available", snap.Stats.TotalAvailableJobs, "s_running", snap.Stats.TotalRunningJobs,
+					"launch_s", snap.LaunchS, "launches", snap.Launches)
 				tlPoolTarget(snap, now)
 			}
 		}
@@ -873,18 +874,17 @@ func (l *Listener) price(ctx context.Context) {
 	}
 }
 
-// setPools sets each set's hot pool: the operator's pin, or what the set's recent arrivals ask for within the hour's
+// setPools sets each set's hot pool: the operator's pin, or the burst the set's recent jobs ask for within the hour's
 // floor and cap.
 func (l *Listener) setPools(now time.Time) {
 	cfg := l.config()
 	l.mu.Lock()
 	pins := maps(l.pins)
 	l.mu.Unlock()
-	window := time.Duration(max(1, cfg.Pool.WindowMinutes)) * time.Minute
 	for _, s := range l.sets {
 		n, pinned := pins[s.spec.Name]
 		if !pinned {
-			n = cfg.PoolTarget(s.spec, now, s.state.ArrivalRate(now, window))
+			n = cfg.PoolTarget(s.spec, now, s.state.Burst(now, cfg.Pool))
 		}
 		s.state.SetPool(n)
 	}

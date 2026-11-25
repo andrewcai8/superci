@@ -42,25 +42,37 @@ func TestASplitSizeRunsAsSeveralSetsWithTheLabel(t *testing.T) {
 	}
 }
 
-func TestThePoolFollowsArrivalsWithinTheHoursBounds(t *testing.T) {
-	c := Config{Pool: PoolRule{FillSeconds: 40, Factor: 1.5, LeadMinutes: 15},
+func TestThePoolFollowsBurstsWithinTheHoursBounds(t *testing.T) {
+	c := Config{Pool: PoolRule{LeadMinutes: 15},
 		Pools: map[string]PoolConfig{"l": {Floor: [24]int{3: 1, 4: 2}, Cap: [24]int{3: 50, 4: 120}}}}
 	spec := SetSpec{Name: "l", Label: "l", Split: 1}
 	at := func(h, m int) time.Time { return time.Date(2026, 11, 25, h, m, 0, 0, time.UTC) }
-	if n := c.PoolTarget(spec, at(3, 10), 0); n != 1 {
-		t.Fatalf("no arrivals: %d, want the floor", n)
+	for _, tc := range []struct {
+		at          time.Time
+		burst, want int
+		why         string
+	}{
+		{at(3, 10), 0, 1, "no jobs: the floor"},
+		{at(3, 10), 30, 30, "the burst"},
+		{at(3, 10), 500, 50, "the hour's cap"},
+		{at(3, 50), 500, 120, "within the lead of a busier hour: its cap"},
+		{at(3, 50), 0, 2, "within the lead of a busier hour, no jobs: its floor"},
+	} {
+		if n := c.PoolTarget(spec, tc.at, tc.burst); n != tc.want {
+			t.Fatalf("burst %d at %s: pool %d, want %d (%s)", tc.burst, tc.at.Format("15:04"), n, tc.want, tc.why)
+		}
 	}
-	if n := c.PoolTarget(spec, at(3, 10), 0.5); n != 30 {
-		t.Fatalf("0.5 jobs/s: %d, want 0.5*40*1.5", n)
-	}
-	if n := c.PoolTarget(spec, at(3, 10), 5); n != 50 {
-		t.Fatalf("5 jobs/s: %d, want the hour's cap", n)
-	}
-	if n := c.PoolTarget(spec, at(3, 50), 5); n != 120 {
-		t.Fatalf("within the lead of a busier hour: %d, want its cap", n)
-	}
-	if n := c.PoolTarget(spec, at(3, 50), 0); n != 2 {
-		t.Fatalf("within the lead of a busier hour, no arrivals: %d, want its floor", n)
+}
+
+func TestAPoolRuleWithoutAQuantileOrALaunchTimeIsRefused(t *testing.T) {
+	for _, override := range []string{`{"pool": {"quantile": 0, "ready_seconds": 22}}`, `{"pool": {"quantile": 0.8, "ready_seconds": 0}}`, `{"pool": {"quantile": 1.5, "ready_seconds": 22}}`} {
+		path := filepath.Join(t.TempDir(), "config.json")
+		if err := os.WriteFile(path, []byte(override), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadConfig(path); err == nil {
+			t.Fatalf("%s: accepted", override)
+		}
 	}
 }
 

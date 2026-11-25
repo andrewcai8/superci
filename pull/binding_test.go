@@ -193,22 +193,15 @@ func TestNothingIsDecidedUntilEveryRegionIsListed(t *testing.T) {
 }
 
 // OPS-3: arrivals were divided by the whole window, so a restart read as no arrivals and the pool fell to its floor.
+// The pool now counts the jobs that arrived within a launch time of each, which a restart cannot dilute.
 func TestARestartDoesNotReadAsNoArrivals(t *testing.T) {
 	s := NewState("set", 0, 10, []string{"us-east-1"}, t0)
 	for i := 0; i < 300; i++ {
-		s.Observe(&scaleset.RunnerScaleSetMessage{JobAvailableMessages: []*scaleset.JobAvailable{{JobMessageBase: scaleset.JobMessageBase{RunnerRequestID: int64(i)}}}},
+		s.Observe(&scaleset.RunnerScaleSetMessage{JobAssignedMessages: []*scaleset.JobAssigned{{JobMessageBase: scaleset.JobMessageBase{JobID: fmt.Sprint(i)}}}},
 			t0.Add(time.Duration(i)*200*time.Millisecond))
 	}
-	if r := s.ArrivalRate(t0.Add(time.Minute), 10*time.Minute); r != 5 {
-		t.Fatalf("rate %v a minute after a start, want 5 (300 jobs in 60 s)", r)
-	}
-	early := NewState("set", 0, 10, []string{"us-east-1"}, t0)
-	for i := 0; i < 120; i++ {
-		early.Observe(&scaleset.RunnerScaleSetMessage{JobAvailableMessages: []*scaleset.JobAvailable{{JobMessageBase: scaleset.JobMessageBase{RunnerRequestID: int64(i)}}}},
-			t0.Add(time.Duration(i)*time.Second/6))
-	}
-	if r := early.ArrivalRate(t0.Add(20*time.Second), 10*time.Minute); r != 2 {
-		t.Fatalf("rate %v 20 s after a start, want 120 jobs over a minute at least", r)
+	if n := s.Burst(t0.Add(time.Minute), testRule); n != 110 {
+		t.Fatalf("burst %d a minute after a start, want 110 (5 jobs a second for the 22 s a launch takes)", n)
 	}
 }
 

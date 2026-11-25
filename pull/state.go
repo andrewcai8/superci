@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,6 +24,7 @@ type Machine struct {
 	Lifecycle string // "spot" or "on-demand"
 	Round     string // the launch round that started it (its superci-pull-round tag)
 	Launched  time.Time
+	Ordered   time.Time // when this process asked EC2 for it; zero for a machine adopted after a start
 	Seen      time.Time // last listed by DescribeInstances
 	Asked     time.Time // last asked for a runner (or adopted)
 	// Issued says a runner was issued to it. A machine gets one runner, ever. The fence is its claim (Claims), made
@@ -97,6 +99,8 @@ type State struct {
 
 	arrivals    []time.Time          // jobs that arrived, for the pool's rate
 	available   map[string]time.Time // when each waiting job was queued, by jobKey, for its queue wait
+	launches    []time.Duration      // launch call to registered runner, of the set's last machines
+	held        []heldPool           // the bursts of the last hold, newest last
 	lost        []JobRef             // jobs that ended on a machine AWS was taking back, for a re-run
 	waits       []float64            // queue waits (s) of jobs started since the metrics last took them
 	odLaunched  []time.Time
@@ -253,6 +257,7 @@ func (s *State) Launched(round string, got []*Machine, now time.Time) {
 	delete(s.reserved, round)
 	for _, m := range got {
 		if _, ok := s.machines[m.ID]; !ok {
+			m.Ordered = now
 			s.machines[m.ID] = m
 		}
 		s.allLaunched = append(s.allLaunched, now)
@@ -360,6 +365,10 @@ func (s *State) Issue(m *Machine, r *Runner) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	m.Issuing, m.Issued, m.Tagged, m.Runner, m.Claim = false, true, true, r, ""
+	if !m.Ordered.IsZero() {
+		s.launches = append(s.launches, r.Issued.Sub(m.Ordered))
+		s.launches = s.launches[max(0, len(s.launches)-launchSamples):]
+	}
 	if m.Notice {
 		m.Retire = true
 	}
@@ -434,6 +443,9 @@ func (s *State) Observe(msg *scaleset.RunnerScaleSetMessage, now time.Time) {
 	}
 	for _, j := range msg.JobAssignedMessages {
 		s.arrived(j.JobMessageBase, now)
+	}
+	for _, j := range msg.JobAssignedMessages {
+		arrive(j.JobMessageBase)
 	}
 	for _, j := range msg.JobStartedMessages {
 		queued, ok := s.available[jobKey(j.JobMessageBase)]
@@ -533,18 +545,65 @@ func (s *State) TakeLost() []JobRef {
 	return l
 }
 
-// ArrivalRate is the jobs a second that became available over the last window, or over the time since this process
-// started when that is shorter (but at least a minute), so a restart does not read as no arrivals.
-func (s *State) ArrivalRate(now time.Time, window time.Duration) float64 {
+// launchSamples is how many of the set's last launches its launch time is measured over.
+const launchSamples = 64
+
+// heldPool is a burst the set saw, kept for the hold.
+type heldPool struct {
+	at time.Time
+	n  int
+}
+
+// launchTime is how long a launch takes to bring a registered runner: the 90th percentile of the set's last launches
+// (from the launch call to the runner's registration, boot and any wait for the registration budget included), or
+// def until it has eight.
+func (s *State) launchTime(def time.Duration) time.Duration {
+	if len(s.launches) < 8 {
+		return def
+	}
+	xs := slices.Clone(s.launches)
+	slices.Sort(xs)
+	return xs[len(xs)*9/10]
+}
+
+// Burst is the pool the set's recent jobs ask for. A job finds a ready runner when fewer jobs than the pool arrived in
+// the launch time up to and including it: each job takes a runner and launches the next, which is ready one launch
+// time later. Burst is that count at the quantile q of the jobs seen in the last window, and no less than the largest
+// burst of the last hold, so the pool shrinks only once bursts have stayed smaller for a while (a pool runner retired
+// is a registration and a boot spent for nothing). Without arrivals it is 0, and the hour's floor holds.
+func (s *State) Burst(now time.Time, r PoolRule) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.arrivals = since(s.arrivals, now.Add(-window))
+	s.arrivals = since(s.arrivals, now.Add(-r.window()))
 	for id, t := range s.available {
 		if now.Sub(t) > 7*time.Hour {
 			delete(s.available, id)
 		}
 	}
-	return float64(len(s.arrivals)) / min(window, max(time.Minute, now.Sub(s.started))).Seconds()
+	launch := s.launchTime(r.ready())
+	counts := make([]int, len(s.arrivals))
+	lo := 0
+	for i, a := range s.arrivals {
+		for lo < i && !s.arrivals[lo].After(a.Add(-launch)) {
+			lo++
+		}
+		counts[i] = i - lo + 1
+	}
+	n := 0
+	if len(counts) > 0 {
+		slices.Sort(counts)
+		n = counts[min(len(counts)-1, int(r.Quantile*float64(len(counts))))]
+	}
+	s.held = append(s.held, heldPool{now, n})
+	i := 0
+	for i < len(s.held) && now.Sub(s.held[i].at) > r.hold() {
+		i++
+	}
+	s.held = s.held[i:]
+	for _, h := range s.held {
+		n = max(n, h.n)
+	}
+	return n
 }
 
 // TakeWaits hands over the queue waits recorded since the last call.
@@ -980,6 +1039,8 @@ type Snapshot struct {
 	Notices      int                              `json:"notices"`
 	StaleWaiting int                              `json:"stale_waiting"`
 	Orphans      int                              `json:"orphans"`
+	LaunchS      float64                          `json:"launch_s"` // the launch time the pool is sized for, measured
+	Launches     int                              `json:"launches"` // the launches it is measured over
 }
 
 func (s *State) Snapshot(now time.Time) Snapshot {
@@ -991,7 +1052,8 @@ func (s *State) Snapshot(now time.Time) Snapshot {
 		inflight += k
 	}
 	out := Snapshot{Set: s.set, Stats: s.stats, Pool: s.pool, Max: s.max, Capped: s.capped, Ready: s.ready(), Desired: s.desired(), Live: s.live(),
-		Inflight: inflight, Machines: len(s.machines), StaleWaiting: s.staleWaiting, Orphans: orphans}
+		Inflight: inflight, Machines: len(s.machines), StaleWaiting: s.staleWaiting, Orphans: orphans,
+		LaunchS: s.launchTime(0).Seconds(), Launches: len(s.launches)}
 	for _, m := range s.machines {
 		switch {
 		case m.Ending:
