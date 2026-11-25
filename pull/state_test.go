@@ -334,7 +334,7 @@ func TestAJobAssignedWithNoJobAvailableArrivesAndIsTimed(t *testing.T) {
 	s := NewState("set", 0, 10, []string{"us-east-1"}, t0.Add(-time.Hour))
 	queued := t0.Add(-4 * time.Second)
 	for i := 0; i < 60; i++ {
-		base := scaleset.JobMessageBase{RunnerRequestID: int64(i), QueueTime: queued}
+		base := scaleset.JobMessageBase{RunnerRequestID: int64(i + 1), QueueTime: queued}
 		s.Observe(&scaleset.RunnerScaleSetMessage{JobAssignedMessages: []*scaleset.JobAssigned{{JobMessageBase: base}, {JobMessageBase: base}}}, t0)
 	}
 	if r := s.ArrivalRate(t0.Add(time.Minute), 10*time.Minute); r != 0.1 {
@@ -343,5 +343,48 @@ func TestAJobAssignedWithNoJobAvailableArrivesAndIsTimed(t *testing.T) {
 	s.Observe(&scaleset.RunnerScaleSetMessage{JobStartedMessages: []*scaleset.JobStarted{{JobMessageBase: scaleset.JobMessageBase{RunnerRequestID: 7}}}}, t0.Add(2*time.Second))
 	if w := s.TakeWaits(); len(w) != 1 || w[0] != 6 {
 		t.Fatalf("waits %v, want one of 6 s: from when GitHub queued the job", w)
+	}
+}
+
+// GitHub's JobAssigned carries a job id, no runner request id (0) and no queue time: keyed by the runner request id,
+// every job after the first read as one already seen, and the pool kept to its floor.
+func TestAJobAssignedWithoutAnOfferSizesThePool(t *testing.T) {
+	s := NewState("set", 0, 100, []string{"us-east-1"}, t0.Add(-time.Hour))
+	msg := &scaleset.RunnerScaleSetMessage{}
+	for i := 0; i < 30; i++ {
+		msg.JobAssignedMessages = append(msg.JobAssignedMessages, &scaleset.JobAssigned{JobMessageBase: scaleset.JobMessageBase{
+			JobID: fmt.Sprintf("job-%d", i), ScaleSetAssignTime: t0}})
+	}
+	s.Observe(msg, t0.Add(time.Second))
+	if r := s.ArrivalRate(t0.Add(time.Minute), time.Minute); r != 0.5 {
+		t.Fatalf("30 jobs assigned at once: rate %v a second, want 0.5 (30 in the minute)", r)
+	}
+	s.Observe(&scaleset.RunnerScaleSetMessage{JobStartedMessages: []*scaleset.JobStarted{{JobMessageBase: scaleset.JobMessageBase{JobID: "job-3"}}}}, t0.Add(5*time.Second))
+	if w := s.TakeWaits(); len(w) != 1 || w[0] != 5 {
+		t.Fatalf("waits %v, want one of 5 s: from when GitHub assigned the job to the set", w)
+	}
+}
+
+// A backlog GitHub redelivers after a restart arrives in one message; dated by its assignments, the rate covers them.
+func TestARedeliveredBacklogKeepsItsOwnTimes(t *testing.T) {
+	s := NewState("set", 0, 100, []string{"us-east-1"}, t0.Add(-time.Hour))
+	msg := &scaleset.RunnerScaleSetMessage{}
+	for i := 0; i < 30; i++ {
+		msg.JobAssignedMessages = append(msg.JobAssignedMessages, &scaleset.JobAssigned{JobMessageBase: scaleset.JobMessageBase{
+			JobID: fmt.Sprintf("job-%d", i), ScaleSetAssignTime: t0.Add(-time.Duration(30-i) * 20 * time.Second)}})
+	}
+	s.Observe(msg, t0)
+	if r := s.ArrivalRate(t0, time.Minute); r != 0.05 {
+		t.Fatalf("30 jobs assigned 20 s apart, delivered at once: rate %v, want 0.05 (the 3 of the last minute)", r)
+	}
+}
+
+func TestAJobWithNeitherIDCountsAndIsNeverMergedWithAnother(t *testing.T) {
+	s := NewState("set", 0, 100, []string{"us-east-1"}, t0.Add(-time.Hour))
+	for i := 0; i < 3; i++ {
+		s.Observe(&scaleset.RunnerScaleSetMessage{JobAssignedMessages: []*scaleset.JobAssigned{{}}}, t0)
+	}
+	if r := s.ArrivalRate(t0.Add(time.Minute), time.Minute); r != 0.05 {
+		t.Fatalf("three jobs with no job id and no runner request id: rate %v, want 0.05 (3 in the minute)", r)
 	}
 }

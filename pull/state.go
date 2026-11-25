@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -90,10 +91,10 @@ type State struct {
 	surplusSince time.Time            // since when the supply has exceeded the demand
 	orphanSince  map[string]time.Time // stale runners, by name, since first listed as such
 
-	arrivals    []time.Time         // jobs that arrived, for the pool's rate
-	available   map[int64]time.Time // when each waiting job was queued, by runner request, for its queue wait
-	lost        []JobRef            // jobs that ended on a machine AWS was taking back, for a re-run
-	waits       []float64           // queue waits (s) of jobs started since the metrics last took them
+	arrivals    []time.Time          // jobs that arrived, for the pool's rate
+	available   map[string]time.Time // when each waiting job was queued, by jobKey, for its queue wait
+	lost        []JobRef             // jobs that ended on a machine AWS was taking back, for a re-run
+	waits       []float64            // queue waits (s) of jobs started since the metrics last took them
 	odLaunched  []time.Time
 	allLaunched []time.Time
 }
@@ -101,7 +102,7 @@ type State struct {
 func NewState(set string, pool, max int, regions []string, now time.Time) *State {
 	s := &State{set: set, pool: pool, max: max, started: now, machines: map[string]*Machine{}, reserved: map[string]int{},
 		boot: fmt.Sprintf("%x", now.UnixNano()), lastActivity: now, lastStart: now, polled: now, orphanSince: map[string]time.Time{},
-		available: map[int64]time.Time{}, listings: map[string]time.Time{}}
+		available: map[string]time.Time{}, listings: map[string]time.Time{}}
 	for _, r := range regions {
 		s.listings[r] = time.Time{}
 	}
@@ -426,14 +427,14 @@ func (s *State) Observe(msg *scaleset.RunnerScaleSetMessage, now time.Time) {
 		s.arrived(j.JobMessageBase, now)
 	}
 	for _, j := range msg.JobStartedMessages {
-		queued, ok := s.available[j.RunnerRequestID]
+		queued, ok := s.available[jobKey(j.JobMessageBase)]
 		if !j.QueueTime.IsZero() {
 			queued, ok = j.QueueTime, true
 		}
 		if ok {
 			s.waits = append(s.waits, max(0, now.Sub(queued).Seconds()))
 		}
-		delete(s.available, j.RunnerRequestID)
+		delete(s.available, jobKey(j.JobMessageBase))
 		s.lastStart = now
 		if m := s.machineOf(j.RunnerName); m != nil {
 			if r := runnerOf(m, j.RunnerName, int64(j.RunnerID), now); r.Name == j.RunnerName {
@@ -446,7 +447,7 @@ func (s *State) Observe(msg *scaleset.RunnerScaleSetMessage, now time.Time) {
 		}
 	}
 	for _, j := range msg.JobCompletedMessages {
-		delete(s.available, j.RunnerRequestID)
+		delete(s.available, jobKey(j.JobMessageBase))
 		if m := s.machineOf(j.RunnerName); m != nil {
 			r := runnerOf(m, j.RunnerName, int64(j.RunnerID), now)
 			r.Busy, r.Done = true, true
@@ -465,17 +466,42 @@ func (s *State) Observe(msg *scaleset.RunnerScaleSetMessage, now time.Time) {
 	}
 }
 
-// arrived takes in a job the first time a message names it: one arrival, queued since GitHub queued it.
+// arrived takes in a job the first time a message names it: one arrival, dated when GitHub assigned it to the set
+// (so a backlog redelivered after a restart keeps its own times), and queued since GitHub queued it or, as a
+// JobAssigned and a JobStarted carry no queue time, since that assignment.
 func (s *State) arrived(j scaleset.JobMessageBase, now time.Time) {
-	if _, ok := s.available[j.RunnerRequestID]; ok {
+	key := jobKey(j)
+	if _, ok := s.available[key]; ok && key != "" {
 		return
 	}
-	s.arrivals = append(s.arrivals, now)
-	queued := now
+	at := now
+	if t := j.ScaleSetAssignTime; !t.IsZero() && t.Before(now) {
+		at = t
+	}
+	s.arrivals = append(s.arrivals, at)
+	for i := len(s.arrivals) - 1; i > 0 && s.arrivals[i].Before(s.arrivals[i-1]); i-- {
+		s.arrivals[i], s.arrivals[i-1] = s.arrivals[i-1], s.arrivals[i]
+	}
+	queued := at
 	if !j.QueueTime.IsZero() && j.QueueTime.Before(now) {
 		queued = j.QueueTime
 	}
-	s.available[j.RunnerRequestID] = queued
+	if key != "" {
+		s.available[key] = queued
+	}
+}
+
+// jobKey names a job across its messages: its job id. A JobAssigned carries no runner request id (0 in every one of
+// them on Nov 25 2026), so keyed by that, every job after the first read as one already seen. A message without a job
+// id falls back to the runner request id; with neither, the job has no key ("") and counts without being matched.
+func jobKey(j scaleset.JobMessageBase) string {
+	switch {
+	case j.JobID != "":
+		return j.JobID
+	case j.RunnerRequestID != 0:
+		return "request:" + strconv.FormatInt(j.RunnerRequestID, 10)
+	}
+	return ""
 }
 
 // Stalled says whether jobs have waited for the set for over d with none started meanwhile.
