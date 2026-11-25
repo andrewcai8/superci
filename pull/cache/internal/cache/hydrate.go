@@ -32,8 +32,8 @@ type Manifest struct {
 	Repository string   `json:"repository"`
 	Scopes     []string `json:"scopes"`
 	Workspace  string   `json:"workspace"`
-	// Compression is the method actions/cache puts in an entry's version on these machines: its zstd probe finds
-	// the image's zstd too old for --long, so it is "zstd-without-long" (read off main's entries, see Version).
+	// Compression is the method actions/cache puts in an entry's version on these machines. The version
+	// directories of main's entries show it is "zstd-without-long" (see TestTheVersionIsWhatActionsCacheNames...).
 	Compression string          `json:"compression,omitempty"`
 	Entries     []ManifestEntry `json:"entries"`
 }
