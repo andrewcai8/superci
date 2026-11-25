@@ -231,11 +231,11 @@ policy before the listener, the listener last.
    ```
 4. **Build, test and release the listener** (the release restarts it; a graceful stop closes its sessions, the next
    opens at once). `deploy/test.sh` runs the tests of both modules on a tagged instance; `deploy/build.sh` builds
-   the binary (it tests `pull/` only).
+   the release, the listener and the cache's binaries (it tests `pull/` only).
    ```bash
    pull/deploy/test.sh
-   pull/deploy/build.sh /tmp/superci-pull
-   pull/deploy/release.sh /tmp/superci-pull "" pull/deploy/ssh.sh
+   pull/deploy/build.sh /tmp/release
+   pull/deploy/release.sh /tmp/release "" pull/deploy/ssh.sh
    ```
    The listener makes a new launch template version at start, because `sameData` finds the latest has no profile.
    Machines already running, and the idle pool from before the release, keep the old version: they run on GitHub's
@@ -423,10 +423,12 @@ aws --profile ci-runners --region us-east-1 sns subscribe --topic-arn arn:aws:sn
 
 **Release.** Off-peak (before 13:00Z or after 01:00Z), since a release restarts the listener: jobs wait about 10 s.
 A listener that cannot reach its claims bucket does not start: run `deploy/up.sh` (it makes the bucket and grants
-the role) before the first release that has claims. `deploy/build.sh <out>` builds and tests on a tagged arm64 instance and terminates it;
-`deploy/release.sh <binary> [override.json] pull/deploy/ssh.sh` uploads to `s3://superci-pull-243891825325`
+the role) before the first release that has claims. `deploy/build.sh <dir>` builds and tests on a tagged arm64 instance and terminates it;
+`deploy/release.sh <dir> [override.json] pull/deploy/ssh.sh` uploads to `s3://superci-pull-243891825325`
 (checking the override with the new binary on the listener first) and restarts the listener (a graceful stop closes
-its sessions, so the next opens at once).
+its sessions, so the next opens at once). It releases only a clean commit of origin's main, writes `bin/RELEASE.json`
+(commit, build time, sha256), and the listener logs its commit at start (`"msg":"start","revision":…`;
+`superci-pull -version` prints it).
 
 **Roll back.** The bucket is versioned, the binary and the override config alike: copy the previous version over the
 current one and restart.
@@ -465,7 +467,7 @@ listed and each set's session has given the queue's statistics. After a crash, G
 set while the dead one's lapses (30 to 75 s measured).
 
 **Deploy from scratch.** `deploy/up.sh <admin-cidr>` (role, parameters, bucket, groups, address, launch template),
-`deploy/release.sh <binary>`, `deploy/up.sh` again (it starts the group once a release exists), `deploy/alarms.sh`.
+`deploy/release.sh <dir>`, `deploy/up.sh` again (it starts the group once a release exists), `deploy/alarms.sh`.
 The listener makes the runner group `superci-pull` at its first start. **Tear down.** `deploy/down.sh` deletes the
 scale sets and every resource tagged `purpose=superci-pull`; the empty runner group stays at GitHub.
 

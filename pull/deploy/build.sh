@@ -1,16 +1,22 @@
 #!/bin/bash
-# Builds and tests the listener on a tagged arm64 build instance (no compile runs where this is started), copies the
-# binary back, and terminates the instance. The instance is reached with a key made for the run (EC2 Instance
+# Builds one release on a tagged arm64 build instance (no compile runs where this is started), copies it back, and
+# terminates the instance: the listener (tested first), the cache's daemons and function, and the machine start
+# script, each Go binary carrying the commit it was built from (-X main.revision; -trimpath keeps it out of `go version -m`).
+# The commit is HEAD, with -dirty when pull/ has changes git does not hold; release.sh and cache/deploy/release.sh
+# release only a clean commit of origin's main. The instance is reached with a key made for the run (EC2 Instance
 # Connect): no key pair.
 #
-#   pull/deploy/build.sh <output binary>
+#   pull/deploy/build.sh <output directory>   writes superci-pull, pullcache-linux-{amd64,arm64},
+#                                             pullcache-lambda-arm64.zip, up.sh and REVISION (commit, build time)
 set -euo pipefail
-OUT=${1:?output path}
+OUT=${1:?output directory}
 A="aws --profile ci-runners"
 R=us-east-1
 [ "$($A sts get-caller-identity --query Account --output text)" = 243891825325 ] || { echo "refusing: not ci-runners" >&2; exit 1; }
 here=$(cd "$(dirname "$0")/.." && pwd)
-GO=$(sed -n 's/^go //p' "$here/go.mod")
+GO=$(cat "$here/go.mod" "$here/cache/go.mod" | sed -n 's/^go //p' | sort -V | tail -1)
+REV=$(git -C "$here" rev-parse HEAD)
+[ -z "$(git -C "$here" status --porcelain -- .)" ] || REV=$REV-dirty
 AMI=$($A ssm get-parameter --region $R --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64 --query Parameter.Value --output text)
 SG=$($A ec2 describe-security-groups --region $R --filters Name=group-name,Values=superci-pull-listener --query 'SecurityGroups[0].GroupId' --output text)
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
@@ -30,8 +36,16 @@ S="ssh -i $tmp/key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o 
 until push && $S test -f /tmp/go-ready 2>/dev/null; do sleep 5; done
 push
 tar -C "$here/.." -czf - pull | $S 'mkdir -p src && tar -C src -xzf -'
-$S 'cd src/pull && export PATH=/usr/local/go/bin:$PATH GOFLAGS=-buildvcs=false && test -z "$(gofmt -l .)" && go vet ./... && go test -count=1 ./... && CGO_ENABLED=0 go build -trimpath -o /tmp/superci-pull .'
+$S "set -e; export PATH=/usr/local/go/bin:\$PATH GOFLAGS=-buildvcs=false CGO_ENABLED=0 GOOS=linux; X='-X main.revision=$REV'; mkdir /tmp/out
+cd ~/src/pull && test -z \"\$(gofmt -l .)\" && go vet ./... && go test -count=1 ./...
+go build -trimpath -ldflags=\"\$X\" -o /tmp/out/superci-pull .
+cd cache && for a in amd64 arm64; do GOARCH=\$a go build -trimpath -ldflags=\"-s -w \$X\" -o /tmp/out/pullcache-linux-\$a .; done
+mkdir /tmp/fn && GOARCH=arm64 go build -tags lambda.norpc -trimpath -ldflags=\"-s -w \$X\" -o /tmp/fn/bootstrap .
+cd /tmp/fn && python3 -m zipfile -c /tmp/out/pullcache-lambda-arm64.zip bootstrap
+cp ~/src/pull/cache/deploy/machine-up.sh /tmp/out/up.sh"
 push
-$S 'cat /tmp/superci-pull' > "$OUT"
-chmod 755 "$OUT"
-echo "built $OUT $(sha256sum "$OUT" | cut -c1-12)"
+mkdir -p "$OUT"
+$S 'tar -C /tmp/out -cf - .' | tar -C "$OUT" -xf -
+printf '{"commit":"%s","built":"%s"}\n' "$REV" "$(date -u +%FT%TZ)" > "$OUT/REVISION"
+(cd "$OUT" && sha256sum superci-pull pullcache-linux-amd64 pullcache-linux-arm64 pullcache-lambda-arm64.zip up.sh)
+echo "built $OUT at $REV"

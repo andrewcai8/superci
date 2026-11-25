@@ -64,11 +64,14 @@ func main() {
 	}
 	lg := log.New(os.Stderr, "pullcache: ", log.LstdFlags|log.Lmicroseconds)
 	if len(os.Args) < 2 {
-		lg.Fatal("usage: pullcache serve | wrap <externals> | janitor | hydrate <manifest> <root> | mirror")
+		lg.Fatal("usage: pullcache serve | wrap <externals> | janitor | hydrate <manifest> <root> | mirror | version")
 	}
 	var err error
 	switch os.Args[1] {
+	case "version":
+		fmt.Println(revision)
 	case "serve":
+		lg.Printf("serve, revision %s", revision)
 		err = serve(lg)
 	case "wrap":
 		if len(os.Args) != 3 {

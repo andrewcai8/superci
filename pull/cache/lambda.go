@@ -26,6 +26,7 @@ import (
 // runs in its region.
 func lambdaMain() {
 	lg := log.New(os.Stderr, "", 0)
+	lg.Printf("%s, revision %s", os.Getenv("PULLCACHE_LAMBDA"), revision)
 	ctx := context.Background()
 	bucket, region := os.Getenv("PULLCACHE_BUCKET"), os.Getenv("AWS_REGION")
 	switch os.Getenv("PULLCACHE_LAMBDA") {
