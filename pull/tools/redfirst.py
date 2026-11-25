@@ -53,6 +53,8 @@ MUTANTS = [
     ("arrivals dated by the message", "state.go", f"{T}{T}at = t\n", "", "TestARedeliveredBacklogKeepsItsOwnTimes"),
     ("a wait from the message, not the assignment", "state.go", f"{T}queued := at\n", f"{T}queued := now\n", "TestAJobAssignedWithoutAnOfferSizesThePool"),
     ("OPS-4 the second sample after 100 s", "budget.go", "wait = 61 * time.Second", "wait = 100 * time.Second", "TestTheSecondSampleComesAMinuteAfterTheFirst"),
+    ("a failed sample retried every tick", "budget.go", f"{T}if now.Before(b.sampleNext) {{\n{T}{T}return false\n{T}}}\n", "",
+     "TestAFailedSampleIsNotRetriedEveryTick"),
     ("OPS-5 decisions before every region is listed", "state.go", f"{T}for _, at := range s.listings {{\n{T}{T}if at.IsZero() {{", f"{T}for _, at := range s.listings {{\n{T}{T}if false && at.IsZero() {{",
      "TestNothingIsDecidedUntilEveryRegionIsListed"),
     ("OPS-6 no bound from a job's start, none on idle age", "state.go", "r != nil && r.Busy && !r.Started.IsZero() && now.Sub(r.Started) > jobMax", "false",

@@ -829,6 +829,7 @@ func (l *Listener) sampleOrg(ctx context.Context) {
 	}
 	id, err := l.rest.OrgHead(ctx)
 	if err != nil {
+		l.budget.SampleFailed(time.Now())
 		slog.Error("org head", "err", err.Error())
 		return
 	}
