@@ -122,7 +122,7 @@ func (g *REST) get(ctx context.Context, url string, out any) error {
 
 // listRunners reads every page of a runner listing. It fails unless it read every page, so a partial listing is
 // never taken for the whole.
-func (g *REST) listRunners(ctx context.Context, base string, keep func(name string) bool) (map[string]ListedRunner, int64, error) {
+func (g *REST) listRunners(ctx context.Context, base string, keep func(name string) bool) (map[string]ListedRunner, int64, int, error) {
 	out := map[string]ListedRunner{}
 	var highest int64
 	for page := 1; ; page++ {
@@ -136,7 +136,7 @@ func (g *REST) listRunners(ctx context.Context, base string, keep func(name stri
 			} `json:"runners"`
 		}
 		if err := g.get(ctx, fmt.Sprintf("%s?per_page=100&page=%d", base, page), &body); err != nil {
-			return nil, 0, err
+			return nil, 0, page, err
 		}
 		for _, r := range body.Runners {
 			highest = max(highest, r.ID)
@@ -145,22 +145,22 @@ func (g *REST) listRunners(ctx context.Context, base string, keep func(name stri
 			}
 		}
 		if len(body.Runners) < 100 || page*100 >= body.Total {
-			return out, highest, nil
+			return out, highest, page, nil
 		}
 	}
 }
 
-// Runners lists every runner of a runner group whose name starts with prefix.
-func (g *REST) Runners(ctx context.Context, group int, prefix string) (map[string]ListedRunner, error) {
-	out, _, err := g.listRunners(ctx, fmt.Sprintf("https://api.github.com/orgs/%s/actions/runner-groups/%d/runners", g.org, group),
+// Runners lists every runner of a runner group whose name starts with prefix, and says how many requests it took.
+func (g *REST) Runners(ctx context.Context, group int, prefix string) (map[string]ListedRunner, int, error) {
+	out, _, pages, err := g.listRunners(ctx, fmt.Sprintf("https://api.github.com/orgs/%s/actions/runner-groups/%d/runners", g.org, group),
 		func(name string) bool { return strings.HasPrefix(name, prefix) })
-	return out, err
+	return out, pages, err
 }
 
 // OrgHead is the highest runner id among every runner the organization has registered now: a lower bound, by
 // seconds, of the last id GitHub issued, since a runner lives at least until it takes its job.
 func (g *REST) OrgHead(ctx context.Context) (int64, error) {
-	_, highest, err := g.listRunners(ctx, fmt.Sprintf("https://api.github.com/orgs/%s/actions/runners", g.org), func(string) bool { return false })
+	_, highest, _, err := g.listRunners(ctx, fmt.Sprintf("https://api.github.com/orgs/%s/actions/runners", g.org), func(string) bool { return false })
 	return highest, err
 }
 

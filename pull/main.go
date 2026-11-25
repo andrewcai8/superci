@@ -500,6 +500,7 @@ func (l *Listener) refresher() func(context.Context, string) {
 // machines of no configured set, accrues the spend and applies its cap.
 func (l *Listener) reconciler(ctx context.Context, refresh func(context.Context, string)) {
 	var listed, logged time.Time
+	every := 30 * time.Second // between listings of the runners: 3 s a page, so a big pool costs at most 1,200 requests an hour
 	for tick := time.NewTicker(10 * time.Second); ; {
 		select {
 		case <-ctx.Done():
@@ -510,11 +511,11 @@ func (l *Listener) reconciler(ctx context.Context, refresh func(context.Context,
 		for _, r := range l.fleet.regions {
 			refresh(ctx, r.Name)
 		}
-		if now.Sub(listed) > 30*time.Second {
-			if runners, err := l.rest.Runners(ctx, group, "superci-"); err != nil {
+		if now.Sub(listed) > every {
+			if runners, pages, err := l.rest.Runners(ctx, group, "superci-"); err != nil {
 				slog.Error("list runners", "err", err.Error())
 			} else {
-				listed = now
+				listed, every = now, max(30*time.Second, time.Duration(pages)*3*time.Second)
 				for _, s := range l.sets {
 					own := map[string]ListedRunner{}
 					for name, r := range runners {
