@@ -435,3 +435,32 @@ func TestEntriesFinishedBeforeAStopStayInPlaceAndTheOneStoppedDoesNot(t *testing
 		t.Fatalf("a stopped entry must not be where a job looks: %v", err)
 	}
 }
+
+func TestTheManifestTheReadmeShowsParsesAndNamesTheVersionsOfMainsEntries(t *testing.T) {
+	readme := read(t, "../../../README.md")
+	_, after, ok := strings.Cut(readme, "```json\n")
+	if !ok {
+		t.Fatal("the README shows no manifest")
+	}
+	block, _, _ := strings.Cut(after, "```")
+	m, err := cache.ParseManifest([]byte(block))
+	if err != nil {
+		t.Fatalf("the README's manifest: %v", err)
+	}
+	// Read off main's bucket (Nov 25): the entries these keys are in.
+	want := map[string]string{
+		"git-seed-v1-Linux-X64-": "e147b628583c5531a3df3c6023ec0bba34378b29ba54ba408f1613f67f53a817",
+		"bun-modules-v1-Linux-X64-bun*-aura-hono-api-mind-scripts-on-": "bc0252d31637939426fee46aa18cd3112b9769bdfcaa7e83f6cbd1ad3adfb58f",
+		"mind-python-v1-Linux-X64-":                                    "a666248dce0b82ae9c1deb5180eaf65598b56ff1b558869a2f508bec22b1b866",
+		"bun-modules-v1-Linux-X64-bun*-aura-hono-api-scripts-on-":      "f7137a0923f0ae710692383bb17d01f1aa3d3d179305be2bccb674392fc965f8",
+	}
+	for _, e := range m.Entries {
+		if w, ok := want[e.Key]; ok && m.Version(e) != w {
+			t.Errorf("%s: version %s, want %s", e.Key, m.Version(e), w)
+		}
+		delete(want, e.Key)
+	}
+	if len(want) != 0 {
+		t.Errorf("the README's manifest lacks %v", want)
+	}
+}
