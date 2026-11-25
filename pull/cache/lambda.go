@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/aws/aws-lambda-go/events"
 	awslambda "github.com/aws/aws-lambda-go/lambda"
@@ -61,7 +63,10 @@ func lambdaMain() {
 					continue
 				}
 				out, err := m.Copy(ctx, r.S3.Object.URLDecodedKey)
-				lg.Printf("mirror %s to %s: %s %v", r.S3.Object.URLDecodedKey, m.DstBucket, out, err)
+				// One JSON line a copy: the metric filter up.sh makes reads lag_ms, the time from the save to the copy.
+				line, _ := json.Marshal(map[string]any{"ev": "cache.mirror", "key": r.S3.Object.URLDecodedKey, "to": m.DstBucket,
+					"outcome": out, "lag_ms": time.Since(r.EventTime).Milliseconds(), "err": fmt.Sprint(err)})
+				lg.Print(string(line))
 				failed = errors.Join(failed, err)
 			}
 			return failed

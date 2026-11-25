@@ -92,7 +92,8 @@ entry took 88 s, ten parts at a time 13 s). A copy's time is when it was copied,
 key's newest entry is the same in both regions. Pull requests' entries are not copied: they are read by later runs of the
 same pull request only, and they are most of what is saved. S3 replication is not used: it needs versioning, and its
 writer is one the `If-None-Match` rule cannot see (two regions saving one key at once overwrote each other through
-it). `pullcache mirror -bucket B -region R -peer-bucket P -peer-region PR` copies whatever an entry prefix of B
+it). Each copy logs its lag from the save (`lag_ms`), the metric `superci-pull-cache/MirrorLagMs`, and the alarm
+`superci-pull-cache-mirror-lag` fires on a copy over 5 minutes. `pullcache mirror -bucket B -region R -peer-bucket P -peer-region PR` copies whatever an entry prefix of B
 (`-prefix`, `v1/d/` by default) holds that P lacks, as the function does for one save.
 
 The default branch's entries live 7 days: the warm jobs of `ci-cache-warm.yml` save them again within an hour of a
