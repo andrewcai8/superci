@@ -111,19 +111,41 @@ func (s *State) MarkStale(now time.Time, after time.Duration) (stale int) {
 	return s.staleWaiting
 }
 
-// live is the supply: machines not ending, and capacity asked for and not yet seen. A machine a listing shows before
-// its launch call answers settles one unit of its round's reservation, so it is never counted twice.
+// live is the supply: machines not ending and not being taken back by AWS, and capacity asked for and not yet seen.
+// A machine a listing shows before its launch call answers settles one unit of its round's reservation, so it is
+// never counted twice.
 func (s *State) live() int {
 	n := 0
 	for _, k := range s.reserved {
 		n += k
 	}
 	for _, m := range s.machines {
-		if !m.Ending {
+		if !m.Ending && !m.Notice {
 			n++
 		}
 	}
 	return n
+}
+
+// Noticed takes in AWS's two minutes' notice for a spot machine: it is no longer supply, so another is launched at
+// once. With no runner it ends now; with an idle runner it returns that runner, to be removed (fenced) before the
+// machine ends; a busy runner keeps its machine until its job ends or AWS takes it.
+func (s *State) Noticed(id string) (m *Machine, idle *Runner) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m = s.machines[id]
+	if m == nil {
+		return nil, nil
+	}
+	m.Notice = true
+	switch r := m.Runner; {
+	case r == nil:
+		m.Ending = true
+	case !r.Busy && !r.Removing && r.ID != 0:
+		r.Removing = true
+		return m, r
+	}
+	return m, nil
 }
 
 // Deficit reserves the capacity to launch now, under a new round's name. While registrations are paced, or GitHub
@@ -217,7 +239,8 @@ func (s *State) Ask(id string, now time.Time) Verdict {
 	}
 	m.Asked = now
 	m.Runner = nil
-	if m.Ending {
+	if m.Ending || m.Notice {
+		m.Ending = true
 		return End
 	}
 	if s.live() > s.desired() {

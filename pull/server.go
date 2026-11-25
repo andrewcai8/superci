@@ -180,11 +180,15 @@ func (h *Server) notice(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unknown machine", http.StatusForbidden)
 		return
 	}
-	h.state.mu.Lock()
-	m.Notice = true
-	h.state.mu.Unlock()
-	slog.Warn("spot notice", "machine", m.ID, "region", m.Region, "type", m.Type, "az", m.AZ)
+	_, idle := h.state.Noticed(m.ID)
+	slog.Warn("spot notice", "machine", m.ID, "region", m.Region, "type", m.Type, "az", m.AZ, "idle_runner", idle != nil)
 	w.WriteHeader(http.StatusNoContent)
+	if idle != nil {
+		err := h.client.RemoveRunner(context.WithoutCancel(r.Context()), idle.ID)
+		removed := err == nil || errors.Is(err, scaleset.RunnerNotFoundError) || errors.Is(err, scaleset.NotFoundError)
+		h.state.Removed(m, removed)
+		slog.Info("noticed runner", "machine", m.ID, "runner", idle.Name, "removed", removed, "err", errString(err))
+	}
 }
 
 // Admin is for the operator, on localhost only: the state, and the pool and cap to change at run time.

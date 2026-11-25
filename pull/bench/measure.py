@@ -22,6 +22,12 @@ def ts(s):
     return datetime.fromisoformat(s.replace("Z", "+00:00")) if s else None
 
 
+def logtime(s):
+    """A Go log time (nanoseconds, trailing zeros trimmed) to a datetime."""
+    whole, _, frac = s.rstrip("Z").partition(".")
+    return datetime.fromisoformat(f"{whole}.{(frac + '000000')[:6]}+00:00")
+
+
 def pct(xs, p):
     xs = sorted(xs)
     return xs[min(len(xs) - 1, max(0, round(p / 100 * len(xs) + 0.5) - 1))] if xs else None
@@ -91,7 +97,7 @@ if len(sys.argv) > 2:
             e = json.loads(line)
         except ValueError:
             continue
-        t = ts(e["time"][:26] + "+00:00") if e.get("time") else None
+        t = logtime(e["time"]) if e.get("time") else None
         if e.get("msg") == "register":
             if e.get("err"):
                 errors += 1

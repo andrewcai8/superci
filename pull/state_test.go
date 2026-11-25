@@ -285,6 +285,30 @@ func TestARestartAdoptsMachinesAndTheirRunners(t *testing.T) {
 	}
 }
 
+func TestASpotNoticeReplacesTheMachineAndFencesOnlyAnIdleRunner(t *testing.T) {
+	s := NewState("set", 0, 1200, 1400)
+	s.Observe(stats(3, 0))
+	launch(s, machines(3, t0), t0)
+	give(s, "i-0001", &Runner{ID: 11, Name: "set-i-0001-bb", Issued: t0})
+	give(s, "i-0002", &Runner{ID: 12, Name: "set-i-0002-cc", Issued: t0, Busy: true})
+	if _, r := s.Noticed("i-0000"); r != nil {
+		t.Fatal("a machine with no runner has nothing to fence")
+	}
+	if _, r := s.Noticed("i-0001"); r == nil || r.ID != 11 {
+		t.Fatalf("idle runner to remove: %v", r)
+	}
+	if _, r := s.Noticed("i-0002"); r != nil {
+		t.Fatal("a busy runner is not removed under its job")
+	}
+	if _, n := s.Deficit(t0); n != 3 {
+		t.Fatalf("launched %d, want 3: no noticed machine is supply", n)
+	}
+	end := s.ToEnd(t0)
+	if len(end) != 1 || end[0].ID != "i-0000" {
+		t.Fatalf("ending %v: only the machine with no runner ends at once", ids(end))
+	}
+}
+
 func give(s *State, id string, r *Runner) {
 	s.mu.Lock()
 	s.machines[id].Runner = r
