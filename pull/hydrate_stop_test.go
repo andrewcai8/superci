@@ -112,3 +112,67 @@ func TestAMachineRegistersAtOnceAndHydratesInTheBackgroundUnderAHookThatStopsIt(
 		t.Error("a timeout that makes its own process group would hide the hydration's children from the hook")
 	}
 }
+
+// This runs boot.sh's hydrate() as a machine's user data holds it, with the machine's paths and commands replaced by a
+// sandbox's: aws, runuser and chown are stubs and pullcache is a script that says what it hydrated.
+func TestTheHydrationPostsItsStartAndEndAsTimelineMarksAndEndsWithItsPidFileGone(t *testing.T) {
+	cfg, err := LoadConfig("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := bootData(cfg, "https://203.0.113.1:8443", "sha256//pin", "superci-4cpu")
+	start := strings.Index(got, "hydrate() {")
+	end := strings.Index(got[start:], "\n}\n")
+	if start < 0 || end < 0 {
+		t.Fatal("boot data has no hydrate()")
+	}
+	fn := got[start : start+end+3]
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stub := func(name, body string) {
+		if err := os.WriteFile(filepath.Join(bin, name), []byte("#!/bin/bash\n"+body+"\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stub("aws", `cp "$@" 2>/dev/null; echo '{}' > "${@: -1}"`)
+	stub("runuser", `shift 3; exec "$@"`)
+	stub("chown", `true`)
+	stub("pullcache", `echo "hydrate: log line on stderr" >&2; echo "hydrated 4/5 entries 1210 MB"`)
+	spool, hr := filepath.Join(dir, "marks"), filepath.Join(dir, "hydrated")
+	if err := os.WriteFile(spool, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(hr, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fn = strings.NewReplacer("/run/superci-marks", spool, "/usr/local/bin/pullcache", filepath.Join(bin, "pullcache")).Replace(fn)
+	cmd := exec.Command("bash", "-c", fn+"\nhydrate")
+	cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "HR="+hr, "HM="+filepath.Join(dir, "m.json"), "PB=b", "CR=r")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	marks, _ := os.ReadFile(spool)
+	lines := strings.Split(strings.TrimSpace(string(marks)), "\n")
+	if len(lines) != 2 || !strings.HasPrefix(lines[0], "hydrate.start=") || !strings.HasSuffix(lines[0], "=0") ||
+		!strings.HasPrefix(lines[1], "hydrate.done=") || !strings.HasSuffix(lines[1], "=4/5:1210MB") {
+		t.Fatalf("want a start and a done mark with what was hydrated: %q", lines)
+	}
+	if _, err := os.Stat(filepath.Join(hr, ".pid")); !os.IsNotExist(err) {
+		t.Fatalf("a finished hydration leaves no pid for the hook to signal: %v", err)
+	}
+	// With no spool (a listener without the timeline) the hydration still runs and posts nothing.
+	if err := os.Remove(spool); err != nil {
+		t.Fatal(err)
+	}
+	cmd = exec.Command("bash", "-c", fn+"\nhydrate")
+	cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "HR="+hr, "HM="+filepath.Join(dir, "m.json"), "PB=b", "CR=r")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("without a spool: %v: %s", err, out)
+	}
+	if _, err := os.Stat(spool); !os.IsNotExist(err) {
+		t.Fatalf("no spool is made for marks: %v", err)
+	}
+}
