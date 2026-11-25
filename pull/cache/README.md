@@ -88,8 +88,9 @@ function copies each entry the default branch saves into the other bucket, on th
 It reads the version it was told of (`If-Match` on its ETag) and completes the copy with `If-None-Match`, so it never
 writes over an entry: a key both regions saved keeps each region's own first save, and an entry deleted and saved
 again mid-copy ends the copy. A copy is 16 MiB part copies, 32 at a time (one cross-region `CopyObject` of a 452 MB
-entry took 88 s, ten parts at a time 13 s). A copy's time is when it was copied, seconds after the save, so a restore
-key's newest entry is the same in both regions. Pull requests' entries are not copied: they are read by later runs of the
+entry took 88 s, ten parts at a time 13 s). A copy keeps its original's save time as `x-amz-meta-saved`
+(its own LastModified is when it was copied), and a restore key takes the newest save (`cache.Newest`, by
+`Object.SaveTime`), so its newest entry is the same in both regions. Pull requests' entries are not copied: they are read by later runs of the
 same pull request only, and they are most of what is saved. S3 replication is not used: it needs versioning, and its
 writer is one the `If-None-Match` rule cannot see (two regions saving one key at once overwrote each other through
 it). Each copy logs its lag from the save (`lag_ms`), the metric `superci-pull-cache/MirrorLagMs`, and the alarm
