@@ -133,6 +133,7 @@ func (sr *setRegion) ensureTemplate(ctx context.Context, r *Region, name, userDa
 		ImageId:                           aws.String(r.image),
 		UserData:                          aws.String(base64.StdEncoding.EncodeToString([]byte(userData))),
 		SecurityGroupIds:                  []string{group},
+		IamInstanceProfile:                &ec2types.LaunchTemplateIamInstanceProfileSpecificationRequest{Name: aws.String("superci-pull-cache-machine")},
 		InstanceInitiatedShutdownBehavior: ec2types.ShutdownBehaviorTerminate,
 		MetadataOptions: &ec2types.LaunchTemplateInstanceMetadataOptionsRequest{HttpTokens: ec2types.LaunchTemplateHttpTokensStateRequired,
 			HttpPutResponseHopLimit: aws.Int32(1), HttpEndpoint: ec2types.LaunchTemplateInstanceMetadataEndpointStateEnabled},
@@ -166,15 +167,17 @@ func (sr *setRegion) ensureTemplate(ctx context.Context, r *Region, name, userDa
 	return nil
 }
 
-// sameData says whether a template version holds what a new version would: image, user data, security group, disk
-// and metadata options.
+// sameData says whether a template version holds what a new version would: image, user data, security group, the
+// cache's instance profile, disk and metadata options.
 func sameData(have *ec2types.ResponseLaunchTemplateData, want *ec2types.RequestLaunchTemplateData) bool {
 	if have == nil || have.MetadataOptions == nil || len(have.BlockDeviceMappings) != 1 || have.BlockDeviceMappings[0].Ebs == nil {
 		return false
 	}
 	h, w := have.BlockDeviceMappings[0], want.BlockDeviceMappings[0]
 	return aws.ToString(have.ImageId) == aws.ToString(want.ImageId) && aws.ToString(have.UserData) == aws.ToString(want.UserData) &&
-		slices.Equal(have.SecurityGroupIds, want.SecurityGroupIds) && aws.ToString(h.DeviceName) == aws.ToString(w.DeviceName) &&
+		slices.Equal(have.SecurityGroupIds, want.SecurityGroupIds) &&
+		have.IamInstanceProfile != nil && strings.HasSuffix(aws.ToString(have.IamInstanceProfile.Arn), "/superci-pull-cache-machine") &&
+		aws.ToString(h.DeviceName) == aws.ToString(w.DeviceName) &&
 		aws.ToInt32(h.Ebs.VolumeSize) == aws.ToInt32(w.Ebs.VolumeSize) && aws.ToInt32(h.Ebs.Throughput) == aws.ToInt32(w.Ebs.Throughput) &&
 		aws.ToInt32(have.MetadataOptions.HttpPutResponseHopLimit) == aws.ToInt32(want.MetadataOptions.HttpPutResponseHopLimit) &&
 		string(have.MetadataOptions.HttpTokens) == string(want.MetadataOptions.HttpTokens)

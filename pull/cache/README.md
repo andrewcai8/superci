@@ -202,7 +202,8 @@ Everything made is tagged `purpose=superci-pull-cache`.
 
 The machines need three things from the launcher: two lines in `boot.sh` after `T=`, the instance profile in the
 launch template (and in the check that decides whether the template changed), and `iam:PassRole` for the listener.
-`SEAM.md` says exactly where, against `pull-prod` as it stands. None of it is applied on this branch.
+`SEAM.md` says exactly where, against `pull-prod`; branch `pull-prod-cache` applies it. The cache's write isolation
+depends on one job per machine, which `pull-prod` keeps (`SEAM.md`, "One job per machine").
 
 Settings the daemon reads (all optional on a machine, all set by `up.sh`): `PULLCACHE_BUCKET`, `PULLCACHE_REGION`,
 `PULLCACHE_STAGE_BUCKET` (default `<bucket>-stage`), `PULLCACHE_DEFAULT_BRANCH` (`main`), `PULLCACHE_EXTERNALS`,
@@ -210,6 +211,12 @@ Settings the daemon reads (all optional on a machine, all set by `up.sh`): `PULL
 `PULLCACHE_BROKER` (`superci-pull-cache-broker`). The broker reads `PULLCACHE_DEFAULT_BRANCH`, `PULLCACHE_JWKS_URL`
 and `PULLCACHE_ISSUER` too, and they must agree with the machines': a broker that works out another grant than the
 daemon expected is refused by the daemon, and the save is not made.
+
+The issuer is the one setting that has to be changed after the first real job if GitHub's runtime token names another.
+`ISSUER=<iss> deploy/up.sh` writes it to each bucket's `bin/issuer`, sets it on the broker, and `deploy/machine-up.sh`
+reads the same object at boot for the machine's daemon (`PULLCACHE_ISSUER` on a machine overrides it). A run of
+`up.sh` without `ISSUER` keeps what the bucket holds, so the broker's setting is not wiped; `ISSUER=default` removes
+it. A machine that booted before the change keeps its old issuer until it ends, and a machine lives for one job.
 
 ### Operate
 

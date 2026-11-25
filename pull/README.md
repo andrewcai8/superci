@@ -142,6 +142,115 @@ The S3 actions cache plugs in at three places: one line of `boot.sh` after the m
 `IamInstanceProfile` (read-only) in `setRegion.ensureTemplate` (`fleet.go`), and an `iam:PassRole` statement for
 that profile in `deploy/listener-policy.json`. Nothing else in the listener knows about the cache.
 
+The cache is `cache/` (its own Go module; `cache/README.md` says what it is). Its write isolation depends on one job
+per machine, which is the invariant above: a machine that ran a second job could take the first job's credentials from
+the daemon (`cache/SEAM.md`, "One job per machine").
+
+Seen on the real image (Nov 25 2026): a c6i.xlarge of the fleet's image (`ami-0178d4ab7f659a2cc`), launched by hand with
+the `superci-pull-cache-machine` profile and not tagged `superci-pull`, ran `boot.sh`'s two cache lines from user data.
+The line exited 0, `pullcache.service` was serving from the region's bucket 3 s after boot, `externals/node24/bin/node`
+was the 19 MB wrapper over the runner's `node.real`, and a token with an issuer and key id of its own was refused with
+`refused: signed by a key GitHub does not list (iss "https://probe.example/issuer", kid "probe-kid")`. No job ran on it.
+
+#### Deploy the cache seam
+
+Not deployed: the listener still runs the build without it and the launch templates name no instance profile. The
+cache's own infrastructure (buckets, broker and janitor functions, roles, the `superci-pull-cache-machine` instance
+profile) is live in both regions. Every command uses `--profile ci-runners`. The order matters: the policy before the
+listener, the listener last.
+
+1. **Check the cache is there** (read-only).
+   ```bash
+   for r in us-east-1 us-east-2; do
+     aws --profile ci-runners s3 ls s3://superci-pull-cache-243891825325-$r/bin/ --region $r        # pullcache-linux-amd64, -arm64, pullcache-lambda-arm64.zip, up.sh
+     aws --profile ci-runners lambda get-function-configuration --region $r --function-name superci-pull-cache-broker --query '[State,LastUpdateStatus]' --output text   # Active Successful
+   done
+   aws --profile ci-runners iam get-instance-profile --instance-profile-name superci-pull-cache-machine --query 'InstanceProfile.Roles[].RoleName' --output text   # superci-pull-cache-machine
+   ```
+2. **Put this branch's machine script in each bucket** (`bin/up.sh`; it reads the issuer from `bin/issuer` when one
+   exists, and is otherwise the script already there). A machine that boots after this starts the daemon, if it has
+   the role. One without the role runs on GitHub's own cache.
+   ```bash
+   for r in us-east-1 us-east-2; do
+     aws --profile ci-runners s3 cp pull/cache/deploy/machine-up.sh s3://superci-pull-cache-243891825325-$r/bin/up.sh --region $r; done
+   ```
+3. **Let the listener pass the role.** This only adds a statement; the running listener is unaffected.
+   ```bash
+   aws --profile ci-runners iam put-role-policy --role-name superci-pull --policy-name superci-pull --policy-document file://pull/deploy/listener-policy.json
+   ```
+4. **Build, test and release the listener** (the release restarts it; a graceful stop closes its sessions, the next
+   opens at once). `deploy/test.sh` runs the tests of both modules on a tagged instance; `deploy/build.sh` builds
+   the binary (it tests `pull/` only).
+   ```bash
+   pull/deploy/test.sh
+   pull/deploy/build.sh <key> /tmp/superci-pull-cache
+   pull/deploy/release.sh /tmp/superci-pull-cache "" "ssh ec2-user@$L"
+   ```
+   The listener makes a new launch template version at start, because `sameData` finds the latest has no profile.
+   Machines already running, and the idle pool from before the release, keep the old version: they run on GitHub's
+   cache until they end, and a machine lives for one job.
+5. **Attach the instance profile: check it took** (the template versions, then the first machines).
+   ```bash
+   for r in us-east-1 us-east-2; do for set in 2cpu 4cpu 8cpu 16cpu 32cpu; do
+     aws --profile ci-runners ec2 describe-launch-template-versions --region $r --launch-template-name superci-pull-superci-$set --versions '$Latest' \
+       --query 'LaunchTemplateVersions[0].[VersionNumber,LaunchTemplateData.IamInstanceProfile.Arn]' --output text; done; done   # .../instance-profile/superci-pull-cache-machine
+   aws --profile ci-runners ec2 describe-instances --region us-east-1 --filters Name=tag:purpose,Values=superci-pull Name=instance-state-name,Values=pending,running \
+     Name=iam-instance-profile.arn,Values='*superci-pull-cache-machine' --query 'length(Reservations[].Instances[])'     # grows as machines start
+   ssh ec2-user@$L "grep -c 'iam:PassRole' /var/log/superci-pull/listener.jsonl"   # 0: no launch refused for the role
+   ```
+   Every launch refused with `iam:PassRole` (the listener's `fleet` events, the `LaunchShortfall` metric and its
+   alarm) means step 3 did not apply: apply it again, or roll back (below).
+
+#### Verify the first real job hits the cache
+
+Any job of a superci set that uses `actions/cache` (or `setup-*` with a cache) on a machine launched after the release.
+The runner machines take no inbound connection, so the daemon's journal is read through a temporary opening, or the
+S3 and broker evidence below is read instead.
+
+- **The entry reached S3** (definitive, needs no machine access). A save is `v1/<d|r>/<repository id>/<scope>/<version>/<key>`,
+  `d` for the default branch's scope and `r` for any other:
+  ```bash
+  aws --profile ci-runners s3 ls s3://superci-pull-cache-243891825325-us-east-1/v1/ --recursive | sort | tail -5
+  aws --profile ci-runners logs tail /aws/lambda/superci-pull-cache-broker --region us-east-1 --since 30m   # issued for <scope>, or refused with iss and kid
+  ```
+  The next job with the same key restores it: its restore step says "Cache restored from key" and the daemon logs
+  `restore "<key>": found ...`.
+- **The daemon's journal on the machine.** Find the machine (`aws ec2 describe-instances` as in step 5, by its
+  `i-...` in the job's runner name), open port 22 on the runner group `superci-pull-runner` of its region for your
+  address only, push a temporary key with EC2 Instance Connect, and close the port after:
+  ```bash
+  sudo journalctl -u pullcache -o cat     # serving GitHub's cache at http://<private ip>:8257 from superci-pull-cache-243891825325-<region> ...
+                                          # restore "<key>": found ...   save "<key>": saved N MB   (a hit and a save)
+  sudo journalctl -u pullcache -o cat | grep refused:     # <method> "<key>": refused: <why> (iss "<issuer>", kid "<key id>")
+  ```
+- **A `refused:` line names what the first job's token carries.** The daemon logs the token's `iss` and `kid`, never
+  the token. Every refused job is a cache miss, never a failed job.
+  - `iss` is not `https://token.actions.githubusercontent.com`: `ISSUER=<that iss> pull/cache/deploy/up.sh`. It sets
+    the broker's issuer and writes `bin/issuer` in each bucket, which every machine that boots afterwards reads. Run
+    `up.sh` without `ISSUER` later and the value stays; `ISSUER=default` clears it.
+  - `kid` is not in GitHub's JWKS: the runtime token is signed by other keys. The broker takes
+    `BROKER_JWKS_URL=<url> pull/cache/deploy/up.sh`. A machine's daemon has no knob for it yet: it needs
+    `PULLCACHE_JWKS_URL` in `machine-up.sh`, and a new release of that script.
+
+#### Roll back the cache seam
+
+From fastest and smallest to full. None touches the listener's sessions, `SUPERCI_JOBS` or the push plane.
+
+1. **Stop using the cache for new machines, at once, with no restart.** Remove the machine script. A machine that
+   finds none starts no daemon and runs on GitHub's own cache; the profile stays attached and harmless.
+   ```bash
+   for r in us-east-1 us-east-2; do aws --profile ci-runners s3 rm s3://superci-pull-cache-243891825325-$r/bin/up.sh --region $r; done
+   ```
+   Put it back with step 2. Machines already running keep their daemon until they end.
+2. **Take the profile off the templates.** Roll the listener back to the previous binary with the Roll back recipe
+   above (copy the previous `bin/superci-pull` version over the current one, restart). The previous binary embeds
+   the old `boot.sh`, so its user data differs from the latest template version and it makes a new version, without
+   the profile and without the daemon line.
+3. **Only then drop the `PassCacheRole` statement**, if wanted: `git show pull-prod:pull/deploy/listener-policy.json`
+   to a file, then the `put-role-policy` of step 3 with it. Dropping it first makes every launch of a template that
+   still names the profile fail.
+4. **Remove the cache itself** (buckets stay): `pull/cache/deploy/down.sh`. Nothing in the listener needs it gone.
+
 ## Operate
 
 ```bash

@@ -1,11 +1,30 @@
-# Porting the cache seam into `pull-prod`
+# The cache seam in `pull-prod-cache`
 
-The pull machines need three changes in the launcher before they use this cache. None is applied on this branch,
-because `pull-prod` is in flight. The line numbers below are those of `pull-prod` at `4c7b276` ("pull/README: zones,
-waiting machines, re-runs and roll back as built"). If they have moved, find the anchor quoted with each step.
+The pull machines need three changes in the launcher before they use this cache. They are applied on branch
+`pull-prod-cache` (this directory on top of `pull-prod` at `4282aa0`), exactly as below:
+
+| Seam | Where, on `pull-prod-cache` |
+| --- | --- |
+| 1. the daemon starts after `T=` | `pull/boot.sh:17-18` |
+| 2. the instance profile in the launch template | `pull/fleet.go:136` (`ensureTemplate`) and `pull/fleet.go:178-179` (`sameData`), tested in `pull/fleet_test.go` |
+| 3. the listener may pass the role | `pull/deploy/listener-policy.json:78-84` (`PassCacheRole`) |
+
+The steps below say how each was made, and the anchors are those of `pull-prod` at `4282aa0`; they are kept for
+anyone who ports the seam onto another base. Nothing here is live until the listener runs the new binary and has the
+new policy: see "Deploy the cache seam" in `pull/README.md`.
 
 Deploy the cache first (`deploy/up.sh`, then the binaries and the function code as the README's Deploy section says).
 A machine that boots before that runs its jobs on GitHub's own cache, so the order only decides when hits start.
+
+## One job per machine
+
+The cache's write isolation depends on a machine running one job. The daemon keeps each job's broker credentials in
+its memory, per token, for up to an hour, and a step of a job runs as a user with `sudo`, so it can read the daemon's
+memory. If a machine ran a pull request's job after a job of the default branch, that step could take the earlier
+job's credentials and write `main`'s scope. `pull-prod` has the property: `boot.sh` powers the machine off after its
+runner exits, and `State.Ask` (`pull/state.go`) gives a machine no second runner once a runner of it has taken a job.
+Do not reuse a machine (a warm pool that runs several jobs, a runner that takes a second job) without restarting the
+daemon and dropping its credentials between jobs, or moving them out of the machine.
 
 ## 1. `pull/boot.sh`: start the daemon after `T=`
 
@@ -86,5 +105,6 @@ ls -la /home/runner/externals/node24/bin/node /home/runner/externals/node24/bin/
 The first job that uses `actions/cache` shows whether GitHub's runtime token is taken. Look for `restore "..."` and
 `save "...": saved` lines. A refusal reads `refused: ... (iss "...", kid "...")`. If its `iss` is not
 `https://token.actions.githubusercontent.com`, set `PULLCACHE_ISSUER` on the machines and the broker to the issuer it
-shows. If the `kid` is not in GitHub's JWKS, the runtime token is signed by other keys: set `PULLCACHE_JWKS_URL` on
-both. Until then every job is a cache miss, never a failed job.
+shows: `ISSUER=<that issuer> pull/cache/deploy/up.sh` sets it on the broker and writes it to each bucket's
+`bin/issuer`, which each machine's daemon reads at boot, so both agree and a later `up.sh` keeps it. If the `kid` is
+not in GitHub's JWKS, the runtime token is signed by other keys: set `PULLCACHE_JWKS_URL` on both. Until then every job is a cache miss, never a failed job.

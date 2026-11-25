@@ -11,6 +11,10 @@
 #
 #   pull/cache/deploy/up.sh          the functions' code is bin/pullcache-lambda-arm64.zip in each region's bucket
 #   CAP_GB=1000                      what the janitor keeps of a region's entries at most
+#   ISSUER=<iss>                     the issuer the job tokens carry, where it is not GitHub's (https://token.actions.githubusercontent.com):
+#                                    kept in each bucket's bin/issuer, which the broker (set here) and every machine's daemon (read by
+#                                    machine-up.sh at boot) both take, so the two agree and a later run without ISSUER keeps it.
+#                                    ISSUER=default removes it. The refusal in `journalctl -u pullcache` names the issuer to use.
 set -euo pipefail
 
 A="aws --profile ci-runners"
@@ -179,10 +183,18 @@ function_up() {
   echo "function $name $r"
 }
 
+case ${ISSUER:-} in *[,{}\ ]*) echo "refusing: ISSUER holds a comma, a brace or a space" >&2; exit 1 ;; esac
 for r in $REGIONS; do
   b=$(bucket "$r")
   jwks=""; [ -n "${BROKER_JWKS_URL:-}" ] && jwks=",PULLCACHE_JWKS_URL=$BROKER_JWKS_URL"
-  function_up $BROKER "$r" "Variables={PULLCACHE_LAMBDA=broker,PULLCACHE_BUCKET=$b,PULLCACHE_STAGE_BUCKET=$b-stage,PULLCACHE_WRITER_ROLE=$(arn $WRITER),PULLCACHE_DEFAULT_BRANCH=main$jwks}" 256 10 || continue
+  case ${ISSUER:-} in
+    "") ;;
+    default) $A s3 rm --only-show-errors --region "$r" "s3://$b/bin/issuer" || true ;;
+    *) printf '%s' "$ISSUER" | $A s3 cp --only-show-errors --region "$r" - "s3://$b/bin/issuer" ;;
+  esac
+  iss=$($A s3 cp --only-show-errors --region "$r" "s3://$b/bin/issuer" - 2>/dev/null || true)
+  issuer=""; [ -n "$iss" ] && { issuer=",PULLCACHE_ISSUER=$iss"; echo "issuer $r: $iss"; }
+  function_up $BROKER "$r" "Variables={PULLCACHE_LAMBDA=broker,PULLCACHE_BUCKET=$b,PULLCACHE_STAGE_BUCKET=$b-stage,PULLCACHE_WRITER_ROLE=$(arn $WRITER),PULLCACHE_DEFAULT_BRANCH=main$jwks$issuer}" 256 10 || continue
   function_up $JANITOR "$r" "Variables={PULLCACHE_LAMBDA=janitor,PULLCACHE_BUCKET=$b,PULLCACHE_CAP_GB=$CAP_GB}" 1024 600 || continue
   rule=$($A events put-rule --region "$r" --name $JANITOR --schedule-expression 'rate(15 minutes)' --tags "$TAGS" --query RuleArn --output text)
   $A lambda add-permission --region "$r" --function-name $JANITOR --statement-id events --action lambda:InvokeFunction \

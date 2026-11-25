@@ -76,6 +76,13 @@
       "Resource": "*"
     },
     {
+      "Sid": "PassCacheRole",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::243891825325:role/superci-pull-cache-machine",
+      "Condition": { "StringEquals": { "iam:PassedToService": "ec2.amazonaws.com" } }
+    },
+    {
       "Sid": "MarkItselfUnhealthy",
       "Effect": "Allow",
       "Action": "autoscaling:SetInstanceHealth",
