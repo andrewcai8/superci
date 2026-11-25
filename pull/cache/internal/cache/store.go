@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sort"
 	"time"
 )
 
@@ -13,6 +14,53 @@ type Object struct {
 	Size     int64
 	Modified time.Time
 	ETag     string
+	// Saved is when a job saved the entry, as a copy in the other region keeps it (SavedMetadata): the copy's own
+	// Modified is when it was copied. Zero on an original, whose Modified is its save, and in a listing, which
+	// carries no metadata.
+	Saved time.Time
+}
+
+// SavedMetadata names the object metadata (x-amz-meta-saved) that holds a copy's Saved, in RFC 3339 with
+// nanoseconds.
+const SavedMetadata = "saved"
+
+// SaveTime is when the entry was saved. Which of several matches is the newest, and how old an entry is, go by it.
+func (o Object) SaveTime() time.Time {
+	if !o.Saved.IsZero() {
+		return o.Saved
+	}
+	return o.Modified
+}
+
+// Newest is the match saved last, as a HEAD of each says (a listing has no save time). A copy is made after its save,
+// so its Modified is never before its SaveTime: matches are read from the latest Modified down, and the reading stops
+// at the first that cannot be newer than the best so far. Ties go to the larger key.
+func Newest(ctx context.Context, r Reader, objs []Object) (Object, bool, error) {
+	order := append([]Object(nil), objs...)
+	sort.Slice(order, func(i, j int) bool {
+		if !order[i].Modified.Equal(order[j].Modified) {
+			return order[i].Modified.After(order[j].Modified)
+		}
+		return order[i].Key > order[j].Key
+	})
+	var best Object
+	found := false
+	for _, c := range order {
+		if found && c.Modified.Before(best.SaveTime()) {
+			break
+		}
+		o, ok, err := r.Head(ctx, c.Key)
+		if err != nil {
+			return Object{}, false, err
+		}
+		if !ok {
+			continue
+		}
+		if t, b := o.SaveTime(), best.SaveTime(); !found || t.After(b) || t.Equal(b) && o.Key > best.Key {
+			best, found = o, true
+		}
+	}
+	return best, found, nil
 }
 
 // Part is one staged block an entry is assembled from.

@@ -268,18 +268,16 @@ func (s *Server) lookup(ctx context.Context, a Access, key string, restore []str
 			if err != nil {
 				return Object{}, "", false, err
 			}
-			var newest *Object
-			for i := range objs {
-				if newest == nil || objs[i].Modified.After(newest.Modified) || objs[i].Modified.Equal(newest.Modified) && objs[i].Key > newest.Key {
-					newest = &objs[i]
-				}
+			newest, ok, err := Newest(ctx, s.Store, objs)
+			if err != nil {
+				return Object{}, "", false, err
 			}
-			if newest != nil {
+			if ok {
 				name, err := url.PathUnescape(strings.TrimPrefix(newest.Key, base))
 				if err != nil {
 					continue
 				}
-				return *newest, name, true, nil
+				return newest, name, true, nil
 			}
 		}
 	}

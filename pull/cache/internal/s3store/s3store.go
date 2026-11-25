@@ -81,7 +81,11 @@ func (s *Store) Head(ctx context.Context, key string) (cache.Object, bool, error
 		}
 		return cache.Object{}, false, err
 	}
-	return cache.Object{Key: key, Size: aws.ToInt64(out.ContentLength), Modified: aws.ToTime(out.LastModified), ETag: aws.ToString(out.ETag)}, true, nil
+	o := cache.Object{Key: key, Size: aws.ToInt64(out.ContentLength), Modified: aws.ToTime(out.LastModified), ETag: aws.ToString(out.ETag)}
+	if t, err := time.Parse(time.RFC3339Nano, out.Metadata[cache.SavedMetadata]); err == nil {
+		o.Saved = t
+	}
+	return o, true, nil
 }
 
 func (s *Store) List(ctx context.Context, prefix string, max int) ([]cache.Object, error) {

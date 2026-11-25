@@ -87,6 +87,7 @@ type Mem struct {
 	mu      sync.Mutex
 	objs    map[string][]byte
 	mod     map[string]time.Time
+	saved   map[string]time.Time
 	tags    map[string]string
 	n       int
 	Clock   func() time.Time
@@ -104,7 +105,7 @@ type Mem struct {
 var ErrDenied = errors.New("AccessDenied")
 
 func NewMem() *Mem {
-	return &Mem{MinPart: 5 << 20, objs: map[string][]byte{}, mod: map[string]time.Time{}, tags: map[string]string{}, Clock: time.Now}
+	return &Mem{MinPart: 5 << 20, objs: map[string][]byte{}, mod: map[string]time.Time{}, saved: map[string]time.Time{}, tags: map[string]string{}, Clock: time.Now}
 }
 
 func (m *Mem) Get(key string) ([]byte, bool) {
@@ -134,11 +135,21 @@ func (m *Mem) Set(key string, b []byte, at time.Time) {
 	m.set(key, b, at)
 }
 
+// SetCopy writes an object as the mirror does: copied at, holding the save time of its original.
+func (m *Mem) SetCopy(key string, b []byte, saved, at time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.set(key, b, at)
+	m.saved[key] = saved
+}
+
 func (m *Mem) set(key string, b []byte, at time.Time) {
 	m.n++
 	m.objs[key], m.mod[key], m.tags[key] = b, at, fmt.Sprintf(`"%d"`, m.n)
+	delete(m.saved, key)
 }
 
+// object is what a listing says of k: no metadata, so no save time.
 func (m *Mem) object(k string) cache.Object {
 	return cache.Object{Key: k, Size: int64(len(m.objs[k])), Modified: m.mod[k], ETag: m.tags[k]}
 }
@@ -149,7 +160,9 @@ func (m *Mem) Head(_ context.Context, key string) (cache.Object, bool, error) {
 	if _, ok := m.objs[key]; !ok {
 		return cache.Object{}, false, nil
 	}
-	return m.object(key), true, nil
+	o := m.object(key)
+	o.Saved = m.saved[key]
+	return o, true, nil
 }
 
 func (m *Mem) List(_ context.Context, prefix string, max int) ([]cache.Object, error) {
@@ -200,6 +213,7 @@ func (m *Mem) Delete(_ context.Context, keys []string) error {
 	for _, k := range keys {
 		delete(m.objs, k)
 		delete(m.mod, k)
+		delete(m.saved, k)
 		delete(m.tags, k)
 	}
 	return nil
