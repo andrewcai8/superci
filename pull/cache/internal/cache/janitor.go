@@ -208,19 +208,7 @@ func Janitor(ctx context.Context, st Pruner, p Policy, now time.Time, dry bool, 
 		}
 		return rep, nil
 	}
-	for len(junk) > 0 {
-		n := min(len(junk), 1000)
-		got, err := st.Delete(ctx, junk[:n])
-		for i, r := range got {
-			if r == Deleted {
-				lg.Printf("janitor: deleted %s (%d bytes): not a marker", junk[i].Key, junk[i].Size)
-			}
-		}
-		if err != nil {
-			return rep, err
-		}
-		junk = junk[n:]
-	}
+	defer deleteJunk(ctx, st, junk, lg)
 	for len(plan) > 0 {
 		n := min(len(plan), 1000)
 		batch := plan[:n]
@@ -248,6 +236,25 @@ func Janitor(ctx context.Context, st Pruner, p Policy, now time.Time, dry bool, 
 		plan = plan[n:]
 	}
 	return rep, nil
+}
+
+// deleteJunk deletes what lies under MarkRoot and is not a marker, after the run's evictions and whatever happened
+// to them: it is hygiene, so a failure is logged and never stops or fails eviction.
+func deleteJunk(ctx context.Context, st Pruner, junk []Object, lg *log.Logger) {
+	for len(junk) > 0 {
+		n := min(len(junk), 1000)
+		got, err := st.Delete(ctx, junk[:n])
+		for i, r := range got {
+			if r == Deleted {
+				lg.Printf("janitor: deleted %s (%d bytes): not a marker", junk[i].Key, junk[i].Size)
+			}
+		}
+		if err != nil {
+			lg.Printf("janitor: could not delete what is not a marker under %s: %v", MarkRoot, err)
+			return
+		}
+		junk = junk[n:]
+	}
 }
 
 // withSaveTimes is objs with Saved read (a HEAD each, a few at a time) for the entries of the default branch that

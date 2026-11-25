@@ -155,11 +155,11 @@ done
 $A iam get-role --role-name $WRITER >/dev/null
 
 # The janitor lists entries and markers and deletes entries, each only if it is still the version it listed (a
-# conditional delete: DeleteObject, with the ETag).
+# conditional delete: DeleteObject, with the ETag), and deletes what lies under a/ and is not a marker.
 cat > "$tmp/janitor.json" <<JSON
 { "Version": "2012-10-17", "Statement": [
     { "Sid": "List", "Effect": "Allow", "Action": "s3:ListBucket", "Resource": ["arn:aws:s3:::$B1", "arn:aws:s3:::$B2"] },
-    { "Sid": "Evict", "Effect": "Allow", "Action": "s3:DeleteObject", "Resource": ["arn:aws:s3:::$B1/v1/*", "arn:aws:s3:::$B2/v1/*"] }, $(logs $JANITOR) ] }
+    { "Sid": "Evict", "Effect": "Allow", "Action": "s3:DeleteObject", "Resource": ["arn:aws:s3:::$B1/v1/*", "arn:aws:s3:::$B2/v1/*", "arn:aws:s3:::$B1/a/*", "arn:aws:s3:::$B2/a/*"] }, $(logs $JANITOR) ] }
 JSON
 role $JANITOR "$(printf "$trust_service" lambda.amazonaws.com)" "$tmp/janitor.json"
 
