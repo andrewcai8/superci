@@ -14,8 +14,8 @@ A="aws --profile ci-runners"
 here=$(cd "$(dirname "$0")" && pwd)
 . "$here/../../deploy/release-lib.sh"
 T=$DIR/cache
-"$here/../../deploy/manifest.sh" "$DIR" cache > "$T/bin/RELEASE.json.new"
-mv "$T/bin/RELEASE.json.new" "$T/bin/RELEASE.json"
+"$here/../../deploy/manifest.sh" "$DIR" cache > "$DIR/cache.RELEASE.json"
+mv "$DIR/cache.RELEASE.json" "$T/bin/RELEASE.json"
 for r in $CACHE_REGIONS; do
   (cd "$T" && find . -type f ! -path ./bin/RELEASE.json | sed 's|^\./||' | LC_ALL=C sort) | while read -r k; do
     $A s3 cp --quiet --region "$r" "$T/$k" "s3://$CACHE_BUCKET_PREFIX-$r/$k"

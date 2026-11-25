@@ -5,7 +5,7 @@
 # listener manifest's sha256 and prints its commit, and each cache function's code in each region is the cache
 # manifest's zip. Prints a line per check and exits 1 when any fails.
 #
-#   pull/deploy/verify-release.sh [listener|cache|all]
+#   pull/deploy/verify-release.sh [listener|cache|all]      SSH=<command> reaches the listener (pull/deploy/ssh.sh by default)
 set -uo pipefail
 PART=${1:-all}
 A="aws --profile ci-runners"
@@ -30,9 +30,12 @@ bucket() {
     if got=$($A s3 cp --quiet --region "$r" "s3://$b/$k" - 2>/dev/null | sha256sum | cut -d' ' -f1) && [ "$got" = "$want" ]; then ok "s3://$b/$k"
     else fail "s3://$b/$k: sha256 $got, RELEASE.json says $want"; fi
   done
-  local p
+  local p keys
   for p in "$@"; do
-    for k in $($A s3api list-objects-v2 --region "$r" --bucket "$b" --prefix "$p" --query 'Contents[].Key' --output text); do
+    if ! keys=$($A s3api list-objects-v2 --region "$r" --bucket "$b" --prefix "$p" --query 'Contents[].Key' --output text); then
+      fail "s3://$b/$p: could not be listed"; continue
+    fi
+    for k in $keys; do
       [ "$k" = None ] || [ "$k" = bin/RELEASE.json ] && continue
       grep -qxF -- "$k" <<< "$listed" && continue
       [[ "$k" =~ $OPERATOR_KEYS ]] && { echo "note  s3://$b/$k: an operator's file, not part of the release"; continue; }
@@ -48,7 +51,7 @@ if [ "$PART" = listener ] || [ "$PART" = all ]; then
     if [ "$($A ec2 describe-instances --region us-east-1 --filters Name=tag:Name,Values=superci-pull-listener Name=instance-state-name,Values=running --query 'length(Reservations[].Instances[])' --output text)" = 0 ]; then
       echo "note  no listener instance is running"
     else
-      read -r got rev < <("$here/ssh.sh" 'echo "$(sha256sum < /usr/local/bin/superci-pull | cut -d" " -f1) $(/usr/local/bin/superci-pull -version 2>/dev/null || echo none)"')
+      read -r got rev < <(${SSH:-$here/ssh.sh} 'p=$(systemctl show -p MainPID --value superci-pull); echo "$(sudo sha256sum < /proc/$p/exe | cut -d" " -f1) $(sudo /proc/$p/exe -version 2>/dev/null || echo none)"')
       if [ "$got" = "$want" ] && [ "$rev" = "$commit" ]; then ok "listener runs $commit ($got)"; else fail "listener runs sha256 $got, -version ${rev:-none}; RELEASE.json says $want, $commit"; fi
     fi
   fi

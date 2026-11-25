@@ -20,7 +20,7 @@ ID=$($A ec2 run-instances --region $R --image-id "$AMI" --instance-type c7g.2xla
   --tag-specifications "ResourceType=instance,Tags=[{Key=purpose,Value=superci-pull-cache},{Key=Name,Value=superci-pull-cache-test}]" "ResourceType=volume,Tags=[{Key=purpose,Value=superci-pull-cache}]" \
   --user-data "#!/bin/bash
 ( sleep 3600; poweroff ) &
-curl -sfL https://go.dev/dl/go$GO.linux-arm64.tar.gz | tar -C /usr/local -xz && touch /tmp/go-ready" --query 'Instances[0].InstanceId' --output text)
+dnf install -y -q git && curl -sfL https://go.dev/dl/go$GO.linux-arm64.tar.gz | tar -C /usr/local -xz && touch /tmp/go-ready" --query 'Instances[0].InstanceId' --output text)
 trap '$A ec2 terminate-instances --region $R --instance-ids $ID >/dev/null; echo "terminated $ID"; rm -rf "$tmp"' EXIT
 echo "instance $ID (purpose=superci-pull-cache)"
 $A ec2 wait instance-running --region $R --instance-ids "$ID"
