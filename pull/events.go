@@ -210,6 +210,13 @@ var markNames = map[string]bool{"boot.start": true, "cache.start": true, "cache.
 
 const markLimit = 256
 
+// A mark's value holds at most markValMax bytes (a cache key, url-escaped, fits) and a request's marks header at most
+// markHeaderMax, so a job, which is root on its machine, can make the listener write at most markLimit short lines.
+const (
+	markValMax    = 256
+	markHeaderMax = 32 << 10
+)
+
 var markCounts = struct {
 	sync.Mutex
 	n map[string]int
@@ -225,7 +232,12 @@ func (h *Server) mark(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unknown machine", http.StatusForbidden)
 		return
 	}
-	h.markEvents(s, m, recv, r.Header.Get("X-Superci-Marks"), r.Header.Get("X-Superci-Sent"))
+	marks := r.Header.Get("X-Superci-Marks")
+	if len(marks) > markHeaderMax {
+		http.Error(w, "marks too long", http.StatusRequestEntityTooLarge)
+		return
+	}
+	h.markEvents(s, m, recv, marks, r.Header.Get("X-Superci-Sent"))
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -241,6 +253,9 @@ func (h *Server) markEvents(s *Set, m *Machine, recv time.Time, marks, sentAt st
 		at, rest, _ := strings.Cut(rest, "=")
 		dur, val, _ := strings.Cut(rest, "=")
 		t := parseEpoch(at)
+		if len(val) > markValMax {
+			val = val[:markValMax]
+		}
 		if !markNames[name] || t.IsZero() || t.Sub(recv).Abs() > time.Hour {
 			continue
 		}
