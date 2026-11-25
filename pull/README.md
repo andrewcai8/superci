@@ -134,16 +134,37 @@ and after, across restarts of the listener.
 
 ### Pools
 
-Each set keeps a hot pool of idle runners: enough to cover what arrives during `fill_seconds` (45: launch, boot and
-registration) times `factor` (1.5), measured over the set's last 10 minutes of arrivals, between a floor and a cap
-for the hour (UTC). The caps come from megpt-mono's Blacksmith arrivals by hour (`tools/pools.py`); the floors are 1
-for 2, 4 and 8 vCPU and 0 for 16 and 32. Within 15 minutes of the next hour, the larger of the two hours' bounds
-applies, so a busy hour's pool is registered slowly ahead of it. A split size divides its bounds among its sets.
-A job arrives with its first JobAssigned or JobAvailable message: GitHub assigns these sets' jobs directly, with
-no JobAvailable, so before Nov 25 19:00Z every arrival (and every `QueueWait`) read as none and each pool stayed at
-its floor; the load tests above pinned their pools, which hid it. After a start, arrivals are rated over the time
-since it (at least a minute), and no idle runner is trimmed in the first window (10 minutes), so a restart does not
-read as no arrivals and shed the pool.
+Each set keeps a hot pool of idle runners sized from the bursts its jobs come in. A job finds a ready runner when
+fewer jobs than the pool arrived in the launch time up to it, since each job takes a runner and launches the next. So
+the pool is, for each job the set saw in the last 30 minutes (`window_minutes`), how many jobs arrived within one
+launch time up to and including it, taken at the 88th percentile (`quantile`), and never less than the largest such
+burst of the last 5 minutes (`hold_minutes`: a pool runner retired is a registration and a boot spent for nothing).
+The launch time is the set's own: the 90th percentile, over its last 64 launches, from the launch call to the runner's
+registration, so it follows the image, hydration and the registration budget. Until a set has eight launches it is
+`ready_seconds` (45). A job arrives with its first JobAvailable or JobAssigned; GitHub assigns a set's jobs without
+offering them first, and a job is known by its job id. Before Nov 25 19:00Z every arrival (and every `QueueWait`)
+read as none and each pool stayed at its floor; the load tests above pinned their pools, which hid it.
+
+The pool stays between a floor and a cap for the hour (UTC). The floors are 1 for 2, 4 and 8 vCPU and 0 for 16 and
+32; the caps are flat spend guards (120, 200, 130, 40 and 12) above the largest pool the weekday model below asks for.
+Within 15 minutes of the next hour, the larger of the two hours' bounds applies. A split size divides its bounds among
+its sets. No idle runner is trimmed in the first window after a start, while the set has seen too few jobs to size its
+pool.
+
+Why this rule, measured on Nov 25 2026 (`tools/wait/`):
+
+- The 4cpu canary (lint-test-backend's `verify-tools` and `test-go`, 17:03-17:25Z, 140 jobs) waited 22 s p50 and
+  24 s p90. The pool read no arrivals and sat at its floor of 1: 17 jobs found a ready runner (2 s), 123 waited for a
+  launch: Fleet 3.7 s, boot 16.7 s (EC2 to kernel 2.5-5 s, systemd and cloud-init 7 s, boot.sh 4 s), registration
+  0.8 s, runner start 2 s.
+- Demand at full rollout (Blacksmith's Linux jobs; a weekday is about 177,000): at the Nov 24 02:00Z peak, 4 vCPU
+  takes 2.5 jobs a second, 39 in 20 s at the median and 105 at p90. One push brings up to 114 jobs of a size at once.
+- A model of the listener over that weekday (pushes at each hour's rate, each with a real push's jobs; launch times
+  from the canary; validated against the canary at 21.5 s p50 against 22 measured) meets a wait of p50 5 s and p90
+  10 s at every size with this rule at $278 a day idle with plain machines (quantile 0.8) and $424 with hydrated
+  ones (quantile 0.88, launch 38 s median). Launching for a run's later jobs ahead of them saves at most $3 a day: a
+  push's jobs arrive together. A stopped or hibernated spot pool cannot be started reliably: a stopped spot machine
+  is pinned to its type and zone, and 7 starts in 7 over 3 minutes were refused for capacity.
 
 ### Sizes and split
 
@@ -524,7 +545,7 @@ Spot prices on Nov 25 2026 08:00Z (median of each size's 10 cheapest pools), wit
 | --- | --- |
 | The listener (c7g.large on-demand, 30 GB gp3, the Elastic IP's public address) | $0.08 |
 | Idle at the floors (1 machine each of 2, 4 and 8 vCPU; overnight, or with no jobs routed here) | $0.20 |
-| Idle at the busiest hour's caps (57, 119, 37, 6 and 3 machines), reached only when that hour's arrivals are all here | $15.5 |
+| Idle pools at full rollout, modelled over a weekday (all of megpt-mono's Linux jobs here, hydrated machines) | $17.7 on average |
 
 A busy hour costs what its jobs run for at those prices, plus about 30 s of boot and shutdown per job (a machine runs
 one job), plus the pool. `SpendPerHourUSD` is the listener's live figure.
