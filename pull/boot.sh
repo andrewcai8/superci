@@ -13,6 +13,8 @@ L='@LISTENER@'
 PIN='@PIN@'
 T=$(curl -s -m 2 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600' http://169.254.169.254/latest/api/token)
 ID=$(curl -s -m 2 -H "X-aws-ec2-metadata-token: $T" http://169.254.169.254/latest/meta-data/instance-id)
+# The cache (pull/cache): starts the cache server from the bucket's bin/up.sh and wraps the runner's Node; a machine without the role runs on GitHub's own cache.
+CR=$(curl -s -m 2 -H "X-aws-ec2-metadata-token: $T" http://169.254.169.254/latest/meta-data/placement/region); PB=${PULLCACHE_BUCKET:-superci-pull-cache-243891825325-$CR}; aws s3 cp --only-show-errors --region "$CR" "s3://$PB/bin/up.sh" - 2> /dev/null | PULLCACHE_BUCKET=$PB bash || :
 call() { curl -s -k --pinnedpubkey "$PIN" -m 60 -o "$2" -w '%{http_code}' "$L/$1?id=$ID"; }
 ( while sleep 5; do
     [ "$(curl -s -m 2 -o /dev/null -w '%{http_code}' -H "X-aws-ec2-metadata-token: $T" http://169.254.169.254/latest/meta-data/spot/instance-action)" = 200 ] || continue

@@ -1,0 +1,30 @@
+diff --git a/pull/deploy/listener-policy.json b/pull/deploy/listener-policy.json
+index da40ef5..2590c93 100644
+--- a/pull/deploy/listener-policy.json
++++ b/pull/deploy/listener-policy.json
+@@ -31,6 +31,13 @@
+       ],
+       "Resource": "*"
+     },
++    {
++      "Sid": "PassCacheRole",
++      "Effect": "Allow",
++      "Action": "iam:PassRole",
++      "Resource": "arn:aws:iam::243891825325:role/superci-pull-cache-machine",
++      "Condition": { "StringEquals": { "iam:PassedToService": "ec2.amazonaws.com" } }
++    },
+     {
+       "Sid": "AppCredentials",
+       "Effect": "Allow",
+diff --git a/pull/fleet.go b/pull/fleet.go
+index 799738f..54701d0 100644
+--- a/pull/fleet.go
++++ b/pull/fleet.go
+@@ -114,6 +114,7 @@ func (r *Region) ensureTemplate(ctx context.Context, name, image, root string, c
+ 		ImageId:                           aws.String(image),
+ 		UserData:                          aws.String(base64.StdEncoding.EncodeToString([]byte(c.UserData))),
+ 		SecurityGroupIds:                  []string{c.SecurityGrp[r.Name]},
++		IamInstanceProfile:                &ec2types.LaunchTemplateIamInstanceProfileSpecificationRequest{Name: aws.String("superci-pull-cache-machine")},
+ 		InstanceInitiatedShutdownBehavior: ec2types.ShutdownBehaviorTerminate,
+ 		MetadataOptions: &ec2types.LaunchTemplateInstanceMetadataOptionsRequest{HttpTokens: ec2types.LaunchTemplateHttpTokensStateRequired,
+ 			HttpPutResponseHopLimit: aws.Int32(2), HttpEndpoint: ec2types.LaunchTemplateInstanceMetadataEndpointStateEnabled},
