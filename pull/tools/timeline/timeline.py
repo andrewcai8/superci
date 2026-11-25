@@ -317,7 +317,18 @@ class GitHub:
         return self.api(f"actions/jobs/{job_id}/logs", raw=True)
 
 
+SUPERCI_ACCOUNT = "243891825325"
+_checked = set()
+
+
 def aws(profile, *args):
+    """The AWS CLI under --profile, which wins over any AWS_ACCESS_KEY_ID in the environment; the first call of a profile
+    proves it is the superci account, and any other is refused."""
+    if profile not in _checked:
+        who = subprocess.run(["aws", "--profile", profile, "sts", "get-caller-identity", "--query", "Account", "--output", "text"], capture_output=True, text=True)
+        if who.stdout.strip() != SUPERCI_ACCOUNT:
+            raise SystemExit(f"refusing: profile {profile} is account {who.stdout.strip() or who.stderr.strip()[:200]}, not {SUPERCI_ACCOUNT}")
+        _checked.add(profile)
     p = subprocess.run(["aws", "--profile", profile, *args], capture_output=True, text=True)
     if p.returncode:
         raise SystemExit(f"aws {' '.join(args[:3])}: {p.stderr.strip()[:400]}")

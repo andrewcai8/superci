@@ -112,5 +112,18 @@ func TestEachSetsMachinesReadTheirOwnLabelsManifest(t *testing.T) {
 		if !strings.Contains(got, "/hydrate/"+label+".json") {
 			t.Fatalf("%s: the machine does not read its own label's manifest", label)
 		}
+
+func TestOnlyKeepsTheSizesItNames(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "override.json")
+	override := `{"deployment":"superci-pull-timeline","only":["superci-96cpu"],"sizes":{"superci-96cpu":{"cpu":2,"split":1,"max":10,"disk_gb":40,"types":["c7i.large"]}}}`
+	if err := os.WriteFile(path, []byte(override), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Sizes) != 1 || c.Sizes["superci-96cpu"].CPU != 2 || len(c.Pools) != 0 {
+		t.Fatalf("sizes %v pools %v, want only superci-96cpu", c.Sizes, c.Pools)
 	}
 }
