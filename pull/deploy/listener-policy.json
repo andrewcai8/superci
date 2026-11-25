@@ -78,13 +78,13 @@
       }
     },
     {
-      "Sid": "TagAMachineIssued",
+      "Sid": "TagAMachineIssuedOrNoticed",
       "Effect": "Allow",
       "Action": "ec2:CreateTags",
       "Resource": "arn:aws:ec2:*:243891825325:instance/*",
       "Condition": {
         "StringEquals": { "aws:ResourceTag/purpose": "superci-pull" },
-        "ForAllValues:StringEquals": { "aws:TagKeys": ["superci-pull-issued"] }
+        "ForAllValues:StringEquals": { "aws:TagKeys": ["superci-pull-issued", "superci-pull-noticed"] }
       }
     },
     {

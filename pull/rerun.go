@@ -12,7 +12,7 @@ import (
 // machine EC2 says a spot interruption terminated. It re-runs a job only on that proof, and only if GitHub concluded
 // the job failed, so a job that failed by itself, or that a person cancelled, is left as it ended. GitHub re-runs a
 // job only once its whole run has completed, so a lost job waits here until then. A start rebuilds the list from the
-// failed jobs of the last two hours (EC2 keeps the proof for about an hour after a machine ends).
+// machines EC2 lists with a notice tag (for about an hour after a reclaim).
 type Rerunner struct {
 	mu    sync.Mutex
 	rest  *REST
@@ -46,20 +46,14 @@ func (r *Rerunner) Add(j JobRef, now time.Time, proven bool) {
 	slog.Warn("job lost with its machine", "owner", j.Owner, "repo", j.Repo, "run", j.RunID, "job", j.Name, "runner", j.Runner, "proven", proven)
 }
 
-// Rebuild adds the failed jobs of each repository's runs of the last two hours that ran on a set's runner, after a
-// start forgot the list; each is re-run only once EC2 proves a spot reclaim took its machine.
-func (r *Rerunner) Rebuild(ctx context.Context, repos []string, now time.Time) {
-	for _, repo := range repos {
-		jobs, err := r.rest.FailedJobs(ctx, repo, now.Add(-2*time.Hour), "superci-")
-		if err != nil {
-			slog.Error("rebuild lost jobs", "repo", repo, "err", err.Error())
-			continue
-		}
-		for _, j := range jobs {
-			r.Add(j, now, false)
-		}
-		slog.Info("rebuilt lost jobs", "repo", repo, "failed_on_sets", len(jobs))
+// Rebuild adds, after a start forgot the list, each job a spot notice found running: the listener tags a noticed
+// machine with its job's run (superci-pull-noticed), so EC2 keeps the proof and the job for the hour it lists the
+// machine after the reclaim.
+func (r *Rerunner) Rebuild(jobs []JobRef, now time.Time) {
+	for _, j := range jobs {
+		r.Add(j, now, true)
 	}
+	slog.Info("rebuilt lost jobs", "noticed", len(jobs))
 }
 
 // instanceOf is the machine a runner is named after: <set>-<instance id>[-<suffix>].

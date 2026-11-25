@@ -40,6 +40,8 @@ MUTANTS = [
      "TestOnlyAFailedJobASpotReclaimTookIsReRun"),
     ("OPS-12 re-run with no proof of a reclaim", "rerun.go", "if !j.proven && !reclaimed[instanceOf(j.Runner)] {", "if !j.proven && reclaimed == nil {",
      "TestOnlyAFailedJobASpotReclaimTookIsReRun"),
+    ("OPS-12 a spot notice records no job", "state.go", f"{T}case r != nil && r.Job != nil:\n{T}{T}j := *r.Job\n{T}{T}return &j\n", "",
+     "TestASpotNoticeRecordsTheJobAndARestartReadsItBack"),
     ("OPS-13 a finished runner is checked as stuck", "state.go", f"r.Busy, r.Done = true, true\n{T}{T}{T}m.Ending = true", "r.Busy, r.Done = true, true",
      "TestAFinishedRunnerEndsItsMachineAndIsNeverChecked"),
 ]

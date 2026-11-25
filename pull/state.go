@@ -196,8 +196,8 @@ func (s *State) live() int {
 
 // Noticed takes in AWS's two minutes' notice for a spot machine: it is no longer supply, so another is launched at
 // once. With no runner it ends now; with an idle runner it retires (the runner removed before the machine ends); a
-// busy runner keeps its machine until its job ends or AWS takes it.
-func (s *State) Noticed(id string) *Machine {
+// busy runner keeps its machine until its job ends or AWS takes it. It returns the job the machine runs, if known.
+func (s *State) Noticed(id string) *JobRef {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	m := s.machines[id]
@@ -210,8 +210,11 @@ func (s *State) Noticed(id string) *Machine {
 		m.Ending = true
 	case r != nil && !r.Busy:
 		m.Retire = true
+	case r != nil && r.Job != nil:
+		j := *r.Job
+		return &j
 	}
-	return m
+	return nil
 }
 
 // Deficit reserves the capacity to launch now, under a new round's name. It launches no more than leaves limit of
@@ -526,7 +529,7 @@ func (s *State) Seen(region string, listed []*Machine, began, now time.Time) (lo
 			continue
 		}
 		m.IP, m.Type, m.AZ, m.Lifecycle, m.Seen = l.IP, l.Type, l.AZ, l.Lifecycle, now
-		m.Issued, m.Tagged = m.Issued || l.Issued, m.Tagged || l.Tagged
+		m.Issued, m.Tagged, m.Notice = m.Issued || l.Issued, m.Tagged || l.Tagged, m.Notice || l.Notice
 		if m.Launched.IsZero() {
 			m.Launched = l.Launched
 		}

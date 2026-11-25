@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -43,6 +44,7 @@ type Fleet struct {
 const (
 	tagDeployment = "superci-pull-deployment"
 	tagIssued     = "superci-pull-issued"
+	tagNoticed    = "superci-pull-noticed" // <owner>/<repo>/<run id> of the job a spot notice found running
 )
 
 type ImageConfig struct {
@@ -410,6 +412,8 @@ func (f *Fleet) Describe(ctx context.Context, r *Region) ([]*Machine, error) {
 						m.Set = aws.ToString(t.Value)
 					case tagIssued:
 						m.Issued, m.Tagged = true, true
+					case tagNoticed:
+						m.Notice = true
 					}
 				}
 				out = append(out, m)
@@ -431,6 +435,66 @@ func (f *Fleet) TagIssued(ctx context.Context, r *Region, ids []string, when tim
 		time.Sleep(time.Duration(250*(try+1)) * time.Millisecond)
 	}
 	return err
+}
+
+// TagNoticed records on a machine the job a spot notice found running on it.
+func (f *Fleet) TagNoticed(ctx context.Context, m *Machine, j JobRef) error {
+	r := f.Region(m.Region)
+	if r == nil {
+		return fmt.Errorf("no region %q", m.Region)
+	}
+	_, err := r.ec2.CreateTags(ctx, &ec2.CreateTagsInput{Resources: []string{m.ID},
+		Tags: []ec2types.Tag{{Key: aws.String(tagNoticed), Value: aws.String(fmt.Sprintf("%s/%s/%d", j.Owner, j.Repo, j.RunID))}}})
+	return err
+}
+
+// NoticedJobs is the job of every machine of this deployment EC2 lists with a notice tag, running or ended (EC2
+// lists an ended machine for about an hour).
+func (f *Fleet) NoticedJobs(ctx context.Context) ([]JobRef, error) {
+	var out []JobRef
+	for _, r := range f.regions {
+		p := ec2.NewDescribeInstancesPaginator(r.ec2, &ec2.DescribeInstancesInput{MaxResults: aws.Int32(1000), Filters: []ec2types.Filter{
+			{Name: aws.String("tag:purpose"), Values: []string{"superci-pull"}},
+			{Name: aws.String("tag:" + tagDeployment), Values: []string{f.deployment}},
+			{Name: aws.String("tag-key"), Values: []string{tagNoticed}},
+		}})
+		for p.HasMorePages() {
+			page, err := p.NextPage(ctx)
+			if err != nil {
+				return out, err
+			}
+			for _, res := range page.Reservations {
+				for _, in := range res.Instances {
+					var set, noticed string
+					for _, t := range in.Tags {
+						switch aws.ToString(t.Key) {
+						case "superci-pull-set":
+							set = aws.ToString(t.Value)
+						case tagNoticed:
+							noticed = aws.ToString(t.Value)
+						}
+					}
+					if j, ok := noticedJob(set, aws.ToString(in.InstanceId), noticed); ok {
+						out = append(out, j)
+					}
+				}
+			}
+		}
+	}
+	return out, nil
+}
+
+// noticedJob reads a notice tag (<owner>/<repo>/<run id>) as the job of the machine's runner.
+func noticedJob(set, id, tag string) (JobRef, bool) {
+	parts := strings.Split(tag, "/")
+	if len(parts) != 3 || set == "" {
+		return JobRef{}, false
+	}
+	run, err := strconv.ParseInt(parts[2], 10, 64)
+	if err != nil || parts[0] == "" || parts[1] == "" {
+		return JobRef{}, false
+	}
+	return JobRef{Owner: parts[0], Repo: parts[1], RunID: run, Runner: runnerName(set, id)}, true
 }
 
 // SpotReclaimed says which of the given machines EC2 reports terminated by a spot interruption. EC2 lists a

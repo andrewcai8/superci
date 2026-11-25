@@ -30,9 +30,10 @@ type Server struct {
 	budget   *Budget
 	verifier *Verifier
 	client   *scaleset.Client
-	refresh  func(ctx context.Context, region string)    // lists a region again, at most once a second
-	issue    func(ctx context.Context, m *Machine) error // writes the machine's issued tag; nil once EC2 has it
-	slots    chan struct{}                               // bounds concurrent registrations
+	refresh  func(ctx context.Context, region string)              // lists a region again, at most once a second
+	issue    func(ctx context.Context, m *Machine) error           // writes the machine's issued tag; nil once EC2 has it
+	notices  func(ctx context.Context, m *Machine, j JobRef) error // records on the machine the job a spot notice found
+	slots    chan struct{}                                         // bounds concurrent registrations
 	maxAge   func() time.Duration
 }
 
@@ -151,16 +152,24 @@ func (h *Server) jit(w http.ResponseWriter, r *http.Request) {
 }
 
 // notice takes in a machine's word that AWS gave notice it takes the machine back. The machine is no longer supply;
-// an idle runner of it retires (the reconciler removes it before the machine ends).
+// an idle runner of it retires (the reconciler removes it before the machine ends). A job it runs is recorded on the
+// machine (EC2's superci-pull-noticed tag), so a restart can still re-run the job once AWS has taken the machine.
 func (h *Server) notice(w http.ResponseWriter, r *http.Request) {
 	s, m, err := h.machine(r)
 	if err != nil {
 		http.Error(w, "unknown machine", http.StatusForbidden)
 		return
 	}
-	s.state.Noticed(m.ID)
+	job := s.state.Noticed(m.ID)
 	slog.Warn("spot notice", "set", s.spec.Name, "machine", m.ID, "region", m.Region, "type", m.Type, "az", m.AZ)
 	w.WriteHeader(http.StatusNoContent)
+	if job != nil && h.notices != nil {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 10*time.Second)
+		defer cancel()
+		if err := h.notices(ctx, m, *job); err != nil {
+			slog.Error("notice tag", "set", s.spec.Name, "machine", m.ID, "err", err.Error())
+		}
+	}
 }
 
 // removal reads GitHub's answer to removing a runner: only GitHub's refusal for a runner that holds a job means busy.

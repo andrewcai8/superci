@@ -460,3 +460,33 @@ func TestAStartedJobsQueueWaitRunsFromWhenItBecameAvailable(t *testing.T) {
 		t.Fatalf("waits %v, want one of 6 s", w)
 	}
 }
+
+// OPS-12: the list of lost jobs was in memory only; a noticed machine's job is now kept on EC2.
+func TestASpotNoticeRecordsTheJobAndARestartReadsItBack(t *testing.T) {
+	s := newState(0, 10)
+	s.Observe(stats(1, 0), t0)
+	launch(s, machines(1, t0), t0)
+	give(s, "i-0000", &Runner{ID: 5, Name: "set-i-0000", Issued: t0})
+	s.Observe(started("set-i-0000", 42), t0)
+	j := s.Noticed("i-0000")
+	if j == nil || j.RunID != 42 || j.Owner != "o" || j.Repo != "r" {
+		t.Fatalf("noticed job %+v: want run 42 of o/r, for the machine's notice tag", j)
+	}
+	got, ok := noticedJob("set", "i-0000", fmt.Sprintf("%s/%s/%d", j.Owner, j.Repo, j.RunID))
+	if !ok || got.RunID != 42 || got.Runner != "set-i-0000" {
+		t.Fatalf("the tag read back: %+v %v", got, ok)
+	}
+	for _, bad := range []string{"", "o/r", "o/r/x", "/r/1", "o/r/1/2"} {
+		if _, ok := noticedJob("set", "i-0000", bad); ok {
+			t.Fatalf("tag %q read as a job", bad)
+		}
+	}
+	r := newState(0, 10)
+	r.Observe(stats(1, 0), t0)
+	noticed := machines(1, t0)
+	noticed[0].Issued, noticed[0].Notice = true, true
+	r.Seen("us-east-1", noticed, t0, t0)
+	if live := r.Snapshot(t0).Live; live != 0 {
+		t.Fatalf("live %d: a machine EC2 lists as noticed is no supply after a restart", live)
+	}
+}

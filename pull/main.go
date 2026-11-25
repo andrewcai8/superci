@@ -200,7 +200,7 @@ func run(ctx context.Context, f flags) error {
 	for _, s := range l.sets {
 		byName[s.spec.Name] = s
 	}
-	srv := &Server{sets: byName, budget: l.budget, verifier: verifier, client: client, refresh: refresh, issue: l.tagger.Issue,
+	srv := &Server{sets: byName, budget: l.budget, verifier: verifier, client: client, refresh: refresh, issue: l.tagger.Issue, notices: fleet.TagNoticed,
 		slots: make(chan struct{}, max(1, cfg.Registration.Concurrency)), maxAge: l.maxAge}
 	go serve(ctx, &http.Server{Addr: f.listen, Handler: srv, ReadHeaderTimeout: 10 * time.Second}, &id)
 	go serve(ctx, &http.Server{Addr: f.admin, Handler: Admin(l.status, l.healthy, l.override)}, nil)
@@ -235,7 +235,11 @@ func run(ctx context.Context, f flags) error {
 		})
 	}
 	if l.cfg.Rerun {
-		go l.rerun.Rebuild(ctx, cfg.Repositories, now)
+		if jobs, err := fleet.NoticedJobs(ctx); err != nil {
+			slog.Error("rebuild lost jobs", "err", err.Error())
+		} else {
+			l.rerun.Rebuild(jobs, now)
+		}
 		go l.rerun.Run(ctx)
 	}
 	go l.price(ctx)

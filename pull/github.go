@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -189,49 +188,6 @@ func (g *REST) RunnerGroup(ctx context.Context, name string, repos []string) (in
 		return 0, err
 	}
 	return made.ID, nil
-}
-
-// FailedJobs is the failed jobs a runner named with prefix took, in the latest attempt of each of the repository's
-// runs created since a time that failed.
-func (g *REST) FailedJobs(ctx context.Context, repo string, since time.Time, prefix string) ([]JobRef, error) {
-	var out []JobRef
-	created := url.QueryEscape(">=" + since.UTC().Format(time.RFC3339))
-	for page := 1; page <= 10; page++ {
-		var runs struct {
-			Runs []struct {
-				ID int64 `json:"id"`
-			} `json:"workflow_runs"`
-		}
-		if err := g.get(ctx, fmt.Sprintf("https://api.github.com/repos/%s/%s/actions/runs?status=failure&created=%s&per_page=100&page=%d", g.org, repo, created, page), &runs); err != nil {
-			return out, err
-		}
-		for _, run := range runs.Runs {
-			for jp := 1; jp <= 20; jp++ {
-				var body struct {
-					Jobs []struct {
-						Name       string `json:"name"`
-						RunnerName string `json:"runner_name"`
-						Conclusion string `json:"conclusion"`
-					} `json:"jobs"`
-				}
-				if err := g.get(ctx, fmt.Sprintf("https://api.github.com/repos/%s/%s/actions/runs/%d/jobs?filter=latest&per_page=100&page=%d", g.org, repo, run.ID, jp), &body); err != nil {
-					return out, err
-				}
-				for _, j := range body.Jobs {
-					if j.Conclusion == "failure" && strings.HasPrefix(j.RunnerName, prefix) {
-						out = append(out, JobRef{Owner: g.org, Repo: repo, RunID: run.ID, Name: j.Name, Runner: j.RunnerName})
-					}
-				}
-				if len(body.Jobs) < 100 {
-					break
-				}
-			}
-		}
-		if len(runs.Runs) < 100 {
-			break
-		}
-	}
-	return out, nil
 }
 
 // listRunners reads every page of a runner listing. It fails unless it read every page, so a partial listing is
