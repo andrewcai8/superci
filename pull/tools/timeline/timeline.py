@@ -488,7 +488,7 @@ def show_job(tl):
     between = [p for p in tl.phases if p[0] == "between steps"]
     for label, owner, sec, a_, b_, _ in tl.phases:
         if label != "between steps":
-            print(f"  {b_ - t0:7.1f} {sec:6.1f} {100 * sec / tl.wall:5.1f}  {label}" + (f"  [{owner}]" if owner and not label.startswith("unobserved") else ""))
+            print(f"  {b_ - t0:7.1f} {sec:6.1f} {100 * sec / tl.wall:5.1f}  {label[:100]}" + (f"  [{owner}]" if owner and not label.startswith("unobserved") else ""))
     if between:
         sec = sum(p[2] for p in between)
         print(f"  {'':>7} {sec:6.1f} {100 * sec / tl.wall:5.1f}  between steps, {len(between)} gaps  [runner]")
@@ -647,11 +647,11 @@ def cmd_critical_path(a):
         t = tls[j["id"]]
         print(f"\n  job {t.name} ({t.fleet}, {t.label}) created +{created[j['id']] - t0:.1f}s completed +{done[j['id']] - t0:.1f}s wall {t.wall:.1f}s unexplained {t.unexplained:.1f}s")
         for label, owner, sec, x, y, _ in sorted(t.phases, key=lambda p: -p[2])[:5]:
-            print(f"      {sec:6.1f} s  {label}")
+            print(f"      {sec:6.1f} s  {label[:100]}")
             if sec > worst[1]:
                 worst = ((t.name, label), sec)
     if worst[0]:
-        print(f"\n  the longest single phase on the path: {worst[1]:.1f} s, {worst[0][1]} of job {worst[0][0]} ({100 * worst[1] / wall:.0f}% of the run)")
+        print(f"\n  the longest single phase on the path: {worst[1]:.1f} s, {worst[0][1][:100]} of job {worst[0][0][:40]} ({100 * worst[1] / wall:.0f}% of the run)")
 
 
 def cmd_export(a):
