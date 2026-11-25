@@ -373,6 +373,14 @@ func TestADroppedSetIsDeletedOnlyOnceItHoldsNothing(t *testing.T) {
 	if !s.Drained(t0.Add(3 * time.Minute)) {
 		t.Fatal("not drained a minute after its last machine is gone")
 	}
+	booting := NewState("set", 0, 0, []string{"us-east-1"}, t0.Add(-time.Hour))
+	booting.Seen("us-east-1", machines(1, t0), t0, t0)
+	booting.Observe(stats(0, 0), t0)
+	for _, at := range []time.Time{t0, t0.Add(2 * time.Minute)} {
+		if booting.Drained(at) {
+			t.Fatal("drained with a machine running that GitHub counts nothing of yet (it has not registered)")
+		}
+	}
 }
 
 func TestADroppedSetWithAJobAssignedButNotStartedIsNotDeleted(t *testing.T) {
