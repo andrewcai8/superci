@@ -104,7 +104,7 @@ fn cache_plane() -> (Served, String) {
         m.insert(format!("cachem:{link}"), json!({ "region": "us-east-1", "arch": "x86_64", "until": u64::MAX / 4, "runner": "a-runner" }).to_string());
         m.insert("runner:a-runner".into(), "5001".into());
         m.insert("job:5001".into(), json!({ "job_id": 5001, "run_id": 1, "repo": "acme/app", "repo_id": 197814629, "branch": "main", "default_branch": "main", "state": "running", "at_ms": now,
-            "installation_id": 42, "cloud": "aws", "seen_in_progress": true, "name": "test" }).to_string());
+            "installation_id": 42, "cloud": "aws", "seen_in_progress": true, "name": "test", "runner": "a-runner" }).to_string());
     }
     (served, link)
 }
