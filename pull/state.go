@@ -101,6 +101,7 @@ type State struct {
 	available   map[string]time.Time // when each waiting job was queued, by jobKey, for its queue wait
 	launches    []time.Duration      // launch call to registered runner, of the set's last machines
 	held        []heldPool           // the bursts of the last hold, newest last
+	carried     int                  // the burst the last listener saw, held for the first window after a start
 	lost        []JobRef             // jobs that ended on a machine AWS was taking back, for a re-run
 	waits       []float64            // queue waits (s) of jobs started since the metrics last took them
 	odLaunched  []time.Time
@@ -610,7 +611,42 @@ func (s *State) Burst(now time.Time, r PoolRule) int {
 	for _, h := range s.held {
 		n = max(n, h.n)
 	}
+	if now.Sub(s.started) < r.window() {
+		n = max(n, s.carried)
+	}
 	return n
+}
+
+// Carried is what a set's pool keeps across a restart: the burst it was sized for and its launch times.
+type Carried struct {
+	Burst    int     `json:"burst"`
+	Launches []int64 `json:"launches_ms"`
+}
+
+// Carry is the set's pool as the next listener should start from it.
+func (s *State) Carry() Carried {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c := Carried{Launches: make([]int64, len(s.launches))}
+	for i, d := range s.launches {
+		c.Launches[i] = d.Milliseconds()
+	}
+	for _, h := range s.held {
+		c.Burst = max(c.Burst, h.n)
+	}
+	return c
+}
+
+// Resume starts the set from what the last listener carried: its launch times, and its burst for the first window,
+// so a restart does not drop the pool to the floor while the set sees its jobs again.
+func (s *State) Resume(c Carried) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.carried = c.Burst
+	s.launches = s.launches[:0]
+	for _, ms := range c.Launches[max(0, len(c.Launches)-launchSamples):] {
+		s.launches = append(s.launches, time.Duration(ms)*time.Millisecond)
+	}
 }
 
 // TakeWaits hands over the queue waits recorded since the last call.
