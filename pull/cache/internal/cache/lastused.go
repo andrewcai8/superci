@@ -37,18 +37,19 @@ func markHash(entryKey string) string {
 type Marks map[string]time.Time
 
 // ReadMarks is the markers among objs, the listing of MarkRoot, as of now. A marker is empty and dated no later than
-// now's UTC day: the machines' role can write under MarkRoot, so a marker dated ahead would keep an old entry
-// "used" for ever and push main's newest out first. Anything else there is junk, returned for the janitor to delete,
-// so nothing a job writes under MarkRoot outlives one janitor run or changes the ranking.
+// the UTC day after now's (a day of slack for a machine whose clock runs ahead): the machines' role can write under
+// MarkRoot, and a marker dated far ahead would keep an old entry "used" for ever and push main's newest out first.
+// Anything else there is junk, returned for the janitor to delete. A forged marker of today still counts as a use of
+// that day; that bounds what a job can do to one day at a time and never changes what a restore returns.
 func ReadMarks(objs []Object, now time.Time) (Marks, []Object) {
 	m := Marks{}
 	var junk []Object
-	today := now.UTC().Truncate(24 * time.Hour)
+	latest := now.UTC().Truncate(24 * time.Hour).Add(24 * time.Hour)
 	for _, o := range objs {
 		rest, ok := strings.CutPrefix(o.Key, MarkRoot)
 		hash, day, ok2 := strings.Cut(rest, "/")
 		at, err := time.Parse(markDay, day)
-		if !ok || !ok2 || len(hash) != sha256.Size*2 || err != nil || o.Size != 0 || at.After(today) {
+		if !ok || !ok2 || len(hash) != sha256.Size*2 || err != nil || o.Size != 0 || at.After(latest) {
 			junk = append(junk, o)
 			continue
 		}
