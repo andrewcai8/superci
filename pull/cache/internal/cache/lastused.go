@@ -58,10 +58,10 @@ func ReadMarks(objs []Object) Marks {
 
 // LastUsed is when the entry was last restored, or saved if that is later.
 func (m Marks) LastUsed(o Object) time.Time {
-	if t := m[markHash(o.Key)]; t.After(o.Modified) {
+	if t := m[markHash(o.Key)]; t.After(o.SaveTime()) {
 		return t
 	}
-	return o.Modified
+	return o.SaveTime()
 }
 
 // MarkStore is the bucket as the daemon marks with: the machine's own role.

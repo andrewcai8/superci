@@ -63,7 +63,7 @@ Entries are never changed once written. The scope of `main` is class `d`, every 
 | What | Rule | Where it is set |
 | --- | --- | --- |
 | Class `r` (pull requests, merge-queue batches, other branches) | gone 3 days after it was saved | `deploy/lifecycle.json` |
-| Class `d` (the default branch) | no age rule in S3: the janitor deletes an entry nobody has restored for `MAX_IDLE` (30 days), however big the bucket | `deploy/up.sh` (`MAX_IDLE=`) |
+| Class `d` (the default branch) | no age rule in S3. The janitor deletes an entry nobody has restored for `MAX_IDLE` (30 days), and a superseded one nobody restored for 2 days, however small the bucket's use | `deploy/up.sh` (`MAX_IDLE=`), `cache.DefaultSupersededGrace` |
 | Size | the janitor function, every 15 minutes in each region, deletes until the region holds at most `CAP_GB` (1,000 GB): superseded entries first, then other scopes' entries, then the default branch's, each the least recently restored first (below) | `deploy/up.sh` (`CAP_GB=`) |
 | Markers of use | gone 35 days after they were written | `deploy/lifecycle.json` |
 | An upload's blocks | deleted at finish, with the job's own credentials; the stage bucket expires anything left after a day | `deploy/lifecycle-stage.json` |
@@ -99,8 +99,13 @@ the first segment always stays). In the production buckets on Nov 25:
 Entries of one family in one (class, repository, scope, version) are ranked by save time, and the newest is kept. Any
 other is superseded when nobody restored it after the newest was saved: a family that is too wide for its name (two live
 caches that share it) loses nothing it still restores, and a key that is not a hash is its own family, so nothing is
-ever called superseded on a guess about a name. Save time is the object's `LastModified`, the notion the mirror uses:
-its copy into the other region is seconds after the save, so both regions agree on which entry is newest.
+ever called superseded on a guess about a name. Save time is `Object.SaveTime`, the notion a restore key uses: the
+save's own time, which a copy in the other region keeps as `x-amz-meta-saved` (the copy's `LastModified` is when it was
+copied). A listing carries no metadata, so when a run has something to delete the janitor first reads the save time of
+the default branch's entries that share a family with another (a HEAD each, 32 at a time), and plans again on that.
+A run with nothing to delete reads nothing more than its listings. A superseded entry that nobody restored for two days
+(`DefaultSupersededGrace`) is deleted whatever the size, so a key saved every 12 minutes, as the git seed is, holds
+days of saves and not a terabyte of them.
 
 **The delete.** The janitor lists the entries and the markers, computes the plan as a function of that listing alone
 (`cache.Plan`, so two runs over one listing agree, and a run over what a run left deletes nothing), and deletes each
@@ -133,10 +138,10 @@ writer is one the `If-None-Match` rule cannot see (two regions saving one key at
 it). `pullcache mirror -bucket B -region R -peer-bucket P -peer-region PR` copies whatever an entry prefix of B
 (`-prefix`, `v1/d/` by default) holds that P lacks, as the function does for one save.
 
-The default branch's entries live 7 days: the warm jobs of `ci-cache-warm.yml` save them again within an hour of a
-miss (most every 12 minutes). The git seed is a new 450 MB key every 12 minutes: kept 30 days and copied to both
-regions, the seeds alone would pass the janitor's 1,000 GB cap (about 1,600 GB a region), and over the cap it
-evicts every pull request's entry first. Kept 7 days they hold about 380 GB a region.
+The default branch's entries are kept by use, not by age (see Eviction): the warm jobs of `ci-cache-warm.yml` save them
+again within an hour of a miss (most every 12 minutes), and the git seed is a new 450 MB key every 12 minutes. The janitor
+keeps the newest seed of a region and deletes the ones superseded for two days, so the seeds hold about 100 GB a region
+(48 hours of saves) instead of the 1,600 GB that 30 days of them would pass the cap with.
 
 ## Why this and not the others
 

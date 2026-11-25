@@ -7,6 +7,7 @@ import (
 	"log"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -36,22 +37,30 @@ type Policy struct {
 	CapBytes int64
 	// MaxIdle is how long an entry may go without a restore, whatever the size; zero is no limit.
 	MaxIdle time.Duration
+	// SupersededGrace is how long a superseded entry may go without a restore, whatever the size: nothing finds
+	// it by a restore key any more, and a job that still wants it restored it within this time. Zero is no limit.
+	SupersededGrace time.Duration
 }
 
 // DefaultMaxIdle is the longest an entry nobody restores is kept, by use and not by save age: an entry that is read
 // stays however old it is.
 const DefaultMaxIdle = 30 * 24 * time.Hour
 
+// DefaultSupersededGrace keeps an entry a newer one replaced for two days: long enough for the other region's copy
+// of the newer to land and for a job that started on the old inputs to finish, short enough that a cache saved every
+// 12 minutes (the git seed) holds days of saves and not a terabyte of them.
+const DefaultSupersededGrace = 2 * 24 * time.Hour
+
 // Plan names the entries to delete, in the order to delete them. It is a function of the listing, the markers, the
 // policy and the clock alone, so running it twice over one listing, or in two places at once, gives one answer.
 //
-// Idle entries go whatever the size. If what is left is still over the cap, entries go in this order until it is
+// Idle entries go whatever the size, and so do superseded ones nobody restored for SupersededGrace. If what is left is still over the cap, entries go in this order until it is
 // not:
 //
 //  1. Superseded entries: those a newer entry of the same (class, repository, scope, version, family) replaced and
 //     nobody restored since that entry was saved. Old lockfile hashes, old git seeds. The entry kept is the newest
-//     by save time (the object's LastModified, which is when the save ended; the mirror's copy to the other region
-//     is a few seconds after it, so both regions agree on which is newest). An older entry that was restored after
+//     by save time, which is Object.SaveTime: the save's own time, as a copy in the other region keeps it, so both
+//     regions agree on which is newest. An older entry that was restored after
 //     the newest was saved is not superseded: a family too wide for its name (two live caches that share one) loses
 //     nothing it still uses.
 //  2. Other scopes' entries (pull requests, queue batches), then the default branch's: a pull request's entry is
@@ -65,18 +74,8 @@ func Plan(objs []Object, marks Marks, p Policy, now time.Time) []Victim {
 		tier int
 	}
 	newest := map[string]Object{}
-	family := func(o Object) string {
-		e, ok := ParseEntry(o)
-		if !ok {
-			return o.Key
-		}
-		return strings.Join([]string{e.Class, e.Repo, e.Scope, e.Version, Family(e.Name)}, "/")
-	}
-	newer := func(a, b Object) bool { // a was saved after b
-		return cmp.Or(a.Modified.Compare(b.Modified), cmp.Compare(a.Key, b.Key)) > 0
-	}
 	for _, o := range objs {
-		if f := family(o); newest[f].Key == "" || newer(o, newest[f]) {
+		if f := familyOf(o); newest[f].Key == "" || savedAfter(o, newest[f]) {
 			newest[f] = o
 		}
 	}
@@ -94,8 +93,12 @@ func Plan(objs []Object, marks Marks, p Policy, now time.Time) []Victim {
 		if e, ok := ParseEntry(o); ok && e.Class == "d" || !ok && strings.HasPrefix(o.Key, EntryRoot+"d/") {
 			it.tier = 2
 		}
-		if top := newest[family(o)]; top.Key != o.Key && !used.After(top.Modified) {
+		if top := newest[familyOf(o)]; top.Key != o.Key && !used.After(top.SaveTime()) {
 			it.Reason, it.tier = Superseded, 0
+			if p.SupersededGrace > 0 && now.Sub(used) > p.SupersededGrace {
+				out = append(out, it.Victim)
+				continue
+			}
 		}
 		kept = append(kept, it)
 		total += o.Size
@@ -103,7 +106,7 @@ func Plan(objs []Object, marks Marks, p Policy, now time.Time) []Victim {
 	slices.SortFunc(out, func(a, b Victim) int { return cmp.Or(a.LastUsed.Compare(b.LastUsed), cmp.Compare(a.Key, b.Key)) })
 	if total > p.CapBytes {
 		slices.SortFunc(kept, func(a, b item) int {
-			return cmp.Or(cmp.Compare(a.tier, b.tier), a.LastUsed.Compare(b.LastUsed), a.Modified.Compare(b.Modified), cmp.Compare(a.Key, b.Key))
+			return cmp.Or(cmp.Compare(a.tier, b.tier), a.LastUsed.Compare(b.LastUsed), a.SaveTime().Compare(b.SaveTime()), cmp.Compare(a.Key, b.Key))
 		})
 		for _, it := range kept {
 			if total <= p.CapBytes {
@@ -114,6 +117,21 @@ func Plan(objs []Object, marks Marks, p Policy, now time.Time) []Victim {
 		}
 	}
 	return out
+}
+
+// familyOf is the group an entry is superseded within: the same class, repository, scope and version, and the same
+// family of key. An object that is not an entry is a group of its own.
+func familyOf(o Object) string {
+	e, ok := ParseEntry(o)
+	if !ok {
+		return o.Key
+	}
+	return strings.Join([]string{e.Class, e.Repo, e.Scope, e.Version, Family(e.Name)}, "/")
+}
+
+// savedAfter: a was saved after b (ties go to the larger key).
+func savedAfter(a, b Object) bool {
+	return cmp.Or(a.SaveTime().Compare(b.SaveTime()), cmp.Compare(a.Key, b.Key)) > 0
 }
 
 // Removal is what a delete of one listed version did.
@@ -132,6 +150,7 @@ const (
 // Pruner is the bucket as the janitor's own role reaches it: it lists entries and markers, and deletes entries, and
 // nothing else can delete one.
 type Pruner interface {
+	Head(ctx context.Context, key string) (Object, bool, error)
 	List(ctx context.Context, prefix string, max int) ([]Object, error)
 	// Delete deletes each object only if it is still the version it was listed as (its ETag), and says what it did
 	// to each, in order.
@@ -168,12 +187,21 @@ func Janitor(ctx context.Context, st Pruner, p Policy, now time.Time, dry bool, 
 	if err != nil {
 		return Report{}, err
 	}
-	plan := Plan(objs, ReadMarks(mobjs), p, now)
+	marks := ReadMarks(mobjs)
+	plan := Plan(objs, marks, p, now)
+	if len(plan) > 0 {
+		// A listing has no save time, and a copy's LastModified is later than its save: before deleting, read the
+		// save time of the entries whose rank depends on it, and plan again.
+		if objs, err = withSaveTimes(ctx, st, objs); err != nil {
+			return Report{}, err
+		}
+		plan = Plan(objs, marks, p, now)
+	}
 	rep := Report{Entries: len(objs), HeldMB: int(sum(objs) >> 20), Planned: len(plan), Dry: dry}
 	lg.Printf("janitor: %d entries, %d MB held, %d markers, cap %d MB, idle limit %s: %d to delete", rep.Entries, rep.HeldMB, len(mobjs), p.CapBytes>>20, p.MaxIdle, len(plan))
 	if dry {
 		for _, v := range plan {
-			lg.Printf("janitor: would delete %s (%d MB, saved %s, last used %s): %s", v.Key, v.Size>>20, v.Modified.UTC().Format(time.RFC3339), v.LastUsed.UTC().Format(time.RFC3339), v.Reason)
+			lg.Printf("janitor: would delete %s (%d MB, saved %s, last used %s): %s", v.Key, v.Size>>20, v.SaveTime().UTC().Format(time.RFC3339), v.LastUsed.UTC().Format(time.RFC3339), v.Reason)
 		}
 		return rep, nil
 	}
@@ -204,6 +232,46 @@ func Janitor(ctx context.Context, st Pruner, p Policy, now time.Time, dry bool, 
 		plan = plan[n:]
 	}
 	return rep, nil
+}
+
+// withSaveTimes is objs with Saved read (a HEAD each, a few at a time) for the entries of the default branch that
+// share a family with another: the mirror's copies are the only entries that carry one, and the newest of a family
+// is the one that matters. Other entries are returned as listed, and cost nothing.
+func withSaveTimes(ctx context.Context, h interface {
+	Head(ctx context.Context, key string) (Object, bool, error)
+}, objs []Object) ([]Object, error) {
+	members := map[string]int{}
+	for _, o := range objs {
+		members[familyOf(o)]++
+	}
+	out := slices.Clone(objs)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var first error
+	slots := make(chan struct{}, 32)
+	for i, o := range out {
+		if e, ok := ParseEntry(o); !ok || e.Class != "d" || members[familyOf(o)] < 2 {
+			continue
+		}
+		wg.Add(1)
+		slots <- struct{}{}
+		go func() {
+			defer func() { <-slots; wg.Done() }()
+			got, ok, err := h.Head(ctx, o.Key)
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err != nil:
+				if first == nil {
+					first = fmt.Errorf("head %s: %w", o.Key, err)
+				}
+			case ok && got.ETag == o.ETag:
+				out[i].Saved = got.Saved
+			}
+		}()
+	}
+	wg.Wait()
+	return out, first
 }
 
 func sum(objs []Object) (n int64) {

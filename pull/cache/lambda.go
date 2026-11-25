@@ -50,7 +50,7 @@ func lambdaMain() {
 			lg.Fatal(err)
 		}
 		awslambda.Start(func(ctx context.Context) (string, error) {
-			rep, err := cache.Janitor(ctx, st, cache.Policy{CapBytes: capGB << 30, MaxIdle: idle}, time.Now(), false, lg)
+			rep, err := cache.Janitor(ctx, st, cache.Policy{CapBytes: capGB << 30, MaxIdle: idle, SupersededGrace: cache.DefaultSupersededGrace}, time.Now(), false, lg)
 			return rep.String(), err
 		})
 	case "mirror":

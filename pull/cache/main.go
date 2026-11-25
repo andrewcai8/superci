@@ -158,7 +158,7 @@ func janitor(lg *log.Logger, args []string) error {
 	if *capMB > 0 {
 		capBytes = *capMB << 20
 	}
-	rep, err := cache.Janitor(context.Background(), st, cache.Policy{CapBytes: capBytes, MaxIdle: *idle}, time.Now(), *dry, lg)
+	rep, err := cache.Janitor(context.Background(), st, cache.Policy{CapBytes: capBytes, MaxIdle: *idle, SupersededGrace: cache.DefaultSupersededGrace}, time.Now(), *dry, lg)
 	lg.Printf("janitor: %s", rep)
 	return err
 }
