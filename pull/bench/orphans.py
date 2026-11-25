@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Lists orphans: machines of the scale sets that hold no registered runner (and are not new), and runners of the sets
 whose machine is not running. Reads EC2 (both regions) with the ci-runners profile and GitHub's runner listing of the
-Default group through GH_APP_CMD, a command that prints a REST path's body as the App's installation.
+deployment's runner group (superci-pull) through GH_APP_CMD, a command that prints a REST path's body as the App's
+installation.
 
   GH_APP_CMD=ghapp orphans.py
 """
@@ -15,18 +16,23 @@ now = datetime.now(timezone.utc)
 machines = {}
 for region in ("us-east-1", "us-east-2"):
     out = json.loads(subprocess.run(["aws", "--profile", "ci-runners", "ec2", "describe-instances", "--region", region, "--filters",
-                                     "Name=tag:purpose,Values=superci-pull", "Name=tag-key,Values=superci-pull-set",
+                                     "Name=tag:purpose,Values=superci-pull", "Name=tag:superci-pull-deployment,Values=superci-pull",
+                                     "Name=tag-key,Values=superci-pull-set",
                                      "Name=instance-state-name,Values=pending,running",
                                      "--query", "Reservations[].Instances[].{id:InstanceId,launch:LaunchTime,set:Tags[?Key=='superci-pull-set']|[0].Value}",
                                      "--output", "json"], check=True, capture_output=True, text=True).stdout)
     for m in out:
         machines[m["id"]] = m
+def gh(path):
+    return json.loads(subprocess.run([os.environ.get("GH_APP_CMD", "ghapp"), path], check=True, capture_output=True, text=True).stdout)
+
+
+group = next(g["id"] for g in gh("/orgs/Authentic-Intelligence/actions/runner-groups?per_page=100")["runner_groups"] if g["name"] == "superci-pull")
 runners, page = {}, 1
 while True:
-    body = json.loads(subprocess.run([os.environ.get("GH_APP_CMD", "ghapp"), f"/orgs/Authentic-Intelligence/actions/runner-groups/1/runners?per_page=100&page={page}"],
-                                     check=True, capture_output=True, text=True).stdout)
+    body = gh(f"/orgs/Authentic-Intelligence/actions/runner-groups/{group}/runners?per_page=100&page={page}")
     for r in body["runners"]:
-        m = re.match(r"^(superci-[0-9]+cpu(?:-[0-9]+)?)-(i-[0-9a-f]+)-[0-9a-f]+$", r["name"])
+        m = re.match(r"^(superci-[0-9]+cpu(?:-[0-9]+)?)-(i-[0-9a-f]+)(?:-[0-9a-f]+)?$", r["name"])
         if m:
             runners[r["name"]] = (m.group(2), r["status"], r["busy"])
     if len(body["runners"]) < 100:
