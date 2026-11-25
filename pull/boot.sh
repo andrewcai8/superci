@@ -22,7 +22,7 @@ HM=/run/superci-hydrate.json; HR=/home/runner/hydrated
 if [ -x /usr/local/bin/pullcache ] && aws s3 cp --only-show-errors --region "$CR" "s3://$PB/bin/hydrate/@LABEL@.json" "$HM" 2> /dev/null; then
   install -d -o runner -g runner "$HR"
   timeout -k 5 110 runuser -u runner -- env HOME=/home/runner PULLCACHE_BUCKET="$PB" PULLCACHE_REGION="$CR" /usr/local/bin/pullcache hydrate -timeout 100s "$HM" "$HR" || :
-  echo "SUPERCI_HYDRATED=$HR" >> /home/runner/.env
+  printf '\nSUPERCI_HYDRATED=%s\n' "$HR" >> /home/runner/.env
 fi
 DOC=$(curl -s -m 2 -H "X-aws-ec2-metadata-token: $T" http://169.254.169.254/latest/dynamic/instance-identity/rsa2048)
 call() { curl -s -k --pinnedpubkey "$PIN" -m 60 --data-binary "$DOC" -o "$2" -w '%{http_code}' "$L/$1"; }

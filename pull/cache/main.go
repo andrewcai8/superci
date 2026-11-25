@@ -186,7 +186,7 @@ func hydrate(lg *log.Logger, args []string) error {
 		return err
 	}
 	began := time.Now()
-	h := &cache.Hydrator{Reader: st, DefaultBranch: env("PULLCACHE_DEFAULT_BRANCH", "main"), Root: fs.Arg(1), Log: lg,
+	h := &cache.Hydrator{Reader: st, DefaultBranch: env("PULLCACHE_DEFAULT_BRANCH", "main"), AnyScope: os.Getenv("PULLCACHE_HYDRATE_ANY_SCOPE") == "1", Root: fs.Arg(1), Log: lg,
 		ToolCache: env("RUNNER_TOOL_CACHE", "/opt/hostedtoolcache"), Platform: cache.ThisPlatform()}
 	res := h.Run(ctx, m)
 	lg.Printf("hydrate: %d entries in %.1f s", len(res), time.Since(began).Seconds())

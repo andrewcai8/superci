@@ -316,8 +316,13 @@ of that time unpacking main's caches, so the job's setup takes them with a renam
    "entries": [{"key": "git-seed-v1-Linux-X64-", "checkout": true},
                {"key": "bun-modules-v1-Linux-X64-bun*-aura-hono-api-scripts-on-"},
                {"key": "bun-modules-v1-Linux-X64-bun*-aura-hono-api-mind-scripts-on-"},
-               {"key": "mind-python-v1-Linux-X64-"}]}
+               {"key": "mind-python-v1-Linux-X64-"},
+               {"python": "3.13"}]}
   ```
+  `python` installs that CPython into the machine's tool cache as actions/setup-python would, so a job's
+  setup-python of that version finds it. Every scope must be the default branch's: only main's jobs write it, so no
+  PR's save can become what another machine's job starts from. `pullcache hydrate` refuses any other scope unless
+  `PULLCACHE_HYDRATE_ANY_SCOPE=1`, which only a dev listener's A/B sets.
 - **When.** `boot.sh` runs `pullcache hydrate` after the cache daemon starts and before it asks `/jit`, as the
   `runner` user, for at most 100 s. The runner does not exist until it is done, so no job can see a half-unpacked
   entry, and each entry is unpacked in `.tmp-<key>/` and renamed into place whole. `<root>/.hydrated.json` says what
