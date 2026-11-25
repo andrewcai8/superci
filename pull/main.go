@@ -389,7 +389,7 @@ func (l *Listener) drain(ctx context.Context, s *Set, stop context.CancelFunc) {
 			return
 		case <-tick.C:
 		}
-		if !s.state.Drained() {
+		if !s.state.Drained(time.Now()) {
 			continue
 		}
 		err := l.client.DeleteRunnerScaleSet(ctx, s.id)

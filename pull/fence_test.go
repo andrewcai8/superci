@@ -352,13 +352,13 @@ func TestAFailedTagBatchIsSplitNotTriedIdByIdAlone(t *testing.T) {
 // E9: a set the config dropped is deleted only once it holds no machine, so no job it runs fails.
 func TestADroppedSetIsDeletedOnlyOnceItHoldsNothing(t *testing.T) {
 	s := NewState("set", 0, 0, []string{"us-east-1"}, t0.Add(-time.Hour))
-	if s.Drained() {
+	if s.Drained(t0) {
 		t.Fatal("drained before its machines were listed")
 	}
 	s.Observe(stats(1, 0), t0)
 	s.Seen("us-east-1", machines(1, t0.Add(-10*time.Minute)), t0, t0)
 	s.Observe(started("set-i-0000", 9), t0)
-	if s.Drained() {
+	if s.Drained(t0) {
 		t.Fatal("drained while its runner holds a job")
 	}
 	s.Observe(completed("set-i-0000"), t0.Add(time.Minute))
@@ -366,7 +366,26 @@ func TestADroppedSetIsDeletedOnlyOnceItHoldsNothing(t *testing.T) {
 		t.Fatalf("ending %v: its job completed", ids(end))
 	}
 	s.Seen("us-east-1", nil, t0.Add(2*time.Minute), t0.Add(2*time.Minute))
-	if !s.Drained() {
-		t.Fatal("not drained once its last machine is gone")
+	s.Observe(stats(0, 0), t0.Add(2*time.Minute))
+	if s.Drained(t0.Add(2 * time.Minute)) {
+		t.Fatal("deleted on the first look at an empty set: one listing that missed a busy machine would fail its job")
+	}
+	if !s.Drained(t0.Add(3 * time.Minute)) {
+		t.Fatal("not drained a minute after its last machine is gone")
+	}
+}
+
+func TestADroppedSetWithAJobAssignedButNotStartedIsNotDeleted(t *testing.T) {
+	s := NewState("set", 0, 0, []string{"us-east-1"}, t0.Add(-time.Hour))
+	s.Seen("us-east-1", nil, t0, t0)
+	s.Observe(stats(1, 0), t0)
+	for _, at := range []time.Time{t0, t0.Add(time.Minute), t0.Add(5 * time.Minute)} {
+		if s.Drained(at) {
+			t.Fatalf("deleted at %s with a job assigned to it and no runner yet: that job would fail", at.Sub(t0))
+		}
+	}
+	s.Observe(stats(0, 0), t0.Add(6*time.Minute))
+	if s.Drained(t0.Add(6*time.Minute)) || !s.Drained(t0.Add(7*time.Minute)) {
+		t.Fatal("once GitHub counts nothing for a minute, the set goes")
 	}
 }
