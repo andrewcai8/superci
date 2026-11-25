@@ -220,5 +220,11 @@ for r in $REGIONS; do
   # The bucket's whole notification configuration: this one rule.
   $A s3api put-bucket-notification-configuration --region "$r" --bucket "$b" --notification-configuration \
     "{\"LambdaFunctionConfigurations\":[{\"Id\":\"mirror\",\"LambdaFunctionArn\":\"arn:aws:lambda:$r:$ACCOUNT:function:$MIRROR\",\"Events\":[\"s3:ObjectCreated:*\"],\"Filter\":{\"Key\":{\"FilterRules\":[{\"Name\":\"prefix\",\"Value\":\"v1/d/\"}]}}}]}"
+  # How long a save of main's waits for its copy in the other region; a job there misses it until then.
+  $A logs put-metric-filter --region "$r" --log-group-name "/aws/lambda/$MIRROR" --filter-name lag --filter-pattern '{ $.ev = "cache.mirror" && $.outcome = "copied" }' \
+    --metric-transformations metricName=MirrorLagMs,metricNamespace=superci-pull-cache,metricValue='$.lag_ms',unit=Milliseconds
+  $A cloudwatch put-metric-alarm --region "$r" --alarm-name superci-pull-cache-mirror-lag --namespace superci-pull-cache --metric-name MirrorLagMs \
+    --statistic Maximum --period 900 --evaluation-periods 1 --threshold 300000 --comparison-operator GreaterThanThreshold --treat-missing-data notBreaching \
+    --alarm-description "A save of main's took over 5 minutes to reach the other region (superci-pull-cache-mirror)" --tags "$TAGS"
   echo "mirror $r: the default branch's new entries are copied to $(bucket $peer)"
 done

@@ -10,6 +10,7 @@ for r in us-east-1 us-east-2; do
   $A events remove-targets --region $r --rule superci-pull-cache-janitor --ids janitor >/dev/null 2>&1
   $A events delete-rule --region $r --name superci-pull-cache-janitor 2>/dev/null
   $A s3api put-bucket-notification-configuration --region $r --bucket $b --notification-configuration '{}' 2>/dev/null
+  $A cloudwatch delete-alarms --region $r --alarm-names superci-pull-cache-mirror-lag 2>/dev/null
   for f in superci-pull-cache-broker superci-pull-cache-janitor superci-pull-cache-mirror; do
     $A lambda delete-function --region $r --function-name $f 2>/dev/null && echo "$r: deleted function $f"
     $A logs delete-log-group --region $r --log-group-name /aws/lambda/$f 2>/dev/null
