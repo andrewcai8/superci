@@ -15,9 +15,9 @@ import gate as G  # noqa: E402
 T = G.T
 
 
-def obs(wall, queue=2.0, ok=True, fleet="superci", run=None, sha="a", branch="x", job_id=None):
+def obs(wall, queue=2.0, ok=True, fleet="superci", run=None, sha="a", branch="x", job_id=None, timed_out=False, attempt=1):
     n = next(_ids)
-    return G.Obs(job_id or n, run or n, sha, branch, fleet, ok, queue, wall)
+    return G.Obs(job_id or n, run or n, sha, branch, fleet, ok, queue, wall, timed_out, attempt)
 
 
 _ids = iter(range(1, 10 ** 6))
@@ -97,9 +97,9 @@ class Gate1(unittest.TestCase):
         self.assertEqual(row.value, "1 of 13")
         self.assertEqual(row.status, G.PASS)
         self.assertIn("2 more", row.note)
-        on_main = obs(30, ok=False, sha="s2", fleet="superci", branch="main")
-        row = judge(self.good() + fails[:2] + [obs(30, ok=False, sha="s2"), on_main], base=B)["failures (superci)"]
-        self.assertEqual(row.value, "3 of 14", "a failure on main counts for the branch run, not for itself")
+        main_on_blacksmith = obs(30, ok=False, sha="s2", fleet="blacksmith", branch="main")
+        row = judge(self.good() + fails, base=B + [main_on_blacksmith])["failures (superci)"]
+        self.assertEqual(row.value, "2 of 13", "main's run on Blacksmith failed the same commit")
 
     def test_unexplained_time_must_be_under_two_seconds_at_p50(self):
         self.assertEqual(judge(self.good(), unexplained=[1.0] * 9)["unexplained p50 (timeline)"].status, G.PASS)
@@ -175,15 +175,16 @@ class RecordedCanary(unittest.TestCase):
         self.assertGreater(T.q([o.wall for o in self.S], 50), 2 * T.q([o.wall for o in self.B], 50))
 
     def test_the_same_legs_at_a_third_of_the_time_pass(self):
-        fast = [G.dataclasses.replace(o, wall=o.wall / 3, queue=o.queue / 20) for o in self.S]
+        fast = [G.dataclasses.replace(o, wall=o.wall / 3, queue=None if o.queue is None else o.queue / 20) for o in self.S]
         rows = rows_by_name(G.evaluate_job(fast, self.B, 625.0, [0.4] * len(fast)))
         self.assertEqual({n: r.status for n, r in rows.items()}, {n: G.PASS for n in rows}, [r for r in rows.values() if r.status != G.PASS])
 
-    def test_a_rerun_attempt_is_not_an_observation(self):
-        rerun = next(j for j in self.rec["blacksmith"] if (j["run_attempt"] or 1) > 1)
-        self.assertIsNone(G.is_obs(rerun, {}))
-        first_attempts = [j for j in self.rec["blacksmith"] if (j["run_attempt"] or 1) == 1 and j["conclusion"] in ("success", "failure")]
-        self.assertEqual(len(self.B), len(first_attempts))
+    def test_a_rerun_attempt_is_an_observation_without_a_queue_wait(self):
+        reruns = [j for j in self.rec["blacksmith"] if (j["run_attempt"] or 1) > 1 and j["conclusion"] in G.OUTCOMES]
+        self.assertTrue(reruns)
+        self.assertEqual({(o.attempt > 1, o.queue is None) for o in self.B if o.attempt > 1}, {(True, True)})
+        outcomes = [j for j in self.rec["blacksmith"] if j["conclusion"] in G.OUTCOMES and j.get("started_at") and j.get("completed_at")]
+        self.assertEqual(len(self.B), len(outcomes))
 
     def test_the_fleet_comes_from_the_runner_group_and_labels(self):
         self.assertEqual({o.fleet for o in self.S}, {"superci"})
@@ -193,7 +194,7 @@ class RecordedCanary(unittest.TestCase):
 def scale(**kw):
     base = dict(replayed=100, completed=100, stranded=[], lost=0, waits=spread_around(3, 1, 100), window_use=[(1000.0, 400.0), (1060.0, 700.0)], org_known=[1.0, 1.0],
                 claims={f"i-{n}" for n in range(10)}, issued=collections.Counter({f"i-{n}": 1 for n in range(10)}), claim_taken=collections.Counter({f"i-{n}": 1 for n in range(10)}),
-                claim_refused=0, launched=["spot"] * 19 + ["on-demand"], orphans=[(2000.0, 0.0)], orphans_due=1990.0,
+                claim_refused=0, launched=["spot"] * 19 + ["on-demand"], orphans=[(2000.0, 0.0)], orphans_due=1990.0, lo=1000.0, hi=1060.0,
                 alarms={"superci-pull-orphans": "OK", "superci-pull-jobs-stalled": "OK"}, queuewait_samples=100.0)
     base.update(kw)
     return G.Scale(**base)
@@ -221,7 +222,7 @@ class Gate2(unittest.TestCase):
         self.assertEqual(judge_scale(waits=[])["queue wait p50"].status, G.FAIL)
 
     def test_registrations_stay_under_eighty_percent_of_the_cap_in_every_window(self):
-        self.assertEqual(judge_scale(window_use=[(1000.0, 1200.0)])["org registrations per 5 min"].status, G.PASS)
+        self.assertEqual(judge_scale(window_use=[(1000.0, 1200.0), (1060.0, 100.0)])["org registrations per 5 min"].status, G.PASS)
         row = judge_scale(window_use=[(1000.0, 400.0), (1060.0, 1201.0)])["org registrations per 5 min"]
         self.assertEqual(row.status, G.FAIL)
         self.assertIn("1201", row.value)
@@ -328,6 +329,217 @@ class Trace(unittest.TestCase):
             self.assertIn("cpu8_1:", big)
             self.assertIn("cpu8_2:", big, "a matrix holds at most 256 legs")
             self.assertEqual(big.count("{i: "), 300)
+
+
+def gh_job(jid, run, attempt, conclusion, created, started, completed, fleet="superci", name="verify-tools", sha="s", branch="ci/load-1"):
+    """A job as GitHub's REST API returns it."""
+    j = {"id": jid, "run_id": run, "run_attempt": attempt, "name": name, "conclusion": conclusion, "status": "completed", "head_sha": sha, "head_branch": branch,
+         "created_at": T.iso(created), "started_at": T.iso(started) if started else None, "completed_at": T.iso(completed) if completed else None}
+    if fleet == "superci":
+        j.update(runner_group_name="superci-pull", runner_name="superci-i-1", labels=["superci-4cpu"])
+    else:
+        j.update(runner_group_name="Default", runner_name="blacksmith-4vcpu-ubuntu-2404-abc", labels=["blacksmith-4vcpu-ubuntu-2404"])
+    return j
+
+
+class Excuses(unittest.TestCase):
+    def test_superci_failures_on_main_do_not_excuse_each_other(self):
+        legs = [(r, leg) for r in range(5) for leg in range(2)]
+        failing = {(0, 0), (0, 1), (1, 0)}
+        S = [obs(80 + leg, 1.0, ok=(r, leg) not in failing, run=100 + r, sha="m", branch="main") for r, leg in legs]
+        B20 = fleet(spread_around(100, 10, 20), spread_around(3, 1, 20), fleet="blacksmith")
+        rows = G.evaluate_job(S, B20, 200.0, [0.5] * 10)
+        by = rows_by_name(rows)
+        self.assertEqual(by["failures (superci)"].value, "3 of 10")
+        self.assertEqual(by["failures (superci)"].status, G.FAIL)
+        self.assertEqual({n: r.status for n, r in by.items() if n != "failures (superci)"}, {n: G.PASS for n in by if n != "failures (superci)"}, "only the failures row is red")
+        self.assertEqual(printed(rows, "gate 1"), 1)
+
+    def test_a_failed_superci_run_on_the_same_commit_in_another_branch_does_not_excuse_either(self):
+        a, b = obs(30, ok=False, sha="s9", branch="ci/a"), obs(30, ok=False, sha="s9", branch="ci/b")
+        row = judge(self.good_runs() + [a, b])["failures (superci)"]
+        self.assertEqual(row.value, "2 of 12")
+
+    def good_runs(self):
+        return fleet(spread_around(80, 2, 10), spread_around(1, 0.2, 10))
+
+
+class Attempts(unittest.TestCase):
+    T0 = 1_000_000.0
+
+    def test_a_rerun_attempt_counts_its_failure_and_wall_time_but_not_its_queue_wait(self):
+        first = G.is_obs(gh_job(1, 1, 1, "failure", self.T0, self.T0 + 2, self.T0 + 62), {})
+        self.assertFalse(first.ok)
+        rerun = G.is_obs(gh_job(2, 1, 2, "success", self.T0, self.T0 + 500, self.T0 + 560), {})
+        self.assertIsNotNone(rerun, "a rerun's wall time is real")
+        self.assertEqual((rerun.ok, rerun.attempt, rerun.wall), (True, 2, 60.0))
+        self.assertIsNone(rerun.queue, "a rerun keeps its first attempt's created_at: its queue wait is not real")
+
+    def test_queue_wait_rows_skip_a_rerun_s_missing_queue_wait_and_its_wall_time_counts(self):
+        S = self.good() + [obs(500, None, attempt=2) for _ in range(3)]
+        rows = judge(S, ceiling=None)
+        self.assertEqual(rows["queue wait p50"].status, G.PASS)
+        self.assertEqual(rows["wall p90"].status, G.FAIL, "the 500 s rerun is in the wall sample")
+
+    def good(self):
+        return fleet(spread_around(80, 2, 10), spread_around(1, 0.2, 10))
+
+
+class FakeGitHub:
+    """GitHub's jobs listing: `filter=latest` is the newest attempt's jobs, `filter=all` every attempt's."""
+    runs_jobs = {}
+
+    def __init__(self, repo, cache):
+        self.calls = 0
+
+    def run_jobs(self, run_id, attempts="latest"):
+        jobs = FakeGitHub.runs_jobs[run_id]
+        if attempts == "all":
+            return list(jobs)
+        top = max(j["run_attempt"] for j in jobs)
+        return [j for j in jobs if j["run_attempt"] == top]
+
+
+class GateJobEndToEnd(unittest.TestCase):
+    """cmd_job over a canned GitHub: what it reads and what it prints."""
+    now = None
+
+    def run_gate(self, superci_runs, blacksmith_runs):
+        now = self.now = __import__("time").time()
+        runs, FakeGitHub.runs_jobs = [], {}
+        for i, jobs in enumerate(superci_runs + blacksmith_runs):
+            rid = 1000 + i
+            for j in jobs:
+                j["run_id"] = rid
+                shift = (now - 1800) if i < len(superci_runs) else (now - 10 * 3600)
+                for k in ("created_at", "started_at", "completed_at"):
+                    if j[k]:
+                        j[k] = T.iso(T.ts(j[k]) - 1_000_000.0 + shift)
+            FakeGitHub.runs_jobs[rid] = jobs
+            runs.append({"id": rid, "created_at": jobs[0]["created_at"], "head_branch": "ci/load-1"})
+        saved = (G.T.GitHub, G.runs_of, G.T.gather, G.T.build)
+        G.T.GitHub, G.runs_of = FakeGitHub, lambda gh, wf, lo, hi: runs
+        G.T.gather = lambda *a, **k: {}
+        G.T.build = lambda j, ev: type("TL", (), {"wall": 1.0, "unexplained": 0.5})()
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                limits = os.path.join(d, "limits.tsv")
+                with open(limits, "w") as fh:
+                    fh.write("lint-test-backend.yml\tverify-tools\t200\tx\n")
+                a = G.build_parser().parse_args(["--cache", d, "job", "verify-tools", "--branch-glob", "ci/*", "--limits", limits, "--since", T.iso(now - 7200)])
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    code = a.fn(a)
+                return code, buf.getvalue()
+        finally:
+            G.T.GitHub, G.runs_of, G.T.gather, G.T.build = saved
+
+    def superci(self, n, **kw):
+        return [[gh_job(10 * i + 1, 0, 1, "success", 1_000_000.0, 1_000_001.0, 1_000_081.0)] for i in range(n)]
+
+    def blacksmith(self, n):
+        return [[gh_job(5000 + i, 0, 1, "success", 1_000_000.0, 1_000_003.0, 1_000_103.0, fleet="blacksmith")] for i in range(n)]
+
+    def test_a_failure_that_a_rerun_then_passed_is_counted(self):
+        rerun_run = [gh_job(901, 0, 1, "failure", 1_000_000.0, 1_000_001.0, 1_000_031.0), gh_job(902, 0, 2, "success", 1_000_000.0, 1_000_400.0, 1_000_480.0)]
+        code, out = self.run_gate(self.superci(5) + [rerun_run], self.blacksmith(8))
+        self.assertRegex(out, r"failures \(superci\)\s+1 of 7")
+
+    def test_the_jobs_of_every_attempt_are_read(self):
+        seen = []
+        orig = FakeGitHub.run_jobs
+        FakeGitHub.run_jobs = lambda self, run_id, attempts="latest": (seen.append(attempts), orig(self, run_id, attempts))[1]
+        try:
+            self.run_gate(self.superci(5), self.blacksmith(2))
+        finally:
+            FakeGitHub.run_jobs = orig
+        self.assertEqual(set(seen), {"all"})
+
+    def test_cancelled_jobs_are_reported_per_fleet(self):
+        cancelled_s = [gh_job(801, 0, 1, "cancelled", 1_000_000.0, 1_000_001.0, 1_000_011.0)]
+        cancelled_b = [gh_job(802, 0, 1, "cancelled", 1_000_000.0, 1_000_003.0, 1_000_013.0, fleet="blacksmith")]
+        code, out = self.run_gate(self.superci(5) + [cancelled_s], self.blacksmith(8) + [cancelled_b])
+        line = next((l for l in out.splitlines() if l.strip().startswith("cancelled")), "")
+        self.assertIn("superci 1 run", line, out)
+        self.assertIn("blacksmith 1 run", line, out)
+
+
+class TimedOutAndCancelled(unittest.TestCase):
+    T0 = 1_000_000.0
+
+    def test_timed_out_is_a_failure_with_its_wall_time_floored_at_the_ceiling(self):
+        o = G.is_obs(gh_job(1, 1, 1, "timed_out", self.T0, self.T0 + 2, self.T0 + 52), {})
+        self.assertIsNotNone(o, "a job GitHub timed out is an observation")
+        self.assertEqual((o.ok, o.timed_out), (False, True))
+
+    def test_a_timed_out_leg_pushes_wall_p90_over_the_ceiling_and_counts_as_a_failure(self):
+        timed = [G.is_obs(gh_job(1, 1, 1, "timed_out", self.T0, self.T0 + 2, self.T0 + 52), {}) for _ in range(2)]
+        self.assertTrue(all(timed))
+        S = fleet(spread_around(80, 2, 10), spread_around(1, 0.2, 10)) + timed
+        by = judge(S, ceiling=200.0)
+        self.assertEqual(by["wall p90"].status, G.FAIL)
+        self.assertGreater(float(by["wall p90"].value.split()[0]), 150.0, "a 50 s timed-out leg counts at the 200 s ceiling, not at 50 s")
+        self.assertEqual(by["failures (superci)"].value, "2 of 12")
+        self.assertEqual(by["failures (superci)"].status, G.FAIL)
+
+    def test_without_a_ceiling_a_timed_out_leg_keeps_the_wall_time_it_ran(self):
+        timed = [G.is_obs(gh_job(i, 1, 1, "timed_out", self.T0, self.T0 + 2, self.T0 + 150), {}) for i in (1, 2)]
+        self.assertTrue(all(timed))
+        S = fleet(spread_around(80, 2, 10), spread_around(1, 0.2, 10))
+        self.assertEqual(judge(S + timed, ceiling=None)["wall p90"].status, G.FAIL)
+        self.assertEqual(judge(S, ceiling=None)["wall p90"].status, G.PASS)
+
+    def test_cancelled_jobs_are_not_observations_and_are_counted_per_fleet(self):
+        cancelled = [gh_job(1, 1, 1, "cancelled", self.T0, self.T0 + 2, self.T0 + 5), gh_job(2, 1, 1, "cancelled", self.T0, self.T0 + 2, self.T0 + 5),
+                     gh_job(3, 2, 1, "cancelled", self.T0, self.T0 + 2, self.T0 + 5, fleet="blacksmith")]
+        self.assertIsNone(G.is_obs(cancelled[0], {}))
+        self.assertEqual(G.cancelled_by_fleet(cancelled), {"superci": (1, 2), "blacksmith": (1, 1)})
+
+
+class Flags(unittest.TestCase):
+    def parse(self, *argv):
+        with contextlib.redirect_stderr(io.StringIO()):
+            return G.build_parser().parse_args(list(argv))
+
+    def test_gate_1_needs_a_branch_glob_so_the_superci_window_is_named(self):
+        with self.assertRaises(SystemExit):
+            self.parse("job", "verify-tools")
+        self.assertEqual(self.parse("job", "verify-tools", "--branch-glob", "main").branch_glob, "main")
+
+    def test_gate_2_needs_the_trace_so_a_push_that_never_ran_is_a_missing_job(self):
+        with self.assertRaises(SystemExit):
+            self.parse("scale", "--from", "2026-11-25T18:00:00Z", "--to", "2026-11-25T19:00:00Z")
+        self.assertEqual(self.parse("scale", "--from", "a", "--to", "b", "--trace", "t.json").trace, "t.json")
+
+
+class Gate2Completion(unittest.TestCase):
+    def test_extra_jobs_do_not_hide_a_stranded_one(self):
+        row = judge_scale(replayed=100, completed=100, stranded=[("extra", "failure")])["completion"]
+        self.assertEqual(row.status, G.FAIL)
+        self.assertIn("extra", row.note)
+
+    def test_a_job_that_never_ran_is_named_as_missing(self):
+        row = judge_scale(replayed=100, completed=95, stranded=[])["completion"]
+        self.assertEqual(row.status, G.FAIL)
+        self.assertIn("5 never ran", row.note)
+
+    def test_more_jobs_completed_than_the_trace_held_is_not_complete_either(self):
+        self.assertEqual(judge_scale(replayed=100, completed=101)["completion"].status, G.FAIL)
+
+
+class RegistrationCoverage(unittest.TestCase):
+    def test_a_minute_without_a_datapoint_fails_the_row_and_names_the_gap(self):
+        row = judge_scale(lo=960.0, hi=1140.0, window_use=[(960.0, 100.0), (1080.0, 100.0)])["org registrations per 5 min"]
+        self.assertEqual(row.status, G.FAIL)
+        self.assertIn("1 of 3 minutes", row.note)
+        self.assertIn(T.iso(1020.0), row.note)
+
+    def test_the_first_and_last_minutes_count(self):
+        late_start = judge_scale(lo=960.0, hi=1140.0, window_use=[(1020.0, 100.0), (1080.0, 100.0)])["org registrations per 5 min"]
+        self.assertEqual(late_start.status, G.FAIL)
+        early_stop = judge_scale(lo=960.0, hi=1140.0, window_use=[(960.0, 100.0), (1020.0, 100.0)])["org registrations per 5 min"]
+        self.assertEqual(early_stop.status, G.FAIL)
+        self.assertEqual(judge_scale(lo=960.0, hi=1140.0, window_use=[(960.0, 100.0), (1020.0, 100.0), (1080.0, 100.0)])["org registrations per 5 min"].status, G.PASS)
 
 
 if __name__ == "__main__":
