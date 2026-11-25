@@ -2,8 +2,9 @@
 
 GitHub runner scale sets served by EC2 spot in the `ci-runners` account (243891825325), one per runner size of
 megpt-mono: `superci-2cpu`, `superci-4cpu`, `superci-8cpu`, `superci-16cpu` and `superci-32cpu`. GitHub holds every
-job until a runner takes it; one listener reads each set's queue, keeps machines for it, and registers a runner for a
-machine when the machine proves who it is. Its state is EC2's tags and GitHub's queues; a restart rebuilds the rest.
+job until a runner takes it; one listener reads each set's queue, keeps machines for it, and registers a machine's one
+runner when the machine proves who it is. Its state is EC2's tags and GitHub's queues; a restart rebuilds the rest.
+The sets are in the runner group `superci-pull`, which only megpt-mono may use.
 
 A workflow asks for a size by its label:
 
@@ -25,23 +26,29 @@ superci-pull: one process on one c7g.large, an Auto Scaling group of one in us-e
               offers them (5 of 6: use1-az3 offers none) at weight 2 and of us-east-2 (3 of 3) at weight 1; a
               region's spot shortfall goes to the other, then on-demand, at most 10% of the last half hour's
               launches; a ClientToken on every call
-  /jit      : POST with the machine's signed identity document; a runner only when the machine holds none
-  reconciler: every 10 s lists EC2 and GitHub's runners; adopts, removes stale runners, ends stuck machines, trims
-              surplus idle runners (RemoveRunner first), accrues spend, applies the caps
-  metrics   : CloudWatch namespace superci-pull, every minute; alarms on them (deploy/alarms.sh)
+  /jit      : POST with the machine's signed identity document; a runner only for a machine never issued one, and
+              its config leaves only after EC2 has the machine's superci-pull-issued tag
+  lister    : lists the group's runners every 30 s (3 s a page), on its own: a slow GitHub slows only it
+  reconciler: every 10 s lists EC2; adopts, ends machines whose job completed, stuck, overdue or shed ones, retires
+              surplus idle runners (RemoveRunner first), accrues spend, applies the caps; its GitHub calls run apart
+  metrics   : CloudWatch namespace superci-pull, every minute; alarms and a dashboard on them (deploy/alarms.sh)
      |
-EC2 machines tagged purpose=superci-pull, superci-pull-set=<set>
+EC2 machines tagged purpose=superci-pull, superci-pull-deployment=superci-pull, superci-pull-set=<set>, and once
+issued its runner superci-pull-issued=<when>
   RunsOn ubuntu24 x64 image (superci's pinned build rule); boot.sh asks /jit, runs the runner for its one job and
-  powers off (or powers off when told it is not needed); metadata hop limit 1, so a job's containers cannot reach it
+  powers off (or powers off when told it gets none); the listener ends it when its job completes, whatever runs on
+  it; metadata hop limit 1, so a job's containers cannot reach it
 ```
 
 ### What decides each fact
 
 | Fact | Source | After a restart |
 | --- | --- | --- |
-| Jobs waiting, assigned, running | GitHub's statistics on each message | the session's first statistics; until then every machine waits and nothing launches or ends |
-| Machines | EC2 instances with a set's tag | the first listing (machines are adopted) |
-| A machine's runner, busy or not | JobStarted and JobCompleted, and GitHub's runner listing | the runner listing |
+| Jobs waiting, assigned, running | GitHub's statistics on each message | the session's first statistics; until then, and until every region is listed, nothing launches or ends and no machine is granted a runner |
+| Machines | EC2 instances with the deployment's tag and a set's tag | the first listing of every region (machines are adopted) |
+| Whether a machine was ever issued a runner | the tag `superci-pull-issued`, written before the runner's config leaves; also any runner GitHub lists or a job message names after it | the listing; a grant waits for a listing begun 30 s after the start (EC2's reads are eventually consistent) |
+| A machine's runner, busy or not | JobStarted and JobCompleted, GitHub's runner listing, and GitHub's answer for the runner's name | the messages GitHub redelivers, the listing, and a check by name |
+| A job a spot notice found running | the tag `superci-pull-noticed=<owner>/<repo>/<run>` | the tags of machines EC2 still lists (about an hour after a reclaim) |
 | Who a machine is | the instance identity document EC2 signed (PKCS7, RSA-2048), checked against AWS's certificate | the same |
 | The organization's registration rate | the advance of runner ids (one sequence for the organization), less ours | blind (0.3/s) for about 90 s |
 | Spend today and this month | accrued from running machines at their pool's spot price | the SSM parameter `/superci-pull/spend` |
@@ -51,15 +58,24 @@ EC2 machines tagged purpose=superci-pull, superci-pull-set=<set>
 
 - **No job is lost inside our account.** GitHub redelivers a message until the listener acknowledges it, and the
   listener acknowledges only after it has acquired the message's jobs and taken in its statistics.
-- **A machine ends only when its runner can take no job.** It powers itself off only when it holds no runner (it
-  asked and was told 410). The listener ends a machine with an idle runner only after GitHub removed that runner
-  (GitHub refuses to remove a runner that holds a job), and one without a fence only when no runner of it is
-  registered in a complete listing made well after its last runner was issued.
+- **A machine ends only on proof that its runner can take no job.** The proof is one of:
+  - GitHub's JobCompleted for its runner: the listener ends the machine, whatever runs on it;
+  - GitHub's removal of its idle runner (GitHub refuses to remove a runner that holds a job);
+  - GitHub's answer that it has no runner of the machine's id or name;
+  - for a machine never issued one, three complete listings in a row with none of it;
+  - its age past a bound (below).
+
+  An ask is no proof of anything: anything on a machine can ask.
 - **We never take the organization's last registrations.** Registrations go only into what GitHub's cap leaves the
   rest of the organization, less a margin; when the organization is near the cap, our jobs wait, not Blacksmith's.
-- **A machine runs one job, and holds at most one runner, bound to its instance.** A runner is named after the
-  instance its identity document names; a machine gets one only on its first ask after boot (or again for one that
-  never started), and none once a runner of it has taken a job. No job inherits what another left on a machine.
+- **A machine gets one runner, ever.** The runner is named `<set>-<instance id>`. The listener registers it, writes
+  the instance's `superci-pull-issued` tag, and only then lets the config leave; a tag it cannot write withholds the
+  config, and the machine ends. Every later ask, from the boot script that lost its answer or from a job that kept
+  the machine alive, is answered 410 with nothing, before and after any restart. A runner is never replaced: a
+  machine that asks again holding an idle runner ends once GitHub removes the runner. No job inherits what another
+  left on a machine, and no job can take a second runner from it.
+- **Nothing is decided before every region is listed and the queue is known.** A region not yet listed would read
+  as no machines: everything launched again, every runner of it an orphan.
 - **The supply converges.** Every decision is level-triggered from the listings, so a lost answer, a crash or a dead
   machine is repaired by the next reconcile.
 
@@ -77,12 +93,25 @@ from a listing of the organization's runners (every 100 s at most). Everyone els
 - A registration a waiting job needs comes first. A pool registration leaves half the saved-up burst to jobs and
   keeps to its own pace (`pool_rate`, and `pool_share` of the spare).
 - GitHub's refusal stops every registration for 5 s, doubling to a minute while it keeps refusing.
-- Until the rate is measured (90 s after a start) the listener registers at `blind_rate` (0.3/s) at most.
+- Until the rate is measured (about 75 s after a start: two listings 61 s apart, each dated when it began) the
+  listener registers at `blind_rate` (0.3/s) at most.
 - Across every set, machines waiting for a runner are bounded by what the budget registers in 90 s (a waiting machine
   is paid for). Past twice that, once the rate is measured, machines that have waited three minutes end.
 
 The estimate is published as `OrgRegistrationRate`, `OthersRegistrationRate`, `OurRegistrationRate`,
 `SpareRegistrationRate` and `RegistrationWindowUse`, and logged every 30 s (`"msg":"budget"`).
+
+How the advance is measured, and how far off it can be:
+
+- A head is the highest id GitHub has issued by a time. One from our own registration is exact. One from a listing
+  of the organization's runners is a lower bound: an ephemeral runner is deleted after its job, so the newest ids
+  can be gone already. It is short by at most what registered and finished within the listing.
+- The rate is the advance between the head 300 s ago (interpolated) and the newest head, over at least 60 s.
+  Others' rate is that advance less ours. A lower-bound head reads the rate low by at most (missed ids) / span:
+  with jobs of 30 s or more and a 10-15 s listing, a few ids over 60-300 s, under 0.1/s.
+- Ids are not dense if GitHub skips some. The advance then overstates the rate, which only makes us register less.
+- The budget does not depend on the estimate alone. The 20% margin, the window guard at `cap x (1 - margin / 2)` and
+  the backoff after a refusal bound the damage of an error in either direction.
 
 Moving a job from Blacksmith to superci moves its registration rather than adding one, so a gradual ramp of the
 fleet switch keeps the organization's total where it is. A test that adds jobs (a load test) adds registrations,
@@ -93,10 +122,9 @@ and at the organization's measured 3.5 to 4.5 a second it has almost nothing to 
 A machine POSTs `/latest/dynamic/instance-identity/rsa2048` from its metadata service. The listener verifies the PKCS7
 signature with AWS's RSA-2048 certificate of the region the document names (`certs/`, from AWS's documentation),
 requires account 243891825325, and serves the instance only if it is a machine of one of the sets. Its address plays
-no part. The runner it registers is named `<set>-<instance id>-<suffix>`. A machine runs one job: once its runner
-has taken a job it is told to end (boot.sh powers off after its runner exits anyway). It gets a second runner only
-for one that never started, after GitHub removed that one on the listener's request. Anything else on the machine
-that reads the document (a job) gets nothing while the runner holds its job, and nothing after.
+no part. The runner it registers is named `<set>-<instance id>`. A machine gets that one runner, ever (Invariants).
+Anything else on the machine that reads the document (a job) gets 410 and nothing, while its runner holds the job
+and after, across restarts of the listener.
 
 ### Pools
 
@@ -105,6 +133,8 @@ registration) times `factor` (1.5), measured over the set's last 10 minutes of a
 for the hour (UTC). The caps come from megpt-mono's Blacksmith arrivals by hour (`tools/pools.py`); the floors are 1
 for 2, 4 and 8 vCPU and 0 for 16 and 32. Within 15 minutes of the next hour, the larger of the two hours' bounds
 applies, so a busy hour's pool is registered slowly ahead of it. A split size divides its bounds among its sets.
+After a start, arrivals are rated over the time since it (at least a minute), and no idle runner is trimmed in the
+first window (10 minutes), so a restart does not read as no arrivals and shed the pool.
 
 ### Sizes and split
 
@@ -123,18 +153,29 @@ deleted at GitHub then, and a job one of their runners held fails, so shrink a s
 
 ### Lifetimes, spend and lost jobs
 
-- A job may run `job_minutes` + `margin_minutes` (360 + 30): the machine kills a runner past that and powers off.
-  A pool machine gets no runner past `max_age_hours` (8), and every machine powers itself off at 8 h plus a job's
-  length, whatever it is doing. A machine that cannot reach the listener for 15 minutes powers off (it holds no
-  runner then).
-- Spend is accrued every 10 s from each running machine's price (its pool's spot price, refreshed every 30 minutes;
-  $0.058 per vCPU-hour for on-demand; gp3 included). At `daily_usd` (1,000) or `monthly_usd` (15,000) the listener
-  launches nothing and keeps no pool; running jobs finish, and queued jobs wait until the day or month turns or the
-  cap is raised. It is an estimate made to bound the bill, not the bill.
-- A job lost to a spot reclaim is re-run once with GitHub's re-run API: a job that completed on a machine AWS gave
-  notice it takes back, or one whose machine EC2 stopped listing before the job completed. It is re-run when its run
-  has completed (GitHub re-runs a job only in a completed run) and only if GitHub's conclusion is not a success, so a
-  job that finished inside the two minutes' notice is left alone. The list is in memory: a restart forgets it.
+- The listener bounds every machine, whatever runs on it:
+  - a job may run `job_minutes` + `margin_minutes` (360 + 30) from when it started (JobStarted);
+  - an idle runner retires (removed, then its machine ends) once the machine is `max_age_hours` (8) old, and a
+    machine never issued one ends then;
+  - any machine ends at 8 h plus a job's length.
+
+  The machine also powers itself off at 8 h plus a job's length, and after 15 minutes without reaching the listener
+  (it holds no runner then). A job can stop those timers; it cannot stop the listener's.
+- Spend is accrued every 10 s from each running machine's price: its pool's spot price (refreshed every 30
+  minutes; $0.058 per vCPU-hour for on-demand), its gp3 volume and its public IPv4 address ($0.005/h). Data
+  transfer out is not counted. At `daily_usd` (1,000) or `monthly_usd` (15,000) the listener launches nothing and
+  keeps no pool. Running jobs finish; queued jobs wait until the day or month turns or the cap is raised: CI on
+  superci stops. `superci-pull-spend-daily` alarms at 80% of the cap the listener runs with. To keep CI going,
+  raise the cap (override file) or send the jobs back to Blacksmith: unset megpt-mono's `SUPERCI_JOBS`. The estimate
+  bounds the bill; it is not the bill.
+- A job lost to a spot reclaim is re-run once with GitHub's re-run API, only on proof of the reclaim:
+  - the job completed on a machine AWS gave notice it takes back (the notice is recorded on the machine as
+    `superci-pull-noticed`), or
+  - the job's machine left before the job completed, and EC2 says a spot interruption terminated it.
+
+  It is re-run once its run has completed (GitHub re-runs a job only in a completed run), and only if GitHub
+  concluded the job `failure`; a job that succeeded, or that a person cancelled, is left alone. A start rebuilds the
+  list from the notice tags of the machines EC2 still lists, about an hour after a reclaim.
 
 ### Cache seam
 
@@ -154,10 +195,10 @@ was the 19 MB wrapper over the runner's `node.real`, and a token with an issuer 
 
 #### Deploy the cache seam
 
-Not deployed: the listener still runs the build without it and the launch templates name no instance profile. The
-cache's own infrastructure (buckets, broker and janitor functions, roles, the `superci-pull-cache-machine` instance
-profile) is live in both regions. Every command uses `--profile ci-runners`. The order matters: the policy before the
-listener, the listener last.
+Deployed Nov 25 2026 12:09Z with round 2 (`pull-prod-r2`): every runner template's version 21 names the
+`superci-pull-cache-machine` profile, and the machines launched since carry it. The steps below are how it was done,
+and how to do it again on a fresh deployment. Every command uses `--profile ci-runners`. The order matters: the
+policy before the listener, the listener last.
 
 1. **Check the cache is there** (read-only).
    ```bash
@@ -183,8 +224,8 @@ listener, the listener last.
    the binary (it tests `pull/` only).
    ```bash
    pull/deploy/test.sh
-   pull/deploy/build.sh <key> /tmp/superci-pull-cache
-   pull/deploy/release.sh /tmp/superci-pull-cache "" "ssh ec2-user@$L"
+   pull/deploy/build.sh /tmp/superci-pull
+   pull/deploy/release.sh /tmp/superci-pull "" pull/deploy/ssh.sh
    ```
    The listener makes a new launch template version at start, because `sameData` finds the latest has no profile.
    Machines already running, and the idle pool from before the release, keep the old version: they run on GitHub's
@@ -196,7 +237,7 @@ listener, the listener last.
        --query 'LaunchTemplateVersions[0].[VersionNumber,LaunchTemplateData.IamInstanceProfile.Arn]' --output text; done; done   # .../instance-profile/superci-pull-cache-machine
    aws --profile ci-runners ec2 describe-instances --region us-east-1 --filters Name=tag:purpose,Values=superci-pull Name=instance-state-name,Values=pending,running \
      Name=iam-instance-profile.arn,Values='*superci-pull-cache-machine' --query 'length(Reservations[].Instances[])'     # grows as machines start
-   ssh ec2-user@$L "grep -c 'iam:PassRole' /var/log/superci-pull/listener.jsonl"   # 0: no launch refused for the role
+   pull/deploy/ssh.sh "grep -c 'iam:PassRole' /var/log/superci-pull/listener.jsonl"   # 0: no launch refused for the role
    ```
    Every launch refused with `iam:PassRole` (the listener's `fleet` events, the `LaunchShortfall` metric and its
    alarm) means step 3 did not apply: apply it again, or roll back (below).
@@ -254,17 +295,20 @@ From fastest and smallest to full. None touches the listener's sessions, `SUPERC
 ## Operate
 
 ```bash
-L=32.202.70.249; ssh ec2-user@$L               # SSH from the admin address up.sh allowed
-tail -f /var/log/superci-pull/listener.jsonl    # JSON events: message, fleet, register, ask, budget, state, terminate
+pull/deploy/ssh.sh                               # a shell on the listener: a key made for this session (EC2 Instance
+                                                 # Connect), from the admin address up.sh allowed; no key pair is kept
+tail -f /var/log/superci-pull/listener.jsonl    # JSON events: message, fleet, register, ask, budget, state, retire, terminate
                                                 # (also in CloudWatch Logs, group /superci-pull/listener, a stream per instance)
-curl -s localhost:8080/state | jq               # budget, spend, and per set: desired, live, idle, busy, pool, orphans
-curl -s localhost:8080/healthz                  # what the health timer checks
+curl -s localhost:8080/state | jq               # budget, spend, and per set: ready, desired, live, idle, busy, issued, pool, orphans
+curl -s localhost:8080/healthz                  # what the health timer checks (the process's liveness)
 ```
 
-**Change pool sizes, caps or limits.** Write an override file and upload it; every field it names replaces the
-built-in one (`config.json`), and a `pools` entry replaces that size's whole entry. The instance fetches it every
-minute and the listener applies pools, caps, the registration budget and machine limits within 30 s; sizes, splits,
-types, disks and regions apply at the next start (`sudo systemctl restart superci-pull`).
+**Change pool sizes, caps or limits.** Write an override file, check it with the listener's own binary, and upload
+it. Every field it names replaces the built-in one (`config.json`), and a `pools` or `sizes` entry replaces that
+size's whole entry (name every field of it). A field the listener does not know, or an hourly array of other than 24
+values, is refused. The instance fetches the file every minute and installs it only if it is valid (`sync.sh`); the
+listener applies pools, caps, the registration budget and machine limits within 30 s; sizes, splits, types, disks,
+regions, the deployment and its repositories apply at the next start (`sudo systemctl restart superci-pull`).
 
 ```bash
 cat > override.json <<'JSON'
@@ -272,33 +316,49 @@ cat > override.json <<'JSON'
  "pools": {"superci-4cpu": {"floor": [2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2],
                             "cap":   [40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,60,60,60,60,60,60,60,60]}}}
 JSON
+pull/deploy/ssh.sh /usr/local/bin/superci-pull -validate -config /dev/stdin < override.json   # valid: /dev/stdin
 aws --profile ci-runners s3 cp override.json s3://superci-pull-243891825325/config/config.json
 ```
 
 A pin until the file next changes: `curl -s -X POST 'localhost:8080/override?set=superci-4cpu&pool=20&max=300'`
 (`pool=-1` drops the pin).
 
-**Read metrics.** CloudWatch, namespace `superci-pull`, us-east-1: `Heartbeat`, `OrgRegistrationRate`,
-`OthersRegistrationRate`, `OurRegistrationRate`, `SpareRegistrationRate`, `RegistrationWindowUse`, `OrgRateKnown`,
-`Registrations`, `RegistrationRefusals`, `RegistrationErrors`, `QueueWait` (seconds per started job, with
-percentiles), `Orphans`, `SpendTodayUSD`, `SpendMonthUSD`, `SpendPerHourUSD`, `SpendCapped`, `Machines` and
-`OnDemandShare`; per set (dimension `Set`): `Machines`, `IdleRunners`, `BusyRunners`, `Pool`, `JobsWaiting`.
+**Roll back a config.** The bucket is versioned: copy the previous version of `config/config.json` over the current
+one (as for the binary below); the instance installs it within a minute.
 
-**Alarms** (`deploy/alarms.sh`, topic `superci-pull-alarms`; subscribe with `aws sns subscribe`):
+**Read metrics.** The dashboard `superci-pull` (us-east-1) shows the alarms, queue wait, jobs waiting and machines per
+set, the registration rates, registrations and errors, spend against the daily cap, and the listener's warnings.
+CloudWatch, namespace `superci-pull`: `Heartbeat`, `OrgRegistrationRate`, `OthersRegistrationRate`,
+`OurRegistrationRate`, `SpareRegistrationRate`, `RegistrationWindowUse`, `OrgRateKnown`, `Registrations`,
+`RegistrationRefusals`, `RegistrationErrors`, `LaunchShortfall`, `QueueWait` (seconds per started job, with
+percentiles), `StalledSets`, `Orphans`, `SpendTodayUSD`, `SpendDailyCapUSD`, `SpendMonthUSD`, `SpendPerHourUSD`,
+`SpendCapped`, `Machines` and `OnDemandShare`; per set (dimension `Set`): `Machines`, `IdleRunners`, `BusyRunners`,
+`Pool`, `JobsWaiting`.
+
+**Alarms** (`deploy/alarms.sh`, topic `superci-pull-alarms`). The topic has no subscriber until one is added:
+
+```bash
+aws --profile ci-runners --region us-east-1 sns subscribe --topic-arn arn:aws:sns:us-east-1:243891825325:superci-pull-alarms --protocol email --notification-endpoint <address>
+```
 
 | Alarm | Fires when |
 | --- | --- |
 | superci-pull-listener-down | no heartbeat for 3 minutes |
+| superci-pull-jobs-stalled | a set's jobs have waited 10 minutes with none of its jobs started, for 2 minutes |
 | superci-pull-registration-refusals | GitHub refused a registration in a 5-minute period |
+| superci-pull-registration-errors | a registration failed otherwise in a 5-minute period (GitHub's API, a name GitHub already held, the issued tag refused) |
 | superci-pull-queue-wait-p90 | queue wait p90 over 60 s in two 5-minute periods running |
 | superci-pull-orphans | orphans above 0 for 10 minutes |
-| superci-pull-spend-daily | today's spend past 80% of the daily cap |
-| superci-pull-spend-capped | a spend cap is reached |
+| superci-pull-spend-daily | today's spend past 80% of the daily cap the listener runs with (`SpendDailyCapUSD`) |
+| superci-pull-spend-capped | a spend cap is reached: CI on superci stops |
+| superci-pull-launch-shortfall | EC2 started fewer machines than asked for 15 minutes running |
 | superci-pull-org-rate-unknown | the organization's rate unmeasured for 15 minutes |
 
-**Release.** `deploy/build.sh <key> <out>` builds and tests on a tagged arm64 instance and terminates it;
-`deploy/release.sh <binary> [override.json] ["ssh ec2-user@$L"]` uploads to `s3://superci-pull-243891825325` and
-restarts the listener (a graceful stop closes its sessions, so the next opens at once).
+**Release.** Off-peak (before 13:00Z or after 01:00Z), since a release restarts the listener: jobs wait about 10 s,
+and grants wait 30 s more. `deploy/build.sh <out>` builds and tests on a tagged arm64 instance and terminates it;
+`deploy/release.sh <binary> [override.json] pull/deploy/ssh.sh` uploads to `s3://superci-pull-243891825325`
+(checking the override with the new binary on the listener first) and restarts the listener (a graceful stop closes
+its sessions, so the next opens at once).
 
 **Roll back.** The bucket is versioned, the binary and the override config alike: copy the previous version over the
 current one and restart.
@@ -307,7 +367,20 @@ current one and restart.
 B=superci-pull-243891825325
 aws --profile ci-runners s3api list-object-versions --bucket $B --prefix bin/superci-pull --query 'Versions[].[VersionId,LastModified]' --output text
 aws --profile ci-runners s3api copy-object --bucket $B --key bin/superci-pull --copy-source "$B/bin/superci-pull?versionId=<previous>"
-ssh ec2-user@$L "sudo aws s3 cp --quiet s3://$B/bin/superci-pull /usr/local/bin/superci-pull && sudo systemctl restart superci-pull"
+pull/deploy/ssh.sh "sudo aws s3 cp --quiet s3://$B/bin/superci-pull /usr/local/bin/superci-pull && sudo systemctl restart superci-pull"
+```
+
+A build before round 2 does not know the deployment tag, the issued tag or the runner group `superci-pull`: rolling
+back to one moves nothing back to the Default group, and it would grant runners to machines this build issued. Roll
+back across round 2 only after draining (`override?pool=0&max=0`, then no machine left).
+
+**Replace the listener, with no SSH.** Mark its instance unhealthy; the Auto Scaling group replaces it with one that
+boots from the launch template (`up.sh` makes its versions) and the latest binary in S3. Measured Nov 25: the new
+instance answered on the Elastic IP 32 s after the call.
+
+```bash
+aws --profile ci-runners --region us-east-1 autoscaling set-instance-health --health-status Unhealthy --instance-id \
+  $(aws --profile ci-runners --region us-east-1 autoscaling describe-auto-scaling-groups --auto-scaling-group-names superci-pull-listener --query 'AutoScalingGroups[0].Instances[0].InstanceId' --output text)
 ```
 
 To stop taking jobs, send the jobs back to Blacksmith with the fleet switch (megpt-mono's `SUPERCI_JOBS`, which
@@ -315,19 +388,48 @@ since #34100 routes a switched job to `superci-<N>cpu`); to stop launching at on
 `curl -s -X POST 'localhost:8080/override?max=0'` (machines end as their jobs finish).
 
 **Resilience.** systemd restarts the process (5 s). A health timer marks the instance unhealthy after five failed
-`/healthz` checks and the Auto Scaling group replaces it; the group also replaces an instance EC2 reports down. A
-replacement takes the Elastic IP and the TLS key, so machines keep their address and pin, adopts every machine from
-EC2 and every runner from GitHub, and runs no decision until each set's session has given the queue's statistics.
-After a crash, GitHub refuses a new session for a set while the dead one's lapses (30 to 75 s measured).
+checks in a row and the Auto Scaling group replaces it. A check fails when the process's reconciler has not finished a
+pass for a minute, or when the instance does not hold the Elastic IP; GitHub's or EC2's slowness does not fail it. An
+instance that cannot take the Elastic IP at boot marks itself unhealthy at once. The group also replaces an instance
+EC2 reports down. A replacement takes the Elastic IP and the TLS key, so machines keep their address and pin, adopts
+every machine of the deployment from EC2 and every runner from GitHub, and decides nothing until every region is
+listed and each set's session has given the queue's statistics. After a crash, GitHub refuses a new session for a
+set while the dead one's lapses (30 to 75 s measured).
 
-**Deploy from scratch.** `deploy/up.sh <admin-cidr> <ssh-public-key>` (role, parameters, bucket, groups, key pair,
-address, launch template), `deploy/release.sh <binary>`, `deploy/up.sh` again (it starts the group once a release
-exists), `deploy/alarms.sh`. **Tear down.** `deploy/down.sh "ssh ec2-user@$L"` deletes the scale sets and every
-resource tagged `purpose=superci-pull`.
+**Deploy from scratch.** `deploy/up.sh <admin-cidr>` (role, parameters, bucket, groups, address, launch template),
+`deploy/release.sh <binary>`, `deploy/up.sh` again (it starts the group once a release exists), `deploy/alarms.sh`.
+The listener makes the runner group `superci-pull` at its first start. **Tear down.** `deploy/down.sh` deletes the
+scale sets and every resource tagged `purpose=superci-pull`; the empty runner group stays at GitHub.
 
 **Load test.** `bench/workflow.py` writes the workflow (a wave of mixed sizes per push, a matrix burst for a push
 whose message says "burst"); `bench/measure.py BRANCH SINCE UNTIL listener.jsonl` measures it against the pass bar;
 `bench/orphans.py` lists orphaned machines and runners.
+
+## Security
+
+- **Who may use the runners.** The runner group `superci-pull` admits megpt-mono only (`repositories` in the config),
+  never a public repository. The listener makes and keeps the group with the App's
+  `organization_self_hosted_runners: write`, and acts only on its own group's sets.
+- **What a job can do.** A job is root on its machine, can read its identity document and its user data, and can
+  stop its power-off. It cannot get a second runner, from this listener or the next (the issued tag), and its
+  machine ends when its job completes. The machine's role reads the cache bucket and invokes the cache broker; it
+  cannot write EC2 tags. Measured below (Round 2, live proof).
+- **What the listener can do.** Its role launches only from launch templates tagged `purpose=superci-pull`, only
+  instances it tags so, only the RunsOn image (owner 135269210855) or our own, and only into our security groups.
+  It changes runner templates only, never the listener's own (tagged `superci-pull-role=listener`) nor the push
+  plane's. It writes only the issued and notice tags after launch, and ends only instances tagged
+  `purpose=superci-pull`.
+- **SSH.** Port 22 of the listener's group admits the admin address up.sh was given (72.226.74.73/32). The template
+  names no key pair; `deploy/ssh.sh` pushes a key made for one session with EC2 Instance Connect. The key pair
+  `superci-pull` an earlier `up.sh` imported is unused, and its private half is not kept here; delete it when no
+  instance launched before round 2 is left.
+- **Port 8443** is open to everyone: machines of both regions reach the listener there, and it serves only a machine
+  whose identity document AWS signed for one of its instances.
+- **Follow-up: a GitHub App of its own.** The listener uses the push plane's App (its credentials copied to
+  `/superci-pull/github-app` by `up.sh`), whose key is shared with the push plane, and holds `actions: write` only
+  to re-run lost jobs. An operator should create an App for superci-pull alone, with `organization_self_hosted_runners:
+  write` and `actions: write` on megpt-mono, install it on the organization, and put its id and key in
+  `/superci-pull/github-app` (and its installation id in `installation`).
 
 ## Cost
 
@@ -349,12 +451,19 @@ one job), plus the pool. `SpendPerHourUSD` is the listener's live figure.
   organization used 2 to 4.9 of GitHub's 5 a second through the morning. Moving jobs from Blacksmith moves their
   registrations, so ramp the fleet switch gradually and watch `OthersRegistrationRate`; adding load (a test) needs
   a pool registered ahead.
+- **A burst waits on registrations past the pool.** A burst of N jobs on a size whose pool holds P idle runners
+  starts P at once; the rest wait for machines (about 15 s from launch to a registered runner) and for
+  registrations at the spare rate S (`SpareRegistrationRate`, `cap x 0.8 / 300 - others' rate`). The last job of the
+  burst waits about `15 s + (N - P) / S`: at S = 2/s, a 200-job burst onto a pool of 10 waits up to about 110 s.
 - **gp3 storage.** 40-150 GB disks use 50 TiB per region at about 800 machines; the quota is now 200 TiB in us-east-1
   and 100 TiB in us-east-2 (`LaunchShortfall` and its alarm show the next limit hit).
 - **Spot vCPU quotas** are 15,000 (us-east-1) and 5,000 (us-east-2); the region weights (2:1) follow them.
-- **The re-run list is in memory**, so a job lost in the minutes before a restart stays failed.
-- **SSH** uses the key pair `superci-pull` and the admin address `up.sh` was given; the alarms' topic has no
-  subscriber until one is added.
+- **Re-runs after a restart** reach only jobs a spot notice found running (the notice tag), within about an hour of
+  the reclaim; a job whose machine was reclaimed with no notice, while the listener was down, stays failed.
+- **A machine issued a runner whose answer was lost** (the connection dropped after the tag was written) ends
+  unused: one machine and one registration, never a second runner.
+- **EC2's tag reads are eventually consistent.** A grant waits for a listing begun 30 s after the start, which the
+  documented propagation (seconds) is well within.
 
 ## Measured (Nov 25 2026, megpt-mono)
 
@@ -365,6 +474,20 @@ one job), plus the pool. `SpendPerHourUSD` is the listener's live figure.
 | Crash mid-run, 30 jobs over every size | 45569779369 | `kill -9` of the process at 07:39:39, then the listener's instance terminated at 07:40:40: 30/30 succeeded; at +10 min, 0 orphaned machines, 0 orphaned runners, and `Orphans` 0 in every period |
 | Listener down (stopped 08:24:59 to 08:28:47) | | `superci-pull-listener-down` went to ALARM at 08:28:40 and back to OK at 08:30:40 (on `FILL(Heartbeat, 0)`; a plain heartbeat alarm stayed OK through an earlier 5-minute outage) |
 | Spot reclaim mid-job (AWS FIS `send-spot-instance-interruptions`, role `superci-pull-fis`) | 45573133090 | the notice reached the listener 25 s after it was sent; AWS took the machine 2 min later and GitHub failed the job (attempt 1); the listener re-ran it 5 s after the run completed, and attempt 2 succeeded on another machine |
+
+### Round 2, live proof: a job that keeps its machine and keeps asking (Nov 25 2026, 12:18-12:28Z)
+
+Four runs of one job on `superci-2cpu` (branch `ci/superci-load-pull-11`, deleted after). The job replaced its
+machine's `poweroff` with `/bin/true` (so neither the boot script nor its life timer could end the machine), then
+started a systemd unit outside the runner's process tree that POSTed the machine's identity document to `/jit` every
+3 s, logging each answer, and kept doing so after the job ended.
+
+| Run | What happened to the listener | Asks answered | Registrations of the machine | How the machine ended |
+| --- | --- | --- | --- | --- |
+| 45612544464 | none (this first version killed the boot script, which ended the runner with it: exit 143) | none made | 1 | the listener terminated it 6 s after its job failed |
+| 45612774653 | none | 27, every one 410 with 0 bytes | 1 | the listener terminated it 5 s after its job completed (`Client.UserInitiatedShutdown`); an ask before JobStarted arrived was read as a second ask with an idle runner, GitHub refused the runner's removal (job still running) and the runner was kept busy |
+| 45613138188 | stopped 12:23:02-12:24:21; the job completed at 12:23:51 with no listener up | 12 (3 after the restart), all 410 | 1 | the new process read GitHub's redelivered completion and terminated it 20 s after its start |
+| 45613663785 | killed (`kill -9`) 140 ms after it read the job's completion, before it could end the machine | 43 (17 after the restart, through 40 s of session conflicts while the dead sessions lapsed), all 410 | 1 | the new process found no runner of the machine's name at GitHub (`stuck ... runner gone`) and terminated it 58 s after its start |
 
 ### Load test: 5 jobs a second for 10 minutes, mixed sizes, and a 200-job matrix burst
 

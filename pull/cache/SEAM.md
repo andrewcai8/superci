@@ -21,9 +21,10 @@ A machine that boots before that runs its jobs on GitHub's own cache, so the ord
 The cache's write isolation depends on a machine running one job. The daemon keeps each job's broker credentials in
 its memory, per token, for up to an hour, and a step of a job runs as a user with `sudo`, so it can read the daemon's
 memory. If a machine ran a pull request's job after a job of the default branch, that step could take the earlier
-job's credentials and write `main`'s scope. `pull-prod` has the property: `boot.sh` powers the machine off after its
-runner exits, and `State.Ask` (`pull/state.go`) gives a machine no second runner once a runner of it has taken a job.
-Do not reuse a machine (a warm pool that runs several jobs, a runner that takes a second job) without restarting the
+job's credentials and write `main`'s scope. `pull-prod-r2` has the property: a machine gets one runner, ever, recorded as the instance tag
+`superci-pull-issued` before the runner's config leaves the listener, so not even a restart of the listener hands a
+second one to a job that kept its machine alive; and the listener ends the machine when its job completes
+(`pull/README.md`, Invariants, and the live proof under Measured). Do not reuse a machine (a warm pool that runs several jobs, a runner that takes a second job) without restarting the
 daemon and dropping its credentials between jobs, or moving them out of the machine.
 
 ## 1. `pull/boot.sh`: start the daemon after `T=`

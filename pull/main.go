@@ -169,6 +169,11 @@ func run(ctx context.Context, f flags) error {
 		tagger: NewTagger(ctx, fleet), budget: NewBudget(cfg.Registration, now), spend: NewSpend(cfg.DailyUSD, cfg.MonthlyUSD, specs, now),
 		rest: rest, client: client, strays: map[string]*Machine{}, reconciled: now}
 	l.rerun = NewRerunner(l.rest, fleet.SpotReclaimed)
+	// The organization's rate is measured from the start, while the sets are set up: it takes two samples 61 s apart.
+	go func() {
+		l.sampleOrg(ctx)
+		every(ctx, 5*time.Second, func() { l.sampleOrg(ctx) })
+	}()
 	if err := l.spend.Load(ctx, ssmc, f.spendParam); err != nil {
 		slog.Error("load spend", "err", err.Error())
 	}
@@ -215,8 +220,6 @@ func run(ctx context.Context, f flags) error {
 	go l.reconciler(ctx, refresh)
 	go l.lister(ctx)
 	go every(ctx, 15*time.Second, func() { l.setPools(time.Now()) })
-	l.sampleOrg(ctx)
-	go every(ctx, 5*time.Second, func() { l.sampleOrg(ctx) })
 	go every(ctx, 30*time.Minute, func() { l.price(ctx) })
 	go every(ctx, time.Minute, func() {
 		if err := l.spend.Save(ctx, ssmc, f.spendParam); err != nil {
@@ -758,9 +761,10 @@ func parallel[T any](items []T, f func(T)) {
 
 // sampleOrg learns the organization's highest runner id from a listing when the budget asks for one (SampleDue). A
 // listing reads every page of the organization's runners (2,600 at a busy hour, 27 requests of the App's 5,000 an
-// hour).
+// hour, 10-15 s); its head is dated when it began, so two samples 61 s apart span 61 s however long each took.
 func (l *Listener) sampleOrg(ctx context.Context) {
-	if !l.budget.SampleDue(time.Now()) {
+	began := time.Now()
+	if !l.budget.SampleDue(began) {
 		return
 	}
 	id, err := l.rest.OrgHead(ctx)
@@ -768,7 +772,7 @@ func (l *Listener) sampleOrg(ctx context.Context) {
 		slog.Error("org head", "err", err.Error())
 		return
 	}
-	l.budget.Head(time.Now(), id)
+	l.budget.Head(began, id)
 }
 
 // price refreshes the spot prices the spend accrues at.
