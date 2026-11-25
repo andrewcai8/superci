@@ -36,7 +36,7 @@ MUTANTS = [
     ("E7 Shed with no runner listing", "state.go", " && m.Missed >= 1 && ", " && ", "TestShedWaitsForReadinessAndARunnerListing"),
     ("E8 a failed tag batch is tried id by id", "tagger.go", "\tt.tag(ctx, r, part[:len(part)/2])\n\tt.tag(ctx, r, part[len(part)/2:])",
      "\tfor i := range part {\n\t\tt.tag(ctx, r, part[i:i+1])\n\t}", "TestAFailedTagBatchIsSplitNotTriedIdByIdAlone"),
-    ("E9 a dropped set deleted with machines", "state.go", "len(s.machines) == 0 && ", "", "TestADroppedSetIsDeletedOnlyOnceItHoldsNothing"),
+    ("E9 a dropped set deleted with machines", "state.go", "len(s.machines) > 0 || ", "", "TestADroppedSetIsDeletedOnlyOnceItHoldsNothing"),
     ("SEC-F1 a listed runner does not mark its machine issued", "state.go", f"m.Issued = true\n{T}{T}{T}held[m] = true", "held[m] = true",
      "TestAMachineWithAListedRunnerIsIssuedAndTagged"),
     ("SEC-F2 a runner that never started is replaced", "state.go", f"{T}case r != nil && !r.Busy:\n{T}{T}m.Retire = true\n{T}{T}return End\n",
