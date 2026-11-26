@@ -441,8 +441,10 @@ of that time unpacking main's caches, so the job's setup takes them with a renam
   listener keeps the job timeline's spool of marks (`/run/superci-marks`), the machine posts `hydrate.start` and, when
   hydration ends on its own, `hydrate.done` with `<entries ok>/<entries>:<MB>MB` as its value; a start with no done and a
   `job.running` is a hydration the job stopped.
-- **Stop.** The runner's `ACTIONS_RUNNER_HOOK_JOB_STARTED` is `hydrate-stop.sh`: when the job starts it ends the
-  whole hydration group (SIGTERM, then SIGKILL after 2 s), so hydration never competes with the job for CPU or disk.
+- **Stop.** `hydrate-stop.sh` ends the whole hydration group (SIGTERM, then SIGKILL after 2 s) as soon as the runner
+  takes its job: `boot.sh` runs it, as the runner's user, on the runner's `Running job:` line. The runner's
+  `ACTIONS_RUNNER_HOOK_JOB_STARTED` runs it again, which is too late on its own: the hook runs after "Set up job", which
+  a running pre-read slowed from under 1 s to 19 s (Nov 26, canary 4). So hydration never competes with the job for CPU or disk.
   The job takes the entries already in place and restores the rest itself. A hydrator that already ended leaves the hook
   nothing to do.
 - **Pre-read.** A volume made from the image's snapshot is restored as its blocks are first read: a first read costs 5 to
@@ -451,8 +453,8 @@ of that time unpacking main's caches, so the job's setup takes them with a renam
   29 GB the root had before it grew, with `fio` at 32 reads in flight: 120 to 140 s at the volume's 250 MB/s. It costs
   nothing (EBS reads are free), and 85% of jobs start on a machine older than that (Nov 26, 1,042 jobs: p50 303 s). On
   machines that had finished it, first reads ran at 1,600 to 2,100 IOPS, libLLVM took 0.18 to 0.34 s and 1 GiB read one
-  request at a time took 3.2 to 3.4 s (3.1 s or 20 to 27 s without). The hook's removal of the pid file ends the read
-  within half a second, so a job that starts first never shares its volume with it. The machine posts `preread.start`
+  request at a time took 3.2 to 3.4 s (3.1 s or 20 to 27 s without). The stop's removal of the pid file ends the read
+  within half a second of the runner taking its job, so a job that starts first never shares its volume with it. The machine posts `preread.start`
   and `preread.done`, with `full` or `stopped` as its value.
   EC2's `VolumeInitializationRate` (100 to 300 MiB/s in the launch template, which RunsOn's snapshot accepts) ends
   no sooner (128 s at 200 MiB/s, 85 s at 300) and bills $0.0024 or $0.0036 per GB of the snapshot's 26.9 GB on every

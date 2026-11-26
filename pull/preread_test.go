@@ -160,3 +160,39 @@ func TestNoPrereadStartsAfterTheJobDidOrWithoutARootSize(t *testing.T) {
 		})
 	}
 }
+
+func TestTheRunnerTakingItsJobEndsThePrereadBeforeSetUpJob(t *testing.T) {
+	b := startPreread(t, `echo $$ > "$BOX/fio.pid"; exec sleep 300`, "30083776512", `true`)
+	waitFor(t, "fio to start", func() bool { return b.read("fio.pid") != "" })
+	cfg, err := LoadConfig("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := bootData(cfg, "https://203.0.113.1:8443", "sha256//pin", "superci-4cpu")
+	head := "while IFS= read -r line; do"
+	start := strings.Index(got, head)
+	end := strings.Index(got[start:], "\n      done\n")
+	if start < 0 || end < 0 {
+		t.Fatal("boot data has no runner output loop")
+	}
+	if err := os.WriteFile(b.path("hook.sh"), []byte(hydrateStop), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sudo := `[ "$*" = "-u runner /home/runner/superci-hydrate-stop.sh" ] && exec env SUPERCI_HYDRATED="$HR" bash -e -o pipefail "$BOX/hook.sh"; exit 1`
+	if err := os.WriteFile(b.path("bin/sudo"), []byte("#!/bin/bash\n"+sudo+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	loop := exec.Command("bash", "-c", `mark() { echo "$1" >> "$BOX/runner-marks"; }
+printf '%s\n' '√ Connected to GitHub' '2026-11-26 14:26:01Z: Running job: test-go' | `+got[start:start+end]+"\n      done")
+	loop.Env = append(os.Environ(), "PATH="+b.path("bin")+":"+os.Getenv("PATH"), "HR="+b.hr, "BOX="+b.dir)
+	if out, err := loop.CombinedOutput(); err != nil {
+		t.Fatalf("runner output loop: %v\n%s", err, out)
+	}
+	b.wait(t, 5*time.Second)
+	if got := b.read("runner-marks"); got != "job.running" {
+		t.Errorf("runner marks %q, want job.running", got)
+	}
+	if got, want := strings.Join(b.marks(), " "), "hydrate.start= hydrate.done= preread.start= preread.done=stopped"; got != want {
+		t.Errorf("marks %q, want %q", got, want)
+	}
+}
