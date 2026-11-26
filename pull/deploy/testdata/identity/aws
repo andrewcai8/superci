@@ -1,0 +1,188 @@
+#!/usr/bin/env -S python3 -I
+"""The aws CLI as identity_test.sh needs it: S3 objects, IAM, EC2 instances and SSM kept under $FAKE, every call logged
+to $FAKE/calls.log. Answers each call in the shape the script's own --query and --output ask for."""
+import json, os, shutil, sys
+
+root = os.environ["FAKE"]
+args = sys.argv[1:]
+with open(os.path.join(root, "calls.log"), "a") as log:
+    log.write(" ".join(args) + "\n")
+
+BOOL = {"--quiet", "--only-show-errors", "--with-decryption", "--recursive", "--associate-public-ip-address"}
+
+
+def opt(name, default=None):
+    return args[args.index(name) + 1] if name in args else default
+
+
+def opts(name):
+    return [args[i + 1] for i, a in enumerate(args) if a == name and i + 1 < len(args)]
+
+
+pos, skip = [], False
+for a in args:
+    if skip:
+        skip = False
+    elif a in BOOL:
+        pass
+    elif a.startswith("--"):
+        skip = True
+    else:
+        pos.append(a)
+svc, cmd = pos[0], pos[1] if len(pos) > 1 else ""
+state = os.path.join(root, "state")
+os.makedirs(state, exist_ok=True)
+
+
+def s3path(url):
+    bucket, _, key = url[len("s3://"):].partition("/")
+    return os.path.join(root, "s3", bucket, key)
+
+
+def keys(bucket, prefix):
+    base = os.path.join(root, "s3", bucket)
+    out = []
+    for d, _, fs in os.walk(base):
+        for f in fs:
+            k = os.path.relpath(os.path.join(d, f), base)
+            if k.startswith(prefix):
+                out.append(k)
+    return sorted(out)
+
+
+def instances():
+    d = os.path.join(state, "instances")
+    return [json.load(open(os.path.join(d, f))) for f in sorted(os.listdir(d))] if os.path.isdir(d) else []
+
+
+def save(i):
+    d = os.path.join(state, "instances")
+    os.makedirs(d, exist_ok=True)
+    json.dump(i, open(os.path.join(d, i["id"]), "w"))
+
+
+def multi(name):
+    if name not in args:
+        return []
+    out = []
+    for a in args[args.index(name) + 1:]:
+        if a.startswith("--"):
+            break
+        out.append(a)
+    return out
+
+
+def filters():
+    out = {}
+    for f in multi("--filters"):
+        k, _, v = f.partition(",Values=")
+        out[k[len("Name="):]] = v.split(",")
+    return out
+
+
+if svc == "sts":
+    if opt("--query") == "Arn":
+        print("arn:aws:sts::243891825325:assumed-role/ops/me")
+    else:
+        print(os.environ.get("FAKE_ACCOUNT", "243891825325"))
+elif svc == "s3" and cmd == "cp":
+    src, dst = pos[2], pos[3]
+    if "--recursive" in args:
+        if os.path.exists(os.path.join(root, "upload-fail")):
+            sys.stderr.write("upload failed\n")
+            sys.exit(1)
+        assert opt("--sse") == "aws:kms", "an upload without SSE-KMS"
+        for f in os.listdir(src):
+            p = s3path(dst) + f
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            shutil.copyfile(os.path.join(src, f), p)
+    elif src.startswith("s3://"):
+        if not os.path.isfile(s3path(src)):
+            sys.stderr.write("fatal error: An error occurred (404) when calling the HeadObject operation\n")
+            sys.exit(1)
+        if dst == "-":
+            sys.stdout.buffer.write(open(s3path(src), "rb").read())
+        else:
+            shutil.copyfile(s3path(src), dst)
+    else:
+        os.makedirs(os.path.dirname(s3path(dst)), exist_ok=True)
+        shutil.copyfile(src, s3path(dst))
+elif svc == "s3" and cmd == "sync":
+    src, dst = pos[2], pos[3]
+    bucket, _, prefix = src[len("s3://"):].partition("/")
+    for k in keys(bucket, prefix):
+        out = os.path.join(dst, k[len(prefix):])
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        shutil.copyfile(os.path.join(root, "s3", bucket, k), out)
+elif svc == "s3api" and cmd == "head-bucket":
+    sys.exit(0 if os.path.isdir(os.path.join(root, "s3", opt("--bucket"))) else 254)
+elif svc == "s3api" and cmd == "create-bucket":
+    os.makedirs(os.path.join(root, "s3", opt("--bucket")), exist_ok=True)
+elif svc == "s3api" and cmd == "put-bucket-policy":
+    open(os.path.join(state, "bucket-policy.json"), "w").write(opt("--policy"))
+elif svc == "s3api" and cmd == "list-objects-v2":
+    ks = keys(opt("--bucket"), opt("--prefix", ""))
+    print("\t".join(ks) if ks else "None")
+elif svc == "iam" and cmd in ("get-role", "get-instance-profile"):
+    sys.exit(0 if os.path.exists(os.path.join(state, "iam-" + (opt("--role-name") or opt("--instance-profile-name")) + cmd)) else 254)
+elif svc == "iam" and cmd in ("create-role", "create-instance-profile"):
+    open(os.path.join(state, "iam-" + (opt("--role-name") or opt("--instance-profile-name")) + cmd.replace("create", "get")), "w").write("")
+elif svc == "iam" and cmd == "put-role-policy":
+    open(os.path.join(state, "role-policy.json"), "w").write(opt("--policy-document"))
+elif svc == "ssm" and cmd == "get-parameter":
+    sys.stdout.write(open(os.path.join(root, "tls.json")).read())
+elif svc == "ec2" and cmd == "describe-vpcs":
+    print("vpc-1")
+elif svc == "ec2" and cmd == "describe-security-groups":
+    if "superci-pull-listener" in " ".join(filters().get("group-name", [])):
+        print("198.51.100.7/32")
+    else:
+        p = os.path.join(state, "sg")
+        print(open(p).read() if os.path.exists(p) else "None")
+elif svc == "ec2" and cmd == "create-security-group":
+    open(os.path.join(state, "sg"), "w").write("sg-identity")
+    print("sg-identity")
+elif svc == "ec2" and cmd == "describe-addresses":
+    print("203.0.113.9")
+elif svc == "ec2" and cmd == "describe-subnets":
+    print("subnet-" + filters()["availability-zone"][0][-1])
+elif svc == "ec2" and cmd == "describe-images":
+    for i, b in enumerate(["20261001000000", "20261102081424", "20261120000000"]):
+        print("ami-%d\truns-on-v2.2-ubuntu24-full-x64-%s" % (i, b))
+elif svc == "ec2" and cmd == "run-instances":
+    n = len(instances()) + 1
+    az = "us-east-1" + opt("--subnet-id")[-1]
+    tags = {}
+    for spec in opts("--tag-specifications"):
+        if spec.startswith("ResourceType=instance"):
+            for kv in spec.split("Tags=[")[1].rstrip("]").split("},{"):
+                kv = kv.strip("{}")
+                k, _, v = kv.partition(",Value=")
+                tags[k[len("Key="):]] = v
+    save({"id": "i-%04d" % n, "az": az, "ip": "192.0.2.%d" % (10 + n), "state": "running", "tags": tags, "type": opt("--instance-type"), "ami": opt("--image-id"),
+          "metadata": opt("--metadata-options"), "profile": opt("--iam-instance-profile"), "sg": opt("--security-group-ids")})
+    open(os.path.join(state, "userdata-%04d" % n), "w").write(opt("--user-data"))
+    os.makedirs(os.path.join(root, "hosts", "192.0.2.%d" % (10 + n), "run"), exist_ok=True)
+    open(os.path.join(root, "hosts", "192.0.2.%d" % (10 + n), "run", "superci-id-ready"), "w").write("")
+    print("i-%04d" % n)
+elif svc == "ec2" and cmd == "describe-instances":
+    f, ids = filters(), (opt("--instance-ids") or "").split()
+    sel = [i for i in instances() if (not ids or i["id"] in ids)
+           and ("tag:Name" not in f or i["tags"].get("Name") in f["tag:Name"])
+           and ("tag:superci-pull-role" not in f or i["tags"].get("superci-pull-role") in f["tag:superci-pull-role"])
+           and ("instance-state-name" not in f or i["state"] in f["instance-state-name"] or (i["state"] == "running" and "pending" in f["instance-state-name"]))]
+    q = opt("--query") or ""
+    if "PublicIpAddress" in q and "Placement" in q:
+        for i in sel:
+            print("%s\t%s\t%s" % (i["az"], i["id"], i["ip"]))
+    elif "PublicIpAddress" in q:
+        print(sel[0]["ip"] if sel else "None")
+    else:
+        print("\t".join(i["id"] for i in sel))
+elif svc == "ec2" and cmd == "terminate-instances":
+    for i in instances():
+        if i["id"] in opt("--instance-ids").split():
+            i["state"] = "terminated"
+            save(i)
+elif opt("--query") is not None:
+    print("stub-id")

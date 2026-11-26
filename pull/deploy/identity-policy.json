@@ -1,0 +1,13 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Sid": "ReadAndWriteTheIdentityFiles", "Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": "arn:aws:s3:::@BUCKET@/@DEPLOYMENT@/*" },
+    { "Sid": "ListTheIdentityFiles", "Effect": "Allow", "Action": "s3:ListBucket", "Resource": "arn:aws:s3:::@BUCKET@",
+      "Condition": { "StringLike": { "s3:prefix": "@DEPLOYMENT@/*" } } },
+    { "Sid": "EncryptAndDecryptThroughS3", "Effect": "Allow", "Action": ["kms:Decrypt", "kms:GenerateDataKey"], "Resource": "arn:aws:kms:us-east-1:@ACCOUNT@:key/*",
+      "Condition": { "StringEquals": { "kms:ViaService": "s3.us-east-1.amazonaws.com", "kms:CallerAccount": "@ACCOUNT@" } } },
+    { "Sid": "ReadTheReleasedShim", "Effect": "Allow", "Action": "s3:GetObject",
+      "Resource": ["arn:aws:s3:::@RELEASE@/bin/superci-shim", "arn:aws:s3:::@RELEASE@/bin/RELEASE.json"] }
+  ]
+}

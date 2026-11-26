@@ -186,7 +186,7 @@ curl -s -X POST 'localhost:8080/lease?n=40&ttl=120'            # {"id":"…","gr
 curl -s -X POST 'localhost:8080/lease/settle?id=<id>&made=7'   # how many it made; 204, or 410 if it expired
 ```
 
-A lease is up to `n` registrations at batch priority, prepaid out of the budget and held in flight (`pending`,
+A lease is up to `n` registrations at batch priority (the identity plane's `/identities/token` takes one too, Identity hosts), prepaid out of the budget and held in flight (`pending`,
 `leased` in `/state`) for `ttl` (at most 10 minutes). Settling turns the ones made into ours; one never settled is
 released when it expires. A lane runs only the registrations it was granted.
 
@@ -582,6 +582,86 @@ of that time unpacking main's caches, so the job's setup takes them with a renam
   set's user data) and its `pullcache` in `bin/`.
 - **Turn it off.** Delete `bin/hydrate/<label>.json`; machines launched afterwards hydrate nothing. A job on a machine
   that hydrated nothing restores as it did.
+
+## Identity hosts
+
+The identity plane takes jobs without spending a registration on each. GitHub caps registrations at 1,500 in 5
+minutes for the organization, and at peak the fleet already reaches it. An **identity** is a classic runner registered
+once (`config.sh --disableupdate --no-default-labels`, one label) whose `bin/Runner.Worker` is the shim, which hands
+each job to a fresh machine. Its listener runs on an **identity host**, and no job code runs there. The identity's
+`.runner`, `.credentials` and `.credentials_rsaparams` never leave the host and S3.
+
+- **Sizing.** Peak concurrency per size (Blacksmith, Nov 23-26) at 2/4/8/16/32 vCPU is 146/427/346/71/38. With 1.5x
+  headroom that is 220/640/520/110/60, or 1,550 identities. Measured on the lab host after 3 jobs each, a default
+  listener grows from 36 MiB private to 74-106 MiB. With the GC settings below one held 46 MiB, so the budget is **64 MiB
+  private per identity plus 60 MiB shared per host**: 1,550 identities are about 97 GiB. That is two `r7i.4xlarge`
+  (128 GiB each, 48 GiB of listeners apiece, and either one alone could hold all 1,550 while the other is replaced),
+  on demand, in two AZs. Four `r7i.2xlarge` cost the same and cut a lost host to a quarter of the plane instead of a
+  half, but need four AZs, so `up` defaults to the larger type and takes `--type` for the other.
+  `identity.sh status` reads the real figure (Private_Dirty of each `Runner.Listener`, and how many are over 64 MiB).
+- **Memory.** Each identity's unit `superci-id@<name>` sets `DOTNET_gcServer=0 DOTNET_GCgen0size=0x200000
+  DOTNET_GCHeapHardLimit=0x6000000 DOTNET_TieredPGO=0 DOTNET_TC_QuickJitForLoops=1 DOTNET_GCConserveMemory=7` and
+  `MemoryMax=192M`, with `Restart=always`: a listener that leaks is restarted, not left to starve the host.
+- **Where an identity lives.** Identity `i` (the number in its name) is on host `i mod H`, with the hosts in AZ order.
+  Its files are in `s3://superci-pull-identities-<account>/<deployment>/hosts/<az>/<name>/`, SSE-KMS. A host that
+  replaces another in the same AZ restores that share at boot and registers nothing.
+- **Who may read them.** The host's role `superci-pull-identity` may read and write that prefix and read the released
+  shim and `bin/RELEASE.json`, nothing else (`identity-policy.json`). The bucket policy
+  (`identity-bucket-policy.json`) blocks public access, refuses a put that is not SSE-KMS or not the role's, refuses a
+  read that is not the role's, and refuses a delete that is not the operator's. The host starts a shim only if its
+  sha256 is the one `bin/RELEASE.json` names, as the listener does for its own binary.
+- **The image** is the machines' (`runs-on-v2.2-ubuntu24-full-x64`, pinned as `fleet.go` pins it), so the runner is
+  the same version. IMDSv2 only, hop limit 1. Tags: `superci-pull-role=identity`, `superci-pull-deployment`,
+  `purpose=superci-pull`, `Name=superci-pull-identity-<az>`. The shim's `/shim` endpoint serves only an instance with
+  the first two.
+
+```bash
+pull/deploy/identity.sh up us-east-1a                         # bucket, role, group, host (r7i.4xlarge; --type T for another); waits until it has restored its share
+pull/deploy/identity.sh register 4cpu 100                     # superci-id-4cpu-0001 .. 0100, label superci-park
+pull/deploy/identity.sh register --rate 0.25 4cpu 100 101     # the next hundred (the default rate; 1 a second at most)
+pull/deploy/identity.sh relabel 4cpu superci-park superci-4cpu   # cutover of a size (after deleting its scale set)
+pull/deploy/identity.sh relabel 4cpu superci-4cpu superci-park   # rollback (then recreate the scale set)
+pull/deploy/identity.sh status                                # hosts, identities per host, listeners, memory against 64 MiB, labels at GitHub
+pull/deploy/identity.sh down us-east-1a                       # terminates the host by its name; identities stay, `up` restores them
+```
+
+**Registering.** Every registration spends the organization's cap, so `register` is bounded four ways:
+
+- At most `--rate` registrations a second over all hosts (0.25 by default, never above 1): one identity at a time,
+  each started at least `1/rate` seconds after the last. 1,550 identities take about 1.7 hours at the default.
+- In leases of at most 20 (fewer at a low rate, so a batch fits the lease's 10 minutes), from the listener's
+  `/identities/token`. Each lease is settled with the count made before the next is asked for. The listener grants
+  at batch priority, never a token a waiting machine is owed.
+- Stopped by the first failure. A `config.sh` that exits non-zero (a 429 or `ConfigureTooManyRunners` in its log is
+  named as GitHub's refusal) ends the command, settles the lease with what was made, and exits 1 naming the identity.
+  Run the same command again to continue: names already held, in S3 and at GitHub, are skipped, and one registered
+  whose upload failed is stored without a new registration.
+- Held back at peak unless `--peak-ok`: it waits (30 s a poll, 30 minutes at most) while the listener's `/state` shows
+  the budget throttled after a refusal, the organization's rate unknown, or above 3.5 a second.
+
+It prints the identities made, the time taken and the time the rest would take at that pace. `n` is at most 100 a
+call and `first` defaults to the number after the highest identity of the size, so a later call continues a size.
+The token goes from the listener's admin endpoint to the host's stdin, and to `config.sh` in its environment
+(`ACTIONS_RUNNER_INPUT_TOKEN`): never in an argument, a file or the output.
+
+**Cutover and rollback of a size.** Delete the size's scale set, then `relabel <size> superci-park superci-<size>`.
+Rollback relabels back to `superci-park` and recreates the scale set. A relabel makes no registration: it is one
+REST write per identity, paced at `RELABEL_PAUSE` (0.6 s), and resumes where it stopped when run again.
+
+**The listener's endpoints** (admin, localhost; from another host through `deploy/ssh.sh`):
+
+```bash
+curl -s -X POST 'localhost:8080/identities/token?n=20'          # {"lease","granted","token","expires","url","group","group_name"}
+curl -s -X POST 'localhost:8080/identities/labels?id=<runner id>&labels=superci-4cpu'   # 204; replaces the runner's labels
+curl -s localhost:8080/identities | jq                          # the group's superci-id-* runners, labels and status
+```
+
+`/identities/token` is a lease of `n` (1 to 100) at batch priority (`/lease`, above) and, when any is granted, a
+registration token for the organization (`POST /orgs/<org>/actions/runners/registration-token`), after making sure the
+runner group `<deployment>-identities` exists, open to the config's repositories only. A lease of nothing mints no
+token. A token that cannot be minted gives the lease back. The token is never logged. With `"scope": "repository"` in
+the config the token and the labels are the first repository's, and the group is the Default group (1).
+`deploy/identity_test.sh` runs the scripts end to end against stubs of AWS, SSH, `config.sh` and these endpoints.
 
 ## Operate
 

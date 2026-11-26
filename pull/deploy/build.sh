@@ -4,6 +4,7 @@
 # an ignored file) is built or released. Writes the release directory (mode 700; see release-lib.sh):
 #   REVISION                     the commit and the build time
 #   listener/bin/superci-pull    the listener, tested first
+#   listener/bin/superci-shim    the identity hosts' bin/Runner.Worker (linux amd64: they run the machines' image)
 #   listener/deploy/*            its units and scripts, listener/config/config.json its override (deploy/override.json)
 #   cache/bin/pullcache-linux-{amd64,arm64}, cache/bin/pullcache-lambda-arm64.zip, cache/bin/up.sh (cache/deploy/machine-up.sh)
 # Each Go binary carries the commit (-X main.revision; -trimpath keeps it out of `go version -m`): `superci-pull
@@ -46,6 +47,7 @@ tar -C "$tmp/src" -czf - pull | $S 'mkdir -p src && tar -C src -xzf -'
 $S "set -e; export PATH=/usr/local/go/bin:\$PATH GOFLAGS=-buildvcs=false CGO_ENABLED=0 GOOS=linux; X='-X main.revision=$REV'; mkdir /tmp/out
 cd ~/src/pull && test -z \"\$(gofmt -l .)\" && go vet ./... && go test -count=1 ./...
 go build -trimpath -ldflags=\"\$X\" -o /tmp/out/superci-pull .
+GOARCH=amd64 go build -trimpath -ldflags=\"-s -w \$X\" -o /tmp/out/superci-shim ./shim
 cd cache && for a in amd64 arm64; do GOARCH=\$a go build -trimpath -ldflags=\"-s -w \$X\" -o /tmp/out/pullcache-linux-\$a .; done
 mkdir /tmp/fn && GOARCH=arm64 go build -tags lambda.norpc -trimpath -ldflags=\"-s -w \$X\" -o /tmp/fn/bootstrap .
 cd /tmp/fn && python3 -m zipfile -c /tmp/out/pullcache-lambda-arm64.zip bootstrap"
@@ -54,6 +56,7 @@ umask 077
 mkdir -p "$OUT/listener/bin" "$OUT/listener/deploy" "$OUT/listener/config" "$OUT/cache/bin" "$tmp/out"
 $S 'tar -C /tmp/out -cf - .' | tar -C "$tmp/out" -xf -
 install -m 755 "$tmp/out/superci-pull" "$OUT/listener/bin/superci-pull"
+install -m 755 "$tmp/out/superci-shim" "$OUT/listener/bin/superci-shim"
 for f in pullcache-linux-amd64 pullcache-linux-arm64 pullcache-lambda-arm64.zip; do install -m 755 "$tmp/out/$f" "$OUT/cache/bin/$f"; done
 for f in superci-pull.service superci-pull-sync.service superci-pull-sync.timer superci-pull-health.service superci-pull-health.timer sync.sh health.sh cloudwatch-agent.json logrotate.conf; do
   install -m 644 "$src/deploy/$f" "$OUT/listener/deploy/$f"

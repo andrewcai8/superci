@@ -240,7 +240,7 @@ type Status struct {
 //
 // A lane that registers runners outside the listener leases registrations from the budget first (lease.go):
 // POST /lease?n=40&ttl=120 answers {"id", "granted", "expires"}, and POST /lease/settle?id=<id>&made=<k> ends it.
-func Admin(status func() Status, healthy func() error, override func(set string, pool, max int), budget *Budget) http.Handler {
+func Admin(status func() Status, healthy func() error, override func(set string, pool, max int), budget *Budget, routes ...func(*http.ServeMux)) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /state", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -294,6 +294,9 @@ func Admin(status func() Status, healthy func() error, override func(set string,
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
+	for _, add := range routes {
+		add(mux)
+	}
 	return mux
 }
 

@@ -1,0 +1,3 @@
+#!/bin/bash
+cat "$PROC_ROOT/pids" 2> /dev/null
+exit 0

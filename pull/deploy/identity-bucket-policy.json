@@ -1,0 +1,17 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Sid": "TlsOnly", "Effect": "Deny", "Principal": "*", "Action": "s3:*",
+      "Resource": ["arn:aws:s3:::@BUCKET@", "arn:aws:s3:::@BUCKET@/*"], "Condition": { "Bool": { "aws:SecureTransport": "false" } } },
+    { "Sid": "NoPutWithoutKms", "Effect": "Deny", "Principal": "*", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::@BUCKET@/*",
+      "Condition": { "StringNotEquals": { "s3:x-amz-server-side-encryption": "aws:kms" } } },
+    { "Sid": "NoPutWithoutAnEncryptionHeader", "Effect": "Deny", "Principal": "*", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::@BUCKET@/*",
+      "Condition": { "Null": { "s3:x-amz-server-side-encryption": "true" } } },
+    { "Sid": "OnlyTheIdentityHostsWrite", "Effect": "Deny", "Principal": "*", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::@BUCKET@/*",
+      "Condition": { "ArnNotEquals": { "aws:PrincipalArn": "arn:aws:iam::@ACCOUNT@:role/@ROLE@" } } },
+    { "Sid": "OnlyTheIdentityHostsRead", "Effect": "Deny", "Principal": "*", "Action": ["s3:GetObject", "s3:GetObjectVersion"], "Resource": "arn:aws:s3:::@BUCKET@/*",
+      "Condition": { "ArnNotEquals": { "aws:PrincipalArn": "arn:aws:iam::@ACCOUNT@:role/@ROLE@" } } },
+    { "Sid": "OnlyTheOperatorDeletes", "Effect": "Deny", "Principal": "*", "Action": ["s3:DeleteObject", "s3:DeleteObjectVersion"], "Resource": "arn:aws:s3:::@BUCKET@/*",
+      "Condition": { "ArnNotLike": { "aws:PrincipalArn": @OPERATOR@ } } }
+  ]
+}

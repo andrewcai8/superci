@@ -1,0 +1,19 @@
+#!/bin/bash
+# An identity host over SSH as identity_test.sh needs it: the command runs here under $FAKE/hosts/<ip>, its absolute
+# paths moved there, sudo dropped, and the host script it runs (the one pushed to it) pointed at fake runner files.
+# Every call's whole argument list is logged to $FAKE/ssh.log.
+echo "$*" >> "$FAKE/ssh.log"
+target=""; while [ $# -gt 0 ]; do case $1 in -*@*|*@*) target=$1; shift; break ;; -i|-o) shift 2 ;; *) shift ;; esac; done
+ip=${target#*@}
+H=$FAKE/hosts/$ip; mkdir -p "$H/bin" "$H/run" "$H/opt/id" "$H/proc" "$H/units"
+az=$(python3 -I -c 'import json,sys,os
+for f in sorted(os.listdir(sys.argv[1])):
+    i = json.load(open(os.path.join(sys.argv[1], f)))
+    if i["ip"] == sys.argv[2]: print(i["az"])' "$FAKE/state/instances" "$ip")
+[ -n "$az" ] || { echo "ssh: no host $ip" >&2; exit 255; }
+cmd=$(sed -e 's|sudo ||g' -e "s|/usr/local/bin/|$H/bin/|g" -e "s|/run/|$H/run/|g" <<< "$*")
+[ -e "$H/conf" ] || printf 'BUCKET=superci-pull-identities-243891825325\nDEPLOYMENT=superci-pull\nRELEASE=superci-pull-243891825325\n' > "$H/conf"
+export PATH=$H/bin:$PATH ID_ROOT=$H/opt/id RUNNER_SRC=$FAKE_RUNNER SHIM_BIN=$H/shim SHIM_ENV=$H/shim.env ID_CONF=$H/conf UNIT_DIR=$H/units \
+  ID_LOG=$H/log ID_AZ=$az PROC_ROOT=$H/proc READY_FILE=$H/run/superci-id-ready FAKE_UNITS=$H/enabled
+[ -e "$H/shim" ] || printf '#!/bin/sh\n' > "$H/shim"; chmod 755 "$H/shim"
+exec bash -c "$cmd"

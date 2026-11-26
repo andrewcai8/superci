@@ -26,6 +26,7 @@ D=$W/pull/deploy
 # A release directory as build.sh writes it, its programs standing in for the Go binaries and carrying the commit.
 R=$T/release; mkdir -p "$R/listener/bin" "$R/listener/deploy" "$R/listener/config" "$R/cache/bin"
 printf '#!/bin/sh\n# %s\ncase "$1" in -version) echo %s ;; -validate) cat > /dev/null; echo valid ;; esac\n' "$C" "$C" > "$R/listener/bin/superci-pull"
+printf '#!/bin/sh\necho shim %s\n' "$C" > "$R/listener/bin/superci-shim"
 for a in amd64 arm64; do printf '#!/bin/sh\necho %s\n' "$C" > "$R/cache/bin/pullcache-linux-$a"; done
 printf 'bootstrap %s\n' "$C" > "$T/bootstrap"; (cd "$T" && python3 -I -m zipfile -c "$R/cache/bin/pullcache-lambda-arm64.zip" bootstrap)
 chmod 755 "$R"/listener/bin/* "$R"/cache/bin/*
