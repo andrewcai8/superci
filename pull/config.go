@@ -58,6 +58,9 @@ type SizeConfig struct {
 	Max    int      `json:"max"`
 	DiskGB int      `json:"disk_gb"`
 	Types  []string `json:"types"`
+	// OnDemandFirst is how many of the leading types are asked on demand, when their spot is short, before any slower type:
+	// on_demand_share bounds only the on-demand machines of the others. 0 asks every type's spot first.
+	OnDemandFirst int `json:"on_demand_first"`
 }
 
 // PoolConfig bounds one size's hot pool by the hour of the day (UTC): never fewer idle runners than floor, never more
@@ -227,6 +230,9 @@ func (c Config) validate() error {
 		if !ownSetName.MatchString(label) || s.CPU <= 0 || s.Split < 1 || s.Max < 0 || len(s.Types) == 0 || s.DiskGB <= 0 {
 			return fmt.Errorf("config: size %s needs a name superci-<N>cpu, cpu, split >= 1, max, disk_gb and types", label)
 		}
+		if s.OnDemandFirst < 0 || s.OnDemandFirst > len(s.Types) {
+			return fmt.Errorf("config: size %s: on_demand_first %d is not between 0 and its %d types", label, s.OnDemandFirst, len(s.Types))
+		}
 	}
 	for label, p := range c.Pools {
 		if _, ok := c.Sizes[label]; !ok {
@@ -280,6 +286,8 @@ type SetSpec struct {
 	Max    int
 	DiskGB int
 	Types  []string
+	// OnDemandFirst is SizeConfig's.
+	OnDemandFirst int
 }
 
 func (c Config) Sets() []SetSpec {
@@ -297,7 +305,7 @@ func (c Config) Sets() []SetSpec {
 				name = l + "-" + strconv.Itoa(k+1)
 			}
 			out = append(out, SetSpec{Name: name, Label: l, Index: k, Split: s.Split, CPU: s.CPU,
-				Max: int(math.Ceil(float64(s.Max) / float64(s.Split))), DiskGB: s.DiskGB, Types: s.Types})
+				Max: int(math.Ceil(float64(s.Max) / float64(s.Split))), DiskGB: s.DiskGB, Types: s.Types, OnDemandFirst: s.OnDemandFirst})
 		}
 	}
 	return out

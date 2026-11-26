@@ -307,6 +307,11 @@ class Gate2(unittest.TestCase):
         self.assertEqual(judge_scale(launched=["spot"] * 8 + ["on-demand"] * 2)["on-demand share"].status, G.FAIL)
         self.assertEqual(judge_scale(launched=[])["on-demand share"].status, G.FAIL)
 
+    def test_an_on_demand_first_type_is_outside_the_share(self):
+        row = judge_scale(launched=["spot"] * 9 + ["fast"] * 80 + ["on-demand"])["on-demand share"]
+        self.assertEqual(row.status, G.PASS, row)
+        self.assertEqual(judge_scale(launched=["fast"] * 8 + ["on-demand"] * 2)["on-demand share"].status, G.FAIL)
+
     def test_no_alarm_in_alarm_at_the_end(self):
         firing = judge_scale(alarms={"superci-pull-orphans": "ALARM", "superci-pull-jobs-stalled": "OK"})["alarms at the end"]
         self.assertEqual(firing.status, G.FAIL)

@@ -293,7 +293,7 @@ class Scale:
     issued: collections.Counter    # instance id -> jit.issued events
     claim_taken: collections.Counter
     claim_refused: int
-    launched: list            # lifecycle of each machine.launched in the window
+    launched: list            # lifecycle of each machine.launched in the window, "fast" for a size's on_demand_first types
     orphans: list             # (epoch, Orphans) from 10 min after the replay
     orphans_due: float
     lo: float                 # the replay window
@@ -343,10 +343,12 @@ def evaluate_scale(s):
         rows.append(Row("orphans 10 min after", f"max {peak:.0f}", "0", PASS if peak == 0 else FAIL))
     else:
         rows.append(Row("orphans 10 min after", "-", "0", FAIL, f"no Orphans datapoint at {T.iso(s.orphans_due)}+: run it after then"))
-    od = sum(1 for l in s.launched if l != "spot")
+    od = sum(1 for l in s.launched if l not in ("spot", "fast"))
+    fast = sum(1 for l in s.launched if l == "fast")
     share = od / len(s.launched) if s.launched else None
     rows.append(Row("on-demand share", "-" if share is None else f"{100 * share:.1f}% ({od} of {len(s.launched)})", f"<= {100 * ON_DEMAND_SHARE:.0f}%",
-                    PASS if share is not None and share <= ON_DEMAND_SHARE else FAIL, "" if s.launched else "no machine.launched events"))
+                    PASS if share is not None and share <= ON_DEMAND_SHARE else FAIL,
+                    "no machine.launched events" if not s.launched else f"{fast} of an on_demand_first type, outside the share" if fast else ""))
     firing = sorted(n for n, st in s.alarms.items() if st == "ALARM")
     rows.append(Row("alarms at the end", f"{len(firing)} in ALARM of {len(s.alarms)}", "0 in ALARM", PASS if not firing and s.alarms else FAIL,
                     f"firing: {firing}" if firing else "" if s.alarms else "no alarms listed"))
@@ -594,7 +596,8 @@ def collect_scale(a):
     issued = collections.Counter(e["inst"] for e in ev if e["ev"] == "jit.issued" and in_window(e) and e.get("inst"))
     taken = collections.Counter(e["inst"] for e in ev if e["ev"] == "jit.claim" and e.get("result") == "taken" and in_window(e))
     refused = sum(1 for e in ev if e["ev"] == "jit.claim" and e.get("result") == "refused" and in_window(e))
-    launched = [e.get("lifecycle") or "on-demand" for e in ev if e["ev"] == "machine.launched" and lo <= e["t"] <= hi]
+    launched = ["fast" if (e.get("step") or "").startswith("fast-") else e.get("lifecycle") or "on-demand"
+                for e in ev if e["ev"] == "machine.launched" and lo <= e["t"] <= hi]
     grants = [e for e in ev if e["ev"] == "jit.granted" and in_window(e)]
     due = hi + ORPHAN_WAIT_S
     return Scale(replayed=replayed, completed=sum(1 for j in jobs if j.get("conclusion") == "success"), stranded=stranded, lost=lost_n, waits=waits,
