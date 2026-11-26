@@ -129,7 +129,8 @@ def is_obs(job, run):
 
     A cancelled job has no outcome, but it did spend time, and a plane that is slow and gets cancelled must not look fast. It is
     an observation of at least what it spent: a job that started contributes wall = started to completed (its queue wait is real);
-    one cancelled in the queue contributes queue = created to completed and no wall. Both fleets get this rule, whatever
+    one cancelled in the queue contributes queue = created to completed and no wall. A job was cancelled in the queue when no
+    runner took it (no runner_name): GitHub sets its started_at to its created_at, so started_at cannot tell. Both fleets get this rule, whatever
     cancelled the job (a newer push superseding the run is not distinguishable from any other cancel in the jobs listing, and
     the same rule on both fleets keeps the p50 and p90 comparison fair). A lower bound can only under-report, so a row that fails
     on lower bounds fails on the real times too; a cancelled job is never a failure and never counts as a run."""
@@ -138,9 +139,10 @@ def is_obs(job, run):
     if not job.get("completed_at") or (job.get("conclusion") not in OUTCOMES and not cancelled) or (not job.get("started_at") and not cancelled):
         return None
     created, completed = T.ts(job["created_at"]), T.ts(job["completed_at"])
-    started = T.ts(job["started_at"]) if job.get("started_at") else None
+    queued_cancel = cancelled and not job.get("runner_name")
+    started = T.ts(job["started_at"]) if job.get("started_at") and not queued_cancel else None
     if started is None:
-        queue, wall = (completed - created if attempt == 1 else None), None
+        queue, wall = (max(0.0, completed - created) if attempt == 1 else None), None  # GitHub's second-granular stamps can put completed_at a second early
     else:
         queue, wall = (started - created if attempt == 1 else None), completed - started
     return Obs(job["id"], job["run_id"], job.get("head_sha") or run.get("head_sha") or "", job.get("head_branch") or run.get("head_branch") or "",

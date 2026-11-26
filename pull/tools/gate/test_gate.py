@@ -519,8 +519,9 @@ class TimedOutAndCancelled(unittest.TestCase):
 
 
 def queued_cancel(jid, run, created, completed, fleet="superci", attempt=1):
-    """A job GitHub cancelled in the queue: no start, and no runner assigned yet."""
-    j = gh_job(jid, run, attempt, "cancelled", created, None, completed, fleet=fleet)
+    """A job GitHub cancelled in the queue, as GitHub records it: started_at equals created_at and no runner was assigned
+    (measured on megpt-mono's Blacksmith jobs, Nov 25: 12 of 44 cancels, some with completed_at a second before started_at)."""
+    j = gh_job(jid, run, attempt, "cancelled", created, created, completed, fleet=fleet)
     j.update(runner_group_name=None, runner_name=None)
     return j
 
@@ -540,6 +541,12 @@ class CancelledJobsAreLowerBounds(unittest.TestCase):
         o = G.is_obs(queued_cancel(1, 1, self.T0, self.T0 + 120), {})
         self.assertEqual((o.cancelled, o.wall, o.queue, o.fleet), (True, None, 120.0, "superci"))
         self.assertEqual(G.wall_sample([o], None), [])
+
+    def test_a_queued_cancel_whose_completed_at_precedes_started_at_gives_no_negative_wall(self):
+        j = queued_cancel(1, 1, self.T0, self.T0 - 1)
+        o = G.is_obs(j, {})
+        self.assertIsNone(o.wall)
+        self.assertGreaterEqual(o.queue, 0.0)
 
     def test_a_rerun_attempt_cancelled_in_the_queue_has_no_real_queue_wait(self):
         o = G.is_obs(queued_cancel(1, 1, self.T0, self.T0 + 120, attempt=2), {})
