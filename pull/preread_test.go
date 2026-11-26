@@ -27,11 +27,12 @@ func (b *prereadBox) read(name string) string {
 // to the pre-read; findmnt answers for a root on /dev/nvme0n1p1 and fio is the given script. rootBytes is what disk() exports.
 // find is the real one, its arguments logged to find.log.
 func startPreread(t *testing.T, fio, rootBytes string, pullcache string) *prereadBox {
-	return startPrereadSlow(t, fio, rootBytes, pullcache, "0")
+	return startPrereadOn(t, fio, rootBytes, pullcache, "0", "0", "16000000")
 }
 
-// startPrereadSlow is startPreread with each file of the warm taking catSleep seconds to read.
-func startPrereadSlow(t *testing.T, fio, rootBytes, pullcache, catSleep string) *prereadBox {
+// startPrereadOn is startPreread on a machine of memKB kB, with the walk taking walkSleep seconds and each file of the warm
+// catSleep.
+func startPrereadOn(t *testing.T, fio, rootBytes, pullcache, catSleep, walkSleep, memKB string) *prereadBox {
 	t.Helper()
 	cfg, err := LoadConfig("")
 	if err != nil {
@@ -68,7 +69,7 @@ func startPrereadSlow(t *testing.T, fio, rootBytes, pullcache, catSleep string) 
 	}
 	// The warm's file list (find ... -print0) is the sandbox's hot/ files, never the host's binaries; each cat is logged
 	// and takes $CAT_SLEEP. systemctl is logged, never run.
-	stub("find", `echo "$@" >> "$BOX/find.log"; case " $* " in *" -print0 "*) exec `+realFind+` "$BOX/hot" -type f -print0 ;; esac; exec `+realFind+` "$@"`)
+	stub("find", `echo "$@" >> "$BOX/find.log"; case " $* " in *" -print0 "*) exec `+realFind+` "$BOX/hot" -type f -print0 ;; *" -printf "*) sleep "${WALK_SLEEP:-0}" ;; esac; exec `+realFind+` "$@"`)
 	stub("cat", `[ "$1" = -- ] && { echo "$2" >> "$BOX/cat.log"; sleep "${CAT_SLEEP:-0}"; }; exec /bin/cat "$@"`)
 	stub("systemctl", `echo "$@" >> "$BOX/systemctl.log"`)
 	if err := os.MkdirAll(filepath.Join(b.dir, "hot"), 0o755); err != nil {
@@ -82,9 +83,12 @@ func startPrereadSlow(t *testing.T, fio, rootBytes, pullcache, catSleep string) 
 	if err := os.WriteFile(b.spool, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	fn := strings.NewReplacer("/run/superci-marks", b.spool, "/usr/local/bin/pullcache", filepath.Join(bin, "pullcache")).Replace(got[start : start+end+3])
+	if err := os.WriteFile(b.path("meminfo"), []byte("MemTotal:       "+memKB+" kB\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fn := strings.NewReplacer("/run/superci-marks", b.spool, "/usr/local/bin/pullcache", filepath.Join(bin, "pullcache"), "/proc/meminfo", b.path("meminfo")).Replace(got[start : start+end+3])
 	b.cmd = exec.Command("bash", "-c", fn+"\nhydrate")
-	b.cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "HR="+b.hr, "HM="+b.path("m.json"), "PB=b", "CR=r", "ROOT_BYTES="+rootBytes, "BOX="+b.dir, "CAT_SLEEP="+catSleep)
+	b.cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "HR="+b.hr, "HM="+b.path("m.json"), "PB=b", "CR=r", "ROOT_BYTES="+rootBytes, "BOX="+b.dir, "CAT_SLEEP="+catSleep, "WALK_SLEEP="+walkSleep)
 	if err := b.cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -237,7 +241,7 @@ printf '%s\n' '√ Connected to GitHub' '2026-11-26 14:26:01Z: Running job: test
 }
 
 func TestAJobThatStartsDuringTheWarmStopsItWithinAFile(t *testing.T) {
-	b := startPrereadSlow(t, `true`, "30083776512", `true`, "0.3")
+	b := startPrereadOn(t, `true`, "30083776512", `true`, "0.3", "0", "16000000")
 	waitFor(t, "the warm to read a file", func() bool { return b.read("cat.log") != "" })
 	if err := os.Remove(filepath.Join(b.hr, ".pid")); err != nil {
 		t.Fatal(err)
@@ -257,5 +261,35 @@ func TestAJobThatStartsDuringTheWarmStopsItWithinAFile(t *testing.T) {
 	}
 	if got, want := strings.Join(b.marks(), " "), "hydrate.start= hydrate.done= preread.start= preread.done=full rewarm.done=full warm.done=stopped"; got != want {
 		t.Errorf("marks %q, want %q", got, want)
+	}
+}
+
+func TestAJobThatStartsDuringTheWalkStartsNoDaemonAndNoWarm(t *testing.T) {
+	b := startPrereadOn(t, `true`, "30083776512", `true`, "0", "1", "16000000")
+	waitFor(t, "the walk to start", func() bool { return strings.Contains(b.read("find.log"), "-printf") })
+	if err := os.Remove(filepath.Join(b.hr, ".pid")); err != nil {
+		t.Fatal(err)
+	}
+	b.wait(t, 5*time.Second)
+	if got := b.read("systemctl.log") + b.read("cat.log"); got != "" {
+		t.Errorf("the warm ran after the job started during the walk: %q", got)
+	}
+	if got, want := strings.Join(b.marks(), " "), "hydrate.start= hydrate.done= preread.start= preread.done=full rewarm.done=stopped"; got != want {
+		t.Errorf("marks %q, want %q", got, want)
+	}
+}
+
+func TestOnlyAMachineOf12GBOrMoreWarmsTheLibraries(t *testing.T) {
+	for memKB, libs := range map[string]bool{"3900000": false, "7800000": false, "16000000": true} {
+		b := startPrereadOn(t, `true`, "30083776512", `true`, "0", "0", memKB)
+		b.wait(t, 20*time.Second)
+		lines := strings.Split(b.read("find.log"), "\n")
+		list := lines[len(lines)-1]
+		if got := strings.Contains(list, "/usr/lib/x86_64-linux-gnu"); got != libs {
+			t.Errorf("%s kB: the warm's list %q has the libraries %v, want %v", memKB, list, got, libs)
+		}
+		if !strings.Contains(list, "/home/runner/externals") {
+			t.Errorf("%s kB: the warm's list %q lacks the runner's externals", memKB, list)
+		}
 	}
 }

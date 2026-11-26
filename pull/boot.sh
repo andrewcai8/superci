@@ -121,12 +121,16 @@ hydrate() {
     # The walk reads inodes, not files: an idle machine's first node took 274-403 ms and docker 1.7-3.8 s (Blacksmith 41
     # and 813). These binaries in the page cache and dockerd up took them to 11 and 10 ms (Nov 26). One file at a time,
     # so a job that starts stops it within a file.
+    # The libraries are 1.2 GB more: only a machine of 12 GB or more reads them, so the warm never presses a smaller one's
+    # hydrated trees out of memory.
+    local libs=()
+    [ "$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)" -lt 12000000 ] || libs=(/usr/lib/python3 /usr/lib/x86_64-linux-gnu)
     systemctl start docker.service > /dev/null 2>&1 || :
     hot() {
       local f
       find "$(readlink -f "$(command -v node)")" /usr/bin/docker /usr/bin/dockerd /usr/bin/containerd /usr/bin/containerd-shim-runc-v2 \
-        /usr/bin/runc /usr/bin/git /usr/lib/git-core "$(readlink -f "$(command -v python3)")" /usr/lib/python3 /home/runner/externals \
-        /usr/lib/x86_64-linux-gnu -type f -print0 2> /dev/null | while IFS= read -r -d '' f; do
+        /usr/bin/runc /usr/bin/git /usr/lib/git-core "$(readlink -f "$(command -v python3)")" /home/runner/externals \
+        "${libs[@]}" -type f -print0 2> /dev/null | while IFS= read -r -d '' f; do
         [ -e "$HR/.pid" ] || return 1
         cat -- "$f" > /dev/null 2>&1
       done
