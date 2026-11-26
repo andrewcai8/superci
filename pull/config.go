@@ -9,10 +9,13 @@ import (
 	"io"
 	"math"
 	"os"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
 	"time"
+
+	"github.com/actions/scaleset"
 )
 
 //go:embed config.json
@@ -35,6 +38,7 @@ type Config struct {
 	Pools        map[string]PoolConfig `json:"pools"`
 	Pool         PoolRule              `json:"pool"`
 	Registration RegConfig             `json:"registration"`
+	Batch        BatchRule             `json:"batch"`
 	DailyUSD     float64               `json:"daily_usd"`
 	MonthlyUSD   float64               `json:"monthly_usd"`
 	OnDemand     float64               `json:"on_demand_share"`
@@ -103,6 +107,58 @@ type RegConfig struct {
 	PoolShare   float64 `json:"pool_share"`
 	BlindRate   float64 `json:"blind_rate"`
 	Concurrency int     `json:"concurrency"`
+	// Reserve is the tokens of the saved-up burst only critical registrations (the required check's jobs) may take:
+	// a batch registration needs them saved up besides its own. It is cut to the burst less one.
+	Reserve int `json:"critical_reserve"`
+}
+
+// BatchRule names the jobs that may wait for registration budget: a job is batch when its event is one of Events, or
+// its workflow ref (owner/repo/.github/workflows/x.yml@refs/...) or its display name matches one of the patterns.
+// Every other job is critical, so a job no rule knows is never made to wait. A batch job still gets its runner: it
+// takes what the critical jobs leave, and never the tokens the reserve holds.
+type BatchRule struct {
+	Events       []string `json:"events"`
+	WorkflowRefs []string `json:"workflow_refs"`
+	Jobs         []string `json:"jobs"`
+	refs, jobs   []*regexp.Regexp
+}
+
+// compile checks the patterns and keeps them compiled.
+func (r *BatchRule) compile() error {
+	compile := func(kind string, ps []string) (out []*regexp.Regexp, err error) {
+		for _, p := range ps {
+			re, err := regexp.Compile(p)
+			if err != nil {
+				return nil, fmt.Errorf("config: batch %s pattern %q: %w", kind, p, err)
+			}
+			out = append(out, re)
+		}
+		return out, nil
+	}
+	var err error
+	if r.refs, err = compile("workflow_refs", r.WorkflowRefs); err != nil {
+		return err
+	}
+	r.jobs, err = compile("jobs", r.Jobs)
+	return err
+}
+
+// Matches says whether a job is batch.
+func (r BatchRule) Matches(j scaleset.JobMessageBase) bool {
+	if slices.Contains(r.Events, j.EventName) {
+		return true
+	}
+	for _, re := range r.refs {
+		if re.MatchString(j.JobWorkflowRef) {
+			return true
+		}
+	}
+	for _, re := range r.jobs {
+		if re.MatchString(j.JobDisplayName) {
+			return true
+		}
+	}
+	return false
 }
 
 func LoadConfig(path string) (Config, error) {
@@ -123,6 +179,9 @@ func LoadConfig(path string) (Config, error) {
 		}
 	}
 	c.keepOnly()
+	if err := c.Batch.compile(); err != nil {
+		return c, err
+	}
 	return c, c.validate()
 }
 
@@ -182,8 +241,8 @@ func (c Config) validate() error {
 	if c.DailyUSD < 0 || c.MonthlyUSD < 0 || c.OnDemand < 0 || c.OnDemand > 1 {
 		return errors.New("config: caps must not be negative, and on_demand_share is in [0, 1]")
 	}
-	if r := c.Registration; r.Cap <= 0 || r.WindowS <= 0 || r.Margin < 0 || r.Margin >= 1 || r.PoolShare < 0 || r.PoolShare > 1 {
-		return errors.New("config: registration needs cap, window_s, a margin in [0, 1) and a pool_share in [0, 1]")
+	if r := c.Registration; r.Cap <= 0 || r.WindowS <= 0 || r.Margin < 0 || r.Margin >= 1 || r.PoolShare < 0 || r.PoolShare > 1 || r.Reserve < 0 {
+		return errors.New("config: registration needs cap, window_s, a margin in [0, 1), a pool_share in [0, 1] and a critical_reserve of 0 or more")
 	}
 	if p := c.Pool; p.Quantile <= 0 || p.Quantile > 1 || p.ReadySeconds <= 0 || p.HoldMinutes < 0 {
 		return errors.New("config: pool needs a quantile in (0, 1], ready_seconds above 0 and hold_minutes of 0 or more")

@@ -41,6 +41,6 @@
       "metrics": [["superci-pull", "OldestWaitingJobAgeS", {"label": "oldest waiting job"}], [".", "OldestUnregisteredMachineAgeS", {"label": "oldest machine without a runner"}]],
       "annotations": {"horizontal": [{"value": 60, "label": "60 s: the alarm, two minutes running"}]}}},
     {"type": "metric", "x": 12, "y": 39, "width": 12, "height": 6, "properties": {"title": "Registrations the budget turned away a minute, by reason (GitHub was never asked)", "region": "us-east-1", "view": "timeSeries", "period": 60, "stat": "Sum",
-      "metrics": [["superci-pull", "BudgetDenied", "Reason", "window"], ["...", "tokens"], ["...", "throttled"], ["...", "blind"]]}}
+      "metrics": [["superci-pull", "BudgetDenied", "Reason", "window"], ["...", "tokens"], ["...", "throttled"], ["...", "blind"], ["...", "held"]]}}
   ]
 }

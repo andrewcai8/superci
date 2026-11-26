@@ -218,7 +218,7 @@ func run(ctx context.Context, f flags) error {
 		if err != nil {
 			return err
 		}
-		l.sets = append(l.sets, &Set{spec: spec, id: gid, state: NewState(spec.Name, 0, spec.Max, regions, now), fleet: sf})
+		l.sets = append(l.sets, &Set{spec: spec, id: gid, state: setState(spec, cfg, regions, now), fleet: sf})
 	}
 	dropped, err := droppedScaleSets(ctx, client, group, specs)
 	if err != nil {
@@ -245,7 +245,7 @@ func run(ctx context.Context, f flags) error {
 	srv := &Server{sets: byName, budget: l.budget, verifier: verifier, client: client, refresh: refresh, claim: claims.Take, issue: l.tagger.Issue, notices: fleet.TagNoticed,
 		slots: make(chan struct{}, max(1, cfg.Registration.Concurrency)), maxAge: l.maxAge}
 	go serve(ctx, &http.Server{Addr: f.listen, Handler: srv, ReadHeaderTimeout: 10 * time.Second}, &id)
-	go serve(ctx, &http.Server{Addr: f.admin, Handler: Admin(l.status, l.healthy, l.override)}, nil)
+	go serve(ctx, &http.Server{Addr: f.admin, Handler: Admin(l.status, l.healthy, l.override, l.budget)}, nil)
 	errs := make(chan error, len(l.sets))
 	var sessions sync.WaitGroup
 	for _, s := range l.sets {
@@ -336,6 +336,13 @@ func deniedSince(before, now map[string]int) map[string]int {
 		out[reason] = n - before[reason]
 	}
 	return out
+}
+
+// setState is a configured set's state, with the config's batch rule.
+func setState(spec SetSpec, cfg Config, regions []string, now time.Time) *State {
+	s := NewState(spec.Name, 0, spec.Max, regions, now)
+	s.SetBatch(cfg.Batch)
+	return s
 }
 
 // bootData is a machine's user data: boot.sh with the listener's address and key, the longest a machine may live
@@ -1063,6 +1070,7 @@ func (l *Listener) watchConfig() {
 		maxes[spec.Name] = spec.Max
 	}
 	for _, s := range l.sets {
+		s.state.SetBatch(cfg.Batch)
 		if n, ok := maxes[s.spec.Name]; ok {
 			s.state.SetMax(n)
 		}

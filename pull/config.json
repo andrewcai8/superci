@@ -82,7 +82,13 @@
     "pool_rate": 5,
     "pool_share": 0.9,
     "blind_rate": 0.3,
-    "concurrency": 64
+    "concurrency": 64,
+    "critical_reserve": 2
+  },
+  "batch": {
+    "events": ["schedule", "workflow_dispatch"],
+    "workflow_refs": [],
+    "jobs": []
   },
   "daily_usd": 1000,
   "monthly_usd": 15000,

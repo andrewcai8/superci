@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Undoes each fix of round 2, of the fence round (audit E), of the wait round (F1 to F4), of the visible wait (U2) and of the hygiene round (U7) in a copy of pull/ and runs the test written for it, which must fail. A fix whose
+"""Undoes each fix of round 2, of the fence round (audit E), of the wait round (F1 to F4), of the visible wait (U2), of the priority classes (U4) and of the hygiene round (U7) in a copy of pull/ and runs the test written for it, which must fail. A fix whose
 test still passes without it is reported as NOT RED. A path under cache/ runs its test in the cache module. Run it in pull/ where Go is installed:
 
   python3 tools/redfirst.py [name fragment ...]   # only the mutants whose name holds one of them
@@ -149,6 +149,25 @@ MUTANTS = [
      "TestTheOldestJobAlarmFiresWithinTwoMinutesOfTheCanarysStall"),
     ("U2 the alarm needs 10 minutes over 600 s", "deploy/alarms.sh", "OldestWaitingJobAgeS Maximum GreaterThanThreshold 60 60 2 2 notBreaching", "OldestWaitingJobAgeS Maximum GreaterThanThreshold 600 60 2 2 notBreaching",
      "TestTheOldestJobAlarmFiresWithinTwoMinutesOfTheCanarysStall"),
+    ("U4 batch takes the critical reserve", "budget.go", "(p == ForBatch && b.tokens < 1+reserve) || ", "(p == ForBatch && b.tokens < 1+0*reserve) || ", "TestWithSpareForOneTokenACriticalAskIsGrantedBeforeABatchAsk"),
+    ("U4 batch and pool do not give way to a waiting critical ask", "budget.go", f"{T}if p != ForJob && now.Sub(b.criticalWait) < criticalHold {{\n{T}{T}return DeniedHeld\n{T}}}\n", "",
+     "TestABatchOrPoolAskGivesWayWhileACriticalAskWaits"),
+    ("U4 a turned-away critical ask is not remembered", "budget.go", f"{T}{T}b.criticalWait = now\n", "", "TestABatchOrPoolAskGivesWayWhileACriticalAskWaits"),
+    ("U4 a served critical ask is still waiting", "budget.go", f"{T}{T}b.criticalWait = time.Time{{}}\n", "", "TestAServedCriticalAskReleasesTheHold"),
+    ("U4 a reserve above the burst shuts batch out", "budget.go", "min(float64(b.c.Reserve), burst-1)", "float64(b.c.Reserve)", "TestAReserveAboveTheBurstDoesNotShutBatchOutForEver"),
+    ("U4 critical machines are not first", "state.go", f"{T}case ahead < open:\n{T}{T}return ForJob\n", f"{T}case ahead < open:\n{T}{T}return ForBatch\n",
+     "TestMachinesAreClassedByTheJobsTheyWouldTakeCriticalFirst"),
+    ("U4 a queue with no batch job is shared out too", "state.go", f"{T}if batch == 0 {{\n{T}{T}return ForJob\n{T}}}\n", "", "TestMachinesAreClassedByTheJobsTheyWouldTakeCriticalFirst"),
+    ("U4 every ask is critical", "state.go", "b.Try(now, s.class(m, idle))", "b.Try(now, s.class(m, idle)*0)", "TestAMachineForABatchJobWaitsWhileTheMachineForACriticalJobIsGranted"),
+    ("U4 a set starts without the batch rule", "main.go", "\ts.SetBatch(cfg.Batch)\n\treturn s\n", "\treturn s\n", "TestAConfiguredSetKnowsTheConfigsBatchJobsFromItsStart"),
+    ("U4 a batch job is not marked", "state.go", "if s.batchRule.Matches(j) {", "if false {", "TestAMachineForABatchJobWaitsWhileTheMachineForACriticalJobIsGranted"),
+    ("U4 the batch rule ignores the event", "config.go", "if slices.Contains(r.Events, j.EventName) {", "if false {", "TestJobsAreCriticalUnlessTheBatchRuleNamesThem"),
+    ("U4 a negative reserve is accepted", "config.go", " || r.Reserve < 0 {", " {", "TestAnOverrideWithABadBatchPatternOrANegativeReserveIsRefused"),
+    ("U4 a lease takes the critical reserve", "lease.go", "b.take(now, ForBatch)", "b.take(now, ForJob)", "TestALaneLeasesRegistrationsAtBatchPriorityAndSettlesThemAsOurs"),
+    ("U4 a settled lease counts none as ours", "lease.go", "for i := 0; i < min(max(made, 0), l.n); i++ {", "for i := 0; i < 0; i++ {", "TestALaneLeasesRegistrationsAtBatchPriorityAndSettlesThemAsOurs"),
+    ("U4 a lease is held for ever", "lease.go", "if !now.Before(l.expires) {", "if false {", "TestALeaseThatIsNeverSettledIsReleasedWhenItExpires"),
+    ("U4 a lease is granted while a critical ask waits", "budget.go", f"{T}if p != ForJob && now.Sub(b.criticalWait) < criticalHold {{\n{T}{T}return DeniedHeld\n{T}}}\n", "",
+     "TestALeaseIsRefusedWhileACriticalAskWaitsAndWhenTheCapLeavesNothing"),
 ]
 
 here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

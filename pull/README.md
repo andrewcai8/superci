@@ -99,10 +99,16 @@ App's shared 5,000 requests an hour at that pace) is only the fallback. Everyone
 - The spare rate is `cap x (1 - margin) / window - others' rate`: with the defaults (1,500, 20%, 300 s) we register
   only into what keeps the organization as a whole under 4 a second; when the others alone reach 4, we register none.
 - A registration also needs the window's estimated use, plus those in flight, under `cap x (1 - margin / 2)`.
-- A registration a waiting job needs comes first. A pool registration leaves half the saved-up burst (30 s of the
-  spare rate) to jobs and keeps to its own pace (`pool_rate` 5, and `pool_share` 0.9 of the spare). A pool runner is
-  a job's registration made ahead of it: every job takes one, so the pool's pace must keep up with the jobs (2 to 5
-  a second at full rollout); 0.5 a second left the pool empty after every burst.
+- The budget is one allocator with three classes. **Critical** is a registration for a job of the required check; it
+  has a reserve (`critical_reserve`, 2 tokens, cut to the burst less one) and is served first. **Batch** is a job the
+  `batch` rule names (by default the events `schedule` and `workflow_dispatch`: cache-warm crons and load branches;
+  `workflow_refs` and `jobs` add patterns): it borrows only tokens the reserve leaves, and gives way for 6 s after a
+  critical ask was turned away. Every job no rule names is critical. A machine takes no job in particular, so the
+  waiting jobs are shared out to the machines waiting for a runner in launch order, critical jobs first. **Pool**
+  only fills the hot pool: it leaves half the saved-up burst to jobs and keeps to its own pace (`pool_rate` 5, and
+  `pool_share` 0.9 of the spare), and gives way to a critical ask too. A pool runner is a job's registration made
+  ahead of it: every job takes one, so the pool's pace must keep up with the jobs (2 to 5 a second at full
+  rollout); 0.5 a second left the pool empty after every burst.
 - GitHub's refusal stops every registration for 5 s, doubling to a minute while it keeps refusing.
 - Until the rate is measured (about 75 s after a start: two listings 61 s apart, each dated when it began) the
   listener registers at `blind_rate` (0.3/s) at most.
@@ -127,6 +133,19 @@ How the advance is measured, and how far off it can be:
 Moving a job from Blacksmith to superci moves its registration rather than adding one, so a gradual ramp of the
 fleet switch keeps the organization's total where it is. A test that adds jobs (a load test) adds registrations,
 and at the organization's measured 3.5 to 4.5 a second it has almost nothing to add them into.
+
+**Leases.** A lane that registers runners outside the listener (a test of another runner plane) takes from the same
+cap, and a registration the budget did not know of reads as others' rate and starves the listener's own. Such a lane
+asks first, on the admin endpoint (localhost; reach it from another host through `deploy/ssh.sh`):
+
+```bash
+curl -s -X POST 'localhost:8080/lease?n=40&ttl=120'            # {"id":"…","granted":7,"expires":"…"}
+curl -s -X POST 'localhost:8080/lease/settle?id=<id>&made=7'   # how many it made; 204, or 410 if it expired
+```
+
+A lease is up to `n` registrations at batch priority, prepaid out of the budget and held in flight (`pending`,
+`leased` in `/state`) for `ttl` (at most 10 minutes). Settling turns the ones made into ours; one never settled is
+released when it expires. A lane runs only the registrations it was granted.
 
 ### Machine identity
 
@@ -438,7 +457,7 @@ CloudWatch, namespace `superci-pull`: `Heartbeat`, `OrgRegistrationRate`, `Other
 percentiles, and again per set under the dimension `Set`), `StalledSets`, `Orphans`, `SpendTodayUSD`, `SpendDailyCapUSD`, `SpendMonthUSD`, `SpendPerHourUSD`,
 `SpendCapped`, `Machines`, `OnDemandShare`, `OldestWaitingJobAgeS` and `OldestUnregisteredMachineAgeS` (the longest
 waits in progress of any set); `BudgetDenied` (registrations the budget turned away, GitHub never asked; dimension
-`Reason`: `window`, `tokens`, `throttled`, `blind`); per set (dimension `Set`): `Machines`, `IdleRunners`,
+`Reason`: `window`, `tokens`, `throttled`, `blind`, `held`); per set (dimension `Set`): `Machines`, `IdleRunners`,
 `BusyRunners`, `Pool`, `JobsWaiting`, `OldestWaitingJobAgeS`, `OldestUnregisteredMachineAgeS`. A wait is published
 while it lasts: `OldestWaitingJobAgeS` is the age of the oldest job that was offered or assigned and has not started,
 and a machine still told to wait writes a `jit.wait` timeline event every 30 s with the reason.
