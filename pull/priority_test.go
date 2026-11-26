@@ -14,14 +14,19 @@ import (
 
 var testNow = t0.Add(6 * time.Minute)
 
-// scarce is a budget that has saved up one token and a fifth, with the others' rate known: spare for one registration.
-// The reserve is two tokens.
+// scarce is a budget that has saved up one token and a fifth: its rate is 0.5/s and 2.4 s have passed. The reserve
+// is the given number of tokens.
 func scarce(reserve int) *Budget {
 	c := reg()
-	c.Reserve = reserve
-	b := NewBudget(c, testNow.Add(-2400*time.Millisecond))
-	heads(b, 3.5, 6*time.Minute) // spare 0.5/s, so 2.4 s have saved 1.2 tokens
-	return b
+	c.Reserve, c.CeilingRate, c.CeilingBurst = reserve, 0.5, 3
+	return NewBudget(c, testNow.Add(-2400*time.Millisecond))
+}
+
+// filled is a budget whose bucket holds n tokens at testNow, at 1/s.
+func filled(n, reserve int) *Budget {
+	c := reg()
+	c.Reserve, c.CeilingRate, c.CeilingBurst = reserve, 1, n
+	return NewBudget(c, testNow.Add(-time.Duration(n)*time.Second))
 }
 
 func TestWithSpareForOneTokenACriticalAskIsGrantedBeforeABatchAsk(t *testing.T) {
@@ -37,57 +42,41 @@ func TestWithSpareForOneTokenACriticalAskIsGrantedBeforeABatchAsk(t *testing.T) 
 	}
 }
 
-func TestABatchOrPoolAskGivesWayWhileACriticalAskWaits(t *testing.T) {
-	for _, give := range []struct {
-		name string
-		p    Priority
-	}{{"batch", ForBatch}, {"pool", ForPool}} {
-		b := scarce(0)
-		// A token arrives after the critical ask was turned away. The class that asks first after it must not take it.
-		b.Take(testNow.Add(-2*time.Second), ForJob) // 0.2 tokens saved: turned away
-		later := testNow.Add(3 * time.Second)       // 1.7 tokens saved: a token for either
-		if b.Take(later, give.p) {
-			t.Errorf("%s took the token a waiting critical ask was about to take", give.name)
-		}
-		if !b.Take(later, ForJob) {
-			t.Errorf("%s: the critical ask found no token", give.name)
-		}
-		if !b.Take(later.Add(criticalHold), give.p) && give.p == ForBatch {
-			t.Errorf("%s still gives way after the critical ask was served", give.name)
-		}
-	}
-}
-
-func TestACriticalAskNoLongerWaitingHoldsNothing(t *testing.T) {
+func TestABatchAskGivesWayWhileACriticalMachineWaits(t *testing.T) {
 	b := scarce(0)
-	b.Take(testNow.Add(-2*time.Second), ForJob) // turned away
-	if b.Take(testNow, ForBatch) {
-		t.Fatal("batch took a token inside the hold")
+	critical := Asker{ID: "i-0001", Launched: testNow.Add(time.Minute), P: ForJob}
+	batch := Asker{ID: "i-0000", Launched: testNow, P: ForBatch}
+	if ok, why := b.Try(testNow.Add(-2*time.Second), critical); ok || why != DeniedTokens { // 0.2 tokens saved
+		t.Fatalf("critical ask on 0.2 tokens: %v %v", ok, why)
 	}
-	if !b.Take(testNow.Add(criticalHold+time.Second), ForBatch) {
-		t.Fatal("batch is still held after the critical ask stopped asking")
+	// A token arrives. The batch machine launched earlier, but the critical machine that waits comes first.
+	later := testNow.Add(600 * time.Millisecond) // 1.5 tokens
+	if ok, why := b.Try(later, batch); ok || why != DeniedQueued {
+		t.Fatalf("batch took the token a waiting critical machine is owed: %v %v", ok, why)
+	}
+	if ok, _ := b.Try(later, critical); !ok {
+		t.Fatal("the critical machine found no token")
+	}
+	if ok, _ := b.Try(later.Add(2*time.Second), batch); !ok { // 1.5 tokens, nothing ahead
+		t.Fatal("batch still gives way after the critical machine was served")
 	}
 }
 
-func TestAServedCriticalAskReleasesTheHold(t *testing.T) {
-	b := open()
-	b.criticalWait = testNow.Add(-time.Second) // a critical ask was turned away a second ago
-	if b.Take(testNow, ForBatch) {
-		t.Fatal("batch took a token while a critical ask waited")
+func TestAMachineThatStoppedAskingHoldsNothing(t *testing.T) {
+	c := reg()
+	c.CeilingRate, c.CeilingBurst = 0.5, 1 // one token at most, so a place in the queue decides who takes it
+	b := NewBudget(c, testNow.Add(-2400*time.Millisecond))
+	b.Try(testNow.Add(-2*time.Second), Asker{ID: "i-0001", Launched: testNow, P: ForJob}) // turned away
+	if ok, why := b.Try(testNow, Asker{P: ForBatch}); ok || why != DeniedQueued {
+		t.Fatalf("batch took a token while a critical machine waited: %v %v", ok, why)
 	}
-	if !b.Take(testNow, ForJob) {
-		t.Fatal("the critical ask was refused on a full bucket")
-	}
-	if !b.Take(testNow, ForBatch) {
-		t.Fatal("batch still gives way after the critical ask was served")
+	if !b.Take(testNow.Add(queueHold+time.Second), ForBatch) {
+		t.Fatal("batch is still held after the critical machine stopped asking")
 	}
 }
 
 func TestBatchBorrowsTheTokensTheReserveLeavesAndNeverTheReserve(t *testing.T) {
-	c := reg()
-	c.Reserve = 2
-	b := NewBudget(c, testNow.Add(-9*time.Second))
-	heads(b, 3, 6*time.Minute) // spare 1/s: 9 tokens saved
+	b := filled(9, 2)
 	got := 0
 	for b.Take(testNow, ForBatch) {
 		got++
@@ -101,10 +90,7 @@ func TestBatchBorrowsTheTokensTheReserveLeavesAndNeverTheReserve(t *testing.T) {
 }
 
 func TestAReserveAboveTheBurstDoesNotShutBatchOutForEver(t *testing.T) {
-	c := reg()
-	c.Reserve = 100
-	b := NewBudget(c, testNow.Add(-time.Hour))
-	heads(b, 3.9, 6*time.Minute) // spare 0.1/s: a burst of 3 tokens, and a bucket an hour has filled
+	b := filled(3, 100)
 	if !b.Take(testNow, ForBatch) {
 		t.Fatal("a reserve of 100 shuts batch out of a full bucket: it is cut to the burst less one")
 	}
@@ -148,7 +134,8 @@ func TestAnOverrideWithABadBatchPatternOrANegativeReserveIsRefused(t *testing.T)
 	dir := t.TempDir()
 	for name, body := range map[string]string{
 		"pattern": `{"batch": {"jobs": ["("]}}`,
-		"reserve": `{"registration": {"cap": 1500, "window_s": 300, "margin": 0.2, "pool_share": 0.9, "critical_reserve": -1}}`,
+		"reserve": `{"registration": {"cap": 1500, "window_s": 300, "pool_share": 0.9, "ceiling_rate": 2, "ceiling_burst": 50, "recover_s": 120, "critical_reserve": -1}}`,
+		"ceiling": `{"registration": {"cap": 1500, "window_s": 300, "pool_share": 0.9, "ceiling_rate": 0, "ceiling_burst": 50, "recover_s": 120, "critical_reserve": 2}}`,
 	} {
 		p := filepath.Join(dir, name+".json")
 		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
@@ -254,10 +241,7 @@ func TestAMachineForABatchJobWaitsWhileTheMachineForACriticalJobIsGranted(t *tes
 }
 
 func TestALaneLeasesRegistrationsAtBatchPriorityAndSettlesThemAsOurs(t *testing.T) {
-	c := reg()
-	c.Reserve = 2
-	b := NewBudget(c, testNow.Add(-9*time.Second))
-	heads(b, 3, 6*time.Minute) // 9 tokens
+	b := filled(9, 2)
 	l := b.Lease(testNow, 20, time.Minute)
 	if l.Granted != 7 || l.ID == "" {
 		t.Fatalf("lease of 20 on 9 tokens with a reserve of 2: %+v, want 7", l)
@@ -282,10 +266,7 @@ func TestALaneLeasesRegistrationsAtBatchPriorityAndSettlesThemAsOurs(t *testing.
 }
 
 func TestALeaseThatIsNeverSettledIsReleasedWhenItExpires(t *testing.T) {
-	c := reg()
-	c.Reserve = 2
-	b := NewBudget(c, testNow.Add(-9*time.Second))
-	heads(b, 3, 6*time.Minute)
+	b := filled(9, 2)
 	l := b.Lease(testNow, 5, 30*time.Second)
 	if l.Granted != 5 {
 		t.Fatalf("%+v", l)
@@ -303,26 +284,34 @@ func TestALeaseThatIsNeverSettledIsReleasedWhenItExpires(t *testing.T) {
 	}
 }
 
-func TestALeaseIsRefusedWhileACriticalAskWaitsAndWhenTheCapLeavesNothing(t *testing.T) {
+func TestALeaseComesAfterTheMachinesOfItsClassThatWait(t *testing.T) {
 	b := scarce(0)
-	b.Take(testNow.Add(-2*time.Second), ForJob) // turned away: a critical ask waits
-	if l := b.Lease(testNow, 5, time.Minute); l.Granted != 0 || l.ID != "" {
-		t.Errorf("a lease granted while a critical ask waits: %+v", l)
+	b.Try(testNow.Add(-2*time.Second), Asker{ID: "i-0000", Launched: testNow, P: ForBatch}) // turned away: it waits
+	if l := b.Lease(testNow, 5, time.Minute); l.Granted != 0 {
+		t.Errorf("a lease took the one token a waiting batch machine is owed: %+v", l)
 	}
-	starved := NewBudget(reg(), testNow)
-	heads(starved, 4.5, 6*time.Minute)
-	if l := starved.Lease(testNow, 5, time.Minute); l.Granted != 0 {
-		t.Errorf("a lease granted with others over the line: %+v", l)
+	if ok, _ := b.Try(testNow, Asker{ID: "i-0000", Launched: testNow, P: ForBatch}); !ok {
+		t.Error("the waiting batch machine found no token")
+	}
+}
+
+func TestALeaseNeverTakesAWaitingMachinesTokenNorAsksRightAfterARefusal(t *testing.T) {
+	b := scarce(0)
+	b.Try(testNow.Add(-2*time.Second), Asker{ID: "i-0000", Launched: testNow, P: ForJob}) // turned away: it waits
+	if l := b.Lease(testNow, 5, time.Minute); l.Granted != 0 || l.ID != "" {
+		t.Errorf("a lease took the one token a waiting critical machine is owed: %+v", l)
+	}
+	refused := filled(9, 0)
+	refused.Done(testNow, Refused, 0)
+	if l := refused.Lease(testNow.Add(time.Second), 5, time.Minute); l.Granted != 0 {
+		t.Errorf("a lease granted a second after GitHub refused a registration: %+v", l)
 	}
 }
 
 func TestTheAdminEndpointLeasesAndSettles(t *testing.T) {
 	c := reg()
-	c.Reserve = 2
+	c.Reserve, c.CeilingBurst = 2, 9
 	b := NewBudget(c, time.Now().Add(-9*time.Second))
-	for s := 0; s <= 360; s += 15 { // others at 3/s, up to now
-		b.Head(time.Now().Add(time.Duration(s-360)*time.Second), 7_000_000+int64(3*s))
-	}
 	h := Admin(func() Status { return Status{} }, func() error { return nil }, func(string, int, int) {}, b)
 	post := func(target string) *httptest.ResponseRecorder {
 		w := httptest.NewRecorder()

@@ -52,7 +52,7 @@ issued its runner superci-pull-issued=<when>
 | A machine's runner, busy or not | JobStarted and JobCompleted, GitHub's runner listing, and GitHub's answer for the runner's name | the messages GitHub redelivers, the listing, and a check by name |
 | A job a spot notice found running | the tag `superci-pull-noticed=<owner>/<repo>/<run>` | the tags of machines EC2 still lists (about an hour after a reclaim) |
 | Who a machine is | the instance identity document EC2 signed (PKCS7, RSA-2048), checked against AWS's certificate | the same |
-| The organization's registration rate | the advance of runner ids (one sequence for the organization), less ours | blind (0.3/s) for about 90 s |
+| The organization's registration rate (a gauge) | the advance of runner ids (one sequence for the organization), less ours | unknown for about 90 s after a start; admission does not read it |
 | Spend today and this month | accrued from running machines at their pool's spot price | the SSM parameter `/superci-pull/spend` |
 | Each set's burst and launch times | the SSM parameter `/superci-pull/pool/<deployment>`, one per deployment so no listener overwrites another's (`-pool-param` is the prefix); saved every minute, the carried burst held for the first window | the same parameter, if saved within the window |
 | The listener's TLS key, which machines pin | the SSM SecureString `/superci-pull/tls` | the same key |
@@ -69,8 +69,8 @@ issued its runner superci-pull-issued=<when>
   - its age past a bound (below).
 
   An ask is no proof of anything: anything on a machine can ask.
-- **We never take the organization's last registrations.** Registrations go only into what GitHub's cap leaves the
-  rest of the organization, less a margin; when the organization is near the cap, our jobs wait, not Blacksmith's.
+- **GitHub decides when the organization is full.** Registrations go on until GitHub refuses one; a refusal halves
+  our rate and holds every ask, and a ceiling of our own keeps us alone inside GitHub's documented cap.
 - **A machine gets one runner, ever.** The runner is named `<set>-<instance id>`. A grant first creates the
   machine's claim, the S3 object `issued/<instance id>`, with `If-None-Match: *`: of every grant, across restarts,
   forgotten listings and overlapping listeners, exactly one creates it (DDIA ch. 9, compare-and-set; ch. 8, a fencing
@@ -88,32 +88,70 @@ issued its runner superci-pull-issued=<when>
 
 ### Registration budget
 
-GitHub refuses runner registrations past 1,500 in 5 minutes across the whole organization
-(`ConfigureTooManyRunnersException`), JIT runners of scale sets included, and Blacksmith's runners register in our
-organization too. Runner ids are one sequence for the organization, so the advance of the highest id is everyone's
-rate. The listener learns the highest id from each of its own registrations (exact) and, when it registers rarely,
-from a probe: a runner registered and removed at once, whose id is the head, exact (every 100 s at most, inside the
-budget and counted as ours). A listing of every organization runner (44 pages at 4,300 runners, about 1,600 of the
-App's shared 5,000 requests an hour at that pace) is only the fallback. Everyone else's rate is the advance less ours.
+GitHub documents a cap of 1,500 runner registrations in 5 minutes per repository, organization or enterprise, not
+raisable (https://docs.github.com/en/actions/reference/limits). The page does not say what a refusal looks like; the
+listener reads every error of a registration as one (a 429, a 403 with or without a rate-limit header, a 400, 409 or
+422, a 5xx under load), except the answers that say something else: the runner exists, our credential is bad, the scale
+set is gone, or we cancelled the ask. The budget admits on that answer, not on a guess:
 
-- The spare rate is `cap x (1 - margin) / window - others' rate`: with the defaults (1,500, 20%, 300 s) we register
-  only into what keeps the organization as a whole under 4 a second; when the others alone reach 4, we register none.
-- A registration also needs the window's estimated use, plus those in flight, under `cap x (1 - margin / 2)`.
+- **GitHub's refusal is the one hard signal.** It halves the admitted rate (down to 0.1/s at the least), drops the
+  saved tokens, and holds every ask for 5 s, doubling to a minute while GitHub keeps refusing. Nothing saves up and
+  the rate does not climb during a hold; the rate climbs back to the ceiling in `recover_s` (120 s) from the end of
+  the hold while GitHub refuses nothing. Every refusal is counted
+  (`RegistrationRefusals`, its alarm), logged (`"msg":"registration refused by GitHub"`) and written to the timeline
+  (`jit.refused`, `why` `refused`).
+- **Below the admitted rate no machine waits.** The organization's estimated rate decides nothing.
+- **A ceiling of our own** bounds our registrations whatever GitHub answers: `ceiling_rate` a second and
+  `ceiling_burst` at once. It starts at 2 a second and 50 at once, 650 in 300 s, well inside GitHub's documented
+  1,500; 50 covers most simultaneous bursts (the largest measured was 115 jobs within 3 s from four merge queue
+  drafts, Nov 26 03:11Z, which then queue behind the tokens). `ceiling_rate` x `window_s` + `ceiling_burst` must not
+  pass `cap` (1,500): config load and `-validate` refuse a ceiling that could, such as a `ceiling_rate` of 6.
+
+  **Raising it.** Raise one step at a time, set in the override file named by `-config`, and only after 24 hours
+  in which all three hold:
+
+  1. `RegistrationRefusals` is 0 for the whole 24 hours.
+  2. Blacksmith's Linux queue-wait p90 stays under 10 s (the baseline the share on superci must not worsen).
+  3. `denied_tokens` (the listener's budget log line; `BudgetDenied` reason `tokens`) shows we actually
+     hit the ceiling. A ceiling nobody reached is not what held a job back.
+
+  | Step | `ceiling_rate` | `ceiling_burst` | Most in 300 s |
+  | --- | --- | --- | --- |
+  | 0 (default) | 2 | 50 | 650 |
+  | 1 | 3 | 100 | 1,000 |
+  | 2 | 4 | 150 | 1,350 |
+
+  A step that brings a refusal goes back one step. The next step, 5 a second with 150 at once, is 1,650 in one window
+  and is refused by the validation: past step 2 the rate and the burst trade off at `ceiling_rate` x 300 +
+  `ceiling_burst` = 1,500 at most (4 a second with 300 at once, for one), and nothing there leaves room for anyone
+  else's registrations in the organization.
+- **When tokens are short, machines are served in order**: critical before batch before pool, and in each class the
+  machine launched first. A machine turned away keeps its place while it keeps asking (6 s, two polls); the next
+  tokens are owed to the machines ahead of it (`BudgetDenied` reason `queued`).
 - The budget is one allocator with three classes. **Critical** is a registration for a job of the required check; it
-  has a reserve (`critical_reserve`, 2 tokens, cut to the burst less one) and is served first. **Batch** is a job the
-  `batch` rule names (by default the events `schedule` and `workflow_dispatch`: cache-warm crons and load branches;
-  `workflow_refs` and `jobs` add patterns): it borrows only tokens the reserve leaves, and gives way for 6 s after a
-  critical ask was turned away. Every job no rule names is critical. A machine takes no job in particular, so the
-  waiting jobs are shared out to the machines waiting for a runner in launch order, critical jobs first. **Pool**
-  only fills the hot pool: it leaves half the saved-up burst to jobs and keeps to its own pace (`pool_rate` 5, and
-  `pool_share` 0.9 of the spare), and gives way to a critical ask too. A pool runner is a job's registration made
-  ahead of it: every job takes one, so the pool's pace must keep up with the jobs (2 to 5 a second at full
+  has a reserve (`critical_reserve`, 2 tokens, cut to the burst less one). **Batch** is a job the `batch` rule names
+  (by default the events `schedule` and `workflow_dispatch`: cache-warm crons and load branches; `workflow_refs` and
+  `jobs` add patterns): it borrows only tokens the reserve leaves. Every job no rule names is critical. A machine
+  takes no job in particular, so the waiting jobs are shared out to the machines waiting for a runner in launch
+  order, critical jobs first. **Pool** only fills the hot pool: it leaves half the saved-up burst to jobs and keeps
+  to its own pace (`pool_rate` 5, and `pool_share` 0.9 of the admitted rate). A pool runner is a job's registration
+  made ahead of it: every job takes one, so the pool's pace must keep up with the jobs (2 to 5 a second at full
   rollout); 0.5 a second left the pool empty after every burst.
-- GitHub's refusal stops every registration for 5 s, doubling to a minute while it keeps refusing.
-- Until the rate is measured (about 75 s after a start: two listings 61 s apart, each dated when it began) the
-  listener registers at `blind_rate` (0.3/s) at most.
-- Across every set, machines waiting for a runner are bounded by what the budget registers in 90 s (a waiting machine
-  is paid for). Past twice that, once the rate is measured, machines that have waited three minutes end.
+- Across every set, machines waiting for a runner are bounded by what the budget admits in 90 s (a waiting machine
+  is paid for). Past twice that, machines that have waited three minutes end.
+
+The organization's rate is a gauge. Runner ids are one sequence for the organization, so the advance of the highest
+id is everyone's rate. The listener learns the highest id from each of its own registrations (exact) and, when it
+registers rarely, from a probe: a runner registered and removed at once, whose id is the head, exact (every 100 s at
+most, inside the budget and counted as ours). A listing of every organization runner (44 pages at 4,300 runners,
+about 1,600 of the App's shared 5,000 requests an hour at that pace) is only the fallback. Everyone else's rate is
+the advance less ours. Against megpt-mono's jobs it reads within about 10%: 4.67 a second against 4.90 ± 0.50 job
+starts on Nov 26 00:27-00:37Z, and 1.07 registrations per job at 08:30Z and 14:00Z on Nov 25.
+
+Why not admit on the estimate: on Nov 26 it read 4.2 to 4.9 a second from 00:22Z for 21 minutes, the 20% margin it
+kept admitted nothing, and ten test-go jobs waited 482 to 898 s. GitHub refused no one: Blacksmith's jobs in the
+same minutes started in 6 s at the median and 19 s at most, the estimate passed 1,500 in 14 minutes of Nov 25-26,
+and the listener logged no refusal in its 20 hours of logs.
 
 The estimate is published as `OrgRegistrationRate`, `OthersRegistrationRate`, `OurRegistrationRate`,
 `SpareRegistrationRate` and `RegistrationWindowUse`, and logged every 30 s (`"msg":"budget"`).
@@ -127,15 +165,15 @@ How the advance is measured, and how far off it can be:
   Others' rate is that advance less ours. A lower-bound head reads the rate low by at most (missed ids) / span:
   with jobs of 30 s or more and a 10-15 s listing, a few ids over 60-300 s, under 0.1/s.
 - Ids are not dense if GitHub skips some. The advance then overstates the rate, which only makes us register less.
-- The budget does not depend on the estimate alone. The 20% margin, the window guard at `cap x (1 - margin / 2)` and
-  the backoff after a refusal bound the damage of an error in either direction.
+- The estimate admits and refuses nothing, so an error in it changes no decision; the ceiling and the backoff
+  after a refusal bound our registrations.
 
 Moving a job from Blacksmith to superci moves its registration rather than adding one, so a gradual ramp of the
 fleet switch keeps the organization's total where it is. A test that adds jobs (a load test) adds registrations,
 and at the organization's measured 3.5 to 4.5 a second it has almost nothing to add them into.
 
 **Leases.** A lane that registers runners outside the listener (a test of another runner plane) takes from the same
-cap, and a registration the budget did not know of reads as others' rate and starves the listener's own. Such a lane
+cap, and a registration the budget did not know of brings GitHub's refusal nearer for the listener's own. Such a lane
 asks first, on the admin endpoint (localhost; reach it from another host through `deploy/ssh.sh`):
 
 ```bash
@@ -452,12 +490,13 @@ A pin until the file next changes: `curl -s -X POST 'localhost:8080/override?set
 **Read metrics.** The dashboard `superci-pull` (us-east-1) shows the alarms, queue wait, jobs waiting and machines per
 set, the registration rates, registrations and errors, spend against the daily cap, and the listener's warnings.
 CloudWatch, namespace `superci-pull`: `Heartbeat`, `OrgRegistrationRate`, `OthersRegistrationRate`,
-`OurRegistrationRate`, `SpareRegistrationRate`, `RegistrationWindowUse`, `OrgRateKnown`, `Registrations`,
+`OurRegistrationRate`, `SpareRegistrationRate`, `RegistrationWindowUse`, `OrgRateKnown`, `AdmitRate` (the admitted
+rate a second), `RegistrationQueue` (machines that wait in order), `Registrations`,
 `RegistrationRefusals`, `RegistrationErrors`, `LaunchShortfall`, `QueueWait` (seconds per started job, with
 percentiles, and again per set under the dimension `Set`), `StalledSets`, `Orphans`, `SpendTodayUSD`, `SpendDailyCapUSD`, `SpendMonthUSD`, `SpendPerHourUSD`,
 `SpendCapped`, `Machines`, `OnDemandShare`, `OldestWaitingJobAgeS` and `OldestUnregisteredMachineAgeS` (the longest
 waits in progress of any set); `BudgetDenied` (registrations the budget turned away, GitHub never asked; dimension
-`Reason`: `window`, `tokens`, `throttled`, `blind`, `held`); per set (dimension `Set`): `Machines`, `IdleRunners`,
+`Reason`: `tokens`, `throttled`, `queued`); per set (dimension `Set`): `Machines`, `IdleRunners`,
 `BusyRunners`, `Pool`, `JobsWaiting`, `OldestWaitingJobAgeS`, `OldestUnregisteredMachineAgeS`. A wait is published
 while it lasts: `OldestWaitingJobAgeS` is the age of the oldest job that was offered or assigned and has not started,
 and a machine still told to wait writes a `jit.wait` timeline event every 30 s with the reason.
@@ -617,7 +656,7 @@ one job), plus the pool. `SpendPerHourUSD` is the listener's live figure.
   a pool registered ahead.
 - **A burst waits on registrations past the pool.** A burst of N jobs on a size whose pool holds P idle runners
   starts P at once; the rest wait for machines (about 15 s from launch to a registered runner) and for
-  registrations at the spare rate S (`SpareRegistrationRate`, `cap x 0.8 / 300 - others' rate`). The last job of the
+  registrations at the admitted rate S (`AdmitRate`, the ceiling of 2 a second until GitHub refuses one). The last job of the
   burst waits about `15 s + (N - P) / S`: at S = 2/s, a 200-job burst onto a pool of 10 waits up to about 110 s.
 - **gp3 storage.** 40-150 GB disks use 50 TiB per region at about 800 machines; the quota is now 200 TiB in us-east-1
   and 100 TiB in us-east-2 (`LaunchShortfall` and its alarm show the next limit hit).

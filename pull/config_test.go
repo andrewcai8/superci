@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -139,5 +140,48 @@ func TestOnlyKeepsTheSizesItNames(t *testing.T) {
 	}
 	if len(c.Sizes) != 1 || c.Sizes["superci-96cpu"].CPU != 2 || len(c.Pools) != 0 {
 		t.Fatalf("sizes %v pools %v, want only superci-96cpu", c.Sizes, c.Pools)
+	}
+}
+
+// The ceiling is what we alone may register in one window: the burst at once and the rate over the window. It starts
+// low (2 a second, 50 at once: 650 in 5 minutes) and is raised by hand, a step after each quiet day (README).
+func TestTheCeilingStartsAt2And50(t *testing.T) {
+	c, err := LoadConfig("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := c.Registration; r.CeilingRate != 2 || r.CeilingBurst != 50 {
+		t.Fatalf("the built-in ceiling is %v a second and %d at once, want 2 and 50", r.CeilingRate, r.CeilingBurst)
+	}
+}
+
+func TestACeilingThatCouldPassTheCapInOneWindowIsRefused(t *testing.T) {
+	dir := t.TempDir()
+	for _, c := range []struct {
+		rate  string
+		burst int
+		ok    bool
+	}{
+		{"2", 50, true},  // 650
+		{"3", 100, true}, // 1,000
+		{"4", 150, true}, // 1,350
+		{"4", 300, true}, // 1,500
+		{"4", 301, false},
+		{"5", 150, false}, // 1,650
+		{"5", 1, false},
+		{"6", 50, false}, // 1,850
+	} {
+		path := filepath.Join(dir, "config.json")
+		body := fmt.Sprintf(`{"registration": {"ceiling_rate": %s, "ceiling_burst": %d}}`, c.rate, c.burst)
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := LoadConfig(path)
+		if c.ok && err != nil {
+			t.Fatalf("a ceiling of %s a second and %d at once refused: %v", c.rate, c.burst, err)
+		}
+		if !c.ok && (err == nil || !strings.Contains(err.Error(), "ceiling")) {
+			t.Fatalf("a ceiling of %s a second and %d at once accepted (%v): over a 300 s window it passes the 1500 cap", c.rate, c.burst, err)
+		}
 	}
 }

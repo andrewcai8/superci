@@ -51,7 +51,7 @@ alarm spend-capped "A spend cap is reached: the listener launches nothing and ke
   SpendCapped Maximum GreaterThanOrEqualToThreshold 1 300 1 1 notBreaching
 alarm launch-shortfall "EC2 started fewer machines than asked for 15 minutes running (spot capacity, or a quota: vCPUs, gp3 storage)" \
   LaunchShortfall Sum GreaterThanThreshold 0 300 3 3 notBreaching
-alarm org-rate-unknown "The listener has not measured the organization's registration rate for 15 minutes, so it registers at its blind rate only" \
+alarm org-rate-unknown "The listener has not measured the organization's registration rate for 15 minutes, so the estimate gauges nothing (admission does not read it)" \
   OrgRateKnown Maximum LessThanThreshold 1 300 3 3 notBreaching
 $A cloudwatch put-dashboard --dashboard-name superci-pull --dashboard-body "file://$here/dashboard.json" --query 'DashboardValidationMessages' --output text
 echo "dashboard superci-pull: https://us-east-1.console.aws.amazon.com/cloudwatch/home?region=us-east-1#dashboards/dashboard/superci-pull"

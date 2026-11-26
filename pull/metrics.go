@@ -52,6 +52,8 @@ func metricData(m Metrics, now time.Time) []cwtypes.MetricDatum {
 		d("OurRegistrationRate", m.Budget.OursRate, cwtypes.StandardUnitCountSecond),
 		d("SpareRegistrationRate", m.Budget.SpareRate, cwtypes.StandardUnitCountSecond),
 		d("OrgRateKnown", b2f(m.Budget.Known), cwtypes.StandardUnitCount),
+		d("AdmitRate", m.Budget.Rate, cwtypes.StandardUnitCountSecond),
+		d("RegistrationQueue", float64(m.Budget.Queued), cwtypes.StandardUnitCount),
 		d("Registrations", float64(m.Regs), cwtypes.StandardUnitCount),
 		d("RegistrationRefusals", float64(m.Refused), cwtypes.StandardUnitCount),
 		d("RegistrationErrors", float64(m.Failed), cwtypes.StandardUnitCount),
@@ -86,7 +88,7 @@ func metricData(m Metrics, now time.Time) []cwtypes.MetricDatum {
 	// The alarms read these without a dimension: the longest waits of any set.
 	data = append(data, d("OldestWaitingJobAgeS", oldestJob, cwtypes.StandardUnitSeconds),
 		d("OldestUnregisteredMachineAgeS", oldestMachine, cwtypes.StandardUnitSeconds))
-	for reason := DeniedWindow; reason < denialKinds; reason++ {
+	for reason := DeniedTokens; reason < denialKinds; reason++ {
 		data = append(data, d("BudgetDenied", float64(m.Denied[reason.String()]), cwtypes.StandardUnitCount,
 			cwtypes.Dimension{Name: aws.String("Reason"), Value: aws.String(reason.String())}))
 	}

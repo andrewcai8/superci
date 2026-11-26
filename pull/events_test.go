@@ -93,8 +93,8 @@ func TestListenerEventsMatchSchema(t *testing.T) {
 		tlIssued("superci-4cpu", "i-0abc", "superci-4cpu-i-0abc", 3, now.Add(-time.Second), now)
 		tlRefused("superci-4cpu", "i-0abc", "exists", now.Add(-time.Second), now)
 		tlNotice("superci-4cpu", &Machine{ID: "i-0abc", Region: "us-east-1", AZ: "us-east-1b", Type: "c7i.xlarge"}, now)
-		tlAsk("superci-4cpu", "i-0ghi", Wait, "window", now)
-		tlAsk("superci-4cpu", "i-0ghi", Wait, "window", now.Add(31*time.Second))
+		tlAsk("superci-4cpu", "i-0ghi", Wait, "queued", now)
+		tlAsk("superci-4cpu", "i-0ghi", Wait, "queued", now.Add(31*time.Second))
 	})
 	written := map[string]bool{}
 	for _, l := range lines {
