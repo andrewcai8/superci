@@ -1,0 +1,4 @@
+#!/bin/sh
+# superci-logs JOB_URL: what superci knows about one job (see logs.py). Put this directory on PATH, or alias `superci logs`
+# to it: the superci CLI is upstream's and takes no subcommand from this fork.
+exec python3 -I "$(dirname "$0")/logs.py" "$@"
