@@ -28,6 +28,7 @@ remove() { # job: drop it from SUPERCI_JOBS, and delete the variable when it was
     [ $code -eq 1 ] && { echo "SUPERCI_JOBS already unset"; return; }
     echo "GitHub did not answer reading SUPERCI_JOBS (try $try)"; sleep 10
   done
+  [ -n "$now" ] || { echo "SUPERCI_JOBS unread after 5 tries: deleting it, which sends every job back to Blacksmith"; gh variable delete SUPERCI_JOBS -R $R; return; }
   left=$(jq -c --arg j "$1" 'map(select(. != $j))' <<<"$now")
   if [ "$left" = "[]" ]; then gh variable delete SUPERCI_JOBS -R $R; else gh variable set SUPERCI_JOBS -R $R --body "$left"; fi
   echo "SUPERCI_JOBS was $now, now $(jobs_now || echo unset)"
