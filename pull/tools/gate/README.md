@@ -17,9 +17,10 @@ Exit 0 only when every criterion passes. 1 is FAIL, or INCONCLUSIVE when every m
 
 ## Where superci's jobs come from: `--superci-source auto|events|github`
 
-By default `gate job` and `gate scale` read superci's jobs from the listener's `job.record` events (one per finished job: queue
+By default (`auto`) `gate job` and `gate scale` read superci's jobs from the listener's `job.record` events (one per finished job: queue
 wait, wall time, conclusion, workflow and branch, machine; [timeline](../timeline/README.md#events-and-where-they-are-written)),
-through CloudWatch Logs Insights, so superci's side costs no GitHub call. A record is turned into the REST-shaped job the rest of the
+through CloudWatch Logs Insights, so superci's side costs no GitHub call, whenever the window starts a minute or more after the listener's first
+record; before that `auto` reads GitHub's REST API, so a window from before the records is never read as empty. A record is turned into the REST-shaped job the rest of the
 tool reads, so every row below is decided by one code path. What differs from reading GitHub:
 
 - `gate job` still reads Blacksmith's side from GitHub: one listing of the baseline window and the jobs of a spread sample of at most
