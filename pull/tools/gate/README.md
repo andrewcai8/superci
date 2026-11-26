@@ -54,10 +54,11 @@ the gap, so add runs. Nothing is rounded toward either verdict.
 `gate job <job> --canary` prints the rows, then `canary <job>: KEEP` (exit 0) or `ROLL BACK (reasons)` (exit 3). A canary rolls
 back on harm to superci's own jobs, judged against Blacksmith over the same window, and on nothing else:
 
-- a FAIL of wall p50, wall p90, queue wait p50, queue wait p90 or failures. The speed rows count once n passes, since two
-  runs make no p90; the failures row counts from the first run. NOISE asks for runs and rolls nothing back;
+- a FAIL of wall p50, wall p90, queue wait p50, queue wait p90 or failures. A p50 row counts once n passes (5 runs) and a
+  p90 row at 20 runs, since a p90 of six runs is one job; the failures row counts from the first run. NOISE asks for runs
+  and a row with no Blacksmith runs to compare has no verdict: neither rolls anything back;
 - one of `superci-pull-oldest-job-wait`, `-jobs-stalled`, `-listener-down` or `-spend-capped` in ALARM: each means a
-  superci job is not being served.
+  superci job is not being served. These are the plane's, so they send back every job listed.
 
 `superci-pull-registration-refusals` is not on the list. GitHub's cap of 1,500 registrations in 5 minutes is the
 organization's, and a job moved from Blacksmith takes one registration on either fleet, so a refusal says the organization
@@ -65,8 +66,10 @@ is at the cap, not that superci harmed a job. It pages and is counted. If the re
 queue-wait rows and `superci-pull-oldest-job-wait` see it. In canary 4b's minutes over the cap (Nov 26 16:11-16:20Z, the
 organization at 5.03-5.30/s) superci's test-go waited 1-2 s and Blacksmith's 4 vCPU jobs p50 7 s, p90 19 s.
 
-`canary.sh SINCE UNTIL JOB...` runs the check for each job SUPERCI_JOBS still lists, every 15 minutes, until UNTIL. It
-removes a job that gets ROLL BACK from SUPERCI_JOBS, and leaves the other jobs listed.
+`canary.sh SINCE UNTIL JOB...` runs the check for each job SUPERCI_JOBS still lists, every 15 minutes, until UNTIL, with
+Blacksmith's side the 24 h before SINCE (`--baseline-until`), so a job that left Blacksmith still has a baseline. It
+removes a job that gets ROLL BACK from SUPERCI_JOBS, and leaves the other jobs listed. `WORKFLOW` names the jobs' workflow
+file (lint-test-backend.yml by default). A check that crashes exits 1 and rolls nothing back: read its output file.
 
 ## gate 2: `gate scale`
 

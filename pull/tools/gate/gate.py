@@ -56,6 +56,7 @@ SIZES = (2, 4, 8, 16, 32)
 # registration on either fleet, so a refusal (superci-pull-registration-refusals) pages and is counted, and moves nothing.
 ROLLBACK_ROWS = ("wall p50", "wall p90", "queue wait p50", "queue wait p90", "failures (superci)")
 ROLLBACK_ALARMS = ("superci-pull-oldest-job-wait", "superci-pull-jobs-stalled", "superci-pull-listener-down", "superci-pull-spend-capped")
+CANARY_P90_RUNS = 20  # a p90 of fewer runs is one job: one outlier must not send a job back
 ROLLBACK, KEEP = 3, 0
 
 
@@ -241,14 +242,17 @@ def evaluate_job(S, B, ceiling, unexplained, min_runs=MIN_RUNS):
 
 
 def canary_verdict(rows, alarms):
-    """The reasons a live canary must go back to Blacksmith, from gate 1's rows and the alarm states; empty keeps it. A speed
-    row counts only once n passes (a handful of runs is not a p90), and only as FAIL (NOISE asks for runs, not a rollback);
-    the failures row counts from the first run. Of the alarms only ROLLBACK_ALARMS count: each is a superci job not served."""
+    """The reasons a live canary must go back to Blacksmith, from gate 1's rows and the alarm states; empty keeps it. A p50 row
+    counts once n passes and a p90 row once there are CANARY_P90_RUNS runs, each only as FAIL (NOISE asks for runs, not a
+    rollback), and never when Blacksmith had no runs to compare with; the failures row counts from the first run. Of the
+    alarms only ROLLBACK_ALARMS count: each is a superci job not served, so it sends back every job listed."""
     by = {r.name: r for r in rows}
-    enough = "n (superci runs)" in by and by["n (superci runs)"].status == PASS
-    judged = [n for n in ROLLBACK_ROWS if enough or n == "failures (superci)"]
-    return ([f"{n}: {by[n].value} vs {by[n].threshold}" for n in judged if n in by and by[n].status == FAIL]
-            + [f"{n} in ALARM" for n in ROLLBACK_ALARMS if alarms.get(n) == "ALARM"])
+    n = by.get("n (superci runs)")
+    runs = int(n.value) if n and n.value.isdigit() else 0
+    need = {"wall p50": MIN_RUNS, "queue wait p50": MIN_RUNS, "wall p90": CANARY_P90_RUNS, "queue wait p90": CANARY_P90_RUNS, "failures (superci)": 0}
+    harmed = [r for r in (by.get(k) for k in ROLLBACK_ROWS) if r and r.status == FAIL and runs >= need[r.name] and not r.note.startswith("no Blacksmith runs")]
+    return ([f"{r.name}: {r.value} vs {r.threshold}" for r in harmed]
+            + [f"{a} in ALARM" for a in ROLLBACK_ALARMS if alarms.get(a) == "ALARM"])
 
 
 def parse_limits(text):

@@ -4,7 +4,9 @@
 # GitHub's read budget is shared, so never under 600), each check only while at least 1,500 reads remain. Stops at UNTIL.
 #
 #   pull/tools/gate/canary.sh SINCE UNTIL JOB...      # SINCE: when SUPERCI_JOBS listed the jobs; UNTIL: the end of the watch
-#   EVERY=900 LIMITS=ci-limits.tsv LOG=dir pull/tools/gate/canary.sh ...
+#   EVERY=900 WORKFLOW=lint-test-backend.yml LIMITS=ci-limits.tsv LOG=dir pull/tools/gate/canary.sh ...
+#
+# Blacksmith's side is the 24 h before SINCE, when the jobs still ran there.
 set -uo pipefail
 R=Authentic-Intelligence/megpt-mono
 here=$(cd "$(dirname "$0")" && pwd)
@@ -27,8 +29,9 @@ while [ "$(date -u +%s)" -lt "$(date -u -d "$until" +%s)" ]; do
     jq -e --arg j "$job" 'index($j) != null' <<<"$listed" >/dev/null || continue
     left=$(gh api rate_limit --jq .resources.core.remaining)
     [ "$left" -ge 1500 ] || { echo "$(date -u +%TZ) $job: skipped, $left GitHub reads left"; continue; }
-    out="$log/canary-$job-$(date -u +%H%M).txt"
-    python3 -B "$here/gate.py" --profile ci-runners job "$job" --branch-glob '*' --since "$since" --canary ${LIMITS:+--limits "$LIMITS"} >"$out" 2>&1
+    out="$log/canary-${job//[^A-Za-z0-9._-]/_}-$(date -u +%H%M).txt"
+    python3 -B "$here/gate.py" --profile ci-runners job "$job" --workflow "${WORKFLOW:-lint-test-backend.yml}" --branch-glob '*' --since "$since" \
+      --baseline-until "$since" --canary ${LIMITS:+--limits "$LIMITS"} >"$out" 2>&1
     code=$?
     echo "$(date -u +%TZ) $job: $(grep -E '^canary ' "$out" || tail -1 "$out") (exit $code, $out)"
     [ $code -eq 3 ] && remove "$job"

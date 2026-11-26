@@ -205,12 +205,22 @@ class Canary(unittest.TestCase):
         self.assertEqual(G.canary_verdict(rows, alarms), [])
 
     def test_a_job_slower_than_blacksmith_rolls_back(self):
-        rows = list(judge(fleet(spread_around(140, 2, 10), spread_around(1, 0.2, 10))).values())
+        rows = list(judge(fleet(spread_around(140, 2, 20), spread_around(1, 0.2, 20))).values())
         self.assertEqual([r.split(":")[0] for r in G.canary_verdict(rows, self.QUIET)], ["wall p50", "wall p90"])
 
     def test_a_queue_wait_past_blacksmiths_rolls_back(self):
-        rows = list(judge(fleet(spread_around(80, 2, 10), spread_around(30, 1, 10))).values())
+        rows = list(judge(fleet(spread_around(80, 2, 20), spread_around(30, 1, 20))).values())
         self.assertEqual([r.split(":")[0] for r in G.canary_verdict(rows, self.QUIET)], ["queue wait p50", "queue wait p90"])
+
+    def test_one_slow_job_among_few_sends_nothing_back(self):
+        rows = list(judge(fleet([80.0] * 5 + [200.0], [1.0] * 6)).values())
+        self.assertEqual(rows_by_name(rows)["wall p90"].status, G.FAIL)
+        self.assertEqual(G.canary_verdict(rows, self.QUIET), [])
+
+    def test_no_blacksmith_runs_to_compare_sends_nothing_back(self):
+        rows = list(judge(fleet(spread_around(80, 2, 20), spread_around(1, 0.2, 20)), base=[]).values())
+        self.assertEqual(rows_by_name(rows)["wall p50"].status, G.FAIL)
+        self.assertEqual(G.canary_verdict(rows, self.QUIET), [])
 
     def test_every_harm_alarm_rolls_back(self):
         rows = list(judge(Gate1().good()).values())
