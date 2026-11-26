@@ -17,11 +17,27 @@ func TestTheBuiltInConfigHasEverySize(t *testing.T) {
 	}
 	for _, label := range []string{"superci-2cpu", "superci-4cpu", "superci-8cpu", "superci-16cpu", "superci-32cpu"} {
 		s, ok := c.Sizes[label]
-		if !ok || len(s.Types) < 10 {
-			t.Fatalf("%s: %+v, want 10 or more types", label, s)
+		if !ok || len(s.Types) < 3 {
+			t.Fatalf("%s: %+v, want 3 or more types", label, s)
 		}
 		if _, ok := c.Pools[label]; !ok {
 			t.Fatalf("%s has no pool bounds", label)
+		}
+	}
+}
+
+// unit-tests' heaviest leg peaks at 11.3 GB on Blacksmith's 16 GB 4 vCPU runner, and the kernel ended it at 6.2 GB on a
+// c8a.xlarge (8 GB) in 5 of 5 runs: a 4 or 8 vCPU machine has 4 GiB a vCPU (m) or more (r), as Blacksmith's do.
+func TestTheFourAndEightCPUSizesHaveBlacksmithsMemory(t *testing.T) {
+	c, err := LoadConfig("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, label := range []string{"superci-4cpu", "superci-8cpu"} {
+		for _, ty := range c.Sizes[label].Types {
+			if ty[0] != 'm' && ty[0] != 'r' {
+				t.Errorf("%s lists %s, which has less than 4 GiB a vCPU", label, ty)
+			}
 		}
 	}
 }

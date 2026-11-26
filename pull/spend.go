@@ -33,7 +33,7 @@ type Spend struct {
 }
 
 const (
-	onDemandPerVCPUHour = 0.058            // m7a's list price, at the top of the types used
+	onDemandPerVCPUHour = 0.155            // m8azn.3xlarge's list price ($1.24) over the 8 vCPUs of the set it serves, the most of the types used
 	gp3PerGBHour        = 0.08 / 730       // storage
 	gp3ExtraPerHour     = 125 * 0.04 / 730 // 250 MB/s is 125 above the free 125; 3,000 IOPS are free
 	ipv4PerHour         = 0.005            // every machine has a public IPv4 address (the default subnets give one)

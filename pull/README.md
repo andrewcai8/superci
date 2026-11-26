@@ -22,8 +22,8 @@ superci-pull: one process on one c7g.large, an Auto Scaling group of one in us-e
   sessions  : one message session per set; a message is acknowledged only after it is handled
   budget    : one registration budget for every set, inside what GitHub leaves the organization (below)
   launcher  : per set, desired = min(max, assigned + waiting + pool); launches desired - live as instant EC2 Fleets
-              of at most 250, capacity-optimized-prioritized over the size's 12 types (listed fastest first: c8a and
-              m8a, then c8i, m8i, c7a and m7a, then four older families for capacity) x every zone of us-east-1 that
+              of at most 250, capacity-optimized-prioritized over the size's types, listed fastest first (4 and 8 vCPU: m8azn,
+              then m8a and r8a; the others: c8a and m8a, then c8i, m8i, c7a and m7a, then older families) x every zone of us-east-1 that
               offers them (5 of 6: use1-az3 offers none) at weight 2 and of us-east-2 (3 of 3) at weight 1; a
               region's spot shortfall goes to the other, then on-demand, at most 10% of the last half hour's
               launches; a ClientToken on every call
@@ -250,12 +250,12 @@ A push's jobs arrive together, so it is warm more often than independent jobs wo
 | Label | Types | Max machines | Disk |
 | --- | --- | --- | --- |
 | superci-2cpu | 18 `.large` of c5, c5a, c6a, c6i, c7a, c7i, c7i-flex, c8a, c8i, m5, m5a, m6a, m6i, m7a, m7i, m7i-flex, m8a, m8i | 600 | 40 GB |
-| superci-4cpu | the same 18 at `.xlarge` | 1,200 | 60 GB |
-| superci-8cpu | `.2xlarge` | 600 | 80 GB |
+| superci-4cpu | m8azn.xlarge (5 GHz), m8a.xlarge, r8a.xlarge | 1,200 | 60 GB |
+| superci-8cpu | m8azn.3xlarge (12 vCPU, 5 GHz), m8a.2xlarge, r8a.2xlarge | 600 | 80 GB |
 | superci-16cpu | `.4xlarge` | 100 | 120 GB |
 | superci-32cpu | 17 `.8xlarge` (no c5) | 50 | 150 GB |
 
-Memory is 2 GiB per vCPU (c families) or 4 (m families). One set hands out about 15 jobs a second; `"split": K`
+Memory is 2 GiB per vCPU (c families), 4 (m) or 8 (r); the 4 and 8 vCPU sizes have 4 or more, as Blacksmith's runners do, since a unit-test leg needs 11 GB on 4 vCPUs. The root grows to the disk at boot: the image's own cloud-init does not grow it. One set hands out about 15 jobs a second; `"split": K`
 runs a size as K sets (`superci-4cpu`, `superci-4cpu-2`, …), each carrying the size's label, and GitHub spreads the
 label's jobs across them (measured below). A split changes at the next start. A set the config no longer has is
 drained first: its session asks for no job (max 0), its machines end as their jobs complete or as idle supply, and

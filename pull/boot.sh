@@ -36,6 +36,18 @@ mark boot.start "$(cut -d' ' -f1 /proc/uptime)"
 # 20% waited on the volume's 250 MB/s; nothing on a one-job machine needs its writes on disk soon.
 printf '%s\n' kernel.apparmor_restrict_unprivileged_userns=0 kernel.apparmor_restrict_unprivileged_unconfined=0 net.ipv4.ip_local_reserved_ports=50000-59999 vm.dirty_ratio=50 > /etc/sysctl.d/99-superci.conf
 sysctl -eqp /etc/sysctl.d/99-superci.conf || :
+# The image's cloud-init leaves out growpart, so its root stays the 29 GB it was built at (7 GB free) on any volume: a
+# hydrated machine ran out of space restoring the Swift toolchain. It grows to the volume in the background (about 1 s).
+# ext4 writes a file out at once when it is renamed over another (auto_da_alloc): the worker-boundary tests' facts cache
+# does that 27,000 times, which took 36 s on the volume's 3,000 IOPS and 11 s without it. A one-job machine needs no file
+# to survive a crash.
+disk() {
+  local root
+  root=$(findmnt -no SOURCE /)
+  mount -o remount,noauto_da_alloc /
+  ( growpart "/dev/$(lsblk -no PKNAME "$root")" "${root##*[!0-9]}" && resize2fs "$root" ) > /dev/null 2>&1 &
+}
+disk
 usermod -aG docker runner 2> /dev/null || :
 # First reads from a new volume are slow one at a time: the runner's own files are read 64 at a time first.
 find /home/runner/bin -type f -print0 2> /dev/null | xargs -0 -r -P 64 -n 16 cat &> /dev/null
@@ -48,6 +60,13 @@ T=$(curl -s -m 2 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600' http://
 # The actions cache (pull/cache): starts its daemon from the region's cache bucket and wraps the runner's Node; a machine without the role runs on GitHub's own cache.
 mark cache.start
 CR=$(curl -s -m 2 -H "X-aws-ec2-metadata-token: $T" http://169.254.169.254/latest/meta-data/placement/region); PB=superci-pull-cache-243891825325-$CR; aws s3 cp --only-show-errors --region "$CR" "s3://$PB/bin/up.sh" - 2> /dev/null | PULLCACHE_BUCKET=$PB bash || :
+# The image's apt goes to archive.ubuntu.com and security.ubuntu.com over HTTPS: from EC2 that hung for 120 s or failed in
+# 2 of 5 fresh updates (a Swift job's native packages, hermetic's Chromium), where the region's EC2 mirror took 4 s each time.
+mirror() {
+  [ -n "$1" ] || return 0
+  sed -i "s|https://archive.ubuntu.com/ubuntu/|http://$1.ec2.archive.ubuntu.com/ubuntu/|; s|https://security.ubuntu.com/ubuntu/|http://$1.ec2.archive.ubuntu.com/ubuntu/|" "${2:-/etc/apt/sources.list.d/ubuntu.sources}"
+}
+mirror "$CR"
 mark cache.up
 # Hydration (pull/README.md): with a manifest for this label, main's caches are unpacked in the background while the machine
 # asks for its runner and waits for its job, which takes them by rename. The runner's job-started hook stops it when the job starts.
