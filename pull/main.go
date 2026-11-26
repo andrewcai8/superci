@@ -772,7 +772,7 @@ func (l *Listener) reconciler(ctx context.Context, refresh func(context.Context,
 				tlRetired(s.spec.Name, m, "overdue", now)
 			}
 			if s.fleet != nil {
-				for _, m := range s.state.Recycle(s.fleet.Versions(), recycleBatch) {
+				for _, m := range s.state.Recycle(now, s.fleet.Versions(), recycleBatch) {
 					tlRetired(s.spec.Name, m, "recycle", now)
 				}
 			}

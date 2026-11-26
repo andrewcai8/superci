@@ -462,33 +462,38 @@ func (f *Fleet) Describe(ctx context.Context, r *Region) ([]*Machine, error) {
 		}
 		for _, res := range page.Reservations {
 			for _, i := range res.Instances {
-				m := &Machine{ID: aws.ToString(i.InstanceId), Region: r.Name, IP: aws.ToString(i.PublicIpAddress), Type: string(i.InstanceType),
-					Lifecycle: "on-demand", Launched: aws.ToTime(i.LaunchTime)}
-				if i.InstanceLifecycle == ec2types.InstanceLifecycleTypeSpot {
-					m.Lifecycle = "spot"
-				}
-				if i.Placement != nil {
-					m.AZ = aws.ToString(i.Placement.AvailabilityZone)
-				}
-				for _, t := range i.Tags {
-					switch aws.ToString(t.Key) {
-					case "superci-pull-round":
-						m.Round = aws.ToString(t.Value)
-					case "superci-pull-set":
-						m.Set = aws.ToString(t.Value)
-					case tagIssued:
-						m.Issued, m.Tagged = true, true
-					case tagNoticed:
-						m.Notice = true
-					case "aws:ec2launchtemplate:version":
-						m.Template = aws.ToString(t.Value)
-					}
-				}
-				out = append(out, m)
+				out = append(out, listedMachine(i, r.Name))
 			}
 		}
 	}
 	return out, nil
+}
+
+// listedMachine is what a listing says of one of our instances in a region.
+func listedMachine(i ec2types.Instance, region string) *Machine {
+	m := &Machine{ID: aws.ToString(i.InstanceId), Region: region, IP: aws.ToString(i.PublicIpAddress), Type: string(i.InstanceType),
+		Lifecycle: "on-demand", Launched: aws.ToTime(i.LaunchTime)}
+	if i.InstanceLifecycle == ec2types.InstanceLifecycleTypeSpot {
+		m.Lifecycle = "spot"
+	}
+	if i.Placement != nil {
+		m.AZ = aws.ToString(i.Placement.AvailabilityZone)
+	}
+	for _, t := range i.Tags {
+		switch aws.ToString(t.Key) {
+		case "superci-pull-round":
+			m.Round = aws.ToString(t.Value)
+		case "superci-pull-set":
+			m.Set = aws.ToString(t.Value)
+		case tagIssued:
+			m.Issued, m.Tagged = true, true
+		case tagNoticed:
+			m.Notice = true
+		case "aws:ec2launchtemplate:version":
+			m.Template = aws.ToString(t.Value)
+		}
+	}
+	return m
 }
 
 // TagIssued records on EC2 that machines of a region were issued their runner. Every machine of one call gets the

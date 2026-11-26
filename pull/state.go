@@ -993,11 +993,13 @@ func (s *State) Overdue(now time.Time, jobMax, idleMax, lifeMax time.Duration) (
 // Recycle replaces, at most limit a pass, the idle machines that booted from an older version of their region's launch
 // template than current names: a release changed what a machine runs at boot, and a job should not be judged on the old.
 // An idle runner retires (removed first, fenced by GitHub, then the machine ends), a machine with no runner yet ends, and
-// a busy one finishes its job. Retired machines are no supply, so the pool launches their replacements at once.
-func (s *State) Recycle(current map[string]string, limit int) (out []*Machine) {
+// a busy one finishes its job. Retired machines are no supply, so the pool launches their replacements at once; nothing is
+// recycled while no replacement could launch (a lost session, a spend cap) or while jobs wait for the runners there are,
+// and a runner issued in the last recycleHold may be about to take a job.
+func (s *State) Recycle(now time.Time, current map[string]string, limit int) (out []*Machine) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.ready() {
+	if !s.ready() || !s.leased(now) || s.capped || s.waitingJobs() > s.idleRunners() {
 		return nil
 	}
 	for _, m := range s.machines {
@@ -1008,7 +1010,7 @@ func (s *State) Recycle(current map[string]string, limit int) (out []*Machine) {
 			continue
 		}
 		switch r := m.Runner; {
-		case r != nil && !r.Busy && !r.Removing && r.ID != 0:
+		case r != nil && !r.Busy && !r.Removing && r.ID != 0 && now.Sub(r.Issued) > recycleHold:
 			m.Retire = true
 		case r == nil && !m.Issued:
 			m.Ending = true
@@ -1019,6 +1021,9 @@ func (s *State) Recycle(current map[string]string, limit int) (out []*Machine) {
 	}
 	return out
 }
+
+// recycleHold is how long a newly issued runner is left to take the job it may have been registered for.
+const recycleHold = 20 * time.Second
 
 // Surplus retires idle runners once the supply has exceeded what the queue asks for for a while (the queue's
 // statistics lag its messages by a moment), and not in the first warmup after a start, while the arrival rate (and so
