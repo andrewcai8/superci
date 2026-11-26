@@ -210,6 +210,7 @@ MUTANTS = [
     ("fleet 4cpu asks no type on demand first", "config.json", '"on_demand_first": 1', '"on_demand_first": 0', "TestSuperci4cpuAsksM8aznOnDemandBeforeASlowerSpotType"),
     ("fleet the fast types skip on demand", "fleet.go", '\t\tgot = append(got, sf.onDemand(ctx, round, "fast-", n-len(got), n, fast)...)\n', "", "TestSuperci4cpuAsksM8aznOnDemandBeforeASlowerSpotType"),
     ("fleet the share bounds no size", "fleet.go", 'sf.onDemand(ctx, round, "", n-len(got), odRoom, rest)', 'sf.onDemand(ctx, round, "", n-len(got), n, rest)', "TestASizeWithoutOnDemandFirstKeepsOnDemandUnderItsShare"),
+    ("fleet the share-bounded ask repeats the fast types", "fleet.go", 'sf.onDemand(ctx, round, "", n-len(got), odRoom, rest)', 'sf.onDemand(ctx, round, "", n-len(got), odRoom, sf.spec.Types)', "TestTheShareBoundedAskLeavesOutTheTypesAlreadyAskedOnDemand"),
     ("fleet on_demand_first past the types is accepted", "config.go", "s.OnDemandFirst < 0 || s.OnDemandFirst > len(s.Types)", "s.OnDemandFirst < 0", "TestOnDemandFirstPastTheSizesTypesIsRefused"),
 ]
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 
@@ -16,9 +17,10 @@ import (
 // capacity stands in for one region's EC2: how many machines of each (type, spot or on-demand) it will still start. A
 // fleet takes its overrides in priority order, as capacity-optimized-prioritized and prioritized do when capacity allows.
 type capacity struct {
-	mu   sync.Mutex
-	left map[string]int // "<type>/<spot|on-demand>"
-	n    int
+	mu    sync.Mutex
+	left  map[string]int // "<type>/<spot|on-demand>"
+	n     int
+	asked []string // "<kind> <types...>" of each call
 }
 
 func (c *capacity) CreateFleet(_ context.Context, in *ec2.CreateFleetInput, _ ...func(*ec2.Options)) (*ec2.CreateFleetOutput, error) {
@@ -29,6 +31,11 @@ func (c *capacity) CreateFleet(_ context.Context, in *ec2.CreateFleetInput, _ ..
 		kind = "on-demand"
 	}
 	pools := slices.Clone(in.LaunchTemplateConfigs[0].Overrides)
+	call := kind
+	for _, p := range pools {
+		call += " " + string(p.InstanceType)
+	}
+	c.asked = append(c.asked, call)
 	sort.SliceStable(pools, func(i, j int) bool { return aws.ToFloat64(pools[i].Priority) < aws.ToFloat64(pools[j].Priority) })
 	want := int(aws.ToInt32(in.TargetCapacitySpecification.TotalTargetCapacity))
 	out := &ec2.CreateFleetOutput{}
@@ -105,6 +112,21 @@ func TestSuperci4cpuFallsToSlowerSpotOnlyWhenM8aznIsOutEntirely(t *testing.T) {
 	got := shapes(launchSet(t, "superci-4cpu", out, maps(out)).Launch(context.Background(), "r1", 6, 0))
 	if want := map[string]int{"m8a.xlarge/spot": 4, "r8a.xlarge/spot": 2}; !sameShapes(got, want) {
 		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
+func TestTheShareBoundedAskLeavesOutTheTypesAlreadyAskedOnDemand(t *testing.T) {
+	east := &capacity{left: map[string]int{"m8azn.xlarge/on-demand": 2, "m8a.xlarge/on-demand": 100}}
+	sf := launchSet(t, "superci-4cpu", map[string]int{}, map[string]int{})
+	sf.fleet.regions[0].fleets, sf.fleet.regions[1].fleets = east, &capacity{left: map[string]int{}}
+	got := shapes(sf.Launch(context.Background(), "r1", 6, 3))
+	if want := map[string]int{"m8azn.xlarge/on-demand": 2, "m8a.xlarge/on-demand": 3}; !sameShapes(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for _, call := range east.asked {
+		if strings.HasPrefix(call, "on-demand") && strings.Contains(call, "m8a.xlarge") && strings.Contains(call, "m8azn") {
+			t.Fatalf("the share-bounded ask named m8azn again: %q (calls %q)", call, east.asked)
+		}
 	}
 }
 
