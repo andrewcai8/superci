@@ -76,6 +76,8 @@ func TestListenerEventsMatchSchema(t *testing.T) {
 			JobCompletedMessages: []*scaleset.JobCompleted{{Result: "Succeeded", RunnerID: 3, RunnerName: "superci-4cpu-i-0abc", JobMessageBase: jobBase}},
 		}, now)
 		tlAcquired("superci-4cpu", []int64{7}, now)
+		tlJobRecord(newJobRecord("superci-4cpu", &scaleset.JobCompleted{Result: "Succeeded", RunnerName: "superci-4cpu-i-0abc", JobMessageBase: jobBase}, &Machine{ID: "i-0abc", Launched: now.Add(-time.Minute)},
+			func(Machine) float64 { return 0.4 }, began{}), now)
 		tlLaunched("superci-4cpu", "r-1", "spot", now.Add(-2*time.Second), []*Machine{{ID: "i-0abc", Region: "us-east-1", AZ: "us-east-1b", Type: "c7i.xlarge", Lifecycle: "spot"}})
 		tlEnded("us-east-1", "idle", []string{"i-0abc"}, now)
 		tlAsk("superci-4cpu", "i-0abc", Wait, "tokens", now)

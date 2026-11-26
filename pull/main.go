@@ -228,6 +228,9 @@ func run(ctx context.Context, f flags) error {
 		slog.Warn("draining scale set the config no longer has", "name", d.Name, "id", d.ID)
 		l.sets = append(l.sets, &Set{spec: SetSpec{Name: d.Name}, id: d.ID, state: NewState(d.Name, 0, 0, regions, now), drain: true})
 	}
+	for _, s := range l.sets {
+		s.state.SetPricer(l.spend.Price)
+	}
 	poolParam := poolParamName(f.poolParam, cfg.Deployment)
 	if err := loadPools(ctx, ssmc, poolParam, l.sets, cfg.Pool.window(), now); err != nil {
 		slog.Error("load pools", "err", err.Error())
@@ -548,8 +551,11 @@ func (s *scaler) Scale(ctx context.Context, msg *scaleset.RunnerScaleSetMessage)
 		slog.Info("acquired", "set", s.set.spec.Name, "asked", len(ids), "got", len(got))
 		tlAcquired(s.set.spec.Name, got, time.Now())
 	}
-	s.set.state.Observe(msg, time.Now())
+	done := s.set.state.Observe(msg, time.Now())
 	tlMessage(s.set.spec.Name, msg, time.Now())
+	for _, r := range done {
+		tlJobRecord(r, time.Now())
+	}
 	if msg == nil {
 		return nil
 	}
