@@ -23,6 +23,14 @@ JOBS_QUERY = (
     "| stats count(*) as jobs, sum(e-s)/60000 as minutes by datefloor(fromMillis(s), 1d) as day, set"
 )
 
+# One line per job from the listener's job.record events (a redelivered completion has two: min of a number that is the same
+# in both is that number): the machine's estimated cost over its life, and the part of it spent while the job ran.
+RECORDS_QUERY = (
+    'filter msg="tl" and ev="job.record" '
+    "| stats min(t_ms) as t, min(usd) as usd, min(busy_usd) as busy by job, set "
+    "| stats count(*) as jobs, sum(usd) as usd, sum(busy) as busy by datefloor(fromMillis(t), 1d) as day, set"
+)
+
 
 def vcpu_of(set_name):
     """vCPUs of a scale set from its name: superci-<cpu>cpu or superci-<cpu>cpu-<k>. The listener has also logged
@@ -52,10 +60,12 @@ def coverage(day, since):
     return "partial" if day == since[:10] else "none"
 
 
-def build_rows(days, ce, blacksmith, superci, since=None, price=BLACKSMITH_USD_PER_VCPU_MIN):
+def build_rows(days, ce, blacksmith, superci, since=None, price=BLACKSMITH_USD_PER_VCPU_MIN, records=None):
     """ce: {day: {service: usd}}; blacksmith: {day: list usd}; superci: {day: {set: (jobs, wall minutes)}}; since: when the
     listener's job events begin, None if it has none. Avoided Blacksmith spend is what the superci jobs' vCPU-minutes would
-    have cost at Blacksmith's list price; a day before `since` has no job-minutes to price, so it has no avoided and no net."""
+    have cost at Blacksmith's list price; a day before `since` has no job-minutes to price, so it has no avoided and no net.
+    records: {day: {set: (jobs, est usd, busy usd)}} from the listener's job records: the machines' estimated cost of the day's
+    jobs, with the share spent outside the job (boot and idle) split out, set against what Cost Explorer billed."""
     rows = []
     for day in days:
         services = ce.get(day, {})
@@ -69,6 +79,8 @@ def build_rows(days, ce, blacksmith, superci, since=None, price=BLACKSMITH_USD_P
                 unmapped += m
             else:
                 vcpu_minutes += v * m
+        rec = list(records.get(day, {}).values()) if records else []
+        rec_jobs, est, busy = sum(r[0] for r in rec), sum(r[1] for r in rec), sum(r[2] for r in rec)
         cov = coverage(day, since)
         avoided = vcpu_minutes * price if cov != "none" else None
         factor = invoice_factor(day)
@@ -87,6 +99,12 @@ def build_rows(days, ce, blacksmith, superci, since=None, price=BLACKSMITH_USD_P
             "net_invoice_usd": None if avoided is None else avoided * factor - cost,
             "invoice_factor": factor,
             "superci_usd_per_job_minute": cost / minutes if minutes and cov == "full" else None,
+            "record_jobs": int(rec_jobs),
+            "record_usd": est if rec_jobs else None,
+            "record_idle_usd": est - busy if rec_jobs else None,
+            "record_idle_share": (est - busy) / est if rec_jobs and est else None,
+            "record_usd_per_job": est / rec_jobs if rec_jobs else None,
+            "record_share_of_bill": est / cost if rec_jobs and cost else None,
         })
     return rows
 
@@ -164,6 +182,20 @@ def read_jobs(env, start, end):
     return jobs, since
 
 
+def read_records(env, start, end):
+    t0 = int(dt.datetime.fromisoformat(start).replace(tzinfo=dt.timezone.utc).timestamp())
+    t1 = int(dt.datetime.fromisoformat(end).replace(tzinfo=dt.timezone.utc).timestamp())
+    out = {}
+    for f in run_query(env, t0, t1, RECORDS_QUERY):
+        day = f["day"][:10]
+        try:
+            dt.date.fromisoformat(day)
+        except ValueError:
+            sys.exit(f"logs query gave a day key that is not a date: {f['day']!r}")
+        out.setdefault(day, {})[f["set"]] = (int(f["jobs"]), float(f.get("usd") or 0), float(f.get("busy") or 0))
+    return out
+
+
 def fmt(v, spec):
     return "-" if v is None else format(v, spec)
 
@@ -182,6 +214,15 @@ def render(rows, today):
     lines.append(f"{'total':<11}{t('superci_usd'):>9.2f}{(format(t('blacksmith_list_usd'), '.0f') if all(r['blacksmith_list_usd'] is not None for r in rows) else '-'):>11}"
                  f"{t('jobs'):>7}{t('job_minutes'):>9.0f}{t('vcpu_minutes'):>10.0f}{sum(r['avoided_list_usd'] or 0 for r in rows):>9.2f}{sum(r['net_list_usd'] or 0 for r in rows):>10.2f}{sum(r['net_invoice_usd'] or 0 for r in rows):>10.2f}")
     unmapped = t("unmapped_minutes")
+    if any(r["record_jobs"] for r in rows):
+        lines += ["", "the listener's job records (its own estimate of each job's machine, boot to finish, idle split out):",
+                  f"{'day (UTC)':<11}{'jobs':>7}{'est $':>9}{'idle $':>9}{'idle':>6}{'$/job':>8}{'of bill':>9}"]
+        for r in rows:
+            if r["record_jobs"]:
+                lines.append(f"{r['day']:<11}{r['record_jobs']:>7}{r['record_usd']:>9.2f}{r['record_idle_usd']:>9.2f}{na(r['record_idle_share'] and 100 * r['record_idle_share'], '5.0f'):>5}%"
+                             f"{r['record_usd_per_job']:>8.3f}{na(r['record_share_of_bill'] and 100 * r['record_share_of_bill'], '8.0f'):>8}%")
+        lines += ["est = the machine's price x its life from launch to the job's finish, summed over the day's finished jobs; idle = the part outside the job. "
+                  "of bill = est / Cost Explorer's superci: the rest is machines that never took a job (the pool's idle floor, boots that failed), disks left, transfer."]
     lines += ["", "* today, partial: Cost Explorer lags and the day is not over.",
               "~ the listener's job events begin during this day, so job-min and avoided cover only its later hours while superci covers all 24; net is not a day's net. n/a: the day is before the first job event, so its job-minutes are unreadable here.",
               "total's avoided and net add the days with job events, the `~` day among them (its superci is the whole day); its superci and blacksmith add every day, blacksmith `-` if a day has no row.",
@@ -206,7 +247,7 @@ def main(argv=None):
     stop = (last + dt.timedelta(days=1)).isoformat()
     env = aws_env(a.profile)
     jobs, since = read_jobs(env, days[0], stop)
-    rows = build_rows(days, read_ce(env, days[0], stop), read_blacksmith(days[0], stop), jobs, since)
+    rows = build_rows(days, read_ce(env, days[0], stop), read_blacksmith(days[0], stop), jobs, since, records=read_records(env, days[0], stop))
     print(json.dumps(rows, indent=1) if a.json else render(rows, dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")))
 
 

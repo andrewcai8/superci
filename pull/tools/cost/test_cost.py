@@ -60,6 +60,34 @@ class Rows(unittest.TestCase):
         r = C.build_rows(["2026-11-20"], {"2026-11-20": {}}, {}, {}, "2026-11-01T00:00:00Z")[0]
         self.assertEqual((r["superci_usd"], r["superci_usd_per_job_minute"], r["net_list_usd"], r["blacksmith_list_usd"]), (0, None, 0, None))
 
+class Records(unittest.TestCase):
+    def rows(self, records):
+        day = "2026-11-26"
+        return C.build_rows([day], {day: {"EC2": 100.0}}, {}, {day: {"superci-4cpu": (10, 100.0)}}, "2026-11-01T00:00:00Z", records=records)[0]
+
+    def test_the_records_price_a_job_and_split_the_idle_from_the_busy_share(self):
+        r = self.rows({"2026-11-26": {"superci-4cpu": (30, 40.0, 25.0), "superci-8cpu": (10, 20.0, 15.0)}})
+        self.assertEqual(r["record_jobs"], 40)
+        self.assertAlmostEqual(r["record_usd"], 60.0)
+        self.assertAlmostEqual(r["record_idle_usd"], 20.0)
+        self.assertAlmostEqual(r["record_idle_share"], 1 / 3)
+        self.assertAlmostEqual(r["record_usd_per_job"], 1.5)
+        self.assertAlmostEqual(r["record_share_of_bill"], 0.6)
+
+    def test_a_day_with_no_records_has_no_estimate_and_the_table_leaves_it_out(self):
+        r = self.rows({})
+        self.assertEqual((r["record_jobs"], r["record_usd"], r["record_idle_share"], r["record_usd_per_job"]), (0, None, None, None))
+        self.assertNotIn("job records", C.render([r], "x"))
+
+    def test_the_rendering_names_the_records_and_the_bill_they_cover(self):
+        out = C.render([self.rows({"2026-11-26": {"superci-4cpu": (30, 40.0, 25.0)}})], "x")
+        self.assertIn("the listener's job records", out)
+        self.assertRegex(out, r"2026-11-26\s+30\s+40\.00\s+15\.00\s+38%\s+1\.333\s+40%")
+
+    def test_the_query_reads_one_line_per_job(self):
+        self.assertIn('ev="job.record"', C.RECORDS_QUERY)
+        self.assertIn("by job, set", C.RECORDS_QUERY)
+
 
 if __name__ == "__main__":
     unittest.main()

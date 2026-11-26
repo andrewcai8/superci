@@ -23,6 +23,7 @@ queries (under 0.01 USD) and one `blacksmith usage`. It makes no GitHub call.
 | net(list) | avoided - superci |
 | net(inv) | the same with avoided at 50% through Nov 30, the YC discount on the invoice. Audit B read the discount; no script can |
 | $/job-min | superci / job-min, fully loaded: idle pool, boot, disks, IPv4, transfer |
+| job records table | the listener's `job.record` events: each finished job's machine, priced from launch to the job's finish, with the part outside the job (boot and idle) split out, per day; `of bill` is that estimate over Cost Explorer's superci, the rest being machines that took no job, disks and transfer. Printed once a day has records |
 
 ## Where it is not exact
 
