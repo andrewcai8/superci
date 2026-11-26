@@ -175,6 +175,26 @@ Moving a job from Blacksmith to superci moves its registration rather than addin
 fleet switch keeps the organization's total where it is. A test that adds jobs (a load test) adds registrations,
 and at the organization's measured 3.5 to 4.5 a second it has almost nothing to add them into.
 
+**Scope.** `"scope": "repository"` makes the sets at megpt-mono instead of at the organization. Their runners then
+draw on the repository's bucket, which no other runner of the organization fills. The first start at the repository
+deletes the sets of the deployment's organization group, and it refuses while one of their runners holds a job. The
+meter then reads the repository's own id sequence, so `OrgRegistrationRate` is ours alone.
+
+Why, measured on Nov 26 from 20:06 to 20:48Z:
+
+- From 19:52Z the organization held GitHub's cap. GitHub refused 53 of the listener's 1,379 asks, with `429
+  ConfigureTooManyRunnersException: You have configured more than 1500 runners within the last 5 minutes`.
+- In the same 42 minutes, 318 repository-scope registrations were made at megpt-mono. Each was deleted at once, and
+  GitHub refused none.
+- 7 of them landed within 1 s of an organization refusal, 2 within 50 ms.
+- If the buckets were one, about 3.9 refusals were expected, so 0 had a chance of about 0.02.
+- Runner ids are a sequence per scope (the organization's near 8.27 million, the repository's 250 to 577), which fits
+  a bucket per scope.
+
+At one registration per job (1.1 with the pool's spare), the repository's bucket carries every Linux job of the
+Nov 25 08Z peak at about 94% of the cap, with nothing left for growth. It is a stopgap. The end state registers rarely
+(the identity plane).
+
 **Leases.** A lane that registers runners outside the listener (a test of another runner plane) takes from the same
 cap, and a registration the budget did not know of brings GitHub's refusal nearer for the listener's own. Such a lane
 asks first, on the admin endpoint (localhost; reach it from another host through `deploy/ssh.sh`):

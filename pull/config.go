@@ -49,6 +49,10 @@ type Config struct {
 	// Only, when set, keeps just the sizes it names (and their pools): a second deployment for a test serves one label of
 	// its own, not every built-in size, which would carry the same labels as the production sets.
 	Only []string `json:"only"`
+	// Scope is where the sets register their runners: "organization" (the default) or "repository", which needs one
+	// repository. GitHub counts its 1,500 registrations in 5 minutes per scope, and the organization's bucket is the one
+	// every other runner of the organization fills.
+	Scope string `json:"scope"`
 }
 
 // SizeConfig is one runner size: the label jobs ask for is its key (superci-<cpu>cpu).
@@ -247,6 +251,15 @@ func (c Config) validate() error {
 	if c.Deployment == "" || len(c.Repositories) == 0 {
 		return errors.New("config: deployment and repositories are needed")
 	}
+	switch c.Scope {
+	case "", "organization":
+	case "repository":
+		if len(c.Repositories) != 1 {
+			return fmt.Errorf("config: scope repository needs exactly one repository, not %d", len(c.Repositories))
+		}
+	default:
+		return fmt.Errorf("config: scope %q is neither organization nor repository", c.Scope)
+	}
 	if c.DailyUSD < 0 || c.MonthlyUSD < 0 || c.OnDemand < 0 || c.OnDemand > 1 {
 		return errors.New("config: caps must not be negative, and on_demand_share is in [0, 1]")
 	}
@@ -264,6 +277,22 @@ func (c Config) validate() error {
 		return errors.New("config: job_minutes and max_age_hours must be positive")
 	}
 	return nil
+}
+
+// repository is the repository the sets register at, or "" when they register at the organization.
+func (c Config) repository() string {
+	if c.Scope == "repository" {
+		return c.Repositories[0]
+	}
+	return ""
+}
+
+// scopeURL is the GitHub URL the scale sets live under.
+func (c Config) scopeURL() string {
+	if r := c.repository(); r != "" {
+		return "https://github.com/" + c.Org + "/" + r
+	}
+	return "https://github.com/" + c.Org
 }
 
 // job is the longest a job may run: its timeout and a margin.

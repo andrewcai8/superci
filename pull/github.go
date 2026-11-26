@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -46,14 +47,15 @@ type REST struct {
 	app          App
 	installation int64
 	org          string
+	repo         string // the repository the sets register at; "" at the organization
 	http         *http.Client
 	mu           sync.Mutex
 	token        string
 	expires      time.Time
 }
 
-func NewREST(app App, installation int64, org string) *REST {
-	return &REST{app: app, installation: installation, org: org, http: &http.Client{Timeout: 30 * time.Second}}
+func NewREST(app App, installation int64, org, repo string) *REST {
+	return &REST{app: app, installation: installation, org: org, repo: repo, http: &http.Client{Timeout: 30 * time.Second}}
 }
 
 func (g *REST) tokenFor(ctx context.Context) (string, error) {
@@ -84,11 +86,15 @@ func (g *REST) tokenFor(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("installation token: %s", resp.Status)
 	}
 	var t struct {
-		Token     string    `json:"token"`
-		ExpiresAt time.Time `json:"expires_at"`
+		Token       string            `json:"token"`
+		ExpiresAt   time.Time         `json:"expires_at"`
+		Permissions map[string]string `json:"permissions"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&t); err != nil {
 		return "", err
+	}
+	if g.token == "" {
+		slog.Info("app permissions", "permissions", t.Permissions)
 	}
 	g.token, g.expires = t.Token, t.ExpiresAt
 	return g.token, nil
@@ -143,6 +149,33 @@ func (g *REST) call(ctx context.Context, method, url string, in, out any, ok ...
 		}
 	}
 	return fmt.Errorf("%s %s: %s", method, url, resp.Status)
+}
+
+// orgGroupID is the id of the organization's runner group of this name, or 0 when it has none.
+func (g *REST) orgGroupID(ctx context.Context, name string) (int, error) {
+	var list struct {
+		Groups []struct {
+			ID   int    `json:"id"`
+			Name string `json:"name"`
+		} `json:"runner_groups"`
+	}
+	if err := g.get(ctx, fmt.Sprintf("https://api.github.com/orgs/%s/actions/runner-groups?per_page=100", g.org), &list); err != nil {
+		return 0, err
+	}
+	for _, gr := range list.Groups {
+		if gr.Name == name {
+			return gr.ID, nil
+		}
+	}
+	return 0, nil
+}
+
+// OrgGroupRunners lists the runners of one of the organization's runner groups whose name starts with prefix, whatever
+// the scope the sets register at.
+func (g *REST) OrgGroupRunners(ctx context.Context, group int, prefix string) (map[string]ListedRunner, error) {
+	out, _, _, err := g.listRunners(ctx, fmt.Sprintf("https://api.github.com/orgs/%s/actions/runner-groups/%d/runners", g.org, group),
+		func(name string) bool { return strings.HasPrefix(name, prefix) })
+	return out, err
 }
 
 // RunnerGroup finds or makes the organization's runner group of this name, open to the given repositories of the
@@ -220,17 +253,26 @@ func (g *REST) listRunners(ctx context.Context, base string, keep func(name stri
 	}
 }
 
-// Runners lists every runner of a runner group whose name starts with prefix, and says how many requests it took.
+// Runners lists every runner of the sets' runner group whose name starts with prefix, and says how many requests it
+// took. At the repository a group is not listed apart: the repository's runners are.
 func (g *REST) Runners(ctx context.Context, group int, prefix string) (map[string]ListedRunner, int, error) {
-	out, _, pages, err := g.listRunners(ctx, fmt.Sprintf("https://api.github.com/orgs/%s/actions/runner-groups/%d/runners", g.org, group),
-		func(name string) bool { return strings.HasPrefix(name, prefix) })
+	base := fmt.Sprintf("https://api.github.com/orgs/%s/actions/runner-groups/%d/runners", g.org, group)
+	if g.repo != "" {
+		base = fmt.Sprintf("https://api.github.com/repos/%s/%s/actions/runners", g.org, g.repo)
+	}
+	out, _, pages, err := g.listRunners(ctx, base, func(name string) bool { return strings.HasPrefix(name, prefix) })
 	return out, pages, err
 }
 
-// OrgHead is the highest runner id among every runner the organization has registered now: a lower bound, by
-// seconds, of the last id GitHub issued, since a runner lives at least until it takes its job.
+// OrgHead is the highest runner id among every runner registered now at the sets' scope (the organization, or the
+// repository, whose ids are a sequence of their own): a lower bound, by seconds, of the last id GitHub issued, since a
+// runner lives at least until it takes its job.
 func (g *REST) OrgHead(ctx context.Context) (int64, error) {
-	_, highest, _, err := g.listRunners(ctx, fmt.Sprintf("https://api.github.com/orgs/%s/actions/runners", g.org), func(string) bool { return false })
+	base := fmt.Sprintf("https://api.github.com/orgs/%s/actions/runners", g.org)
+	if g.repo != "" {
+		base = fmt.Sprintf("https://api.github.com/repos/%s/%s/actions/runners", g.org, g.repo)
+	}
+	_, highest, _, err := g.listRunners(ctx, base, func(string) bool { return false })
 	return highest, err
 }
 
