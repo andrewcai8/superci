@@ -317,11 +317,18 @@ const (
 // A machine this process knows of no runner for is granted one once the set is ready, inside the registration budget
 // (ahead of the pool's when a job waits); the grant goes on only if it wins the machine's claim (Claims).
 func (s *State) Ask(id string, now time.Time, b *Budget, maxAge time.Duration) Verdict {
+	v, _ := s.AskWhy(id, now, b, maxAge)
+	return v
+}
+
+// AskWhy is Ask with what a Wait waits for: "issuing" (its registration is in flight), "not_ready" (the set has not
+// listened to every region and its queue yet) or the budget's Denial.
+func (s *State) AskWhy(id string, now time.Time, b *Budget, maxAge time.Duration) (Verdict, string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	m := s.machines[id]
 	if m == nil {
-		return Unknown
+		return Unknown, ""
 	}
 	m.Asked = now
 	if m.FirstAsk.IsZero() {
@@ -330,36 +337,36 @@ func (s *State) Ask(id string, now time.Time, b *Budget, maxAge time.Duration) V
 	m.Asks++
 	switch r := m.Runner; {
 	case m.Issuing:
-		return Wait
+		return Wait, "issuing"
 	case r != nil && r.Done:
 		m.Ending = true
-		return End
+		return End, ""
 	case r != nil && !r.Busy:
 		m.Retire = true
-		return End
+		return End, ""
 	case m.Issued || r != nil:
-		return End
+		return End, ""
 	case m.Ending || m.Notice:
 		m.Ending = true
-		return End
+		return End, ""
 	case !s.ready():
-		return Wait
+		return Wait, "not_ready"
 	}
 	live, idle := s.supplyCounts()
 	switch {
 	case now.Sub(m.Launched) > maxAge || s.leased(now) && live > s.desired():
 		m.Ending = true
-		return End
+		return End, ""
 	}
 	prio := ForPool
 	if s.waitingJobs() > idle {
 		prio = ForJob
 	}
-	if !b.Take(now, prio) {
-		return Wait
+	if ok, why := b.Try(now, prio); !ok {
+		return Wait, why.String()
 	}
 	m.Issuing, m.IssuingSince = true, now
-	return Grant
+	return Grant, ""
 }
 
 // Claim is the token of a granted machine's claim: the one its grant made, when it made one, or a new one.
@@ -561,6 +568,35 @@ func (s *State) Stalled(now time.Time, d time.Duration) bool {
 		return false
 	}
 	return now.Sub(s.waitingSince) > d && now.Sub(s.lastStart) > d
+}
+
+// oldestWaitingJob is how long the longest-waiting job of the set has waited for a runner to take it: the age, from
+// the time GitHub queued it, of the oldest job a message offered or assigned to the set that no runner has started.
+// The statistics say how many jobs wait; a job that never reports its start (cancelled in the queue) stays in
+// available, so the oldest of the newest that many is the bound: no job waits longer than it.
+func (s *State) oldestWaitingJob(now time.Time) time.Duration {
+	n := s.waitingJobs()
+	if n <= 0 || len(s.available) == 0 {
+		return 0
+	}
+	queued := make([]time.Time, 0, len(s.available))
+	for _, t := range s.available {
+		queued = append(queued, t)
+	}
+	slices.SortFunc(queued, func(a, b time.Time) int { return a.Compare(b) })
+	return max(0, now.Sub(queued[max(0, len(queued)-n)]))
+}
+
+// oldestUnregisteredMachine is how long the longest-waiting machine has gone without a runner: launched, not ending,
+// never issued one (a registration in flight included).
+func (s *State) oldestUnregisteredMachine(now time.Time) time.Duration {
+	var oldest time.Duration
+	for _, m := range s.machines {
+		if !m.Ending && !m.Issued && m.Runner == nil && !m.Launched.IsZero() {
+			oldest = max(oldest, now.Sub(m.Launched))
+		}
+	}
+	return oldest
 }
 
 // TakeLost hands over the jobs that completed on a machine AWS gave notice it takes back (whether each failed is
@@ -1135,6 +1171,10 @@ type Snapshot struct {
 	Orphans      int                              `json:"orphans"`
 	LaunchS      float64                          `json:"launch_s"` // the launch time the pool is sized for, measured
 	Launches     int                              `json:"launches"` // the launches it is measured over
+	// OldestJobS and OldestUnregisteredS are waits in progress: how long the longest-waiting job has waited for a
+	// runner to start it, and how long the longest-waiting machine has gone without a runner.
+	OldestJobS          float64 `json:"oldest_job_s"`
+	OldestUnregisteredS float64 `json:"oldest_unregistered_s"`
 }
 
 func (s *State) Snapshot(now time.Time) Snapshot {
@@ -1147,7 +1187,8 @@ func (s *State) Snapshot(now time.Time) Snapshot {
 	}
 	out := Snapshot{Set: s.set, Stats: s.stats, Pool: s.pool, Max: s.max, Capped: s.capped, Ready: s.ready(), Desired: s.desired(), Live: s.live(),
 		Inflight: inflight, Machines: len(s.machines), StaleWaiting: s.staleWaiting, Orphans: orphans,
-		LaunchS: s.launchTime(0).Seconds(), Launches: len(s.launches)}
+		LaunchS: s.launchTime(0).Seconds(), Launches: len(s.launches),
+		OldestJobS: s.oldestWaitingJob(now).Seconds(), OldestUnregisteredS: s.oldestUnregisteredMachine(now).Seconds()}
 	for _, m := range s.machines {
 		switch {
 		case m.Ending:

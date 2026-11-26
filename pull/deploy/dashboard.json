@@ -5,6 +5,7 @@
     {"type": "alarm", "x": 0, "y": 0, "width": 24, "height": 3, "properties": {"title": "Alarms", "alarms": [
       "arn:aws:cloudwatch:us-east-1:243891825325:alarm:superci-pull-listener-down",
       "arn:aws:cloudwatch:us-east-1:243891825325:alarm:superci-pull-jobs-stalled",
+      "arn:aws:cloudwatch:us-east-1:243891825325:alarm:superci-pull-oldest-job-wait",
       "arn:aws:cloudwatch:us-east-1:243891825325:alarm:superci-pull-queue-wait-p90",
       "arn:aws:cloudwatch:us-east-1:243891825325:alarm:superci-pull-registration-refusals",
       "arn:aws:cloudwatch:us-east-1:243891825325:alarm:superci-pull-registration-errors",
@@ -35,6 +36,11 @@
     {"type": "log", "x": 0, "y": 33, "width": 12, "height": 6, "properties": {"title": "Timeline: boot phases (s) on the machine, p50 and p90 (each phase ends at the mark named)", "region": "us-east-1", "view": "table",
       "query": "SOURCE '/superci-pull/listener' | filter msg = 'tl' and ev in ['cache.start', 'cache.up', 'doc.got', 'jit.sent', 'jit.answered', 'runner.start', 'runner.online'] | stats count(*) as n, pct(dur_ms, 50) / 1000 as p50_s, pct(dur_ms, 90) / 1000 as p90_s by ev | sort p50_s desc"}},
     {"type": "log", "x": 12, "y": 33, "width": 12, "height": 6, "properties": {"title": "Timeline: launch call and registration (s) per set, p50 and p90", "region": "us-east-1", "view": "table",
-      "query": "SOURCE '/superci-pull/listener' | filter msg = 'tl' and ev in ['machine.launched', 'jit.issued'] | stats pct(answer_ms, 50) / 1000 as launch_p50_s, pct(answer_ms, 90) / 1000 as launch_p90_s, pct(register_ms, 50) / 1000 as register_p50_s, pct(register_ms, 90) / 1000 as register_p90_s by set | sort set"}}
+      "query": "SOURCE '/superci-pull/listener' | filter msg = 'tl' and ev in ['machine.launched', 'jit.issued'] | stats pct(answer_ms, 50) / 1000 as launch_p50_s, pct(answer_ms, 90) / 1000 as launch_p90_s, pct(register_ms, 50) / 1000 as register_p50_s, pct(register_ms, 90) / 1000 as register_p90_s by set | sort set"}},
+    {"type": "metric", "x": 0, "y": 39, "width": 12, "height": 6, "properties": {"title": "Waits in progress (s): the oldest job waiting for a runner, and the oldest machine with none", "region": "us-east-1", "view": "timeSeries", "period": 60, "stat": "Maximum",
+      "metrics": [["superci-pull", "OldestWaitingJobAgeS", {"label": "oldest waiting job"}], [".", "OldestUnregisteredMachineAgeS", {"label": "oldest machine without a runner"}]],
+      "annotations": {"horizontal": [{"value": 60, "label": "60 s: the alarm, two minutes running"}]}}},
+    {"type": "metric", "x": 12, "y": 39, "width": 12, "height": 6, "properties": {"title": "Registrations the budget turned away a minute, by reason (GitHub was never asked)", "region": "us-east-1", "view": "timeSeries", "period": 60, "stat": "Sum",
+      "metrics": [["superci-pull", "BudgetDenied", "Reason", "window"], ["...", "tokens"], ["...", "throttled"], ["...", "blind"]]}}
   ]
 }

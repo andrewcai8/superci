@@ -289,6 +289,17 @@
       ],
       "what": "the ask that was granted: the registration token wait ended; waited_ms since its first ask, polls the asks it took (the machine asks every 3 s)"
     },
+    "jit.wait": {
+      "src": "listener",
+      "fields": [
+        "set",
+        "inst",
+        "why",
+        "waited_ms",
+        "polls"
+      ],
+      "what": "a machine still told to wait for its runner, written every 30 s of the wait (jit.granted comes only at its end); why is the budget's denial (window, tokens, throttled, blind), issuing or not_ready"
+    },
     "listener.start": {
       "src": "listener",
       "fields": [

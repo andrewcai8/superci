@@ -29,6 +29,7 @@ type Budget struct {
 	sampleNext     time.Time     // no sample before this
 	made, refused  int
 	failed         int
+	denied         [denialKinds]int // asks the budget turned away, by why
 }
 
 type head struct {
@@ -43,6 +44,23 @@ const (
 	ForJob Priority = iota
 	ForPool
 )
+
+// Denial is why the budget turned a registration away. A denial is GitHub never being asked, so none of it reaches
+// Refused: without its own count a starved budget (Take false at every ask) reads as a quiet one.
+type Denial int
+
+const (
+	Allowed         Denial = iota
+	DeniedWindow           // the organization's use of the window leaves no room under the cap
+	DeniedTokens           // the spare rate has saved up no token
+	DeniedThrottled        // GitHub refused a registration a moment ago
+	DeniedBlind            // the organization's rate is unknown and the blind rate is spent
+	denialKinds
+)
+
+var denialNames = [denialKinds]string{"", "window", "tokens", "throttled", "blind"}
+
+func (d Denial) String() string { return denialNames[d] }
 
 // Outcome is what GitHub answered to a registration.
 type Outcome int
@@ -175,24 +193,38 @@ func (b *Budget) Estimate(now time.Time) Estimate {
 	return b.estimate(now)
 }
 
-// Take reserves one registration now, or says no. A registration is allowed when the organization's use of the
-// window leaves room under Cap less half the margin, and the spare rate has saved up a token. A pool registration
-// also leaves half the saved-up burst to jobs, and keeps to its own pace: PoolRate, and PoolShare of the spare rate.
-// While the organization's rate is unknown, the listener registers at BlindRate only. After a refusal by GitHub, no
-// one registers for a while.
+// Take reserves one registration now, or says no.
 func (b *Budget) Take(now time.Time, p Priority) bool {
+	ok, _ := b.Try(now, p)
+	return ok
+}
+
+// Try is Take with the reason of a no. A registration is allowed when the organization's use of the window leaves room
+// under Cap less half the margin, and the spare rate has saved up a token. A pool registration also leaves half the
+// saved-up burst to jobs, and keeps to its own pace: PoolRate, and PoolShare of the spare rate. While the
+// organization's rate is unknown, the listener registers at BlindRate only. After a refusal by GitHub, no one
+// registers for a while. Every no is counted by its reason.
+func (b *Budget) Try(now time.Time, p Priority) (bool, Denial) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	why := b.try(now, p)
+	if why != Allowed {
+		b.denied[why]++
+	}
+	return why == Allowed, why
+}
+
+func (b *Budget) try(now time.Time, p Priority) Denial {
 	if now.Before(b.throttledUntil) {
-		return false
+		return DeniedThrottled
 	}
 	e := b.estimate(now)
 	w := b.window().Seconds()
 	if e.Known && e.WindowUse+float64(b.pending)+1 > float64(b.c.Cap)*(1-b.c.Margin/2) {
-		return false
+		return DeniedWindow
 	}
 	if !e.Known && float64(countBetween(b.ours, now.Add(-b.window()), now)+b.pending+1) > b.c.BlindRate*w {
-		return false
+		return DeniedBlind
 	}
 	// The saved-up burst spans a launch and a margin (30 s): what the spare rate refills while a burst's machines boot
 	// is theirs when they ask, rather than lost above a shallower bucket. The window guard above bounds the whole.
@@ -203,14 +235,14 @@ func (b *Budget) Take(now time.Time, p Priority) bool {
 	b.tokens = min(burst, b.tokens+dt*e.SpareRate)
 	b.poolTokens = min(max(1, poolRate*10), b.poolTokens+dt*poolRate)
 	if b.tokens < 1 || (p == ForPool && (b.tokens < 1+burst/2 || b.poolTokens < 1)) {
-		return false
+		return DeniedTokens
 	}
 	if p == ForPool {
 		b.poolTokens--
 	}
 	b.tokens--
 	b.pending++
-	return true
+	return Allowed
 }
 
 // Done settles a reservation with GitHub's answer. A runner GitHub made is also the organization's newest id.
@@ -257,13 +289,19 @@ type BudgetSnapshot struct {
 	Refused   int  `json:"refused"`
 	Failed    int  `json:"failed"`
 	Throttled bool `json:"throttled"`
+	// Denied counts the asks turned away since the start, by reason (window, tokens, throttled, blind).
+	Denied map[string]int `json:"denied"`
 }
 
 func (b *Budget) Snapshot(now time.Time) BudgetSnapshot {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	denied := make(map[string]int, denialKinds-1)
+	for d := DeniedWindow; d < denialKinds; d++ {
+		denied[d.String()] = b.denied[d]
+	}
 	return BudgetSnapshot{Estimate: b.estimate(now), Pending: b.pending, Made: b.made, Refused: b.refused, Failed: b.failed,
-		Throttled: now.Before(b.throttledUntil)}
+		Throttled: now.Before(b.throttledUntil), Denied: denied}
 }
 
 // countBetween counts the times in (from, to] of a sorted slice.

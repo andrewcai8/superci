@@ -30,6 +30,8 @@ math listener-down "No heartbeat from the listener for 3 minutes: the process or
   LessThanThreshold 1 3 3 breaching
 alarm jobs-stalled "A set's jobs have waited 10 minutes with none of its jobs started: launches, registrations or the spend cap are stuck" \
   StalledSets Maximum GreaterThanOrEqualToThreshold 1 60 2 2 notBreaching
+alarm oldest-job-wait "The job that has waited longest for a runner has waited over 60 s, two minutes running: registrations the budget turns away, launches or boots are holding a job (a wait the budget causes is no refusal by GitHub, and QueueWait shows a job only once it starts)" \
+  OldestWaitingJobAgeS Maximum GreaterThanThreshold 60 60 2 2 notBreaching
 alarm registration-refusals "GitHub refused a runner registration (ConfigureTooManyRunners): the organization reached its cap of 1,500 in 5 minutes" \
   RegistrationRefusals Sum GreaterThanThreshold 0 300 1 1 notBreaching
 alarm registration-errors "A runner registration failed other than by GitHub's cap: GitHub's API, a runner name GitHub already held, or EC2 refusing the issued tag" \

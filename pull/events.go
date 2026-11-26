@@ -140,11 +140,16 @@ func tlTime(t time.Time) string {
 	return t.UTC().Format(time.RFC3339Nano)
 }
 
-// askState is a machine's waits for its runner: when it first asked and how many asks it made.
+// askState is a machine's waits for its runner: when it first asked, how many asks it made, and when its wait last
+// showed as a jit.wait.
 type askState struct {
-	first time.Time
-	polls int
+	first    time.Time
+	polls    int
+	lastWait time.Time
 }
+
+// waitEvery is how often a machine that is still waiting for its runner writes a jit.wait.
+const waitEvery = 30 * time.Second
 
 // firstAsks holds the machines whose first ask was written, so a machine waiting for the registration budget (it asks
 // every 3 s) leaves one jit.ask, and one jit.granted that says how long it waited.
@@ -155,9 +160,11 @@ var firstAsks = struct {
 
 var verdictNames = map[Verdict]string{Grant: "grant", End: "end", Wait: "wait", Unknown: "unknown"}
 
-// tlAsk writes a machine's ask: the first of its asks as jit.ask, and the verdict that ends its waiting as jit.granted
-// (with how long and how many asks it took) or jit.refused (end).
-func tlAsk(set, inst string, v Verdict, now time.Time) {
+// tlAsk writes a machine's ask: the first of its asks as jit.ask, the verdict that ends its waiting as jit.granted
+// (with how long and how many asks it took) or jit.refused (end), and, while it is still told to wait, a jit.wait every
+// waitEvery with why it waits (State.AskWhy). The wait is written while it lasts: jit.granted comes at its end, which
+// is too late to show a stall.
+func tlAsk(set, inst string, v Verdict, why string, now time.Time) {
 	firstAsks.Lock()
 	defer firstAsks.Unlock()
 	st := firstAsks.seen[inst]
@@ -168,6 +175,15 @@ func tlAsk(set, inst string, v Verdict, now time.Time) {
 	}
 	st.polls++
 	switch v {
+	case Wait:
+		since := st.first
+		if st.lastWait.After(since) {
+			since = st.lastWait
+		}
+		if now.Sub(since) >= waitEvery {
+			st.lastWait = now
+			tl("jit.wait", now, "set", set, "inst", inst, "why", why, "waited_ms", now.Sub(st.first).Milliseconds(), "polls", st.polls)
+		}
 	case Grant:
 		tl("jit.granted", now, "set", set, "inst", inst, "waited_ms", now.Sub(st.first).Milliseconds(), "polls", st.polls)
 		delete(firstAsks.seen, inst)

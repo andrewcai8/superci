@@ -93,8 +93,8 @@ func (h *Server) jit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unknown machine", http.StatusForbidden)
 		return
 	}
-	verdict := s.state.Ask(m.ID, time.Now(), h.budget, h.maxAge())
-	tlAsk(s.spec.Name, m.ID, verdict, started)
+	verdict, why := s.state.AskWhy(m.ID, time.Now(), h.budget, h.maxAge())
+	tlAsk(s.spec.Name, m.ID, verdict, why, started)
 	switch verdict {
 	case Wait:
 		w.Header().Set("Retry-After", "3")

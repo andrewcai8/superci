@@ -436,8 +436,12 @@ CloudWatch, namespace `superci-pull`: `Heartbeat`, `OrgRegistrationRate`, `Other
 `OurRegistrationRate`, `SpareRegistrationRate`, `RegistrationWindowUse`, `OrgRateKnown`, `Registrations`,
 `RegistrationRefusals`, `RegistrationErrors`, `LaunchShortfall`, `QueueWait` (seconds per started job, with
 percentiles, and again per set under the dimension `Set`), `StalledSets`, `Orphans`, `SpendTodayUSD`, `SpendDailyCapUSD`, `SpendMonthUSD`, `SpendPerHourUSD`,
-`SpendCapped`, `Machines` and `OnDemandShare`; per set (dimension `Set`): `Machines`, `IdleRunners`, `BusyRunners`,
-`Pool`, `JobsWaiting`.
+`SpendCapped`, `Machines`, `OnDemandShare`, `OldestWaitingJobAgeS` and `OldestUnregisteredMachineAgeS` (the longest
+waits in progress of any set); `BudgetDenied` (registrations the budget turned away, GitHub never asked; dimension
+`Reason`: `window`, `tokens`, `throttled`, `blind`); per set (dimension `Set`): `Machines`, `IdleRunners`,
+`BusyRunners`, `Pool`, `JobsWaiting`, `OldestWaitingJobAgeS`, `OldestUnregisteredMachineAgeS`. A wait is published
+while it lasts: `OldestWaitingJobAgeS` is the age of the oldest job that was offered or assigned and has not started,
+and a machine still told to wait writes a `jit.wait` timeline event every 30 s with the reason.
 
 **Alarms** (`deploy/alarms.sh`, topic `superci-pull-alarms`). The topic has no subscriber until one is added:
 
@@ -451,6 +455,7 @@ aws --profile ci-runners --region us-east-1 sns subscribe --topic-arn arn:aws:sn
 | superci-pull-jobs-stalled | a set's jobs have waited 10 minutes with none of its jobs started, for 2 minutes |
 | superci-pull-registration-refusals | GitHub refused a registration in a 5-minute period |
 | superci-pull-registration-errors | a registration failed otherwise in a 5-minute period (GitHub's API, a name GitHub already held, the issued tag refused) |
+| superci-pull-oldest-job-wait | the oldest job waiting for a runner is over 60 s old, two minutes running |
 | superci-pull-queue-wait-p90 | queue wait p90 over 60 s in two 5-minute periods running |
 | superci-pull-orphans | orphans above 0 for 10 minutes (a probe runner left registered more than 3 minutes counts, and the lister removes it) |
 | superci-pull-pool-at-floor | a set's pool at the hour's floor for 5 minutes while more of its jobs waited than it had idle runners |
