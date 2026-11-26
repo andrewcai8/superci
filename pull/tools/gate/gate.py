@@ -281,16 +281,18 @@ def matches(job_name, wanted):
 # ---------------------------------------------------------------------------------------------------------------------
 
 RECORDS_WHERE = 'msg = "tl" and ev = "job.record"'
+TIMEOUT_SLACK_S = 5.0  # a failed job that ran to within this of the job's ceiling timed out
 EVENTS_BASELINE_RUNS = 100  # Blacksmith's side still comes from GitHub: a spread sample of this many runs, cached, since a finished job never changes
 
 
 def job_records(profile, lo, hi):
     """The listener's job.record events written in [lo, hi], one per job: GitHub redelivers a completion until the listener
-    acknowledges it, so a job can have two lines and the first is kept. A partial record (no start) is left out: its times are unknown."""
+    acknowledges it, so a job can have two lines and the first is kept. A partial record (a completion after a listener restart, its start unknown) is left out, but a job cancelled before any runner took it (partial, cancelled, no runner) is kept: it is a queue-wait lower bound, which a slow plane must not hide."""
     seen, out = set(), []
     for e in T.listener_events(profile, lo, hi, where=RECORDS_WHERE):
-        if e.get("partial"):
-            continue  # a completion after a listener restart: its start is unknown, so it has no queue wait or wall time to count
+        if e.get("partial") and not (e.get("conclusion") == "cancelled" and not e.get("runner")):
+            continue  # a completion after a listener restart: its start is unknown, so it has no queue wait or wall time to count.
+            #           A job cancelled before any runner took it has no start either, and is kept: its queue wait is a lower bound
         if e.get("job") and e["job"] not in seen:
             seen.add(e["job"])
             out.append(e)
@@ -307,7 +309,7 @@ def record_workflow(e):
     return os.path.basename((e.get("workflow_ref") or "").partition("@")[0])
 
 
-def synth_job(e):
+def synth_job(e, group=T.SUPERCI_RUNNER_GROUP):
     """A record as the REST job the rest of the gate reads, so one code path decides every row. A job no runner took has no runner
     and no started_at, which is how a job cancelled in the queue is told from one cancelled while running; its label (the set's
     name when the message carried none) places it on superci. A record has no steps."""
@@ -316,7 +318,7 @@ def synth_job(e):
             "head_branch": record_branch(e), "created_at": e.get("queue_time") or e.get("start_time") or e.get("finish_time"),
             "started_at": e["start_time"] if started else None, "completed_at": e.get("finish_time"), "conclusion": e.get("conclusion"),
             "run_attempt": 1, "runner_name": e.get("runner") if started else None,
-            "runner_group_name": T.SUPERCI_RUNNER_GROUP if started else None, "labels": list(e.get("labels") or []) or [e.get("set") or ""], "steps": []}
+            "runner_group_name": group if started else None, "labels": list(e.get("labels") or []) or [e.get("set") or ""], "steps": []}
 
 
 def timeline_job(j):
@@ -597,9 +599,10 @@ def cmd_job(a):
     by_run = {r["id"]: r for r in runs}
     jobs = [(j, by_run[rid]) for rid, js in jobs_of(gh, runs, attempts="all").items() for j in js if matches(j["name"], a.job)]
     if events:
+        jobs = [(j, r) for j, r in jobs if not is_superci(j, a.superci_group)]  # a sampled baseline run can hold superci jobs too: they come from the records alone
         recs = [e for e in job_records(a.profile, since, now + 600) if record_workflow(e) == a.workflow and fnmatch.fnmatch(record_branch(e), a.branch_glob)
                 and matches(e.get("name") or "", a.job) and (T.ts(e.get("queue_time") or e.get("finish_time")) or 0) >= since]
-        jobs += [(j, {"head_branch": j["head_branch"], "head_sha": ""}) for j in map(synth_job, recs)]
+        jobs += [(j, {"head_branch": j["head_branch"], "head_sha": ""}) for j in (synth_job(e, a.superci_group) for e in recs)]
     jobs_all = [j for j, r in jobs]
     S_jobs = [j for j, r in jobs if is_superci(j, a.superci_group) and T.ts(j["created_at"]) >= since]
     B_jobs = [j for j, r in jobs if fleet_or_label(j) == "blacksmith" and b_lo <= T.ts(j["created_at"]) <= b_hi]
@@ -609,6 +612,9 @@ def cmd_job(a):
     if events and any(not o.ok and not o.cancelled for o in B):
         # A superci failure is excused when Blacksmith failed the same commit; a record has no commit, so its run's head is read, for the failures alone.
         S = [o if o.ok or o.cancelled else dataclasses.replace(o, sha=gh.api(f"actions/runs/{o.run_id}").get("head_sha") or "") for o in S]
+    if events and ceiling is not None:
+        # a record cannot say timed_out; a failure that ran to the job's ceiling is one, and counts at the ceiling as GitHub's would
+        S = [dataclasses.replace(o, timed_out=True) if not o.ok and not o.cancelled and o.wall is not None and o.wall >= ceiling - TIMEOUT_SLACK_S else o for o in S]
     unexplained = []
     finished = [j for j in S_jobs if j.get("completed_at") and (j.get("run_attempt") or 1) == 1 and j.get("conclusion") in OUTCOMES]  # a rerun's created_at is its first attempt's: no timeline
     if events:
@@ -644,10 +650,11 @@ def collect_scale(a):
     gh = T.GitHub(a.repo, T.Cache(a.cache))
     if a.superci_source == "events":
         # the replay's jobs are the listener's own records: no run is listed and no job is read from GitHub
-        recs = [e for e in job_records(a.profile, lo - 60, hi + 1800) if record_workflow(e) == a.workflow and fnmatch.fnmatch(record_branch(e), a.branch_glob)
-                and lo - 60 <= (T.ts(e.get("queue_time") or e.get("finish_time")) or 0) <= hi]
-        jobs = [synth_job(e) for e in recs]
-        jobs = [dict(j, runner_group_name=a.superci_group) if j["started_at"] else j for j in jobs]
+        # a job queued up to 5 minutes after `hi` belongs to a run created before it, as on GitHub's path; records are written when jobs
+        # finish, so the read runs 2 hours past `hi`, longer than any replayed job
+        recs = [e for e in job_records(a.profile, lo - 60, hi + 7200) if record_workflow(e) == a.workflow and fnmatch.fnmatch(record_branch(e), a.branch_glob)
+                and lo - 60 <= (T.ts(e.get("queue_time") or e.get("finish_time")) or 0) <= hi + 300]
+        jobs = [synth_job(e, a.superci_group) for e in recs]
     else:
         # a workflow that lives only on the load branches has no file name GitHub resolves, so every run is listed and matched by path
         runs = [r for r in runs_of(gh, None, lo - 60, hi) if os.path.basename(r.get("path") or "") == a.workflow and fnmatch.fnmatch(r.get("head_branch") or "", a.branch_glob)]

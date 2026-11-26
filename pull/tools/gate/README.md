@@ -30,7 +30,12 @@ tool reads, so every row below is decided by one code path. What differs from re
 - The branch is the record's `workflow_ref`: `refs/heads/<branch>` for a push (the load branches, main, the merge queue). A pull request's
   ref is `refs/pull/<n>/merge`, which matches only a glob that fits it.
 - The message has no attempt number, so every record counts as a first attempt: a rerun's queue wait is the one GitHub sent for it. It has no
-  `timed_out` either: such a job is a failure, and its wall time is the time it ran.
+  `timed_out` either: a failure that ran to within 5 s of the job's ceiling is read as one and counts at the ceiling, as GitHub's would. Without
+  a ceiling row it is a failure with the wall time it ran.
+- A job cancelled before any runner took it has a partial record (no start) with no runner: it is kept as a queue-wait lower bound, as on GitHub's
+  path. Any other partial record (a completion after a listener restart, start unknown) is left out.
+- A job in a reusable workflow carries the called workflow's file in `workflow_ref`, so `--workflow` must name that file, not the caller's, and the
+  job's name is the message's, which may lack the `caller / ` prefix REST names carry. Neither is checked against live messages yet.
 - Unexplained time is accounted to the moment the job's runner took it (a record has no steps); the row is about the plane's time.
 - A window from before the first record (the listener writes them from the release that carried them) has none: use
   `--superci-source github` there.

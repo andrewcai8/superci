@@ -706,9 +706,11 @@ def record(job, queue_s, wall_s, conclusion="success", queued_at=1_000_000.0, na
     finish = started + (wall_s or 0) if wall_s is not None else queued_at + queue_s
     e = {"msg": "tl", "v": 1, "ev": "job.record", "eid": f"b.{job}", "t": finish, "set": "superci-4cpu", "run": run, "job": job, "name": name,
          "workflow_ref": f"o/r/.github/workflows/{workflow}@refs/heads/{branch}", "labels": ["superci-4cpu"], "conclusion": conclusion,
-         "queue_time": T.iso(queued_at), "finish_time": T.iso(finish), "queue_ms": int(queue_s * 1000), "wall_ms": int((wall_s or 0) * 1000)}
+         "queue_time": T.iso(queued_at), "finish_time": T.iso(finish)}
     if wall_s is not None:
-        e.update(start_time=T.iso(started), runner="superci-4cpu-i-0abc")
+        e.update(start_time=T.iso(started), runner="superci-4cpu-i-0abc", queue_ms=int(queue_s * 1000), wall_ms=int(wall_s * 1000), partial=False)
+    else:  # the listener's record of a job no runner took: it has no start, so it is partial and has no queue or wall time of its own
+        e.update(partial=True)
     return e
 
 
@@ -768,13 +770,11 @@ class GateJobFromRecords(unittest.TestCase):
                 j["run_id"] = rid
                 for k in ("created_at", "started_at", "completed_at"):
                     if j[k]:
-                        j[k] = T.iso(T.ts(j[k]) - 1_000_000.0 + now - 10 * 3600)
+                        j[k] = T.iso(T.ts(j[k]) - 1_000_000.0 + now - (1800 if j["runner_group_name"] == "superci-pull" else 10 * 3600))
             FakeGitHub.runs_jobs[rid] = jobs
             runs.append({"id": rid, "created_at": jobs[0]["created_at"], "head_branch": "main"})
-        records = [dict(r, queue_time=T.iso(now - 1800 + T.ts(r["queue_time"]) - 1_000_000.0), t=now) for r in records]
-        for r in records:
-            r["start_time"] = r.get("start_time") and T.iso(T.ts(r["queue_time"]) + r["queue_ms"] / 1000)
-            r["finish_time"] = T.iso(T.ts(r["queue_time"]) + (r["queue_ms"] + r["wall_ms"]) / 1000)
+        shift = now - 1800 - 1_000_000.0
+        records = [dict(r, t=now, **{k: T.iso(T.ts(r[k]) + shift) for k in ("queue_time", "start_time", "finish_time") if r.get(k)}) for r in records]
         listed, calls = [], []
         saved = (G.T.GitHub, G.runs_of, G.T.gather, G.T.build, G.T.listener_events)
         G.T.GitHub, G.runs_of = FakeGitHub, lambda gh, wf, lo, hi: (listed.append((lo, hi)), runs)[1]
@@ -828,6 +828,33 @@ class GateJobFromRecords(unittest.TestCase):
         self.assertEqual(code, 1, out)
         self.assertRegex(out, r"FAIL\s+queue wait p90")
 
+    def test_a_job_cancelled_before_a_runner_took_it_is_kept_as_a_queue_lower_bound(self):
+        c = record("c1", 120, None, "cancelled")
+        self.assertTrue(c["partial"] and "runner" not in c, "the listener's record of such a job is partial and has no runner")
+        saved = G.T.listener_events
+        G.T.listener_events = lambda profile, lo, hi, where=None: [c, dict(record("c2", 5, 10, "cancelled"), partial=True, eid="b.c2"), record("g", 1, 10)]
+        try:
+            self.assertEqual([e["job"] for e in G.job_records("p", 0, 1)], ["c1", "g"], "a partial cancel that had a runner is a restart's, and is dropped")
+        finally:
+            G.T.listener_events = saved
+
+    def test_superci_jobs_inside_a_sampled_baseline_run_are_not_counted_twice(self):
+        both = [[gh_job(7000 + i, 0, 1, "success", 1_000_000.0, 1_000_001.0, 1_000_081.0) for _ in range(1)] for i in range(2)]  # superci jobs the REST listing also shows
+        recs = [record(f"g{i}", 1, 81, run=100 + i) for i in range(5)]
+        code, out, _, _ = self.run_gate(recs, self.blacksmith(8) + both)
+        self.assertRegex(out, r"superci\s+wall\s+n=5 ", out)
+        self.assertRegex(out, r"superci\s+queue\s+n=5 ", out)
+
+    def test_a_failure_that_ran_to_the_ceiling_is_a_timeout_and_pushes_wall_p90_over_it(self):
+        recs = [record(f"g{i}", 1, 81, run=100 + i) for i in range(16)] + [record(f"t{i}", 1, 200, "failure", run=300 + i) for i in range(4)]  # ceiling 200
+        code, out, _, _ = self.run_gate(recs, self.blacksmith(8))
+        self.assertRegex(out, r"FAIL\s+wall p90", out)
+
+    def test_a_non_default_runner_group_still_finds_the_records(self):
+        recs = [record(f"g{i}", 1, 81, run=100 + i) for i in range(5)]
+        code, out, _, _ = self.run_gate(recs, self.blacksmith(8), extra=("--superci-group", "other-group"))
+        self.assertRegex(out, r"n \(superci runs\)\s+5")
+
     def test_the_github_source_is_still_there_for_a_window_before_the_records(self):
         a = G.build_parser().parse_args(["job", "verify-tools", "--branch-glob", "main"])
         self.assertEqual(a.superci_source, "events")
@@ -843,7 +870,8 @@ class GateScaleFromRecords(unittest.TestCase):
         saved = (G.T.GitHub, G.T.listener_events, G.T.insights, G.metric, G.claim_objects, G.alarm_states, G.runs_of)
         boom = lambda *a, **k: self.fail("GitHub was read")
         G.runs_of = boom
-        G.T.listener_events = lambda profile, lo_, hi_, where=None: recs if where else []
+        windows = []
+        G.T.listener_events = lambda profile, lo_, hi_, where=None: (windows.append((lo_, hi_)), recs if where else [])[1]
         G.T.insights = lambda *a, **k: []
         G.metric = lambda *a, **k: []
         G.claim_objects = lambda *a, **k: set()
@@ -858,6 +886,7 @@ class GateScaleFromRecords(unittest.TestCase):
         finally:
             G.T.GitHub, G.T.listener_events, G.T.insights, G.metric, G.claim_objects, G.alarm_states, G.runs_of = saved
         self.assertEqual((s.completed, gh.calls, len(s.waits)), (9, 0, 10))
+        self.assertGreaterEqual(windows[0][1], lo + 60 + 7200, "records are written when jobs finish: the read runs past the replay's end")
         self.assertEqual(s.stranded, [("verify-tools", "failure")])
         self.assertEqual(sorted(s.waits)[:3], [1.0, 1.0, 1.0])
 
