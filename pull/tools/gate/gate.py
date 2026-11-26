@@ -299,6 +299,21 @@ def job_records(profile, lo, hi):
     return out
 
 
+def first_record(profile, now):
+    """When the listener wrote its first job.record in the last 30 days (epoch seconds), or None when it wrote none."""
+    rows = T.insights(profile, CW_REGION, T.LISTENER_GROUP, f'filter {RECORDS_WHERE} | stats min(t_ms) as first', now - 30 * 86400, now)
+    return int(rows[0]["first"]) / 1000 if rows and rows[0].get("first") else None
+
+
+def resolve_source(a, since, now):
+    """The source superci's jobs are read from. `auto` (the default) reads the listener's records when the window starts after the first
+    one and GitHub otherwise, so a window from before the records is never read as empty. Said on the first line of the output."""
+    if a.superci_source != "auto":
+        return a.superci_source
+    first = first_record(a.profile, now)
+    return "events" if first is not None and since >= first + 60 else "github"
+
+
 def record_branch(e):
     """The branch (or other ref) of a record's workflow_ref, `owner/repo/.github/workflows/<file>@refs/heads/<branch>`. A pull
     request's ref is refs/pull/<n>/merge: the message names no head branch, so such a record matches only a glob that fits it."""
@@ -588,7 +603,7 @@ def cmd_job(a):
     b_lo = b_hi - 3600 * a.baseline_hours
     limits = parse_limits(open(a.limits).read() if a.limits else gh_raw(LIMITS_PATH))
     ceiling = limits.get((a.workflow, a.job))
-    events = a.superci_source == "events"
+    events = resolve_source(a, since, now) == "events"
     # With the listener's job records the superci window needs no GitHub call: only Blacksmith's side is listed and read.
     listed = runs_of(gh, a.workflow, b_lo if events else min(since, b_lo), now)
     # The branch only picks which runs are read whole, to bound GitHub calls; which jobs are superci's is decided by the job's own fleet and group below.
@@ -648,7 +663,7 @@ def collect_scale(a):
     now = time.time()
     lo, hi = T.ts(a.since), T.ts(a.until)
     gh = T.GitHub(a.repo, T.Cache(a.cache))
-    if a.superci_source == "events":
+    if resolve_source(a, lo - 60, now) == "events":
         # the replay's jobs are the listener's own records: no run is listed and no job is read from GitHub
         # a job queued up to 5 minutes after `hi` belongs to a run created before it, as on GitHub's path; records are written when jobs
         # finish, so the read runs 2 hours past `hi`, longer than any replayed job
@@ -727,8 +742,8 @@ def build_parser():
     j.add_argument("--baseline-hours", type=float, default=BASELINE_HOURS, help="Blacksmith's window, ending now")
     j.add_argument("--baseline-until", help="end Blacksmith's window here instead of now")
     j.add_argument("--max-runs", type=int, default=None, help=f"read the baseline's jobs from at most this many runs, spread evenly (GitHub's rate limit is 5,000 an hour; default {EVENTS_BASELINE_RUNS} with the listener's job records, 300 reading superci's side from GitHub); the superci window is always read whole")
-    j.add_argument("--superci-source", choices=("events", "github"), default="events", help="where superci's jobs are read from: the listener's job.record events (default, no GitHub call for superci's side), "
-                   "or GitHub's REST API for a window before the records began")
+    j.add_argument("--superci-source", choices=("auto", "events", "github"), default="auto", help="where superci's jobs are read from: the listener's job.record events (no GitHub call for superci's side), "
+                   "GitHub's REST API, or auto (default): events when the window starts after the first record, GitHub before")
     j.add_argument("--limits", help="a ci-limits.tsv to read instead of origin/main's")
     j.add_argument("--superci-group", default=T.SUPERCI_RUNNER_GROUP)
     j.add_argument("--canary", action="store_true", help=f"judge a live canary: exit {ROLLBACK} to roll it back (a FAIL of {', '.join(ROLLBACK_ROWS)}, or one of {', '.join(ROLLBACK_ALARMS)} in ALARM), else {KEEP}")
@@ -740,7 +755,7 @@ def build_parser():
     s.add_argument("--branch-glob", default="ci/superci-load-pull-*")
     s.add_argument("--trace", required=True, help="the trace the replay drove: its job count is what was replayed, so a push that never created a run is a missing job")
     s.add_argument("--superci-group", default=T.SUPERCI_RUNNER_GROUP)
-    s.add_argument("--superci-source", choices=("events", "github"), default="events", help="where the replay's jobs are read from: the listener's job.record events (default, no GitHub call), or GitHub's REST API")
+    s.add_argument("--superci-source", choices=("auto", "events", "github"), default="auto", help="where the replay's jobs are read from: the listener's job.record events (no GitHub call), GitHub's REST API, or auto (default): events when the window starts after the first record")
     s.set_defaults(fn=cmd_scale)
     r = sub.add_parser("replay-trace", help="write a real hour's arrivals for pull/bench/replay.sh")
     r.add_argument("--hour", required=True, help="start of the window, 2026-11-25T14:00:00Z")

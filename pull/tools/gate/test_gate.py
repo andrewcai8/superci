@@ -788,7 +788,7 @@ class GateJobFromRecords(unittest.TestCase):
                 limits = os.path.join(d, "limits.tsv")
                 with open(limits, "w") as fh:
                     fh.write("lint-test-backend.yml\tverify-tools\t200\tx\n")
-                a = G.build_parser().parse_args(["--cache", d, "job", "verify-tools", "--branch-glob", "ci/*", "--limits", limits, "--since", T.iso(now - 7200), *extra])
+                a = G.build_parser().parse_args(["--cache", d, "job", "verify-tools", "--branch-glob", "ci/*", "--limits", limits, "--since", T.iso(now - 7200), "--superci-source", "events", *extra])
                 buf = io.StringIO()
                 with contextlib.redirect_stdout(buf):
                     code = a.fn(a)
@@ -857,8 +857,39 @@ class GateJobFromRecords(unittest.TestCase):
 
     def test_the_github_source_is_still_there_for_a_window_before_the_records(self):
         a = G.build_parser().parse_args(["job", "verify-tools", "--branch-glob", "main"])
-        self.assertEqual(a.superci_source, "events")
+        self.assertEqual(a.superci_source, "auto")
         self.assertEqual(G.build_parser().parse_args(["job", "verify-tools", "--branch-glob", "main", "--superci-source", "github"]).superci_source, "github")
+
+
+class AutoSource(unittest.TestCase):
+    """auto reads the records only for a window that starts after the first one: a window from before them is never read as empty."""
+    def resolve(self, flag, since, first):
+        saved = G.T.insights
+        G.T.insights = lambda *a, **k: [{"first": str(int(first * 1000))}] if first else []
+        try:
+            a = G.build_parser().parse_args(["job", "verify-tools", "--branch-glob", "main"] + (["--superci-source", flag] if flag else []))
+            return G.resolve_source(a, since, 2_000_000.0)
+        finally:
+            G.T.insights = saved
+
+    def test_a_window_after_the_first_record_reads_records(self):
+        self.assertEqual(self.resolve(None, 1_500_000.0, 1_000_000.0), "events")
+
+    def test_a_window_before_the_first_record_reads_github(self):
+        self.assertEqual(self.resolve(None, 900_000.0, 1_000_000.0), "github")
+        self.assertEqual(self.resolve(None, 1_000_030.0, 1_000_000.0), "github", "a minute of margin: a record written at the edge is not the whole window")
+
+    def test_no_record_at_all_reads_github(self):
+        self.assertEqual(self.resolve(None, 1_500_000.0, None), "github")
+
+    def test_an_explicit_source_is_not_asked_about(self):
+        saved = G.T.insights
+        G.T.insights = lambda *a, **k: self.fail("auto's query ran for an explicit source")
+        try:
+            a = G.build_parser().parse_args(["job", "verify-tools", "--branch-glob", "main", "--superci-source", "events"])
+            self.assertEqual(G.resolve_source(a, 0.0, 1.0), "events")
+        finally:
+            G.T.insights = saved
 
 
 class GateScaleFromRecords(unittest.TestCase):
@@ -881,7 +912,7 @@ class GateScaleFromRecords(unittest.TestCase):
                 trace = os.path.join(d, "t.json")
                 with open(trace, "w") as fh:
                     json.dump({"jobs": [{}] * 10}, fh)
-                a = G.build_parser().parse_args(["--cache", d, "scale", "--from", T.iso(lo), "--to", T.iso(lo + 60), "--trace", trace])
+                a = G.build_parser().parse_args(["--cache", d, "scale", "--from", T.iso(lo), "--to", T.iso(lo + 60), "--trace", trace, "--superci-source", "events"])
                 s, gh = G.collect_scale(a)
         finally:
             G.T.GitHub, G.T.listener_events, G.T.insights, G.metric, G.claim_objects, G.alarm_states, G.runs_of = saved

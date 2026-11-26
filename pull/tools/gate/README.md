@@ -15,7 +15,7 @@ gate replay-trace --hour T [--hours 1] [--bucket 60] [--out trace.json]         
 `--cache DIR` (before the subcommand) keeps GitHub's answers; a finished job never changes, so a rerun costs no calls.
 Exit 0 only when every criterion passes. 1 is FAIL, or INCONCLUSIVE when every miss is a pass inside the noise.
 
-## Where superci's jobs come from: `--superci-source events|github`
+## Where superci's jobs come from: `--superci-source auto|events|github`
 
 By default `gate job` and `gate scale` read superci's jobs from the listener's `job.record` events (one per finished job: queue
 wait, wall time, conclusion, workflow and branch, machine; [timeline](../timeline/README.md#events-and-where-they-are-written)),
@@ -37,8 +37,8 @@ tool reads, so every row below is decided by one code path. What differs from re
 - A job in a reusable workflow carries the called workflow's file in `workflow_ref`, so `--workflow` must name that file, not the caller's, and the
   job's name is the message's, which may lack the `caller / ` prefix REST names carry. Neither is checked against live messages yet.
 - Unexplained time is accounted to the moment the job's runner took it (a record has no steps); the row is about the plane's time.
-- A window from before the first record (the listener writes them from the release that carried them) has none: use
-  `--superci-source github` there.
+- A window from before the first record (the listener writes them from the release that carried them) has none: `auto` reads GitHub there.
+  Force one with `--superci-source events` or `github`.
 
 ## gate 1: `gate job`
 
