@@ -87,6 +87,7 @@ class Records(unittest.TestCase):
     def test_the_query_reads_one_line_per_job(self):
         self.assertIn('ev="job.record"', C.RECORDS_QUERY)
         self.assertIn("by job, set", C.RECORDS_QUERY)
+        self.assertIn("isPresent(busy_usd)", C.RECORDS_QUERY, "a partial record has no busy share to split")
 
 
 if __name__ == "__main__":

@@ -24,9 +24,9 @@ JOBS_QUERY = (
 )
 
 # One line per job from the listener's job.record events (a redelivered completion has two: min of a number that is the same
-# in both is that number): the machine's estimated cost over its life, and the part of it spent while the job ran.
+# in both is that number; a partial record, whose start is unknown, has no busy_usd and is left out): the machine's estimated cost over its life, and the part of it spent while the job ran.
 RECORDS_QUERY = (
-    'filter msg="tl" and ev="job.record" '
+    'filter msg="tl" and ev="job.record" and isPresent(busy_usd) '
     "| stats min(t_ms) as t, min(usd) as usd, min(busy_usd) as busy by job, set "
     "| stats count(*) as jobs, sum(usd) as usd, sum(busy) as busy by datefloor(fromMillis(t), 1d) as day, set"
 )

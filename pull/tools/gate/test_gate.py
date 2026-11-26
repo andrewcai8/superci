@@ -742,6 +742,15 @@ class JobRecords(unittest.TestCase):
         finally:
             G.T.listener_events = saved
 
+    def test_a_partial_record_has_no_times_and_is_not_counted(self):
+        partial = {k: v for k, v in record("g9", 1, 10).items() if k not in ("queue_ms", "wall_ms", "start_time", "queue_time")}
+        saved = G.T.listener_events
+        G.T.listener_events = lambda profile, lo, hi, where=None: [dict(partial, partial=True), record("g10", 1, 10)]
+        try:
+            self.assertEqual([e["job"] for e in G.job_records("p", 0, 1)], ["g10"])
+        finally:
+            G.T.listener_events = saved
+
     def test_a_timeline_of_a_record_ends_where_its_runner_took_the_job(self):
         j = G.synth_job(record("g8", 3, 81))
         self.assertEqual(G.timeline_job(j)["completed_at"], j["started_at"])

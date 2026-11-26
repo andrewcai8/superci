@@ -286,9 +286,11 @@ EVENTS_BASELINE_RUNS = 100  # Blacksmith's side still comes from GitHub: a sprea
 
 def job_records(profile, lo, hi):
     """The listener's job.record events written in [lo, hi], one per job: GitHub redelivers a completion until the listener
-    acknowledges it, so a job can have two lines and the first is kept."""
+    acknowledges it, so a job can have two lines and the first is kept. A partial record (no start) is left out: its times are unknown."""
     seen, out = set(), []
     for e in T.listener_events(profile, lo, hi, where=RECORDS_WHERE):
+        if e.get("partial"):
+            continue  # a completion after a listener restart: its start is unknown, so it has no queue wait or wall time to count
         if e.get("job") and e["job"] not in seen:
             seen.add(e["job"])
             out.append(e)
