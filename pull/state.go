@@ -32,17 +32,20 @@ type Machine struct {
 	// Issued says a runner was issued to it. A machine gets one runner, ever. The fence is its claim (Claims), made
 	// before its runner is registered; EC2's tag superci-pull-issued, written before the config leaves, is a hint a
 	// restart reads back.
-	Issued   bool
-	Claim    string  // the token of its grant's claim, kept while that grant may still go on; spent once it ends
-	Tagged   bool    // EC2 has the issued tag (it listed it, or accepted our write)
-	Issuing  bool    // its registration is in flight
-	Runner   *Runner // its runner, once known
-	Retire   bool    // to end once its idle runner is removed (fenced by GitHub): surplus, a second ask, past its age
-	Checking bool    // GitHub is being asked whether its runner still exists
-	Ending   bool    // told to end, or terminated: no longer supply
-	Ended    time.Time
-	Notice   bool // AWS gave notice that it takes this spot machine back
-	Missed   int  // complete listings in a row that showed no runner of it while it was never issued one
+	Issued       bool
+	Claim        string    // the token of its grant's claim, kept while that grant may still go on; spent once it ends
+	Tagged       bool      // EC2 has the issued tag (it listed it, or accepted our write)
+	Issuing      bool      // its registration is in flight
+	IssuingSince time.Time // when its grant began
+	Runner       *Runner   // its runner, once known
+	Retire       bool      // to end once its idle runner is removed (fenced by GitHub): surplus, a second ask, past its age
+	Checking     bool      // GitHub is being asked whether its runner still exists
+	FenceFails   int       // removals of its idle runner that failed in a row (NotSure)
+	FenceAfter   time.Time // no removal is tried before this
+	Ending       bool      // told to end, or terminated: no longer supply
+	Ended        time.Time
+	Notice       bool // AWS gave notice that it takes this spot machine back
+	Missed       int  // complete listings in a row that showed no runner of it while it was never issued one
 }
 
 // A Runner is one just-in-time registration, which takes one job.
@@ -65,6 +68,9 @@ type JobRef struct {
 	Name        string
 	Runner      string
 }
+
+// issuingMax is how long a grant may stay unsettled before Overdue takes the machine back from it.
+const issuingMax = time.Minute
 
 // pollLease is how long the queue's statistics stay GitHub's word after the message session last answered: twice
 // its long poll (50 s). Past it the session is lost, and nothing is launched or retired on what the statistics said.
@@ -352,7 +358,7 @@ func (s *State) Ask(id string, now time.Time, b *Budget, maxAge time.Duration) V
 	if !b.Take(now, prio) {
 		return Wait
 	}
-	m.Issuing = true
+	m.Issuing, m.IssuingSince = true, now
 	return Grant
 }
 
@@ -884,6 +890,12 @@ func (s *State) Overdue(now time.Time, jobMax, idleMax, lifeMax time.Duration) (
 		return nil
 	}
 	for _, m := range s.machines {
+		if m.Issuing && now.Sub(m.IssuingSince) > issuingMax {
+			// A grant whose handler never settled (it answers within about 35 s, claim, registration and tag each bounded):
+			// the machine would escape every bound below for as long as it lives. It may ask again; the claim still
+			// lets only one grant register a runner, and a late settlement of the old grant is read as it always is.
+			m.Issuing, m.Claim = false, ""
+		}
 		if m.Ending || m.Issuing {
 			continue
 		}
@@ -932,8 +944,9 @@ func (s *State) Surplus(now time.Time, hold, warmup time.Duration, limit int) in
 }
 
 // ToFence is the retiring machines whose idle runner to remove now, at most limit: GitHub refuses to remove a runner
-// that took a job meanwhile, which fences the machine's end.
-func (s *State) ToFence(limit int) []*Machine {
+// that took a job meanwhile, which fences the machine's end. A machine whose removal failed otherwise waits out its
+// backoff, and after fenceTries failures in a row is left to Overdue (its lifeMax) rather than tried for ever.
+func (s *State) ToFence(now time.Time, limit int) []*Machine {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out []*Machine
@@ -942,7 +955,7 @@ func (s *State) ToFence(limit int) []*Machine {
 			break
 		}
 		r := m.Runner
-		if m.Retire && !m.Ending && r != nil && !r.Busy && !r.Removing && r.ID != 0 {
+		if m.Retire && !m.Ending && r != nil && !r.Busy && !r.Removing && r.ID != 0 && m.FenceFails < fenceTries && !now.Before(m.FenceAfter) {
 			r.Removing = true
 			out = append(out, m)
 		}
@@ -959,9 +972,18 @@ const (
 	NotSure                // failed otherwise (a timeout, an outage): try again later
 )
 
+// fenceTries is how many removals of one idle runner may fail otherwise in a row before the machine is left to Overdue,
+// and fenceBackoff and fenceBackoffMax the wait after the first failure (doubling) and its ceiling. Ten tries span about
+// 25 minutes of a GitHub outage, where a retry every pass spent 100 removals a pass of the App's request budget.
+const (
+	fenceTries      = 10
+	fenceBackoff    = 10 * time.Second
+	fenceBackoffMax = 5 * time.Minute
+)
+
 // Fenced settles the removal of a retiring machine's runner: removed, the machine ends; refused because it holds a
-// job, the runner is busy and the machine serves that job; failed otherwise, it is tried again.
-func (s *State) Fenced(m *Machine, out Removal) {
+// job, the runner is busy and the machine serves that job; failed otherwise, it is tried again after a backoff.
+func (s *State) Fenced(m *Machine, out Removal, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if r := m.Runner; r != nil {
@@ -969,6 +991,12 @@ func (s *State) Fenced(m *Machine, out Removal) {
 		if out == HeldJob {
 			r.Busy, m.Retire = true, false
 		}
+	}
+	if out == NotSure {
+		m.FenceFails++
+		m.FenceAfter = now.Add(min(fenceBackoffMax, fenceBackoff<<(m.FenceFails-1)))
+	} else {
+		m.FenceFails, m.FenceAfter = 0, time.Time{}
 	}
 	if out == Removed {
 		m.Ending = true

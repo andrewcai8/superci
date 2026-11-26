@@ -153,7 +153,7 @@
       "fields": [
         "inst",
         "set",
-        "skew_ms",
+        "offset_ms",
         "val",
         "dur_ms"
       ],
@@ -164,7 +164,7 @@
       "fields": [
         "inst",
         "set",
-        "skew_ms",
+        "offset_ms",
         "dur_ms"
       ],
       "what": "the cache daemon's setup began"
@@ -174,7 +174,7 @@
       "fields": [
         "inst",
         "set",
-        "skew_ms",
+        "offset_ms",
         "dur_ms"
       ],
       "what": "the cache daemon's setup ended"
@@ -184,7 +184,7 @@
       "fields": [
         "inst",
         "set",
-        "skew_ms",
+        "offset_ms",
         "dur_ms"
       ],
       "what": "the identity document was read from the metadata service"
@@ -194,7 +194,7 @@
       "fields": [
         "inst",
         "set",
-        "skew_ms",
+        "offset_ms",
         "dur_ms"
       ],
       "what": "the first ask for the runner left the machine"
@@ -204,7 +204,7 @@
       "fields": [
         "inst",
         "set",
-        "skew_ms",
+        "offset_ms",
         "val",
         "dur_ms"
       ],
@@ -215,7 +215,7 @@
       "fields": [
         "inst",
         "set",
-        "skew_ms",
+        "offset_ms",
         "dur_ms"
       ],
       "what": "run.sh was started"
@@ -225,7 +225,7 @@
       "fields": [
         "inst",
         "set",
-        "skew_ms",
+        "offset_ms",
         "dur_ms"
       ],
       "what": "the runner printed Listening for Jobs"
@@ -235,7 +235,7 @@
       "fields": [
         "inst",
         "set",
-        "skew_ms",
+        "offset_ms",
         "dur_ms"
       ],
       "what": "the runner printed Running job"
@@ -245,7 +245,7 @@
       "fields": [
         "inst",
         "set",
-        "skew_ms",
+        "offset_ms",
         "dur_ms"
       ],
       "what": "the runner printed the job's result"
@@ -255,7 +255,7 @@
       "fields": [
         "inst",
         "set",
-        "skew_ms",
+        "offset_ms",
         "val",
         "dur_ms"
       ],
@@ -266,7 +266,7 @@
       "fields": [
         "inst",
         "set",
-        "skew_ms",
+        "offset_ms",
         "dur_ms"
       ],
       "what": "boot.sh powered the machine off"
@@ -352,7 +352,7 @@
       "fields": [
         "inst",
         "set",
-        "skew_ms",
+        "offset_ms",
         "dur_ms",
         "val"
       ],
@@ -363,7 +363,7 @@
       "fields": [
         "inst",
         "set",
-        "skew_ms",
+        "offset_ms",
         "dur_ms",
         "val"
       ],
@@ -374,7 +374,7 @@
       "fields": [
         "inst",
         "set",
-        "skew_ms",
+        "offset_ms",
         "dur_ms",
         "val"
       ],
@@ -385,7 +385,7 @@
       "fields": [
         "inst",
         "set",
-        "skew_ms",
+        "offset_ms",
         "dur_ms",
         "val"
       ],

@@ -314,6 +314,9 @@ func run(ctx context.Context, f flags) error {
 	}
 }
 
+// healthyWithin is how long the reconciler may go without finishing a pass before the listener reads as dead.
+const healthyWithin = 2 * time.Minute
+
 // bootData is a machine's user data: boot.sh with the listener's address and key, the longest a machine may live
 // (the oldest a pool machine may be, and the longest job after it), and its set's label, which names the hydration
 // manifest it reads.
@@ -738,11 +741,11 @@ func (l *Listener) reconciler(ctx context.Context, refresh func(context.Context,
 				tlRetired(s.spec.Name, m, "overdue", now)
 			}
 			s.state.Surplus(now, 20*time.Second, window, 100)
-			go parallel(s.state.ToFence(100), func(m *Machine) {
+			go parallel(s.state.ToFence(now, 100), func(m *Machine) {
 				r := m.Runner
 				err := l.client.RemoveRunner(ctx, r.ID)
 				out := removal(err)
-				s.state.Fenced(m, out)
+				s.state.Fenced(m, out, time.Now())
 				slog.Info("retire", "set", s.spec.Name, "machine", m.ID, "runner", r.Name, "removed", out == Removed, "held_job", out == HeldJob, "err", errString(err))
 				tlRetired(s.spec.Name, m, "retire", time.Now())
 			})
@@ -1077,10 +1080,12 @@ func (l *Listener) status() Status {
 func (l *Listener) metrics() Metrics {
 	now := time.Now()
 	st := l.status()
-	m := Metrics{Budget: st.Budget, Spend: st.Spend, Sets: st.Sets}
+	m := Metrics{Budget: st.Budget, Spend: st.Spend, Sets: st.Sets, SetWaits: map[string][]float64{}}
 	cfg := l.config()
 	for i, s := range l.sets {
-		m.Waits = append(m.Waits, s.state.TakeWaits()...)
+		waits := s.state.TakeWaits()
+		m.Waits = append(m.Waits, waits...)
+		m.SetWaits[s.spec.Name] = waits
 		if s.state.Stalled(now, 10*time.Minute) {
 			m.Stalled++
 		}
@@ -1105,13 +1110,14 @@ func (l *Listener) metrics() Metrics {
 	return m
 }
 
-// healthy says whether the process is alive: its reconciler has finished a pass within the last minute. GitHub's and
-// EC2's slowness is not death (a replacement could not reach them either); a pass bounds its own EC2 calls, and its
-// GitHub calls run on their own.
+// healthy says whether the process is alive: its reconciler has finished a pass within the last two minutes. GitHub's
+// and EC2's slowness is not death (a replacement could not reach them either); a pass bounds its own EC2 calls, and its
+// GitHub calls run on their own. A pass can spend 20 s describing each region one after the other and 20 s ending
+// machines, so a minute is reached by a slow EC2 alone.
 func (l *Listener) healthy() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if d := time.Since(l.reconciled); d > time.Minute {
+	if d := time.Since(l.reconciled); d > healthyWithin {
 		return fmt.Errorf("reconciler idle for %s", d.Round(time.Second))
 	}
 	return nil

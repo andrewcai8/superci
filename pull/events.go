@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -118,6 +119,9 @@ func tlEnded(region, why string, ids []string, now time.Time) {
 		firstAsks.Lock()
 		delete(firstAsks.seen, id)
 		firstAsks.Unlock()
+		offsets.Lock()
+		delete(offsets.last, id)
+		offsets.Unlock()
 	}
 }
 
@@ -243,11 +247,7 @@ func (h *Server) mark(w http.ResponseWriter, r *http.Request) {
 
 // markEvents writes the marks of one request, received at recv.
 func (h *Server) markEvents(s *Set, m *Machine, recv time.Time, marks, sentAt string) {
-	sent := parseEpoch(sentAt)
-	skew := int64(0)
-	if !sent.IsZero() {
-		skew = recv.Sub(sent).Milliseconds()
-	}
+	offset := clockOffset(m.ID, recv, parseEpoch(sentAt))
 	for _, kv := range strings.Split(marks, ",") {
 		name, rest, _ := strings.Cut(kv, "=")
 		at, rest, _ := strings.Cut(rest, "=")
@@ -271,12 +271,43 @@ func (h *Server) markEvents(s *Set, m *Machine, recv time.Time, marks, sentAt st
 		if over {
 			break
 		}
-		fields := []any{"set", s.spec.Name, "inst", m.ID, "skew_ms", skew, "val", val}
+		fields := []any{"set", s.spec.Name, "inst", m.ID, "offset_ms", offset, "val", val}
 		if ms, err := strconv.ParseInt(dur, 10, 64); err == nil {
 			fields = append(fields, "dur_ms", ms)
 		}
 		tl(name, t, fields...)
 	}
+}
+
+// offsetPosts is how many of a machine's last posts its clock offset is estimated from.
+const offsetPosts = 8
+
+// offsets holds each machine's last posts' receipt less stamp, in ms.
+var offsets = struct {
+	sync.Mutex
+	last map[string][]int64
+}{last: map[string][]int64{}}
+
+// clockOffset is the estimate, in ms, of how far the machine's clock is behind the listener's: the smallest receipt
+// less stamp of its last offsetPosts posts. One post's is the offset plus that post's delay (hundreds of ms on a busy
+// listener), so one overstates it by a delay that varies; the smallest of several holds the least delay. Only the last
+// few count, so a clock chrony steps during boot is followed, not remembered. 0 until a post carries its stamp.
+func clockOffset(inst string, recv, sent time.Time) int64 {
+	offsets.Lock()
+	defer offsets.Unlock()
+	if len(offsets.last) > 100000 {
+		offsets.last = map[string][]int64{}
+	}
+	posts := offsets.last[inst]
+	if !sent.IsZero() {
+		posts = append(posts, recv.Sub(sent).Milliseconds())
+		posts = posts[max(0, len(posts)-offsetPosts):]
+		offsets.last[inst] = posts
+	}
+	if len(posts) == 0 {
+		return 0
+	}
+	return slices.Min(posts)
 }
 
 func parseEpoch(s string) time.Time {

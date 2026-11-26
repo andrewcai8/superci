@@ -118,11 +118,11 @@ func TestARunnerThatNeverStartedIsNeverReplaced(t *testing.T) {
 	if g := hostile(s, "i-0000", t0.Add(2*time.Second), 5*time.Minute); g != 0 {
 		t.Fatalf("granted %d more runners to a machine that has one", g)
 	}
-	fence := s.ToFence(10)
+	fence := s.ToFence(t0, 10)
 	if len(fence) != 1 {
 		t.Fatalf("to fence %v: a machine that asks again does not run its idle runner, which is removed", ids(fence))
 	}
-	s.Fenced(fence[0], Removed)
+	s.Fenced(fence[0], Removed, t0)
 	if end := s.ToEnd(t0.Add(6 * time.Minute)); len(end) != 1 {
 		t.Fatalf("ending %v: once its runner is removed, the machine ends", ids(end))
 	}
@@ -141,7 +141,7 @@ func TestASecondAskWhileAJobRunsGetsNoRunnerAndEndsNothing(t *testing.T) {
 	if g := hostile(s, "i-0000", t0.Add(time.Minute), 5*time.Minute); g != 0 {
 		t.Fatalf("granted %d while its runner holds a job", g)
 	}
-	if end, fence := s.ToEnd(t0.Add(6*time.Minute)), s.ToFence(10); len(end)+len(fence) != 0 {
+	if end, fence := s.ToEnd(t0.Add(6*time.Minute)), s.ToFence(t0, 10); len(end)+len(fence) != 0 {
 		t.Fatalf("ending %v, fencing %v: an ask is no proof the job is over", ids(end), ids(fence))
 	}
 }
@@ -157,7 +157,7 @@ func TestARegistrationWhoseConfigNeverLeftEndsTheMachine(t *testing.T) {
 	if v := ask(s, "i-0000", t0.Add(time.Second)); v != End {
 		t.Fatalf("after a withheld config: %v, want End", v)
 	}
-	if fence := s.ToFence(10); len(fence) != 1 || fence[0].ID != "i-0000" {
+	if fence := s.ToFence(t0, 10); len(fence) != 1 || fence[0].ID != "i-0000" {
 		t.Fatalf("to fence %v: the registered runner is removed before its machine ends", ids(fence))
 	}
 	if end := s.ToEnd(t0); len(end) != 1 || end[0].ID != "i-0001" {
@@ -252,13 +252,13 @@ func TestARemovalThatFailsIsTriedAgainNotTakenForAJob(t *testing.T) {
 	launch(s, machines(1, t0), t0)
 	give(s, "i-0000", &Runner{ID: 5, Name: "set-i-0000", Issued: t0})
 	s.Noticed("i-0000")
-	m := s.ToFence(10)[0]
-	s.Fenced(m, NotSure)
+	m := s.ToFence(t0, 10)[0]
+	s.Fenced(m, NotSure, t0)
 	if snap := s.Snapshot(t0); snap.Busy != 0 || snap.Retiring != 1 {
 		t.Fatalf("after a failed removal: %+v, want the runner idle and still retiring", snap)
 	}
-	if again := s.ToFence(10); len(again) != 1 {
-		t.Fatalf("to fence %v: a failed removal is tried again", ids(again))
+	if again := s.ToFence(t0.Add(fenceBackoff), 10); len(again) != 1 {
+		t.Fatalf("to fence %v: a failed removal is tried again once its backoff is over", ids(again))
 	}
 }
 
@@ -291,7 +291,7 @@ func TestJobsAreBoundedFromTheirStartAndIdleRunnersByAge(t *testing.T) {
 	if ended := s.Overdue(at.Add(2*time.Hour), job, idle, life); len(ended) != 0 {
 		t.Fatalf("ended %v: a job 2 h in, on a 9 h-old machine, is within its bound", ids(ended))
 	}
-	if fence := s.ToFence(10); len(fence) != 2 {
+	if fence := s.ToFence(t0, 10); len(fence) != 2 {
 		t.Fatalf("to fence %v: the idle runners of 9 h-old machines retire", ids(fence))
 	}
 	if ended := s.Overdue(at.Add(job+time.Minute), job, idle, life); len(ended) != 1 || ended[0].ID != "i-0000" {

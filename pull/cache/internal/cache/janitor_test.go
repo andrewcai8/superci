@@ -544,6 +544,46 @@ func TestACopyIsRankedByTheSaveTimeItKeepsNotByWhenItWasCopied(t *testing.T) {
 	}
 }
 
+// headFails is a store whose HEAD of the keys holding fail answers an error.
+type headFails struct {
+	*cachetest.Mem
+	fail string
+}
+
+func (h headFails) Head(ctx context.Context, key string) (cache.Object, bool, error) {
+	if strings.Contains(key, h.fail) {
+		return cache.Object{}, false, fmt.Errorf("503 service unavailable")
+	}
+	return h.Mem.Head(ctx, key)
+}
+
+func TestOneFamilyWhoseHeadFailedIsLeftOutAndTheRestOfTheBucketIsStillTrimmed(t *testing.T) {
+	m := cachetest.NewMem()
+	var old [2]cache.Object
+	for i, fam := range []string{"git-seed-v1-Linux-X64-", "node-v1-Linux-X64-"} {
+		old[i] = plant(m, entry(main, fam+"10000000001", gib, ago(5*hour)))
+		plant(m, entry(main, fam+"10000000002", gib, ago(hour)))
+	}
+	h := headFails{m, "git-seed"}
+	var log_ bytes.Buffer
+	rep, err := cache.Janitor(context.Background(), sized{h, gib}, cache.Policy{CapBytes: 2 * gib}, t0, false, log.New(&log_, "", 0))
+	if err != nil {
+		t.Fatalf("one failed HEAD fails the run: %v", err)
+	}
+	if rep.Deleted != 1 || rep.Skipped != 1 {
+		t.Fatalf("report %+v: want the other family's old entry deleted and one family skipped", rep)
+	}
+	if _, ok := m.Get(old[1].Key); ok {
+		t.Error("the old entry of the family whose HEADs worked is still there")
+	}
+	if _, ok := m.Get(old[0].Key); !ok {
+		t.Error("an entry of the family whose HEAD failed was deleted on a ranking nobody could read")
+	}
+	if !strings.Contains(log_.String(), "left family") || !strings.Contains(rep.String(), "1 families skipped") {
+		t.Errorf("the skip is not said: %q, %q", log_.String(), rep.String())
+	}
+}
+
 func TestNothingToDeleteCostsNoHeads(t *testing.T) {
 	m := cachetest.NewMem()
 	for i := range 20 {

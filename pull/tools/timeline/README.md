@@ -38,10 +38,12 @@ ec2, machine, network, runner).
   A Blacksmith job expects the API's alone.
 - **`overlap clamped`** is time that two sources disagree on by less than their resolution (GitHub's timestamps are whole
   seconds; a machine's clock may run ahead). It is reported, not hidden.
-- **A machine clock is corrected on every post.** `skew_ms` is the listener's clock less the machine's at the post that
-  carried a mark, plus one way latency. A machine's clock is seconds off at boot until chrony steps it (1.7 s on the first
-  live run, 36 ms by the end), so each mark moves by the skew of its own post, not by one offset for the machine. A
-  job reports the largest skew, and `clock_corrected` when one passed 250 ms.
+- **A machine clock is corrected on every post.** `offset_ms` is the listener's estimate of how far the machine's clock is
+  behind its own: the smallest of the machine's last 8 posts' receipt less stamp, since a post's own delay is in each and
+  the smallest holds the least. (Lines written before Nov 26 carry `skew_ms`, one post's receipt less stamp, delay
+  included; the tool reads both.) A machine's clock is seconds off at boot until chrony steps it (1.7 s on the first
+  live run, 36 ms by the end), so each mark moves by the offset of its own post, not by one offset for the machine. A
+  job reports the largest offset, and `clock_corrected` when one passed 250 ms.
 - **Warm or cold** is the machine's launch against the job's creation. With no launch event and a queue wait under 6 s the
   machine is `warm (inferred)`: a machine cannot launch and boot that fast.
 

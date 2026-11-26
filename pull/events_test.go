@@ -182,8 +182,46 @@ func TestMarkWritesEventsFromTheMachinesClock(t *testing.T) {
 	if lines[0]["ev"] != "cache.up" || lines[0]["inst"] != "i-0abc" || lines[0]["dur_ms"] != float64(1500) || lines[1]["val"] != "0" || lines[1]["dur_ms"] != float64(5) {
 		t.Errorf("%v", lines)
 	}
-	if sk := lines[0]["skew_ms"].(float64); sk < 90 || sk > 400 {
-		t.Errorf("skew_ms %v, want about the 100 ms the request took", sk)
+	if off := lines[0]["offset_ms"].(float64); off < 90 || off > 400 {
+		t.Errorf("offset_ms %v, want about the 100 ms the one post took", off)
+	}
+	if lines[0]["skew_ms"] != nil {
+		t.Errorf("skew_ms is replaced by offset_ms: %v", lines[0])
+	}
+}
+
+func TestAMachinesClockOffsetIsTheSmallestOfItsLastPostsNotThePostsOwnDelay(t *testing.T) {
+	now := time.Now()
+	behind := 2 * time.Second // the machine's clock runs 2 s behind the listener's
+	post := func(delay time.Duration) int64 {
+		sent := now.Add(-behind) // the machine stamped the post by its own clock
+		return clockOffset("i-offset", sent.Add(behind+delay), sent)
+	}
+	for i, tc := range []struct {
+		delay time.Duration
+		want  int64
+	}{{300 * time.Millisecond, 2300}, {40 * time.Millisecond, 2040}, {120 * time.Millisecond, 2040}} {
+		if got := post(tc.delay); got != tc.want {
+			t.Errorf("post %d after a delay of %s: offset %d, want %d", i, tc.delay, got, tc.want)
+		}
+	}
+	// chrony steps the clock: its later posts show the new, smaller offset once the old ones have left the window.
+	var last int64
+	for i := 0; i < offsetPosts; i++ {
+		last = clockOffset("i-offset", now.Add(30*time.Millisecond), now)
+	}
+	if last != 30 {
+		t.Errorf("after the clock was stepped, %d posts of 30 ms say %d", offsetPosts, last)
+	}
+	// the machine's clock is stepped back 2 s: the old, smaller offsets leave the window
+	for i := 0; i < offsetPosts; i++ {
+		last = clockOffset("i-offset", now.Add(2*time.Second+30*time.Millisecond), now)
+	}
+	if last != 2030 {
+		t.Errorf("after the clock was stepped back, %d posts say %d, want 2030", offsetPosts, last)
+	}
+	if off := clockOffset("i-never-stamped", now, time.Time{}); off != 0 {
+		t.Errorf("a post with no stamp: offset %d, want 0", off)
 	}
 }
 

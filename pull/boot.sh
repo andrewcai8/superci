@@ -9,7 +9,8 @@ exec > >(tee /var/log/superci-pull.log > /dev/console) 2>&1
 # Marks for the job timeline (pull/events.go): the moments of this machine's own clock the listener cannot see. Each is a
 # line of name=epoch=ms since the previous mark[=value] in a spool (the cache daemon appends its own), and a sender posts
 # the lines the listener has not taken to /mark with the identity document, as the ask for the runner does, so the machine
-# needs no credential for them. A line stays in the spool until the listener answers 204, so a listener restart loses none.
+# needs no credential for them. A line stays in the spool until the listener answers 204, so a listener restart loses none;
+# one the listener can never take (413) is dropped.
 SP=/run/superci-marks
 : > $SP
 echo 0 > $SP.sent
@@ -20,8 +21,14 @@ send() {
   [ "$n" -gt "$took" ] || return 0
   n=$(( n < took + 20 ? n : took + 20 ))
   m=$(sed -n "$((took + 1)),${n}p" $SP | paste -sd,)
+  # The listener answers 413 to a marks header over 32 KiB, and a batch it refuses is sent again for ever: the batch is cut
+  # to 30,000 bytes, and one line alone over that is dropped. A 413 anyway (a limit lower than ours) drops the batch's first line.
+  while [ "${#m}" -gt 30000 ] && [ "$n" -gt $((took + 1)) ]; do
+    n=$(( n - 1 )); m=$(sed -n "$((took + 1)),${n}p" $SP | paste -sd,)
+  done
+  [ "${#m}" -le 30000 ] || { echo $((took + 1)) > $SP.sent; return 0; }
   code=$(curl -s -k --pinnedpubkey "$PIN" -m 10 -H "X-Superci-Marks: $m" -H "X-Superci-Sent: $(date +%s.%N)" --data-binary "$DOC" -o /dev/null -w '%{http_code}' "$L/mark")
-  [ "$code" = 204 ] && echo "$n" > $SP.sent
+  case $code in 204) echo "$n" > $SP.sent ;; 413) echo $((took + 1)) > $SP.sent ;; esac
 }
 mark boot.start "$(cut -d' ' -f1 /proc/uptime)"
 ( sleep @LIFE_SECONDS@; poweroff ) > /dev/null 2>&1 &
