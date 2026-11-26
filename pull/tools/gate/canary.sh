@@ -16,9 +16,12 @@ log=${LOG:-.}
 [ "$every" -ge 600 ] || { echo "refusing: EVERY under 600 s spends the shared GitHub read budget" >&2; exit 2; }
 [ "$(aws --profile ci-runners sts get-caller-identity --query Account --output text)" = 243891825325 ] || { echo "refusing: not ci-runners" >&2; exit 2; }
 jobs_now() { # prints SUPERCI_JOBS; returns 1 when it is unset, 2 when GitHub did not answer (gh 2.46 has no `variable get`)
-  local out
-  out=$(gh api "repos/$R/actions/variables/SUPERCI_JOBS" --jq .value 2>&1) && { echo "$out"; return 0; }
-  [[ $out == *"Not Found"* ]] && return 1 || return 2
+  local out err
+  err=$(mktemp)
+  out=$(gh api "repos/$R/actions/variables/SUPERCI_JOBS" --jq .value 2> "$err") && jq -e 'type == "array"' <<<"$out" > /dev/null && { rm -f "$err"; echo "$out"; return 0; }
+  grep -q "Not Found" "$err" && { rm -f "$err"; return 1; }
+  rm -f "$err"
+  return 2
 }
 remove() { # job: drop it from SUPERCI_JOBS, and delete the variable when it was the last; retried while GitHub does not answer
   local now left code try
