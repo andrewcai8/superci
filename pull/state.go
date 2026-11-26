@@ -118,6 +118,7 @@ type State struct {
 	began       map[string]began     // when each running job was queued and taken by its runner, by jobKey, for its record
 	recorded    map[string]time.Time // jobs whose record was made, by jobKey: GitHub redelivers a completion until acknowledged
 	price       func(Machine) float64
+	jobs        []JobRecord // records of the jobs completed since the metrics last took them
 	prunedJobs  time.Time
 	odLaunched  []time.Time
 	allLaunched []time.Time
