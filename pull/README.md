@@ -215,11 +215,15 @@ Within 15 minutes of the next hour, the larger of the two hours' bounds applies.
 its sets. No idle runner is trimmed in the first window after a start, while the set has seen too few jobs to size its
 pool.
 
-The override (`deploy/override.json`) raises `superci-4cpu`'s floor to 5 while it carries only megpt-mono's `test-go`. That
-job arrives in merge-queue bursts the 30-minute quantile does not see: in 123 of its jobs on Blacksmith (Nov 26 00:00 to
-02:00Z) the jobs within 20 s up to each were 1 for 57, 2 for 40, 3 for 12, 4 for 7 and 5 for 7 (p88 3, p99 5), and on
-superci (canary 3, 35 jobs) p99 was 4 with the pool at 0 to 1 idle, so 5 waits of 8 to 23 s took a fresh launch and put
-queue p90 at 12.8 s against the gate's 10. A floor of 5 is 4 idle m8azn.xlarge more than 1: about $500 a month at spot.
+The override (`deploy/override.json`) raises the floors of `superci-4cpu` to 70 and `superci-8cpu` to 100 from 14:00 to
+02:59Z, and to 10 otherwise, while they take megpt-mono's `unit-tests` legs and `test-go`. Their bursts outrun a fresh launch.
+In the Nov 26 16:02-16:22Z peak, 15 merge-queue runs brought 24 legs each on 4 vCPU and 2 on 8 vCPU, and 47 PR pushes brought 28
+legs each on 8 vCPU. The jobs within 20 s up to each arrival were p50 33, p88 67 and p99 92 on 4 vCPU, and p50 34, p88 66 and
+p99 98 on 8 vCPU. Up to 224 8 vCPU legs arrived in a minute and 548 in 5 minutes. Blacksmith's unit legs waited p50 8 s and p90
+10 s on 4 vCPU, and p50 7 s and p90 13 s on 8 vCPU. A replay of those arrivals (each arrival takes an idle runner or the next one
+registered; a launch asks for its token after a 25 s boot; tokens at the ceiling of 2 a second and 50 at once) waits p90 0 s on
+4 vCPU and 5 s on 8 vCPU with these floors. With the 30-minute quantile's pool (about 66 each), 8 vCPU waits p90 17 s at 2/50,
+because the ceiling, not the pool, holds its refills, and 6 s at 3/100. Lower the 8 vCPU floor once the ceiling is raised.
 
 Why this rule, measured on Nov 25 2026 (`tools/wait/`):
 
