@@ -19,17 +19,19 @@ import (
 // parameter. At either cap the listener launches nothing and keeps no pool, so the bill stops growing once the
 // running jobs end.
 type Spend struct {
-	mu         sync.Mutex
-	DailyCap   float64 `json:"-"`
-	MonthlyCap float64 `json:"-"`
-	Day        string  `json:"day"`
-	Month      string  `json:"month"`
-	DayUSD     float64 `json:"day_usd"`
-	MonthUSD   float64 `json:"month_usd"`
-	PerHour    float64 `json:"per_hour"`
-	last       time.Time
-	prices     map[string]float64 // zone/type -> spot $/h
-	sets       map[string]SetSpec
+	mu          sync.Mutex
+	DailyCap    float64 `json:"-"`
+	MonthlyCap  float64 `json:"-"`
+	Day         string  `json:"day"`
+	Month       string  `json:"month"`
+	DayUSD      float64 `json:"day_usd"`
+	MonthUSD    float64 `json:"month_usd"`
+	PerHour     float64 `json:"per_hour"`
+	BusyPerHour float64 `json:"-"` // of PerHour, the machines whose runner holds a job
+	IdlePerHour float64 `json:"-"` // the rest: booting, waiting for a runner or for a job
+	last        time.Time
+	prices      map[string]float64 // zone/type -> spot $/h
+	sets        map[string]SetSpec
 }
 
 const (
@@ -96,11 +98,15 @@ func (s *Spend) Accrue(now time.Time, ms []Machine) {
 	}
 	hours := min(5*time.Minute, max(0, now.Sub(s.last))).Hours()
 	s.last = now
-	perHour := 0.0
+	perHour, busy := 0.0, 0.0
 	for _, m := range ms {
-		perHour += s.price(m)
+		p := s.price(m)
+		perHour += p
+		if m.Runner != nil && m.Runner.Busy {
+			busy += p
+		}
 	}
-	s.PerHour = perHour
+	s.PerHour, s.BusyPerHour, s.IdlePerHour = perHour, busy, perHour-busy
 	s.DayUSD += perHour * hours
 	s.MonthUSD += perHour * hours
 }
@@ -113,20 +119,22 @@ func (s *Spend) Over() bool {
 }
 
 type SpendSnapshot struct {
-	Day        string  `json:"day"`
-	DayUSD     float64 `json:"day_usd"`
-	MonthUSD   float64 `json:"month_usd"`
-	PerHour    float64 `json:"per_hour"`
-	DailyCap   float64 `json:"daily_cap"`
-	MonthlyCap float64 `json:"monthly_cap"`
-	Capped     bool    `json:"capped"`
+	Day         string  `json:"day"`
+	DayUSD      float64 `json:"day_usd"`
+	MonthUSD    float64 `json:"month_usd"`
+	PerHour     float64 `json:"per_hour"`
+	BusyPerHour float64 `json:"busy_per_hour"`
+	IdlePerHour float64 `json:"idle_per_hour"`
+	DailyCap    float64 `json:"daily_cap"`
+	MonthlyCap  float64 `json:"monthly_cap"`
+	Capped      bool    `json:"capped"`
 }
 
 func (s *Spend) Snapshot() SpendSnapshot {
 	over := s.Over()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return SpendSnapshot{Day: s.Day, DayUSD: s.DayUSD, MonthUSD: s.MonthUSD, PerHour: s.PerHour, DailyCap: s.DailyCap,
+	return SpendSnapshot{Day: s.Day, DayUSD: s.DayUSD, MonthUSD: s.MonthUSD, PerHour: s.PerHour, BusyPerHour: s.BusyPerHour, IdlePerHour: s.IdlePerHour, DailyCap: s.DailyCap,
 		MonthlyCap: s.MonthlyCap, Capped: over}
 }
 

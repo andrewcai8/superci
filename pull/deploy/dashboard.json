@@ -41,6 +41,24 @@
       "metrics": [["superci-pull", "OldestWaitingJobAgeS", {"label": "oldest waiting job"}], [".", "OldestUnregisteredMachineAgeS", {"label": "oldest machine without a runner"}]],
       "annotations": {"horizontal": [{"value": 60, "label": "60 s: the alarm, two minutes running"}]}}},
     {"type": "metric", "x": 12, "y": 39, "width": 12, "height": 6, "properties": {"title": "Registrations the budget turned away a minute, by reason (GitHub was never asked)", "region": "us-east-1", "view": "timeSeries", "period": 60, "stat": "Sum",
-      "metrics": [["superci-pull", "BudgetDenied", "Reason", "tokens"], ["...", "throttled"], ["...", "queued"]]}}
+      "metrics": [["superci-pull", "BudgetDenied", "Reason", "tokens"], ["...", "throttled"], ["...", "queued"]]}},
+    {"type": "metric", "x": 0, "y": 45, "width": 12, "height": 6, "properties": {"title": "Jobs finished, per 5 minutes, by result (job.record)", "region": "us-east-1", "view": "timeSeries", "stacked": true, "period": 300, "stat": "Sum",
+      "metrics": [["superci-pull", "JobsCompleted", "Result", "success"], ["...", "failure"], ["...", "cancelled"]]}},
+    {"type": "metric", "x": 12, "y": 45, "width": 12, "height": 6, "properties": {"title": "Failure rate (%) of finished jobs, 30 minutes: the alarm is 20% over at least 10 jobs", "region": "us-east-1", "view": "timeSeries", "period": 1800, "stat": "Sum",
+      "metrics": [["superci-pull", "JobsCompleted", "Result", "failure", {"id": "failed", "visible": false}], ["...", "success", {"id": "passed", "visible": false}], ["...", "cancelled", {"id": "stopped", "visible": false}],
+                  [{"expression": "100 * failed / MAX([failed + passed, 1])", "label": "failed, % of failed + succeeded", "id": "rate"}]],
+      "annotations": {"horizontal": [{"value": 20, "label": "20%: the alarm"}]}}},
+    {"type": "metric", "x": 0, "y": 51, "width": 12, "height": 6, "properties": {"title": "Wall time (s) of succeeded jobs, per set, p50 and p90", "region": "us-east-1", "view": "timeSeries", "period": 300,
+      "metrics": [[{"expression": "SEARCH('{superci-pull,Set} MetricName=\"JobWall\"', 'p50', 300)", "id": "wall50", "label": "p50"}], [{"expression": "SEARCH('{superci-pull,Set} MetricName=\"JobWall\"', 'p90', 300)", "id": "wall90", "label": "p90"}]]}},
+    {"type": "metric", "x": 12, "y": 51, "width": 12, "height": 6, "properties": {"title": "Estimated spend an hour (USD): machines with a job, and machines without one (booting, waiting for a runner or a job)", "region": "us-east-1", "view": "timeSeries", "stacked": true, "period": 300, "stat": "Average",
+      "metrics": [["superci-pull", "SpendBusyPerHourUSD"], [".", "SpendIdlePerHourUSD"]]}},
+    {"type": "metric", "x": 0, "y": 57, "width": 12, "height": 6, "properties": {"title": "Estimated cost of a finished job (USD), and the part of it outside the job: boot and idle", "region": "us-east-1", "view": "timeSeries", "period": 900,
+      "metrics": [["superci-pull", "JobCostUSD", {"id": "cost", "stat": "Sum", "visible": false}], [".", "JobIdleCostUSD", {"id": "idlecost", "stat": "Sum", "visible": false}],
+                  [{"expression": "SUM(SEARCH('{superci-pull,Result} MetricName=\"JobsCompleted\"', 'Sum', 900))", "id": "jobs", "visible": false}],
+                  [{"expression": "cost / MAX([jobs, 1])", "label": "per job", "id": "perjob"}], [{"expression": "idlecost / MAX([jobs, 1])", "label": "of it idle", "id": "peridle"}]]}},
+    {"type": "log", "x": 12, "y": 57, "width": 12, "height": 6, "properties": {"title": "Timeline: slowest jobs, wall and queue wait (s) of succeeded jobs by name (job.record)", "region": "us-east-1", "view": "table",
+      "query": "SOURCE '/superci-pull/listener' | filter msg = 'tl' and ev = 'job.record' and conclusion = 'success' and wall_ms > 0 | stats count(*) as jobs, pct(wall_ms, 50) / 1000 as wall_p50_s, pct(wall_ms, 90) / 1000 as wall_p90_s, pct(queue_ms, 90) / 1000 as queue_p90_s, sum(usd) as usd by name | sort wall_p90_s desc | limit 25"}},
+    {"type": "log", "x": 0, "y": 63, "width": 24, "height": 6, "properties": {"title": "Timeline: failed and cancelled jobs by name and set (job.record)", "region": "us-east-1", "view": "table",
+      "query": "SOURCE '/superci-pull/listener' | filter msg = 'tl' and ev = 'job.record' and conclusion != 'success' | stats count(*) as jobs, max(t_ms) as last by name, set, conclusion | sort jobs desc | limit 25"}}
   ]
 }

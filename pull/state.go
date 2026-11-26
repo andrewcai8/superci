@@ -807,6 +807,15 @@ func (s *State) SetPricer(f func(Machine) float64) {
 	s.mu.Unlock()
 }
 
+// TakeJobs hands over the records of the jobs completed since the last call, for the minute's metrics.
+func (s *State) TakeJobs() []JobRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	j := s.jobs
+	s.jobs = nil
+	return j
+}
+
 // TakeWaits hands over the queue waits recorded since the last call.
 func (s *State) TakeWaits() []float64 {
 	s.mu.Lock()
