@@ -215,6 +215,12 @@ Within 15 minutes of the next hour, the larger of the two hours' bounds applies.
 its sets. No idle runner is trimmed in the first window after a start, while the set has seen too few jobs to size its
 pool.
 
+The override (`deploy/override.json`) raises `superci-4cpu`'s floor to 5 while it carries only megpt-mono's `test-go`. That
+job arrives in merge-queue bursts the 30-minute quantile does not see: in 123 of its jobs on Blacksmith (Nov 26 00:00 to
+02:00Z) the jobs within 20 s up to each were 1 for 57, 2 for 40, 3 for 12, 4 for 7 and 5 for 7 (p88 3, p99 5), and on
+superci (canary 3, 35 jobs) p99 was 4 with the pool at 0 to 1 idle, so 5 waits of 8 to 23 s took a fresh launch and put
+queue p90 at 12.8 s against the gate's 10. A floor of 5 is 4 idle m8azn.xlarge more than 1: about $500 a month at spot.
+
 Why this rule, measured on Nov 25 2026 (`tools/wait/`):
 
 - The 4cpu canary (lint-test-backend's `verify-tools` and `test-go`, 17:03-17:25Z, 140 jobs) waited 22 s p50 and
