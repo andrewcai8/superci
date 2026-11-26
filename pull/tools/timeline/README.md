@@ -57,6 +57,7 @@ ec2, machine, network, runner).
 | `launch.decision`, `pool.target`, `machine.retired`, `listener.start` | the launcher and reconciler (`main.go`) |
 | `boot.start`, `cache.start`, `cache.up`, `doc.got`, `jit.sent`, `jit.answered`, `runner.*`, `job.running`, `job.done`, `poweroff` | `boot.sh` on the machine, through a spool and `/mark` |
 | `hydrate.start`, `hydrate.done` | pull-prehydrate, as marks (names are taken already) |
+| `preread.start`, `preread.done` | the root volume's pre-read, after the hydration, in the same process (`boot.sh`) |
 | `cache.restore`, `cache.save` | the cache daemon, appended to the same spool (`cache/internal/cache/marks.go`) |
 | `ec2.state` | EventBridge, not the listener |
 

@@ -226,7 +226,7 @@ func tlNotice(set string, m *Machine, now time.Time) {
 // are taken, so a job that reads the document cannot write other events; each machine gets at most markLimit.
 var markNames = map[string]bool{"boot.start": true, "cache.start": true, "cache.up": true, "doc.got": true, "jit.sent": true, "jit.answered": true,
 	"runner.start": true, "runner.online": true, "job.running": true, "job.done": true, "runner.exit": true, "poweroff": true,
-	"hydrate.start": true, "hydrate.done": true, "cache.restore": true, "cache.save": true}
+	"hydrate.start": true, "hydrate.done": true, "preread.start": true, "preread.done": true, "cache.restore": true, "cache.save": true}
 
 const markLimit = 256
 

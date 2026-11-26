@@ -439,6 +439,20 @@ of that time unpacking main's caches, so the job's setup takes them with a renam
   whole hydration group (SIGTERM, then SIGKILL after 2 s), so hydration never competes with the job for CPU or disk.
   The job takes the entries already in place and restores the rest itself. A hydrator that already ended leaves the hook
   nothing to do.
+- **Pre-read.** A volume made from the image's snapshot is restored as its blocks are first read: a first read costs 5 to
+  16 ms (60 to 200 IOPS at one at a time) where a restored block costs 0.5 ms, and libLLVM's 123 MB took 0.3 s or 3.6 to
+  9.2 s. When hydration ends (or at once with no manifest) the same process reads the root's snapshot-backed part, the
+  29 GB the root had before it grew, with `fio` at 32 reads in flight: 120 to 140 s at the volume's 250 MB/s. It costs
+  nothing (EBS reads are free), and 85% of jobs start on a machine older than that (Nov 26, 1,042 jobs: p50 303 s). On
+  machines that had finished it, first reads ran at 1,600 to 2,100 IOPS, libLLVM took 0.18 to 0.34 s and 1 GiB read one
+  request at a time took 3.2 to 3.4 s (3.1 s or 20 to 27 s without). The hook's removal of the pid file ends the read
+  within half a second, so a job that starts first never shares its volume with it. The machine posts `preread.start`
+  and `preread.done`, with `full` or `stopped` as its value.
+  EC2's `VolumeInitializationRate` (100 to 300 MiB/s in the launch template, which RunsOn's snapshot accepts) ends
+  no sooner (128 s at 200 MiB/s, 85 s at 300) and bills $0.0024 or $0.0036 per GB of the snapshot's 26.9 GB on every
+  machine: $0.065 to $0.097 each, about $9,300 a month at 4,800 machines a day. It also did not speed first reads before it finished. Fast snapshot restore
+  on a copy of the snapshot is $0.75 per AZ-hour (9 AZs: $4,860 a month) and its credit bucket for a 30 GiB snapshot
+  refills 10 volumes an hour per AZ.
 - **Burst.** An entry is read in ranges of 64 MiB, three ahead, and each machine waits a random 0 to 3 s before its first
   read: a thousand machines make about 16 requests per GB each to one prefix, not 64.
 - **Where.** `/home/runner/hydrated/<version>/<key>/`, in which that directory stands for `/`: an archive's files are
