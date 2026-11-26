@@ -523,6 +523,7 @@ func (s *State) Observe(msg *scaleset.RunnerScaleSetMessage, now time.Time) {
 			s.waits = append(s.waits, max(0, now.Sub(queued).Seconds()))
 		}
 		delete(s.available, jobKey(j.JobMessageBase))
+		delete(s.batch, jobKey(j.JobMessageBase))
 		s.lastStart = now
 		if m := s.machineOf(j.RunnerName); m != nil {
 			if r := runnerOf(m, j.RunnerName, int64(j.RunnerID), now); r.Name == j.RunnerName {

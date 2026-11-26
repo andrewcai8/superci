@@ -200,6 +200,27 @@ func TestMachinesAreClassedByTheJobsTheyWouldTakeCriticalFirst(t *testing.T) {
 	}
 }
 
+func TestAStartedBatchJobNoLongerMakesAWaitingCriticalJobsMachineABatchOne(t *testing.T) {
+	b := scarce(2)
+	s := newState(0, 100)
+	s.SetBatch(BatchRule{Events: []string{"schedule"}})
+	waitingJobs(s, testNow, "schedule", "pull_request")
+	launch(s, machines(1, testNow), testNow)
+	if c := s.class(s.Machine("i-0000"), 0); c != ForJob {
+		t.Fatalf("with the cron job's machine not yet there, the pull request's machine is %v", c)
+	}
+	s.Observe(&scaleset.RunnerScaleSetMessage{
+		Statistics:         &scaleset.RunnerScaleSetStatistic{TotalAssignedJobs: 2, TotalRunningJobs: 1},
+		JobStartedMessages: []*scaleset.JobStarted{{JobMessageBase: scaleset.JobMessageBase{JobID: "a", EventName: "schedule"}, RunnerName: "elsewhere"}},
+	}, testNow)
+	if c := s.class(s.Machine("i-0000"), 0); c != ForJob {
+		t.Fatalf("the cron job started, so one job waits and it is the pull request's: its machine is %v, want ForJob", c)
+	}
+	if v := s.Ask("i-0000", testNow, b, 8*time.Hour); v != Grant {
+		t.Fatalf("the pull request's machine got %v, want Grant: it may use the critical reserve", v)
+	}
+}
+
 func TestAConfiguredSetKnowsTheConfigsBatchJobsFromItsStart(t *testing.T) {
 	c, err := LoadConfig("")
 	if err != nil {

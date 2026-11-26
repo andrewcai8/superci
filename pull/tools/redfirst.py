@@ -159,6 +159,8 @@ MUTANTS = [
      "TestMachinesAreClassedByTheJobsTheyWouldTakeCriticalFirst"),
     ("U4 a queue with no batch job is shared out too", "state.go", f"{T}if batch == 0 {{\n{T}{T}return ForJob\n{T}}}\n", "", "TestMachinesAreClassedByTheJobsTheyWouldTakeCriticalFirst"),
     ("U4 every ask is critical", "state.go", "b.Try(now, s.class(m, idle))", "b.Try(now, s.class(m, idle)*0)", "TestAMachineForABatchJobWaitsWhileTheMachineForACriticalJobIsGranted"),
+    ("U4 a started batch job stays in the batch", "state.go", f"{T}{T}delete(s.batch, jobKey(j.JobMessageBase))\n{T}{T}s.lastStart = now\n", f"{T}{T}s.lastStart = now\n",
+     "TestAStartedBatchJobNoLongerMakesAWaitingCriticalJobsMachineABatchOne"),
     ("U4 a set starts without the batch rule", "main.go", "\ts.SetBatch(cfg.Batch)\n\treturn s\n", "\treturn s\n", "TestAConfiguredSetKnowsTheConfigsBatchJobsFromItsStart"),
     ("U4 a batch job is not marked", "state.go", "if s.batchRule.Matches(j) {", "if false {", "TestAMachineForABatchJobWaitsWhileTheMachineForACriticalJobIsGranted"),
     ("U4 the batch rule ignores the event", "config.go", "if slices.Contains(r.Events, j.EventName) {", "if false {", "TestJobsAreCriticalUnlessTheBatchRuleNamesThem"),
