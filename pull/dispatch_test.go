@@ -8,8 +8,10 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -417,7 +419,11 @@ func TestAMachineThatFailsBeforeTheFirstPipeByteIsSpentAndTheJobRunsOnTheNext(t 
 		name   string
 		break_ func(store *fakeS3, p *dispatcher, m *peer)
 	}{
-		{"its claim failed", func(store *fakeS3, _ *dispatcher, _ *peer) { store.mu.Lock(); store.fail = 1; store.mu.Unlock() }},
+		{"its claim failed on every try", func(store *fakeS3, _ *dispatcher, _ *peer) {
+			store.mu.Lock()
+			store.fail = claimTries
+			store.mu.Unlock()
+		}},
 		{"its connection ended while it was claimed", nil},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -467,17 +473,22 @@ func TestAMachineThatFailsBeforeTheFirstPipeByteIsSpentAndTheJobRunsOnTheNext(t 
 	}
 }
 
-// hookedClaims calls before ahead of each claim it takes.
+// hookedClaims calls before ahead of each claim it takes, and after once it is taken.
 type hookedClaims struct {
 	*Claims
 	before func(name string)
+	after  func(name string)
 }
 
 func (h *hookedClaims) Take(ctx context.Context, name, token string) error {
 	if h.before != nil {
 		h.before(name)
 	}
-	return h.Claims.Take(ctx, name, token)
+	err := h.Claims.Take(ctx, name, token)
+	if h.after != nil {
+		h.after(name)
+	}
+	return err
 }
 
 // Machine death after the handed point: the job is never sent anywhere else; once the window passes the shim exits 1
@@ -886,5 +897,497 @@ func TestASilentConnectionEndsAndOneThatPingsHolds(t *testing.T) {
 	}
 	if _, _, err := alive.next(200 * time.Millisecond); err == nil || !isTimeout(err) {
 		t.Fatalf("the machine that PINGs: %v, want its connection held, with only PINGs on it", err)
+	}
+}
+
+// sessionOn is the job paired with a machine, once there is one.
+func sessionOn(st *DispatchSet, machine string) *session {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.pairs[machine]
+}
+
+// heldForShim is what a job holds for its shim: its frames, the EXITs among them, and their cost against shimHeld.
+func heldForShim(s *session) (frames, exits, cost int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, f := range s.toShim {
+		frames++
+		cost += len(f.p) + heldCost
+		if f.t == frameExit {
+			exits++
+		}
+	}
+	return frames, exits, cost
+}
+
+// A machine's job code can rejoin with its own resume token while its shim is away, after a restart, and send frames
+// in a loop: what the job holds for its shim stays within shimHeld, with one EXIT, and the shim that rejoins gets
+// that one EXIT.
+func TestAFloodOfFramesWhileTheShimIsAwayLeavesTheJobBounded(t *testing.T) {
+	st := dispatchSet("i-0m1")
+	s := st.adopt("i-0m1", "t."+jobA, jobA, jobClaim{}, time.Now())
+	mw := &wire{done: make(chan struct{})}
+	s.mu.Lock()
+	s.from = mw
+	s.mu.Unlock()
+	for i := range 200_000 {
+		s.fromMachine(mw, []frameType{frameStdout, frameStderr}[i%2], []byte("x"))
+	}
+	for range 200_000 {
+		s.fromMachine(mw, frameStdout, nil)
+	}
+	for range 100_000 {
+		s.fromMachine(mw, frameExit, i32(1))
+	}
+	frames, exits, cost := heldForShim(s)
+	if exits != 1 {
+		t.Fatalf("the job holds %d EXITs for its shim, want one", exits)
+	}
+	if cost > shimHeld+heldCost+4 {
+		t.Fatalf("the job holds %d frames costing %d bytes for its shim, past the bound of %d and its EXIT", frames, cost, shimHeld)
+	}
+	if c := st.TakeCounts(); c.Dropped == 0 {
+		t.Fatal("frames past the bound were dropped uncounted")
+	}
+	c1, c2 := net.Pipe()
+	defer c2.Close()
+	go s.attachShim(newWire(c1, bufio.NewReader(c1), time.Hour, time.Minute, nil))
+	shim := &peer{t: t, r: bufio.NewReader(c2)}
+	got := 0
+	for {
+		_ = c2.SetReadDeadline(time.Now().Add(5 * time.Second))
+		var h [5]byte
+		if _, err := ioReadFull(shim.r, h[:]); err != nil {
+			t.Fatal(err)
+		}
+		body := make([]byte, binary.LittleEndian.Uint32(h[1:]))
+		if _, err := ioReadFull(shim.r, body); err != nil {
+			t.Fatal(err)
+		}
+		if frameType(h[0]) == frameExit {
+			if exitCode(body) != 1 {
+				t.Fatalf("exit %d", exitCode(body))
+			}
+			break
+		}
+		got += len(body) + heldCost
+	}
+	if got > shimHeld {
+		t.Fatalf("the shim that rejoined got %d bytes at heldCost a frame, past the bound of %d", got, shimHeld)
+	}
+}
+
+// A PIPE frame whose send found the machine's connection gone is held for the machine's next connection: the
+// machine that rejoins gets every byte of the job, in order.
+func TestAPipeFrameNeverWrittenGoesToTheMachineThatRejoins(t *testing.T) {
+	t.Run("the machine's connection ended between JOB and the flush", func(t *testing.T) {
+		store := &fakeS3{objects: map[string]string{}}
+		hooked := &hookedClaims{Claims: &Claims{store: store, bucket: "claims"}}
+		p := startDispatcher(t, store, identityTags(), dispatchSet("i-0m1"))
+		p.d.claims = hooked
+		m := p.machine(t, "i-0m1")
+		waitUntil(t, "the machine waits", func() bool { return phaseOf(p.st, "i-0m1") == mWaiting })
+		hooked.before = func(name string) {
+			if name == jobFence(jobA) {
+				m.conn.Close()
+				waitUntil(t, "the dispatcher sees the machine gone", func() bool { st := p.st; st.mu.Lock(); defer st.mu.Unlock(); return st.machines["i-0m1"].wire == nil })
+			}
+		}
+		s := p.shim(t)
+		msg := jobMessage(jobA, 7, "unit")
+		s.sendJob(msg)
+		inst, token := s.paired()
+		waitUntil(t, "the job is handed and its machine away", func() bool {
+			j := sessionOn(p.st, "i-0m1")
+			if j == nil {
+				return false
+			}
+			j.mu.Lock()
+			defer j.mu.Unlock()
+			return !j.away[0].IsZero()
+		})
+		again := p.machine(t, inst, resumeHeader, inst+"."+token)
+		if again.code != 101 {
+			t.Fatalf("resume: %d", again.code)
+		}
+		if got := again.pipeBytes(len(msg)); !bytes.Equal(got, msg) {
+			t.Fatalf("the machine that rejoined got %d bytes that are not the job message's %d", len(got), len(msg))
+		}
+	})
+	t.Run("the machine's connection ended under a PIPE frame from the shim", func(t *testing.T) {
+		st := dispatchSet("i-0m1")
+		s := st.adopt("i-0m1", "t."+jobA, jobA, jobClaim{}, time.Now())
+		dead := &wire{done: make(chan struct{})}
+		close(dead.done)
+		s.mu.Lock()
+		s.mach, s.from = dead, dead
+		s.mu.Unlock()
+		if err := s.pipe([]byte("cancel")); err != nil {
+			t.Fatal(err)
+		}
+		c1, c2 := net.Pipe()
+		defer c2.Close()
+		live := newWire(c1, bufio.NewReader(c1), time.Hour, time.Minute, nil)
+		s.mu.Lock()
+		s.from = live
+		s.mu.Unlock()
+		go s.attachMachine(live)
+		machine := &peer{t: t, conn: nil, r: bufio.NewReader(c2)}
+		_ = c2.SetReadDeadline(time.Now().Add(5 * time.Second))
+		var h [5]byte
+		if _, err := ioReadFull(machine.r, h[:]); err != nil {
+			t.Fatalf("the machine that rejoined got nothing: %v", err)
+		}
+		body := make([]byte, binary.LittleEndian.Uint32(h[1:]))
+		if _, err := ioReadFull(machine.r, body); err != nil || frameType(h[0]) != framePipe || string(body) != "cancel" {
+			t.Fatalf("the machine that rejoined got a frame of type %d %q (%v), want the PIPE frame whose send failed", h[0], body, err)
+		}
+	})
+}
+
+// A listener that crashes after the job's claim and before the job's bytes reach the machine leaves a machine with
+// JOB and no job message. Its agent sends EXIT 1 when no first message comes, and that reaches the shim through the
+// session the next dispatcher adopts: the job fails once and runs nowhere else.
+func TestAMachineThatLostItsJobMessageToACrashFailsTheJobThroughTheNextDispatcher(t *testing.T) {
+	store := &fakeS3{objects: map[string]string{}}
+	hooked := &hookedClaims{Claims: &Claims{store: store, bucket: "claims"}}
+	p := startDispatcher(t, store, identityTags(), dispatchSet("i-0m1"))
+	p.d.claims = hooked
+	dead := make(chan struct{})
+	t.Cleanup(func() { close(dead) })
+	hooked.after = func(name string) {
+		if name == jobFence(jobA) {
+			<-dead
+		}
+	}
+	m := p.machine(t, "i-0m1")
+	waitUntil(t, "the machine waits", func() bool { return phaseOf(p.st, "i-0m1") == mWaiting })
+	s := p.shim(t)
+	s.sendJob(jobMessage(jobA, 7, "unit"))
+	token := m.job().Token
+	s.paired()
+	waitUntil(t, "the job's claim is taken", func() bool {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		return store.objects["issued/"+jobFence(jobA)] != ""
+	})
+	p.d.mu.Lock()
+	for w := range p.d.wires {
+		go w.close()
+	}
+	p.d.mu.Unlock()
+	next := startDispatcher(t, store, identityTags(), dispatchSet("i-0m1"))
+	m = next.machine(t, "i-0m1", resumeHeader, "i-0m1."+token)
+	if m.code != 101 {
+		t.Fatalf("resume: %d", m.code)
+	}
+	if err := m.quiet(300 * time.Millisecond); err != nil {
+		t.Fatalf("the machine that rejoined: %v", err)
+	}
+	m.send(frameExit, i32(1))
+	s = next.shim(t, resumeHeader, "i-0m1."+token)
+	if s.code != 101 {
+		t.Fatalf("resume: %d", s.code)
+	}
+	if code := exitCode(s.expect(frameExit)); code != 1 {
+		t.Fatalf("exit %d, want the agent's 1", code)
+	}
+	waitUntil(t, "the machine ends", func() bool { return phaseOf(next.st, "i-0m1") == mEnding })
+}
+
+// countingTags is EC2's tags, counting each read and holding each one while gate is open.
+type countingTags struct {
+	fakeTags
+	mu       sync.Mutex
+	reads    map[string]int
+	inflight int
+	peak     int
+	gate     chan struct{}
+}
+
+func (c *countingTags) Tags(ctx context.Context, region, instance string) (map[string]string, error) {
+	c.mu.Lock()
+	c.reads[instance]++
+	c.inflight++
+	c.peak = max(c.peak, c.inflight)
+	gate := c.gate
+	c.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
+	c.mu.Lock()
+	c.inflight--
+	c.mu.Unlock()
+	return c.fakeTags.Tags(ctx, region, instance)
+}
+
+func (c *countingTags) readsOf(instance string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.reads[instance]
+}
+
+// Any instance of the account can call /shim, job code included: one that is no identity host costs one read of its
+// tags a minute however often it calls, and the reads at once are bounded.
+func TestShimCallersCostBoundedReadsOfTheirTags(t *testing.T) {
+	store := &fakeS3{objects: map[string]string{}}
+	p := startDispatcher(t, store, identityTags(), dispatchSet())
+	tags := &countingTags{fakeTags: identityTags(), reads: map[string]int{}}
+	p.d.tags = tags
+	runner := base64.StdEncoding.EncodeToString([]byte(idRunner))
+	for range 20 {
+		if got := p.dial(t, "/shim", "i-0job", runnerHeader, runner).code; got != http.StatusForbidden {
+			t.Fatalf("/shim from a job's machine: %d, want 403", got)
+		}
+	}
+	if n := tags.readsOf("i-0job"); n != 1 {
+		t.Fatalf("20 calls from one instance that is no identity host read its tags %d times, want once", n)
+	}
+	gate := make(chan struct{})
+	tags.mu.Lock()
+	tags.gate = gate
+	tags.mu.Unlock()
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	busy := 0
+	for i := range 3 * tagLookups {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := p.d.identityHost(context.Background(), InstanceDocument{InstanceID: fmt.Sprintf("i-0caller%02d", i), Region: "us-east-1"})
+			if err != nil && !errors.Is(err, errNotIdentity) {
+				mu.Lock()
+				busy++
+				mu.Unlock()
+			}
+		}()
+	}
+	waitUntil(t, "the callers past the bound are turned away", func() bool { mu.Lock(); defer mu.Unlock(); return busy == 2*tagLookups })
+	if got := p.dial(t, "/shim", "i-0other", runnerHeader, runner).code; got != http.StatusServiceUnavailable {
+		t.Fatalf("/shim while the reads are all in flight: %d, want 503", got)
+	}
+	close(gate)
+	wg.Wait()
+	if tags.peak > tagLookups {
+		t.Fatalf("%d reads of tags ran at once, want at most %d", tags.peak, tagLookups)
+	}
+}
+
+// faultyClaims is an S3 that answers no machine's claim: every one is unknown. The jobs' own claims are taken.
+type faultyClaims struct {
+	*Claims
+	mu    sync.Mutex
+	takes map[string][]string // by machine, the tokens its claim was asked with
+}
+
+func (f *faultyClaims) Take(ctx context.Context, name, token string) error {
+	if strings.HasPrefix(name, "job-") {
+		return f.Claims.Take(ctx, name, token)
+	}
+	f.mu.Lock()
+	f.takes[name] = append(f.takes[name], token)
+	f.mu.Unlock()
+	return errors.New("SlowDown: please reduce your request rate")
+}
+
+func spent(st *DispatchSet) int {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	n := 0
+	for _, m := range st.machines {
+		if m.phase == mEnding {
+			n++
+		}
+	}
+	return n
+}
+
+// A machine's claim whose answer is unknown is asked again with its token before the machine is spent, and a lasting
+// S3 fault spends at most claimSpend machines on a job before it waits.
+func TestALastingS3FaultDoesNotChurnMachines(t *testing.T) {
+	t.Run("a fault shorter than the tries spends no machine", func(t *testing.T) {
+		store := &fakeS3{objects: map[string]string{}}
+		p := startDispatcher(t, store, identityTags(), dispatchSet("i-0m1"))
+		store.mu.Lock()
+		store.fail = claimTries - 1
+		store.mu.Unlock()
+		handOne(t, p, "i-0m1", jobA)
+		if c := p.st.TakeCounts(); c.Retries != 0 || c.Handoffs != 1 {
+			t.Fatalf("counts %+v, want the job on its first machine", c)
+		}
+	})
+	t.Run("a lasting fault", func(t *testing.T) {
+		ids := make([]string, 10)
+		for i := range ids {
+			ids[i] = fmt.Sprintf("i-0m%02d", i)
+		}
+		store := &fakeS3{objects: map[string]string{}}
+		p := startDispatcher(t, store, identityTags(), dispatchSet(ids...))
+		faulty := &faultyClaims{Claims: &Claims{store: store, bucket: "claims"}, takes: map[string][]string{}}
+		p.d.claims = faulty
+		var machines []*peer
+		for _, id := range ids {
+			machines = append(machines, p.machine(t, id))
+		}
+		waitUntil(t, "the machines wait", func() bool { return idleMachines(p.st) == len(ids) })
+		s := p.shim(t)
+		s.sendJob(jobMessage(jobA, 7, "unit"))
+		waitUntil(t, "the job spends its machines", func() bool { return spent(p.st) == claimSpend })
+		for deadline := time.Now().Add(1500 * time.Millisecond); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+			if n := spent(p.st); n > claimSpend {
+				t.Fatalf("a lasting S3 fault spent %d machines on one job, want %d and then a wait", n, claimSpend)
+			}
+		}
+		faulty.mu.Lock()
+		defer faulty.mu.Unlock()
+		for id, tokens := range faulty.takes {
+			if len(tokens) != claimTries || tokens[0] != tokens[len(tokens)-1] {
+				t.Errorf("machine %s's claim was asked %d times with tokens %v, want %d times with one token", id, len(tokens), tokens, claimTries)
+			}
+		}
+		if snap := p.st.Snapshot(time.Now()); snap.JobsWaiting != 1 || snap.Idle != len(ids)-claimSpend {
+			t.Fatalf("%d jobs waiting and %d machines idle, want the job queued and the rest of the machines kept", snap.JobsWaiting, snap.Idle)
+		}
+		if err := machines[len(machines)-1].quiet(100 * time.Millisecond); err != nil {
+			t.Fatalf("a machine past the spent ones: %v", err)
+		}
+	})
+}
+
+// The job's claim is asked again while S3's answer is unknown, whether the claim landed or not: the job is handed to
+// its machine and no machine is spent.
+func TestAJobClaimWhoseAnswerIsUnknownIsAskedAgain(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		fault func(*fakeS3)
+	}{
+		{"not made", func(f *fakeS3) { f.fail = 1 }},
+		{"made, with its answer lost", func(f *fakeS3) { f.lose = 1 }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			store := &fakeS3{objects: map[string]string{}}
+			hooked := &hookedClaims{Claims: &Claims{store: store, bucket: "claims"}}
+			p := startDispatcher(t, store, identityTags(), dispatchSet("i-0m1"))
+			p.d.claims = hooked
+			var once sync.Once
+			hooked.before = func(name string) {
+				if name == jobFence(jobA) {
+					once.Do(func() {
+						store.mu.Lock()
+						c.fault(store)
+						store.mu.Unlock()
+					})
+				}
+			}
+			handOne(t, p, "i-0m1", jobA)
+			if counts := p.st.TakeCounts(); counts.Retries != 0 || counts.Handoffs != 1 {
+				t.Fatalf("counts %+v, want the job handed to its machine", counts)
+			}
+		})
+	}
+}
+
+// A stop lets a hand-off in flight reach its handed point and write the job's bytes before it ends the connections.
+func TestAStopLetsAHandOffInFlightWriteTheJob(t *testing.T) {
+	store := &fakeS3{objects: map[string]string{}}
+	hooked := &hookedClaims{Claims: &Claims{store: store, bucket: "claims"}}
+	p := startDispatcher(t, store, identityTags(), dispatchSet("i-0m1"))
+	p.d.claims = hooked
+	inFlight := make(chan struct{})
+	hooked.before = func(name string) {
+		if name == jobFence(jobA) {
+			close(inFlight)
+			time.Sleep(300 * time.Millisecond)
+		}
+	}
+	m := p.machine(t, "i-0m1")
+	waitUntil(t, "the machine waits", func() bool { return phaseOf(p.st, "i-0m1") == mWaiting })
+	s := p.shim(t)
+	msg := jobMessage(jobA, 7, "unit")
+	s.sendJob(msg)
+	m.job()
+	s.paired()
+	<-inFlight
+	p.d.Close()
+	if got := m.pipeBytes(len(msg)); !bytes.Equal(got, msg) {
+		t.Fatal("the machine did not get the job message before the stop")
+	}
+}
+
+// The reconciler does not wait on a shim that does not read: the lost job's exit code 1 goes to it on its own.
+func TestTheReconcilerDoesNotWaitOnAShimThatDoesNotRead(t *testing.T) {
+	st := dispatchSet("i-0m1")
+	now := time.Now()
+	s := st.adopt("i-0m1", "t."+jobA, jobA, jobClaim{}, now)
+	c1, c2 := net.Pipe()
+	defer c2.Close()
+	s.attachShim(newWire(c1, bufio.NewReader(c1), time.Hour, time.Minute, nil))
+	done := make(chan struct{})
+	go func() {
+		st.Reconcile(now.Add(4*time.Minute), bounds)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the reconciler waited on a shim that does not read")
+	}
+	_ = c2.SetReadDeadline(time.Now().Add(5 * time.Second))
+	var h [9]byte
+	if _, err := io.ReadFull(c2, h[:]); err != nil || frameType(h[0]) != frameExit || exitCode(h[5:]) != 1 {
+		t.Fatalf("the lost job's shim read %v (%v), want EXIT 1", h, err)
+	}
+}
+
+// A job adopted after a restart keeps what its claim names of it, so a lost one is re-run.
+func TestAJobLostAfterARestartIsReportedForItsReRun(t *testing.T) {
+	store := &fakeS3{objects: map[string]string{}}
+	p := startDispatcher(t, store, identityTags(), dispatchSet("i-0m1"))
+	_, _, token := handOne(t, p, "i-0m1", jobA)
+	p = p.restart(t, store, identityTags(), "i-0m1")
+	s := p.shim(t, resumeHeader, "i-0m1."+token)
+	if s.code != 101 {
+		t.Fatalf("resume: %d", s.code)
+	}
+	_, lost := p.st.Reconcile(time.Now().Add(4*time.Minute), bounds)
+	want := JobRef{Owner: "acme", Repo: "mono", RunID: 7, Name: "unit", Runner: "superci-id-4cpu-17", Instance: "i-0m1"}
+	if len(lost) != 1 || lost[0] != want {
+		t.Fatalf("lost %+v, want %+v", lost, want)
+	}
+	if code := exitCode(s.expect(frameExit)); code != 1 {
+		t.Fatalf("exit %d, want 1", code)
+	}
+}
+
+// A shim that dies after the handed point (its identity's listener was killed) loses nothing: the machine renews the
+// job itself, so it is kept while it holds its connection, however long the shim is away, and its EXIT ends it.
+func TestAShimThatDiesAfterTheHandedPointLeavesTheJobRunningToItsExit(t *testing.T) {
+	store := &fakeS3{objects: map[string]string{}}
+	p := startDispatcher(t, store, identityTags(), dispatchSet("i-0m1"))
+	m, s, _ := handOne(t, p, "i-0m1", jobA)
+	s.conn.Close()
+	waitUntil(t, "the dispatcher sees the shim gone", func() bool {
+		j := sessionOn(p.st, "i-0m1")
+		j.mu.Lock()
+		defer j.mu.Unlock()
+		return j.shim == nil
+	})
+	end, lost := p.st.Reconcile(time.Now().Add(10*time.Minute), bounds)
+	if len(end) != 0 || len(lost) != 0 || phaseOf(p.st, "i-0m1") != mClaimed {
+		t.Fatalf("with the shim away past the window: terminate %v, lost %v, machine in phase %d; want the job running on", end, lost, phaseOf(p.st, "i-0m1"))
+	}
+	m.send(frameStdout, []byte("still running"))
+	m.send(frameExit, i32(0))
+	if !m.ended(2 * time.Second) {
+		t.Fatal("the machine's connection was kept after its EXIT, with no shim to take it")
+	}
+	waitUntil(t, "the machine ends", func() bool { return phaseOf(p.st, "i-0m1") == mEnding })
+	end, _ = p.st.Reconcile(time.Now().Add(10*time.Minute), bounds)
+	if len(end) != 1 || end[0].ID != "i-0m1" {
+		t.Fatalf("terminate %v, want the machine whose job ended", end)
+	}
+	if c := p.st.TakeCounts(); c.Lost != 0 {
+		t.Fatalf("counts %+v: a job that ran to its exit code is not lost", c)
 	}
 }

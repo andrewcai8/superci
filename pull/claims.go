@@ -70,7 +70,7 @@ func (c *Claims) Holder(ctx context.Context, instance string) (string, error) {
 		return "", fmt.Errorf("read claim %s: %w", key, err)
 	}
 	defer got.Body.Close()
-	holder, err := io.ReadAll(io.LimitReader(got.Body, 256))
+	holder, err := io.ReadAll(io.LimitReader(got.Body, 8<<10))
 	if err != nil {
 		return "", fmt.Errorf("read claim %s: %w", key, err)
 	}

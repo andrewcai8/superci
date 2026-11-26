@@ -65,7 +65,7 @@ type DispatchCounts struct {
 	Handoffs int // jobs handed to a machine
 	Retries  int // pairings that ended before the handed point: the machine spent, the job paired again
 	Resumes  int // connections that rejoined their job after a break
-	Lost     int // handed jobs whose machine or shim did not come back within the window
+	Lost     int // handed jobs whose machine did not come back within the window, or that ran past their bounds
 	Dropped  int // frames over a job's budgets, dropped
 }
 
@@ -246,6 +246,9 @@ func (st *DispatchSet) rejoined(m *dmachine, mw *wire, s *session) bool {
 	m.wire, m.session, m.phase = mw, s, mClaimed
 	st.idle = slices.DeleteFunc(st.idle, func(o *dmachine) bool { return o == m })
 	st.counts.Resumes++
+	s.mu.Lock()
+	s.from = mw
+	s.mu.Unlock()
 	st.mu.Unlock()
 	if old != nil && old != mw {
 		old.close()
@@ -320,7 +323,7 @@ func (st *DispatchSet) enqueue(s *session, head jobHead, now time.Time) (pair st
 	case h.phase == pairing:
 		return "", h.settled
 	default:
-		s.phase = queued
+		s.phase, s.unknown, s.after = queued, h.unknown, h.after
 		if i := slices.Index(st.queue, h); i >= 0 {
 			st.queue[i] = s
 		} else {
@@ -357,15 +360,16 @@ func (st *DispatchSet) forget(s *session) {
 	}
 }
 
-// next takes the oldest waiting job and the oldest waiting machine for a pairing.
-func (st *DispatchSet) next() (*session, *dmachine, *wire) {
+// next takes the oldest waiting job that is not backing off and the oldest waiting machine for a pairing.
+func (st *DispatchSet) next(now time.Time) (*session, *dmachine, *wire) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	if len(st.queue) == 0 || len(st.idle) == 0 {
+	i := slices.IndexFunc(st.queue, func(s *session) bool { return !now.Before(s.after) })
+	if i < 0 || len(st.idle) == 0 {
 		return nil, nil, nil
 	}
-	s, m := st.queue[0], st.idle[0]
-	st.queue, st.idle = st.queue[1:], st.idle[1:]
+	s, m := st.queue[i], st.idle[0]
+	st.queue, st.idle = slices.Delete(st.queue, i, i+1), st.idle[1:]
 	s.phase, s.settled = pairing, make(chan struct{})
 	m.phase = mPairing
 	return s, m, m.wire
@@ -384,8 +388,9 @@ func (st *DispatchSet) claimed(s *session, m *dmachine, mw *wire, token string) 
 }
 
 // retry settles a pairing that failed before the handed point: the machine is spent, and the job goes back to the
-// head of the queue while its shim holds.
-func (st *DispatchSet) retry(s *session, m *dmachine) {
+// head of the queue while its shim holds. A job that has now spent claimSpend machines on unknown claims is not paired
+// again for the wait it returns.
+func (st *DispatchSet) retry(s *session, m *dmachine, unknown bool, now time.Time) (wait time.Duration) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	st.counts.Retries++
@@ -398,15 +403,21 @@ func (st *DispatchSet) retry(s *session, m *dmachine) {
 	s.settled = nil
 	s.mu.Lock()
 	alive := s.shim != nil && !s.shim.gone()
-	s.from, s.toShim, s.out, s.infos, s.exited = nil, nil, 0, 0, false
+	s.from, s.toShim, s.shimCost, s.out, s.infos, s.exited = nil, nil, 0, 0, 0, false
 	s.mu.Unlock()
 	if !alive {
 		s.phase = over
 		st.forget(s)
-		return
+		return 0
+	}
+	if unknown {
+		if s.unknown++; s.unknown >= claimSpend {
+			s.after, wait = now.Add(claimBackoff), claimBackoff
+		}
 	}
 	s.phase = queued
 	st.queue = append([]*session{s}, st.queue...)
+	return wait
 }
 
 // abandon settles a pairing that failed before the handed point with no shim to go on with: the machine is spent and
@@ -448,21 +459,23 @@ func (st *DispatchSet) pairOf(inst string) (*session, string, chan struct{}) {
 	return s, s.token, s.settled
 }
 
-// adopt is the session of a job a previous process handed, rejoined after a restart: its claims name the pair, and
-// both sides are away until they come.
-func (st *DispatchSet) adopt(inst, token, job string, now time.Time) *session {
+// adopt is the session of a job a previous process handed, rejoined after a restart: its claims name the pair, the
+// job's claim names the job for a re-run, and both sides are away until they come.
+func (st *DispatchSet) adopt(inst, token, job string, c jobClaim, now time.Time) *session {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	if s := st.pairs[inst]; s != nil {
 		return s
 	}
-	s := &session{set: st, id: job, machine: inst, token: token, phase: running, handed: now, arrived: now, live: true, away: [2]time.Time{now, now}}
+	s := &session{set: st, id: job, head: jobHead{ID: job, Run: c.Run, Name: c.Name, Repo: c.Repo}, agent: c.Agent, machine: inst,
+		token: token, phase: running, handed: now, arrived: now, live: true, away: [2]time.Time{now, now}}
 	st.pairs[inst], st.byJob[job] = s, s
 	return s
 }
 
-// finish ends a job: its exit code reached the shim, or it was lost. Its machine ends.
-func (st *DispatchSet) finish(s *session, lost bool) {
+// finish ends a job and its machine. A job whose machine was lost gives its shim exit code 1 first. The writes run on
+// their own: a peer that does not read holds a write for up to its silence, and the reconciler is not to wait on it.
+func (st *DispatchSet) finish(s *session, why jobEnd) {
 	st.mu.Lock()
 	if s.phase == over {
 		st.mu.Unlock()
@@ -473,17 +486,36 @@ func (st *DispatchSet) finish(s *session, lost bool) {
 		delete(st.pairs, s.machine)
 	}
 	st.forget(s)
-	why := "its job ended"
+	lost := why == machineLost
+	reason := "its job ended"
 	if lost {
-		why = "its job was lost"
+		reason = "its job was lost"
 		st.counts.Lost++
 	}
 	if m := st.machines[s.machine]; m != nil && m.session == s {
-		st.end(m, why)
+		st.end(m, reason)
 	}
 	st.mu.Unlock()
-	s.closeAll()
+	go func() {
+		if why == machineLost {
+			s.lose()
+		}
+		s.closeAll()
+	}()
 	slog.Info("dispatch job over", "set", st.spec.Name, "job", s.id, "machine", s.machine, "lost", lost)
+}
+
+// exitHeld ends the machine of a handed job whose exit code came while its shim was away: the job is over on the
+// machine, and its exit code waits in the session for the shim to rejoin.
+func (st *DispatchSet) exitHeld(s *session) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	s.mu.Lock()
+	exited := s.exited
+	s.mu.Unlock()
+	if m := st.machines[s.machine]; m != nil && m.session == s && s.phase == running && exited {
+		st.end(m, "its exit code is held for its shim")
+	}
 }
 
 func (st *DispatchSet) count(f func(*DispatchCounts)) {
@@ -499,19 +531,19 @@ type dispatchBounds struct {
 }
 
 // Reconcile ends what has outlived its bounds and returns the machines to terminate now and the jobs lost. A handed job
-// whose machine has been away past the window, or that ran past its bound, is lost: its shim gets exit code 1. One
-// whose shim has been away past the window is over (the identity's listener failed it when its shim ended). A machine
-// waiting past its age, one that has had no connection past the window, any past its life, and surplus waiting
-// machines end; an ending machine is terminated once, then a minute on if EC2 still lists it.
+// whose machine has been away past the window, or that ran past its bound, is lost: its shim gets exit code 1. A shim
+// away loses nothing: the machine renews its job itself, so the job runs on to its exit code, which is held for the
+// shim until the window after the shim left. A machine waiting past its age, one that has had no connection past the
+// window, any past its life, and surplus waiting machines end; an ending machine is terminated once, then a minute on
+// if EC2 still lists it.
 func (st *DispatchSet) Reconcile(now time.Time, b dispatchBounds) (end []*Machine, lost []JobRef) {
 	for s, why := range st.expired(now, b) {
 		if why == machineLost {
-			s.lose()
 			if j, ok := s.jobRef(); ok {
 				lost = append(lost, j)
 			}
 		}
-		st.finish(s, why != shimLeftAfterExit)
+		st.finish(s, why)
 	}
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -540,20 +572,20 @@ func (st *DispatchSet) Reconcile(now time.Time, b dispatchBounds) (end []*Machin
 	return end, lost
 }
 
-// expiry is why a handed job ends without its exit code reaching its shim.
-type expiry int
+// jobEnd is why a handed job ends.
+type jobEnd int
 
 const (
-	machineLost       expiry = iota // its machine was away past the window, or it ran past its bound: its shim gets 1
-	shimLeft                        // its shim was away past the window before the exit code came
+	exitRelayed       jobEnd = iota // its exit code reached its shim
+	machineLost                     // its machine was away past the window, or it ran past its bound: its shim gets 1
 	shimLeftAfterExit               // its shim was away past the window with the exit code held for it
 )
 
 // expired is the handed jobs to end now, and why.
-func (st *DispatchSet) expired(now time.Time, b dispatchBounds) map[*session]expiry {
+func (st *DispatchSet) expired(now time.Time, b dispatchBounds) map[*session]jobEnd {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	out := map[*session]expiry{}
+	out := map[*session]jobEnd{}
 	for inst, s := range st.pairs {
 		if s.phase != running {
 			continue
@@ -563,11 +595,11 @@ func (st *DispatchSet) expired(now time.Time, b dispatchBounds) map[*session]exp
 		s.mu.Unlock()
 		m := st.machines[inst]
 		switch {
-		case !shimAway.IsZero() && now.Sub(shimAway) > b.window && exited:
-			out[s] = shimLeftAfterExit
-		case !shimAway.IsZero() && now.Sub(shimAway) > b.window:
-			out[s] = shimLeft
-		case !exited && !machineAway.IsZero() && now.Sub(machineAway) > b.window, now.Sub(s.handed) > b.job,
+		case exited:
+			if !shimAway.IsZero() && now.Sub(shimAway) > b.window {
+				out[s] = shimLeftAfterExit
+			}
+		case !machineAway.IsZero() && now.Sub(machineAway) > b.window, now.Sub(s.handed) > b.job,
 			m != nil && now.Sub(m.Launched) > b.life:
 			out[s] = machineLost
 		}

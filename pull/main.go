@@ -728,6 +728,26 @@ func sortMachines(ms []*Machine, sets []*Set, dsets []*DispatchSet) (map[*Set][]
 	return scaled, dispatched, strays
 }
 
+// endStrays is the strays to terminate now: at 10 minutes old, and again a minute on while EC2 lists one. A machine of
+// the dispatch mode may be running its job, as when its size has moved back to a scale set, so it is ended only past
+// a machine's life; it powers off by itself once its job is over, or told there is none.
+func (l *Listener) endStrays(now time.Time, life time.Duration) []*Machine {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var end []*Machine
+	for _, m := range l.strays {
+		after := 10 * time.Minute
+		if m.Dispatch {
+			after = life
+		}
+		if now.Sub(m.Launched) > after && now.Sub(m.Ended) > time.Minute {
+			m.Ended = now
+			end = append(end, m)
+		}
+	}
+	return end
+}
+
 // dispatchLauncher launches a dispatch set's deficit, woken by a job's arrival at the dispatcher. It needs no
 // registration, so nothing but the set's own demand bounds a launch.
 func (l *Listener) dispatchLauncher(ctx context.Context, d *DispatchSet) {
@@ -905,14 +925,7 @@ func (l *Listener) reconciler(ctx context.Context, refresh func(context.Context,
 			}
 			running = append(running, d.Running()...)
 		}
-		l.mu.Lock()
-		for _, m := range l.strays {
-			if now.Sub(m.Launched) > 10*time.Minute && now.Sub(m.Ended) > time.Minute {
-				m.Ended = now
-				end = append(end, m)
-			}
-		}
-		l.mu.Unlock()
+		end = append(end, l.endStrays(now, cfg.life())...)
 		if len(end) > 0 {
 			tctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 			l.fleet.Terminate(tctx, end, "ending")

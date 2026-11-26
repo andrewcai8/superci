@@ -299,3 +299,21 @@ func TestEachDispatchSetPublishesItsDispatchMetrics(t *testing.T) {
 		t.Errorf("the alarm's OldestWaitingJobAgeS is %v, want the dispatch set's 40", oldest)
 	}
 }
+
+// A machine of the dispatch mode left with no dispatch set, as when its size moved back to a scale set, may be running
+// its job: it is not ended at 10 minutes as other strays are, only past a machine's life.
+func TestADispatchStrayIsKeptWhileItMayRunItsJob(t *testing.T) {
+	now := time.Now()
+	l := &Listener{strays: map[string]*Machine{
+		"i-0jit":  {ID: "i-0jit", Launched: now.Add(-30 * time.Minute)},
+		"i-0disp": {ID: "i-0disp", Dispatch: true, Launched: now.Add(-30 * time.Minute)},
+		"i-0old":  {ID: "i-0old", Dispatch: true, Launched: now.Add(-16 * time.Hour)},
+	}}
+	got := map[string]bool{}
+	for _, m := range l.endStrays(now, 15*time.Hour) {
+		got[m.ID] = true
+	}
+	if !got["i-0jit"] || got["i-0disp"] || !got["i-0old"] || len(got) != 2 {
+		t.Fatalf("ended %v, want the scale set's stray and the dispatch stray past its life, not the one that may run its job", got)
+	}
+}

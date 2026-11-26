@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Undoes each fix of round 2, of the fence round (audit E), of the wait round (F1 to F4), of the visible wait (U2), of the priority classes (U4), of the hygiene round (U7), of admission on GitHub's answer (the refusal shapes, the hold, the 2 and 50 start, the ceiling against the cap) and of the identity plane (D-) in a copy of pull/ and runs the test written for it, which must fail. A fix whose
+"""Undoes each fix of round 2, of the fence round (audit E), of the wait round (F1 to F4), of the visible wait (U2), of the priority classes (U4), of the hygiene round (U7), of admission on GitHub's answer (the refusal shapes, the hold, the 2 and 50 start, the ceiling against the cap) and of the identity plane and its fix round (D-) in a copy of pull/ and runs the test written for it, which must fail. A fix whose
 test still passes without it is reported as NOT RED. A path under cache/ runs its test in the cache module. Run it in pull/ where Go is installed:
 
   python3 tools/redfirst.py [name fragment ...]   # only the mutants whose name holds one of them
@@ -229,7 +229,7 @@ MUTANTS = [
     ("warm starts after a job that started during the walk", "boot.sh", "    [ -e \"$HR/.pid\" ] || return 0\n    # The walk reads inodes", "    # The walk reads inodes", "TestAJobThatStartsDuringTheWalkStartsNoDaemonAndNoWarm"),
     ("warm reads the libraries on any machine", "boot.sh", "-ge 12000000 ] 2> /dev/null && libs=", "-ge 0 ] 2> /dev/null && libs=", "TestOnlyAMachineOf12GBOrMoreWarmsTheLibraries"),
     # The identity plane (dispatch.go, dset.go): each mutant undoes one guard of the dispatcher or of a dispatch set.
-    ("D-1 a job's own claim is not taken", "dispatch.go", "\t\terr := d.claims.Take(ctx, jobFence(job), key)\n", "\t\terr := error(nil)\n",
+    ("D-1 a job's own claim is not taken", "dispatch.go", "\tswitch err := d.take(fctx, jobFence(s.id), claim.String(), 0); {", "\tswitch err := d.take(fctx, jobFence(s.id)+newToken(), claim.String(), 0); {",
      "TestNoInterleavingOfPairingFailureAndRestartWritesAJobToTwoMachines"),
     ("D-1 a replay of a handed job is not sent to its pair", "dispatch.go", "\t\tif key != \"\" {\n\t\t\tslog.Warn(\"dispatch job already handed\"", "\t\tif key == \"-\" {\n\t\t\tslog.Warn(\"dispatch job already handed\"",
      "TestNoInterleavingOfPairingFailureAndRestartWritesAJobToTwoMachines"),
@@ -237,7 +237,7 @@ MUTANTS = [
      "TestAMachineThatFailsBeforeTheFirstPipeByteIsSpentAndTheJobRunsOnTheNext"),
     ("D-2 a machine whose JOB could not be written is handed the job", "dispatch.go", "\tif mw.send(frameJob, s.jobFrame(token)) != nil {", "\tif _ = mw.send(frameJob, s.jobFrame(token)); false {",
      "TestAMachineThatFailsBeforeTheFirstPipeByteIsSpentAndTheJobRunsOnTheNext"),
-    ("D-3 a machine away past the window is never lost", "dset.go", "!exited && !machineAway.IsZero() && now.Sub(machineAway) > b.window", "!exited && !machineAway.IsZero() && now.Sub(machineAway) > 100*b.window",
+    ("D-3 a machine away past the window is never lost", "dset.go", "case !machineAway.IsZero() && now.Sub(machineAway) > b.window,", "case !machineAway.IsZero() && now.Sub(machineAway) > 100*b.window,",
      "TestAMachineLostAfterTheHandedPointEndsItsShimWithOneAndTheJobGoesNowhereElse"),
     ("D-3 a lost job's shim gets no exit code", "dispatch.go", "_ = sw.send(frameExit, binary.LittleEndian.AppendUint32(nil, 1))", "_ = sw.send(framePing, nil)",
      "TestAMachineLostAfterTheHandedPointEndsItsShimWithOneAndTheJobGoesNowhereElse"),
@@ -249,7 +249,7 @@ MUTANTS = [
      "TestASecondWorkFromAClaimedMachineAndAResumeWithAnotherTokenGet410"),
     ("D-5 a resume with another token rejoins after a restart", "dispatch.go", "\tcase fence == key:\n\t\treturn st.adopt(", "\tcase fence != key+\"-\":\n\t\treturn st.adopt(",
      "TestASecondWorkFromAClaimedMachineAndAResumeWithAnotherTokenGet410"),
-    ("D-6 an instance without the role tag is a shim", "dispatch.go", "if tags[tagRole] != \"identity\" || tags[tagDeployment] != d.deployment {", "if tags[tagDeployment] != d.deployment {",
+    ("D-6 an instance without the role tag is a shim", "dispatch.go", "ok := tags[tagRole] == \"identity\" && tags[tagDeployment] == d.deployment", "ok := tags[tagDeployment] == d.deployment",
      "TestAShimFromAnInstanceThatIsNoIdentityHostIsRefused"),
     ("D-7 an INFO frame may hold 1 MiB", "dispatch.go", "frameInfo: 4 << 10,", "frameInfo: 1 << 20,", "TestFramesPastTheirBoundsEndTheConnectionOrAreDropped"),
     ("D-7 stdout has no budget", "dispatch.go", "if keep = s.out+len(p) <= outBudget; keep {", "if keep = true; keep {", "TestFramesPastTheirBoundsEndTheConnectionOrAreDropped"),
@@ -258,7 +258,7 @@ MUTANTS = [
      "TestFramesPastTheirBoundsEndTheConnectionOrAreDropped"),
     ("D-8 a .runner may hold credential fields", "dispatch.go", "\t\tif slices.Contains(credentialKeys, strings.ToLower(k)) {", "\t\tif false {",
      "TestAShimThatSendsCredentialsIsRefusedAndNoMachineGetsThem"),
-    ("D-9 a waiting machine is offered to two jobs", "dset.go", "\tst.queue, st.idle = st.queue[1:], st.idle[1:]\n", "\tst.queue = st.queue[1:]\n",
+    ("D-9 a waiting machine is offered to two jobs", "dset.go", "\tst.queue, st.idle = slices.Delete(st.queue, i, i+1), st.idle[1:]\n", "\tst.queue = slices.Delete(st.queue, i, i+1)\n",
      "TestShimsAndMachinesPairingAtOnceGiveEachJobOneMachineAndEachMachineOneJob"),
     ("D-10 a replay is queued beside its job", "dset.go", "\t\tif i := slices.Index(st.queue, h); i >= 0 {\n\t\t\tst.queue[i] = s\n\t\t} else {\n\t\t\tst.queue = append(st.queue, s)\n\t\t}\n\t\th.phase = over\n\t\tgo h.closeAll()\n", "\t\tst.queue = append(st.queue, s)\n",
      "TestAReplayedJobTakesItsQueuedPlaceAndIsNeverASecondJob"),
@@ -283,7 +283,42 @@ MUTANTS = [
      "TestASilentConnectionEndsAndOneThatPingsHolds"),
     ("D-22 a job's connections close with what the peer sent unread", "dispatch.go", "\t\tif w != nil {\n\t\t\tw.end()\n", "\t\tif w != nil {\n\t\t\tw.close()\n",
      "TestAShimThatKeepsPingingWhileItsExitIsRelayedStillGetsIt"),
-    ("D-20 an exit code held for a shim that left is a lost job", "dset.go", "\t\t\tout[s] = shimLeftAfterExit\n", "\t\t\tout[s] = shimLeft\n", "TestAnExitSentAgainAfterARestartIsHarmless"),
+    ("D-20 an exit code held for a shim that left is a lost job", "dset.go", "\t\t\t\tout[s] = shimLeftAfterExit\n", "\t\t\t\tout[s] = machineLost\n", "TestAnExitSentAgainAfterARestartIsHarmless"),
+    # The fix round of the identity plane (review of #42): each mutant undoes one fix.
+    ("D-fix-1 a job holds every EXIT for its shim", "dispatch.go", "\t\tif s.exited {\n\t\t\ts.mu.Unlock()\n\t\t\treturn false\n\t\t}\n", "",
+     "TestAFloodOfFramesWhileTheShimIsAwayLeavesTheJobBounded"),
+    ("D-fix-1 what a job holds for its shim has no bound", "dispatch.go", "if f.t != frameExit && s.shimCost+cost > shimHeld {", "if false {",
+     "TestAFloodOfFramesWhileTheShimIsAwayLeavesTheJobBounded"),
+    ("D-fix-2 a PIPE frame whose flush failed is dropped", "dispatch.go", "s.toMach = append(held[i:], s.toMach...)", "s.toMach = append(held[i+1:], s.toMach...)",
+     "TestAPipeFrameNeverWrittenGoesToTheMachineThatRejoins"),
+    ("D-fix-2 a PIPE frame whose send failed is dropped", "dispatch.go", "\t\ts.mu.Lock()\n\t\ts.toMach = append(s.toMach, p)\n\t\ts.held += len(p)\n\t\ts.mu.Unlock()\n\t\ts.machineAway(m)", "\t\ts.machineAway(m)",
+     "TestAPipeFrameNeverWrittenGoesToTheMachineThatRejoins"),
+    ("D-fix-3 an adopted job never sends what it holds for its shim", "dset.go", "phase: running, handed: now, arrived: now, live: true,", "phase: running, handed: now, arrived: now, live: false,",
+     "TestAMachineThatLostItsJobMessageToACrashFailsTheJobThroughTheNextDispatcher"),
+    ("D-fix-4 a caller that is no identity host is asked about each time", "dispatch.go", "\tcase known && now.Before(h.until):\n\t\treturn errNotIdentity", "\tcase false:\n\t\treturn errNotIdentity",
+     "TestShimCallersCostBoundedReadsOfTheirTags"),
+    ("D-fix-4 reads of tags at once are unbounded", "dispatch.go", "lookups: make(chan struct{}, tagLookups)", "lookups: make(chan struct{}, 1000)",
+     "TestShimCallersCostBoundedReadsOfTheirTags"),
+    ("D-fix-5 a machine's unknown claim is asked once", "dispatch.go", "d.take(ctx, m.ID, token, claimTries)", "d.take(ctx, m.ID, token, 1)",
+     "TestALastingS3FaultDoesNotChurnMachines"),
+    ("D-fix-5 a job spends machines on unknown claims without bound", "dset.go", "if s.unknown++; s.unknown >= claimSpend {", "if s.unknown++; false {",
+     "TestALastingS3FaultDoesNotChurnMachines"),
+    ("D-fix-6 the job's claim is asked once", "dispatch.go", "d.take(fctx, jobFence(s.id), claim.String(), 0)", "d.take(fctx, jobFence(s.id), claim.String(), 1)",
+     "TestAJobClaimWhoseAnswerIsUnknownIsAskedAgain"),
+    ("D-fix-6 a stop does not wait for the hand-offs in flight", "dispatch.go", "go func() { d.handing.Wait(); close(drained) }()", "go func() { close(drained) }()",
+     "TestAStopLetsAHandOffInFlightWriteTheJob"),
+    ("D-fix-7 the reconciler writes to the lost job's shim itself", "dset.go", "\tgo func() {\n\t\tif why == machineLost {", "\tfunc() {\n\t\tif why == machineLost {",
+     "TestTheReconcilerDoesNotWaitOnAShimThatDoesNotRead"),
+    ("D-fix-7 an adopted job forgets its names", "dset.go", "head: jobHead{ID: job, Run: c.Run, Name: c.Name, Repo: c.Repo}, agent: c.Agent,", "head: jobHead{ID: job},",
+     "TestAJobLostAfterARestartIsReportedForItsReRun"),
+    ("D-fix-7 a job's claim holds only its pair", "dispatch.go", "claim := jobClaim{pair: m.ID + \".\" + token, Run: s.head.Run, Name: s.head.Name, Repo: s.head.Repo, Agent: s.agent}", "claim := jobClaim{pair: m.ID + \".\" + token}",
+     "TestAJobLostAfterARestartIsReportedForItsReRun"),
+    ("D-fix-7 a dispatch stray ends at 10 minutes", "main.go", "\t\tif m.Dispatch {\n\t\t\tafter = life", "\t\tif false {\n\t\t\tafter = life",
+     "TestADispatchStrayIsKeptWhileItMayRunItsJob"),
+    ("D-fix-8 a shim away past the window loses its job", "dset.go", "\t\tcase !machineAway.IsZero() && now.Sub(machineAway) > b.window,", "\t\tcase !shimAway.IsZero() && now.Sub(shimAway) > b.window, !machineAway.IsZero() && now.Sub(machineAway) > b.window,",
+     "TestAShimThatDiesAfterTheHandedPointLeavesTheJobRunningToItsExit"),
+    ("D-fix-8 an EXIT held for an absent shim keeps its machine", "dispatch.go", "\t\t} else if t == frameExit {\n\t\t\tst.exitHeld(s)", "\t\t} else if false {\n\t\t\tst.exitHeld(s)",
+     "TestAShimThatDiesAfterTheHandedPointLeavesTheJobRunningToItsExit"),
 ]
 
 here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

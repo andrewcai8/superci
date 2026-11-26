@@ -445,56 +445,69 @@ size is one set (`split` 1), since an identity names its size, not a set of it.
   | Type | Name | From | Bound |
   | ---: | --- | --- | --- |
   | 1, 2 | STDOUT, STDERR | machine | 1 MiB a frame; 4 MiB a job together, past which frames are dropped and counted |
-  | 3 | EXIT | machine | exactly 4 bytes (i32); ends the job |
+  | 3 | EXIT | machine | exactly 4 bytes (i32); ends the job; one a job, the rest dropped |
   | 4 | INFO | machine | 4 KiB a frame, 64 a job, a JSON object of `instance`, `boot`, `t_hdr`, `t_spawn`, `t_exit`, `rc` only |
   | 5 | PIPE | shim | 1 MiB a frame; 33 MiB held while the job has no machine |
   | 6 | JOB | dispatcher | 64 KiB: `{"runner", "token", "job": {run, job, name, repo}}` |
   | 7 | PING | both | empty, every 20 s; 60 s of silence ends the connection |
   | 8 | PAIRED | dispatcher | 1 KiB: `{"instance", "token"}` |
 
-  Any other type, or a frame past its bound, ends the connection. A `/shim` caller must be an identity host of this
-  deployment (its tags, read from EC2 and trusted for 5 minutes) and send its `.runner` in base64 as
+  Any other type, or a frame past its bound, ends the connection. What a machine sends while its shim is away is held
+  for the shim up to 8 MiB, each frame counted at its payload and 64 bytes more, so a flood of empty frames is bounded
+  too; past it frames are dropped and counted, and the one EXIT is always held. A `/shim` caller must be an identity
+  host of this deployment and send its `.runner` in base64 as
   `X-Superci-Runner`; the agent name decides the set, and a `.runner` holding a field of the credential files is
-  refused (403). A `/work` caller must be a machine of a dispatch set that never held a claim (410 otherwise).
+  refused (403). Any instance of the account can call `/shim`, job code included, and each read of its tags spends
+  the account's EC2 Describe budget: an identity host's tags are trusted for 5 minutes, an instance that is not one is
+  refused for 1 minute without asking EC2 again, and at most 4 reads run at once, past which a caller gets 503. A
+  `/work` caller must be a machine of a dispatch set that never held a claim (410 otherwise).
   `/agent` answers a dispatch machine with `agent.py`.
 - **Pairing.** Each dispatch set keeps a queue of waiting machines, oldest first (the warmest), and a queue of jobs.
   The dispatcher reads the job's id and names from the listener's first message (`NewJobRequest`, at most 32 MiB) and
   keeps no secret field of it. A shim whose connection broke before PAIRED replays its job on a new connection: the
-  replay takes the queued job's place, so a job is one job however often it arrives. To pair, the dispatcher takes
-  the machine's claim (`issued/<instance>`, made once) with a fresh token, sends JOB to the machine and PAIRED to the
-  shim, takes the job's own claim (`issued/job-<job id>`, holding `<instance>.<token>`), and writes the first PIPE
-  byte. **The job's claim is the handed point.** Before it, any failure spends the machine (it is ended and never
-  offered again) and puts the job back at the head of its queue. After it, the job goes to no other machine, across
-  restarts and overlapping listeners: a replay of a handed job is sent the PAIRED of the pair that has it. A stop
-  lets the hand-offs in flight finish for 5 s first.
+  replay takes the queued job's place, so a job is one job however often it arrives. To pair, the dispatcher takes the
+  machine's claim (`issued/<instance>`, made once) with a fresh token, sends JOB to the machine and PAIRED to the
+  shim, takes the job's own claim (`issued/job-<job id>`, holding `<instance>.<token>` and, on a second line, the
+  job's run, name, repository and identity, so a job lost after a restart can be re-run), and writes the first PIPE
+  byte. A claim whose answer S3 lost is asked again with the same token, which finds it taken by that token if it
+  landed: a machine's claim 3 times before the machine is spent, the job's claim for up to 3 minutes. A job that has
+  spent 3 machines on claims S3 never answered waits 30 s before each next one, so a lasting S3 fault does not churn
+  the set's machines. **The job's claim is the handed point.** Before it, any failure spends the machine (it is ended
+  and never offered again) and puts the job back at the head of its queue. After it, the job goes to no other machine,
+  across restarts and overlapping listeners: a replay of a handed job is sent the PAIRED of the pair that has it. A
+  stop lets the hand-offs in flight finish for 5 s first.
 - **Resume.** A side whose connection broke after the handed point reconnects with `X-Superci-Resume:
   <instance>.<token>` for up to 3 minutes. The token carries the job's id, so a new dispatcher reads the job's claim:
   it must name the pair (it was taken only once the machine's claim held that token), or the answer is 410. A pair
   never handed is also 410: the shim drops its job's bytes once PAIRED comes, so it cannot start the job again. Bytes
   in flight at the break may be lost; the shim sends what it read while away, and the machine sends its EXIT again
-  until a clean close follows it.
+  until a clean close follows it. A PIPE frame whose send failed is sent on the machine's next connection: a failed
+  send puts no whole frame on the wire, and the agent acts only on whole frames, so no byte reaches the Worker twice.
 - **Ending a connection.** Once the EXIT reaches the shim, both connections end with TLS close_notify and a FIN, and
   the dispatcher reads and drops what each peer still sends for up to 5 s before it closes the socket: a socket closed
   with bytes unread sends a reset, which discards the EXIT still on its way. A stop starts no hand-off, lets those in
   flight finish for 5 s, and ends every connection, which each side rejoins on the next dispatcher.
 - **Loss.** A machine away for 3 minutes with no EXIT, a job past `job_minutes` + `margin_minutes`, or a machine
   past its life loses its job: the shim gets exit code 1, which is no TaskResult, and the identity's listener fails
-  the job. A spot reclaim's lost job is re-run as a scale set's is, known by its machine and found in its run by its
-  name (an identity takes many jobs).
-- **Machines.** A dispatch machine carries `superci-pull-mode=dispatch`, so a scale set and a dispatch set of one
-  size never take each other's machines. Its demand is the jobs waiting plus the jobs running, and its pool follows
-  the jobs that arrive at the dispatcher, by the same rule as a scale set's (Pools). It ends when its EXIT has been
-  relayed, when it has had no connection for 3 minutes (and is 5 minutes old), when it has waited past
-  `max_age_hours`, past its life, or as surplus: the newest machines without a job first, after 20 s of surplus,
-  never in the first window after a start. It holds no runner, so its end needs no GitHub fence.
+  the job. A shim that is away loses nothing: the machine renews its job itself, so the job runs on to its EXIT
+  however long the shim stays away. An EXIT that comes while the shim is away ends the machine and is held for the
+  shim until 3 minutes after the shim left. A spot reclaim's lost job is re-run as a scale set's is, known by its
+  machine and found in its run by its name (an identity takes many jobs).
+- **Machines.** A dispatch machine carries `superci-pull-mode=dispatch`, so a scale set and a dispatch set of one size
+  never take each other's machines. Its demand is the jobs waiting plus the jobs running, and its pool follows the
+  jobs that arrive at the dispatcher, by the same rule as a scale set's (Pools). It ends when its EXIT has been
+  relayed or held for a shim that is away, when it has had no connection for 3 minutes (and is 5 minutes old), when it
+  has waited past `max_age_hours`, past its life, or as surplus: the newest machines without a job first, after 20 s
+  of surplus, never in the first window after a start. It holds no runner, so its end needs no GitHub fence. A
+  dispatch machine left with no dispatch set, as when its size moved back to a scale set, may be running its job: it
+  is ended only past a machine's life, not at 10 minutes as other machines of no set are, and it powers off by itself.
 - **Names.** The lister takes a set's runners by `<set>-i-`, the form of a machine's runner. An identity is never a
   machine's runner or an orphan, and nothing removes one.
 - **Metrics,** per dispatch set under the `Set` dimension: `JobsWaiting`, `Machines`, `Pool`,
   `OldestWaitingJobAgeS`, `DispatchIdleMachines`, `DispatchRunning`, and each minute's `DispatchHandoffs`,
   `DispatchRetries`, `DispatchResumes`, `DispatchLostJobs` and `DispatchDroppedFrames`. Their jobs' waits for a machine
   are in `QueueWait`, and their oldest wait in the alarms' `OldestWaitingJobAgeS`.
-- **Limits.** A listener that crashes between a PAIRED and the job's claim loses that job (the shim has dropped its
-  bytes, and the claim names no pair): one S3 round trip a hand-off. A dispatch set's pool is not carried across a
+- **Limits.** A crash in a hand-off fails that job once (Known limits). A dispatch set's pool is not carried across a
   restart; it starts from the hour's floor. Moving a size back to a scale set fails the jobs its machines run.
 
 ## Hydration
@@ -792,6 +805,13 @@ one job), plus the pool. `SpendPerHourUSD` is the listener's live figure.
 - **EC2's tag reads are eventually consistent.** No grant trusts them: the claim decides. A machine issued by a
   previous process whose tag a listing does not show yet is granted, its grant finds the claim taken and answers 410,
   and its end waits for GitHub's word on its runner.
+- **A dispatcher that crashes in a hand-off fails that job once, and never runs it twice.** The shim drops the job's
+  bytes once PAIRED comes, so from then until the machine has them the job message is only in the dispatcher's memory.
+  A crash between PAIRED and the job's claim (one S3 round trip) leaves a claim that names no pair: both sides are
+  answered 410 when they rejoin, and the shim fails the job. A crash after the job's claim and before its bytes reach
+  the machine leaves a machine with its JOB and no job message: its agent sends EXIT 1 when no complete first message
+  comes within 60 s of JOB, the next dispatcher relays it through the job it adopts, and the job fails. In both cases
+  the job's claim names at most one pair, so no other machine gets the job.
 - **The statistics are a lease.** When the message session has not answered for 100 s (twice its long poll),
   nothing is launched, no idle runner is retired as surplus and no machine is told to end as surplus.
 

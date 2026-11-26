@@ -68,9 +68,17 @@ const (
 	infoBudget    = 64                    // INFO frames one job relays
 	jobMessageMax = 32 << 20              // the most of the listener's job message the dispatcher reads
 	pipeHeld      = jobMessageMax + 1<<20 // PIPE bytes held while the job has no machine to write them to
+	shimHeld      = 8 << 20               // what the machine sent that is held while the shim is away, frames at heldCost
+	heldCost      = 64                    // a held frame's memory beyond its payload, so a flood of empty frames is bounded
 	bootGrace     = 5 * time.Minute       // a launched machine that has not come to /work by then is stuck
 	resumeWindow  = 3 * time.Minute       // how long a handed job waits for a side to rejoin after its connection broke
 	drainFor      = 5 * time.Second       // how long an ended connection reads what its peer still sends
+	hostTrust     = 5 * time.Minute       // how long an identity host's tags are trusted
+	hostDistrust  = time.Minute           // how long a /shim caller that is no identity host is refused without asking EC2
+	tagLookups    = 4                     // EC2 reads of /shim callers' tags at once; past them a caller is answered 503
+	claimTries    = 3                     // asks of one machine's claim while S3's answer is unknown, with one token
+	claimSpend    = 3                     // machines a job spends on unknown claims before each next one waits claimBackoff
+	claimBackoff  = 30 * time.Second
 )
 
 // infoKeys are the keys an INFO frame may hold: the machine agent's times and its Worker's exit code.
@@ -345,8 +353,31 @@ func runnerIdentity(header string) (runner, agent, set string, err error) {
 	return text, agent, "superci-" + m[1], nil
 }
 
-// jobFence is the claim of a handed job: issued/job-<job id>, holding <instance>.<token> of the pair it was handed to.
+// jobFence is the claim of a handed job: issued/job-<job id>, holding a jobClaim.
 func jobFence(job string) string { return "job-" + job }
+
+// A jobClaim is what a handed job's claim holds: the pair it was handed to, <instance>.<token>, and on a second line
+// what a dispatcher that adopts the job after a restart needs to have it re-run if its machine is lost.
+type jobClaim struct {
+	pair  string
+	Run   int64  `json:"run,omitempty"`
+	Name  string `json:"name,omitempty"`
+	Repo  string `json:"repo,omitempty"`
+	Agent string `json:"agent,omitempty"`
+}
+
+func (c jobClaim) String() string {
+	b, _ := json.Marshal(c)
+	return c.pair + "\n" + string(b)
+}
+
+func parseJobClaim(holder string) jobClaim {
+	pair, ref, _ := strings.Cut(holder, "\n")
+	var c jobClaim
+	_ = json.Unmarshal([]byte(ref), &c)
+	c.pair = pair
+	return c
+}
 
 // tagReader reads an instance's tags from EC2 (Fleet.Tags).
 type tagReader interface {
@@ -379,16 +410,25 @@ type Dispatcher struct {
 	readers  sync.WaitGroup // connections' readers
 	stopping atomic.Bool    // no new hand-off starts
 
+	lookups chan struct{} // EC2 reads of /shim callers' tags in flight
+
 	mu    sync.Mutex
-	hosts map[string]time.Time // identity hosts whose tags were read, until when that reading holds
+	hosts map[string]hostCheck // /shim callers whose tags were read
 	wires map[*wire]bool       // every open connection
+}
+
+// hostCheck is what an instance's tags said, identity host or not, and until when that reading holds.
+type hostCheck struct {
+	ok    bool
+	until time.Time
 }
 
 func NewDispatcher(deployment string, sets []*DispatchSet, verifier interface {
 	Verify(body []byte) (InstanceDocument, error)
 }, claims claimStore, tags tagReader, refresh func(context.Context, string)) *Dispatcher {
 	d := &Dispatcher{deployment: deployment, sets: map[string]*DispatchSet{}, verifier: verifier, claims: claims, tags: tags,
-		refresh: refresh, ping: 20 * time.Second, silence: 60 * time.Second, hosts: map[string]time.Time{}, wires: map[*wire]bool{}}
+		refresh: refresh, ping: 20 * time.Second, silence: 60 * time.Second, lookups: make(chan struct{}, tagLookups),
+		hosts: map[string]hostCheck{}, wires: map[*wire]bool{}}
 	for _, s := range sets {
 		d.sets[s.spec.Name] = s
 	}
@@ -550,7 +590,7 @@ func (d *Dispatcher) shim(ctx context.Context, w http.ResponseWriter, r *http.Re
 			return
 		}
 		if s.attachShim(sw) {
-			st.finish(s, false)
+			st.finish(s, exitRelayed)
 		}
 		st.count(func(c *DispatchCounts) { c.Resumes++ })
 		slog.Info("dispatch resumed", "set", st.spec.Name, "side", "shim", "machine", inst, "job", s.id)
@@ -580,26 +620,48 @@ func (d *Dispatcher) spawn(read func()) {
 	}()
 }
 
-// identityHost checks that an instance is an identity host of this deployment, by its EC2 tags. A host that passed
-// is not asked about again for five minutes.
+// identityHost checks that an instance is an identity host of this deployment, by its EC2 tags. Any instance of the
+// account can call /shim, job code included, and each EC2 read spends the account's Describe budget: so a host that
+// passed is not asked about for hostTrust, one that failed for hostDistrust, and at most tagLookups reads run at once.
 func (d *Dispatcher) identityHost(ctx context.Context, doc InstanceDocument) error {
 	now := time.Now()
 	d.mu.Lock()
-	until := d.hosts[doc.InstanceID]
+	h, known := d.hosts[doc.InstanceID]
 	d.mu.Unlock()
-	if now.Before(until) {
+	switch {
+	case known && now.Before(h.until) && h.ok:
 		return nil
+	case known && now.Before(h.until):
+		return errNotIdentity
+	}
+	select {
+	case d.lookups <- struct{}{}:
+		defer func() { <-d.lookups }()
+	default:
+		return fmt.Errorf("tags of %s: %d reads of tags already in flight", doc.InstanceID, tagLookups)
 	}
 	tags, err := d.tags.Tags(ctx, doc.Region, doc.InstanceID)
 	if err != nil {
 		return fmt.Errorf("tags of %s: %w", doc.InstanceID, err)
 	}
-	if tags[tagRole] != "identity" || tags[tagDeployment] != d.deployment {
+	ok := tags[tagRole] == "identity" && tags[tagDeployment] == d.deployment
+	d.mu.Lock()
+	if len(d.hosts) > 4096 {
+		for id, c := range d.hosts {
+			if now.After(c.until) {
+				delete(d.hosts, id)
+			}
+		}
+	}
+	if ok {
+		d.hosts[doc.InstanceID] = hostCheck{ok: true, until: now.Add(hostTrust)}
+	} else {
+		d.hosts[doc.InstanceID] = hostCheck{until: now.Add(hostDistrust)}
+	}
+	d.mu.Unlock()
+	if !ok {
 		return errNotIdentity
 	}
-	d.mu.Lock()
-	d.hosts[doc.InstanceID] = now.Add(5 * time.Minute)
-	d.mu.Unlock()
 	return nil
 }
 
@@ -633,12 +695,14 @@ func (d *Dispatcher) resume(ctx context.Context, st *DispatchSet, inst, token st
 		}
 	}
 	key := inst + "." + token
-	fence, err := d.claims.Holder(ctx, jobFence(job))
+	holder, err := d.claims.Holder(ctx, jobFence(job))
+	claim := parseJobClaim(holder)
+	fence := claim.pair
 	switch {
 	case err != nil:
 		return nil, http.StatusServiceUnavailable, nil
 	case fence == key:
-		return st.adopt(inst, token, job, time.Now()), 0, nil
+		return st.adopt(inst, token, job, claim, time.Now()), 0, nil
 	case fence == "" || !shim:
 		return nil, http.StatusGone, nil
 	}
@@ -742,7 +806,9 @@ func (d *Dispatcher) machineReader(st *DispatchSet, m *dmachine, mw *wire) {
 			break
 		}
 		if s.fromMachine(mw, t, p) {
-			st.finish(s, false)
+			st.finish(s, exitRelayed)
+		} else if t == frameExit {
+			st.exitHeld(s)
 		}
 	}
 	st.machineClosed(m, mw)
@@ -792,7 +858,7 @@ func (d *Dispatcher) shimReader(st *DispatchSet, s *session, sw *wire) {
 // match pairs the set's waiting jobs with its waiting machines, oldest first, each pair on its own.
 func (d *Dispatcher) match(st *DispatchSet) {
 	for !d.stopping.Load() {
-		s, m, mw := st.next()
+		s, m, mw := st.next(time.Now())
 		if s == nil {
 			return
 		}
@@ -812,16 +878,14 @@ func (d *Dispatcher) hand(st *DispatchSet, s *session, m *dmachine, mw *wire) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	token := newToken() + "." + s.id
-	if err := d.claims.Take(ctx, m.ID, token); err != nil {
+	if err := d.take(ctx, m.ID, token, claimTries); err != nil {
 		slog.Warn("dispatch claim", "set", st.spec.Name, "machine", m.ID, "job", s.id, "elsewhere", errors.Is(err, ErrClaimed), "err", err.Error())
-		st.retry(s, m)
-		d.match(st)
+		d.retry(st, s, m, !errors.Is(err, ErrClaimed))
 		return
 	}
 	st.claimed(s, m, mw, token)
 	if mw.send(frameJob, s.jobFrame(token)) != nil {
-		st.retry(s, m)
-		d.match(st)
+		d.retry(st, s, m, false)
 		return
 	}
 	sw := s.shimWire()
@@ -829,15 +893,19 @@ func (d *Dispatcher) hand(st *DispatchSet, s *session, m *dmachine, mw *wire) {
 		st.abandon(s, m)
 		return
 	}
-	key := m.ID + "." + token
+	claim := jobClaim{pair: m.ID + "." + token, Run: s.head.Run, Name: s.head.Name, Repo: s.head.Repo, Agent: s.agent}
 	fctx, fcancel := context.WithTimeout(context.Background(), resumeWindow)
 	defer fcancel()
-	switch err := d.fence(fctx, s.id, key); {
+	// The job's claim is asked again while S3's answer is unknown, for as long as a shim would wait to rejoin: a claim
+	// that may have landed names this pair, nothing else may be sent until that is known, and the shim has PAIRED, so
+	// it cannot start the job again.
+	switch err := d.take(fctx, jobFence(s.id), claim.String(), 0); {
 	case errors.Is(err, ErrClaimed):
 		holder, herr := d.claims.Holder(fctx, jobFence(s.id))
-		slog.Warn("dispatch job already handed", "set", st.spec.Name, "job", s.id, "pair", holder, "err", errString(herr))
-		if herr == nil && holder != "" {
-			_ = sw.send(framePaired, pairedOf(holder))
+		pair := parseJobClaim(holder).pair
+		slog.Warn("dispatch job already handed", "set", st.spec.Name, "job", s.id, "pair", pair, "err", errString(herr))
+		if herr == nil && pair != "" {
+			_ = sw.send(framePaired, pairedOf(pair))
 		}
 		st.abandon(s, m)
 		return
@@ -849,18 +917,17 @@ func (d *Dispatcher) hand(st *DispatchSet, s *session, m *dmachine, mw *wire) {
 	st.handed(s, time.Now())
 	s.attachMachine(mw)
 	if s.goLive() {
-		st.finish(s, false)
+		st.finish(s, exitRelayed)
 	}
 	slog.Info("dispatch handed", "set", st.spec.Name, "job", s.id, "machine", m.ID, "agent", s.agent, "run", s.head.Run, "name", s.head.Name)
 }
 
-// fence takes the job's claim for a pair, asking again while S3's answer is unknown, for as long as a shim would wait
-// to rejoin: a claim that may have landed names this pair, nothing else may be sent until that is known, and the shim
-// has PAIRED, so it cannot start the job again.
-func (d *Dispatcher) fence(ctx context.Context, job, key string) error {
-	for wait := 100 * time.Millisecond; ; wait = min(2*wait, 2*time.Second) {
-		err := d.claims.Take(ctx, jobFence(job), key)
-		if err == nil || errors.Is(err, ErrClaimed) || ctx.Err() != nil {
+// take takes a claim for token, asking again while S3's answer is unknown: tries times in all, or with tries 0 until
+// ctx ends. Take is idempotent per token, so a claim that landed with its answer lost is found to be this token's.
+func (d *Dispatcher) take(ctx context.Context, name, token string, tries int) error {
+	for try, wait := 1, 100*time.Millisecond; ; try, wait = try+1, min(2*wait, 2*time.Second) {
+		err := d.claims.Take(ctx, name, token)
+		if err == nil || errors.Is(err, ErrClaimed) || ctx.Err() != nil || try == tries {
 			return err
 		}
 		select {
@@ -869,6 +936,16 @@ func (d *Dispatcher) fence(ctx context.Context, job, key string) error {
 		case <-time.After(wait):
 		}
 	}
+}
+
+// retry settles a pairing that failed before the handed point and pairs again. A job that has spent claimSpend
+// machines on claims S3 never answered waits claimBackoff before each next one, so a lasting S3 fault does not churn
+// through the set's machines.
+func (d *Dispatcher) retry(st *DispatchSet, s *session, m *dmachine, unknown bool) {
+	if wait := st.retry(s, m, unknown, time.Now()); wait > 0 {
+		time.AfterFunc(wait, func() { d.match(st) })
+	}
+	d.match(st)
 }
 
 // A session is one job, from its shim's arrival to the Worker's exit code reaching the shim: waiting for a machine,
@@ -889,6 +966,8 @@ type session struct {
 	token   string
 	settled chan struct{} // closed when its pairing ends, handed or not
 	handed  time.Time
+	unknown int       // machines spent on claims whose answer was unknown
+	after   time.Time // not paired before then
 
 	wm sync.Mutex // one writer of PIPE frames to the machine at a time, in order
 	ws sync.Mutex // one writer of frames to the shim at a time, in order
@@ -901,6 +980,7 @@ type session struct {
 	toMach   [][]byte
 	held     int
 	toShim   []shimFrame
+	shimCost int // what toShim holds, at heldCost a frame beyond its payload
 	out      int
 	infos    int
 	exited   bool
@@ -976,25 +1056,34 @@ func (s *session) pipe(p []byte) error {
 	}
 	s.mu.Unlock()
 	if m.send(framePipe, p) != nil {
+		s.mu.Lock()
+		s.toMach = append(s.toMach, p)
+		s.held += len(p)
+		s.mu.Unlock()
 		s.machineAway(m)
 	}
 	return nil
 }
 
-// attachMachine makes mw the connection PIPE bytes go to, after the bytes held for it. A frame whose write fails is
-// lost in flight; the rest are held for the machine's next connection.
+// attachMachine makes mw, the job's machine connection, the one PIPE bytes go to, after the bytes held for it. A frame
+// whose send failed is held with the rest for the machine's next connection: a failed send put no whole frame on the
+// wire, and the agent acts only on whole frames, so it is never written twice. A connection the machine has since
+// replaced by rejoining is left alone.
 func (s *session) attachMachine(mw *wire) {
 	s.wm.Lock()
 	defer s.wm.Unlock()
 	s.mu.Lock()
+	if s.from != mw {
+		s.mu.Unlock()
+		return
+	}
 	held := s.toMach
 	s.toMach, s.held = nil, 0
-	s.from = mw
 	s.mu.Unlock()
 	for i, p := range held {
 		if mw.send(framePipe, p) != nil {
 			s.mu.Lock()
-			s.toMach = append(held[i+1:], s.toMach...)
+			s.toMach = append(held[i:], s.toMach...)
 			for _, q := range s.toMach {
 				s.held += len(q)
 			}
@@ -1044,6 +1133,10 @@ func (s *session) fromMachine(mw *wire, t frameType, p []byte) bool {
 			s.infos++
 		}
 	case frameExit:
+		if s.exited {
+			s.mu.Unlock()
+			return false
+		}
 		s.exited = true
 	}
 	s.mu.Unlock()
@@ -1076,20 +1169,35 @@ func (s *session) toShimFrame(t frameType, p []byte) bool {
 	s.mu.Lock()
 	sw := s.shim
 	if sw == nil || !s.live {
-		s.toShim = append(s.toShim, shimFrame{t, p})
+		kept := s.holdForShim(shimFrame{t, p})
 		s.mu.Unlock()
+		if !kept {
+			s.set.count(func(c *DispatchCounts) { c.Dropped++ })
+		}
 		return false
 	}
 	s.mu.Unlock()
 	if sw.send(t, p) != nil {
 		s.mu.Lock()
 		if t == frameExit {
-			s.toShim = append(s.toShim, shimFrame{t, p})
+			s.holdForShim(shimFrame{t, p})
 		}
 		s.mu.Unlock()
 		s.shimAway(sw)
 		return false
 	}
+	return true
+}
+
+// holdForShim holds a frame for the shim within shimHeld, and says whether it did. The exit code is always held: a
+// job holds one at most. The caller holds mu.
+func (s *session) holdForShim(f shimFrame) bool {
+	cost := len(f.p) + heldCost
+	if f.t != frameExit && s.shimCost+cost > shimHeld {
+		return false
+	}
+	s.toShim = append(s.toShim, f)
+	s.shimCost += cost
 	return true
 }
 
@@ -1126,7 +1234,7 @@ func (s *session) sendHeld() bool {
 		s.mu.Unlock()
 		return false
 	}
-	s.toShim = nil
+	s.toShim, s.shimCost = nil, 0
 	s.mu.Unlock()
 	for i, f := range held {
 		if sw.send(f.t, f.p) != nil {
@@ -1136,6 +1244,10 @@ func (s *session) sendHeld() bool {
 			}
 			s.mu.Lock()
 			s.toShim = append(rest, s.toShim...)
+			s.shimCost = 0
+			for _, h := range s.toShim {
+				s.shimCost += len(h.p) + heldCost
+			}
 			s.mu.Unlock()
 			s.shimAway(sw)
 			return false
