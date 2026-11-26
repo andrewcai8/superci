@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"math"
 	"os"
 	"regexp"
@@ -9,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/actions/scaleset"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	cwtypes "github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 )
@@ -221,11 +223,65 @@ func TestAlarmsAreOnTheDashboardPageOneTopicAndNameNoPerson(t *testing.T) {
 func TestHarmAlarmsReadTheJobMetricsTheyNameWithTheirThresholds(t *testing.T) {
 	script, _ := os.ReadFile("deploy/alarms.sh")
 	s := string(script)
-	for _, want := range []string{`IF(failed + passed >= 10, 100 * failed / (failed + passed), 0)`, `GreaterThanThreshold 20 3 2 notBreaching`,
+	for _, want := range []string{`IF(failed + passed >= 20, 100 * failed / (failed + passed), 0)`, `GreaterThanThreshold 20 3 2 notBreaching`,
 		`IF(FILL(started, 0) < 1 AND idle > 8, idle, 0)`, `GreaterThanThreshold 8 6 6 notBreaching`, `"MetricName":"JobsCompleted"`, `"MetricName":"SpendIdlePerHourUSD"`,
 		`"BudgetName": "superci-pull-daily"`, `"TimeUnit": "DAILY"`, `for t in (80, 100)`} {
 		if !strings.Contains(s, want) {
 			t.Errorf("alarms.sh lacks %q", want)
 		}
+	}
+}
+
+// The minute's metrics take the jobs the message loop finished: a completion reaches metricData through Observe and
+// TakeJobs (the two lines that joined them were lost once and every test still passed), a second take is empty, and a
+// redelivered completion is not counted twice.
+func TestAJobObservedFinishedIsPublishedOnceByTheNextMinuteOfMetrics(t *testing.T) {
+	s := newState(0, 10)
+	s.SetPricer(func(Machine) float64 { return 0.40 })
+	m := machines(1, t0.Add(-time.Minute))[0]
+	m.Set = "set"
+	s.Seen("us-east-1", []*Machine{m}, t0.Add(-time.Hour), t0.Add(-time.Hour))
+	done := &scaleset.RunnerScaleSetMessage{JobCompletedMessages: []*scaleset.JobCompleted{{Result: "failed", RunnerName: "set-i-0000",
+		JobMessageBase: scaleset.JobMessageBase{JobID: "g1", QueueTime: t0, RunnerAssignTime: t0, FinishTime: t0.Add(30 * time.Second)}}}}
+	s.Observe(done, t0.Add(30*time.Second))
+	s.Observe(done, t0.Add(31*time.Second))
+	jobs := s.TakeJobs()
+	if len(jobs) != 1 {
+		t.Fatalf("TakeJobs hands over %d records, want the one job's", len(jobs))
+	}
+	at := t0
+	d := datum(jobData(jobs, &at), "JobsCompleted", "Result", "failure")
+	if d == nil || aws.ToFloat64(d.Value) != 1 {
+		t.Errorf("the failed job is not counted: %v", d)
+	}
+	if len(s.TakeJobs()) != 0 {
+		t.Errorf("a second take hands the same records over")
+	}
+}
+
+// Spend reads a snapshot of each machine's runner: State.Running copies it, so the busy flag the message loop writes under
+// the State's lock is not read through a shared pointer.
+func TestRunningCopiesEachMachinesRunner(t *testing.T) {
+	s := newState(0, 10)
+	m := machines(1, t0)[0]
+	m.Runner = &Runner{Name: "r"}
+	s.Seen("us-east-1", []*Machine{m}, t0.Add(-time.Hour), t0.Add(-time.Hour))
+	got := s.Running()
+	if len(got) != 1 || got[0].Runner == nil {
+		t.Fatalf("%+v", got)
+	}
+	if kept := s.machines[m.ID].Runner; got[0].Runner == kept {
+		t.Errorf("Running hands out the runner the State goes on writing")
+	}
+}
+
+func TestTheRecordsWaitingForTheMetricsAreBounded(t *testing.T) {
+	s := newState(0, 10)
+	for i := 0; i < maxJobBuffer+50; i++ {
+		s.Observe(&scaleset.RunnerScaleSetMessage{JobCompletedMessages: []*scaleset.JobCompleted{{Result: "succeeded", RunnerName: "set-i-9",
+			JobMessageBase: scaleset.JobMessageBase{JobID: fmt.Sprint("g", i)}}}}, t0)
+	}
+	if n := len(s.TakeJobs()); n != maxJobBuffer {
+		t.Errorf("%d records kept, want %d", n, maxJobBuffer)
 	}
 }

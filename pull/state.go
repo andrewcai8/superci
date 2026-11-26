@@ -573,6 +573,10 @@ func (s *State) Observe(msg *scaleset.RunnerScaleSetMessage, now time.Time) (don
 	} else {
 		s.waitingSince = time.Time{}
 	}
+	s.jobs = append(s.jobs, done...)
+	if len(s.jobs) > maxJobBuffer { // a listener run with metrics off takes none
+		s.jobs = s.jobs[len(s.jobs)-maxJobBuffer:]
+	}
 	return done
 }
 
@@ -771,6 +775,10 @@ func (s *State) Resume(c Carried) {
 		s.launches = append(s.launches, time.Duration(ms)*time.Millisecond)
 	}
 }
+
+// maxJobBuffer bounds the records waiting for the minute's metrics: a minute's jobs are tens, so only a listener whose
+// metrics are off ever reaches it.
+const maxJobBuffer = 10000
 
 // pruneJobs forgets, at most every ten minutes, the jobs recorded or started more than six hours ago, which GitHub no
 // longer redelivers: a started job whose completion never came, and a job's record once it can no longer repeat.
@@ -1258,7 +1266,12 @@ func (s *State) Running() []Machine {
 	defer s.mu.Unlock()
 	out := make([]Machine, 0, len(s.machines))
 	for _, m := range s.machines {
-		out = append(out, *m)
+		c := *m
+		if m.Runner != nil {
+			r := *m.Runner
+			c.Runner = &r
+		}
+		out = append(out, c)
 	}
 	return out
 }
