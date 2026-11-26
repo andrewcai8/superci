@@ -9,7 +9,7 @@ Each measure is milliseconds and the command's exit code. A measure whose comman
 a sample.
 
 - First exec (node, python, docker's CLI): every probe job is held to Blacksmith's median x 1.25 + 20 ms. The slowest job
-  decides, because one cold machine in three is the failure, not the median.
+  decides, because one cold machine among them is the failure, not the median.
 - Throughput (500 fork-execs of `true`, 50 runs of `node -e 0`): superci's median against the same bound.
 - A gated measure needs MIN_JOBS samples on each fleet, or it is MISSING and fails.
 - bun, git, docker's first daemon call and a cold read of 400 large files are printed, not gated.
