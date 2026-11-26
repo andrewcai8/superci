@@ -25,6 +25,7 @@ func (b *prereadBox) read(name string) string {
 
 // startPreread runs boot.sh's hydrate() as a machine's user data holds it, in a sandbox: no manifest, so it goes straight
 // to the pre-read; findmnt answers for a root on /dev/nvme0n1p1 and fio is the given script. rootBytes is what disk() exports.
+// find is the real one, its arguments logged to find.log.
 func startPreread(t *testing.T, fio, rootBytes string, pullcache string) *prereadBox {
 	t.Helper()
 	cfg, err := LoadConfig("")
@@ -56,6 +57,11 @@ func startPreread(t *testing.T, fio, rootBytes string, pullcache string) *prerea
 	stub("setpriv", `shift 4; exec "$@"`)
 	stub("chown", `true`)
 	stub("pullcache", pullcache)
+	realFind, err := exec.LookPath("find")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stub("find", `echo "$@" >> "$BOX/find.log"; exec `+realFind+` "$@"`)
 	if err := os.WriteFile(b.spool, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -113,8 +119,12 @@ func TestThePrereadReadsOnlyTheSnapshotsPartOfTheRootAndPostsItsStartAndEnd(t *t
 			t.Errorf("fio ran as %q, want %s", args, want)
 		}
 	}
-	if got, want := strings.Join(b.marks(), " "), "hydrate.start= hydrate.done= preread.start= preread.done=full"; got != want {
+	if got, want := strings.Join(b.marks(), " "), "hydrate.start= hydrate.done= preread.start= preread.done=full rewarm.done=full"; got != want {
 		t.Errorf("marks %q, want %q", got, want)
+	}
+	// The direct read dropped the cached inode tables and directories of what hydration wrote: they are walked again.
+	if walked := b.read("find.log"); !strings.HasPrefix(walked, b.hr+" ") || !strings.HasSuffix(walked, "-printf") {
+		t.Errorf("after the pre-read find walked %q, want the hydrated trees", walked)
 	}
 	if _, err := os.Stat(filepath.Join(b.hr, ".pid")); !os.IsNotExist(err) {
 		t.Errorf("a finished pre-read leaves no pid for the hook to signal: %v", err)
@@ -137,6 +147,9 @@ func TestAJobThatStartsDuringThePrereadEndsItWithinASecond(t *testing.T) {
 	waitFor(t, "fio to end", func() bool { return syscall.Kill(pid, 0) != nil })
 	if got, want := strings.Join(b.marks(), " "), "hydrate.start= hydrate.done= preread.start= preread.done=stopped"; got != want {
 		t.Errorf("marks %q, want %q", got, want)
+	}
+	if walked := b.read("find.log"); walked != "" {
+		t.Errorf("a walk ran beside the job: find %q", walked)
 	}
 }
 
