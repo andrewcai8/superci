@@ -51,6 +51,13 @@ QUEUE_P90_S = 10.0
 ON_DEMAND_SHARE = 0.10
 ORPHAN_WAIT_S = 600
 SIZES = (2, 4, 8, 16, 32)
+# A canary rolls back on harm to superci's own jobs, judged against Blacksmith over the same window, never on a cause every
+# runner of the organization shares. GitHub's registration cap is the organization's: a job moved from Blacksmith takes one
+# registration on either fleet, so a refusal (superci-pull-registration-refusals) pages and is counted, and moves nothing.
+ROLLBACK_ROWS = ("wall p50", "wall p90", "queue wait p50", "queue wait p90", "failures (superci)")
+ROLLBACK_ALARMS = ("superci-pull-oldest-job-wait", "superci-pull-jobs-stalled", "superci-pull-listener-down", "superci-pull-spend-capped")
+CANARY_P90_RUNS = 20  # a p90 of fewer runs is one job: one outlier must not send a job back
+ROLLBACK, KEEP = 3, 0
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -232,6 +239,20 @@ def evaluate_job(S, B, ceiling, unexplained, min_runs=MIN_RUNS):
     rows.append(Row("unexplained p50 (timeline)", fmt_s(p50u), f"< {MAX_UNEXPLAINED_S:g} s", PASS if p50u is not None and p50u < MAX_UNEXPLAINED_S else FAIL,
                     "" if unexplained else "no superci timelines"))
     return rows
+
+
+def canary_verdict(rows, alarms):
+    """The reasons a live canary must go back to Blacksmith, from gate 1's rows and the alarm states; empty keeps it. A p50 row
+    counts once n passes and a p90 row once there are CANARY_P90_RUNS runs, each only as FAIL (NOISE asks for runs, not a
+    rollback), and never when Blacksmith had no runs to compare with; the failures row counts from the first run. Of the
+    alarms only ROLLBACK_ALARMS count: each is a superci job not served, so it sends back every job listed."""
+    by = {r.name: r for r in rows}
+    n = by.get("n (superci runs)")
+    runs = int(n.value) if n and n.value.isdigit() else 0
+    need = {"wall p50": MIN_RUNS, "queue wait p50": MIN_RUNS, "wall p90": CANARY_P90_RUNS, "queue wait p90": CANARY_P90_RUNS, "failures (superci)": 0}
+    harmed = [r for r in (by.get(k) for k in ROLLBACK_ROWS) if r and r.status == FAIL and runs >= need[r.name] and not r.note.startswith("no Blacksmith runs")]
+    return ([f"{r.name}: {r.value} vs {r.threshold}" for r in harmed]
+            + [f"{a} in ALARM" for a in ROLLBACK_ALARMS if alarms.get(a) == "ALARM"])
 
 
 def parse_limits(text):
@@ -542,7 +563,15 @@ def cmd_job(a):
     show_spread("superci", S, ceiling)
     show_spread("blacksmith", B, ceiling)
     print()
-    return print_rows("criteria", evaluate_job(S, B, ceiling, unexplained) + unread(gh, a.allow_unread), f"gate 1 for {a.job}")
+    rows = evaluate_job(S, B, ceiling, unexplained) + unread(gh, a.allow_unread)
+    code = print_rows("criteria", rows, f"gate 1 for {a.job}")
+    if not a.canary:
+        return code
+    alarms = alarm_states(a.profile, now, now)
+    reasons = canary_verdict(rows, alarms)
+    paging = sorted(n for n, st in alarms.items() if st == "ALARM" and n not in ROLLBACK_ALARMS)
+    print(f"\ncanary {a.job}: " + (f"ROLL BACK ({'; '.join(reasons)})" if reasons else "KEEP") + (f"   [paging, no rollback: {paging}]" if paging else ""))
+    return ROLLBACK if reasons else KEEP
 
 
 def collect_scale(a):
@@ -621,6 +650,7 @@ def build_parser():
     j.add_argument("--max-runs", type=int, default=300, help="read the baseline's jobs from at most this many runs, spread evenly (GitHub's rate limit is 5,000 an hour); the superci window is always read whole")
     j.add_argument("--limits", help="a ci-limits.tsv to read instead of origin/main's")
     j.add_argument("--superci-group", default=T.SUPERCI_RUNNER_GROUP)
+    j.add_argument("--canary", action="store_true", help=f"judge a live canary: exit {ROLLBACK} to roll it back (a FAIL of {', '.join(ROLLBACK_ROWS)}, or one of {', '.join(ROLLBACK_ALARMS)} in ALARM), else {KEEP}")
     j.set_defaults(fn=cmd_job)
     s = sub.add_parser("scale", help="gate 2: the plane over a replay window")
     s.add_argument("--from", dest="since", required=True)

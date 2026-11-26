@@ -533,20 +533,25 @@ and a machine still told to wait writes a `jit.wait` timeline event every 30 s w
 aws --profile ci-runners --region us-east-1 sns subscribe --topic-arn arn:aws:sns:us-east-1:243891825325:superci-pull-alarms --protocol email --notification-endpoint <address>
 ```
 
-| Alarm | Fires when |
-| --- | --- |
-| superci-pull-listener-down | no heartbeat for 3 minutes |
-| superci-pull-jobs-stalled | a set's jobs have waited 10 minutes with none of its jobs started, for 2 minutes |
-| superci-pull-registration-refusals | GitHub refused a registration in a 5-minute period |
-| superci-pull-registration-errors | a registration failed otherwise in a 5-minute period (GitHub's API, a name GitHub already held, the issued tag refused) |
-| superci-pull-oldest-job-wait | the oldest job waiting for a runner is over 60 s old, two minutes running |
-| superci-pull-queue-wait-p90 | queue wait p90 over 60 s in two 5-minute periods running |
-| superci-pull-orphans | orphans above 0 for 10 minutes (a probe runner left registered more than 3 minutes counts, and the lister removes it) |
-| superci-pull-pool-at-floor | a set's pool at the hour's floor for 5 minutes while more of its jobs waited than it had idle runners |
-| superci-pull-spend-daily | today's spend past 80% of the daily cap the listener runs with (`SpendDailyCapUSD`) |
-| superci-pull-spend-capped | a spend cap is reached: CI on superci stops |
-| superci-pull-launch-shortfall | EC2 started fewer machines than asked for 15 minutes running |
-| superci-pull-org-rate-unknown | the organization's rate unmeasured for 15 minutes |
+| Alarm | Fires when | Rolls a canary back |
+| --- | --- | --- |
+| superci-pull-listener-down | no heartbeat for 3 minutes | yes |
+| superci-pull-jobs-stalled | a set's jobs have waited 10 minutes with none of its jobs started, for 2 minutes | yes |
+| superci-pull-registration-refusals | GitHub refused a registration in a 5-minute period | no |
+| superci-pull-registration-errors | a registration failed otherwise in a 5-minute period (GitHub's API, a name GitHub already held, the issued tag refused) | no |
+| superci-pull-oldest-job-wait | the oldest job waiting for a runner is over 60 s old, two minutes running | yes |
+| superci-pull-queue-wait-p90 | queue wait p90 over 60 s in two 5-minute periods running | no |
+| superci-pull-orphans | orphans above 0 for 10 minutes (a probe runner left registered more than 3 minutes counts, and the lister removes it) | no |
+| superci-pull-pool-at-floor | a set's pool at the hour's floor for 5 minutes while more of its jobs waited than it had idle runners | no |
+| superci-pull-spend-daily | today's spend past 80% of the daily cap the listener runs with (`SpendDailyCapUSD`) | no |
+| superci-pull-spend-capped | a spend cap is reached: CI on superci stops | yes |
+| superci-pull-launch-shortfall | EC2 started fewer machines than asked for 15 minutes running | no |
+| superci-pull-org-rate-unknown | the organization's rate unmeasured for 15 minutes | no |
+
+A canary goes back to Blacksmith on harm to superci's own jobs: an alarm marked yes, or a FAIL of gate 1's wall, queue
+wait or failure rows against Blacksmith over the same window (`tools/gate`, `gate job --canary` and `canary.sh`). The
+others page. `superci-pull-registration-refusals` is the organization's cap, which every runner of the organization shares:
+a job moved from Blacksmith takes one registration on either fleet.
 
 **`superci-pull-pool-at-floor`.** The pool is not following the jobs. Read `curl -s localhost:8080/state | jq '.sets[]'`
 on the listener: a set whose `pool` stays at its floor while jobs wait is reading no arrivals, or has no carried burst.
