@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/actions/scaleset"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 )
 
 var t0 = time.Date(2026, 11, 25, 6, 0, 0, 0, time.UTC)
@@ -476,5 +478,99 @@ func TestTheLaunchTimeEndsAtTheMachinesFirstAsk(t *testing.T) {
 	}
 	if got := s.Snapshot(t0).LaunchS; got != 20 {
 		t.Fatalf("machines that asked 20 s after their launch and waited for the budget until 2 min: launch time %v s, want 20", got)
+	}
+}
+
+func TestAReleaseThatChangesTheBootReplacesTheIdleMachinesOfTheOldOneAFewAtATime(t *testing.T) {
+	s := newState(0, 1200)
+	s.Observe(stats(1, 0), t0)
+	ms := machines(6, t0)
+	for i, m := range ms {
+		m.Template = "35"
+		if i == 5 {
+			m.Template = "36"
+		}
+	}
+	launch(s, ms, t0)
+	for i := range 4 {
+		give(s, fmt.Sprintf("i-%04d", i), &Runner{ID: int64(i + 1), Name: fmt.Sprintf("set-i-%04d", i), Issued: t0})
+	}
+	s.Machine("i-0003").Runner.Busy = true // its job finishes on the old boot
+	// i-0004 has no runner yet; i-0005 booted from the current version.
+	current := map[string]string{"us-east-1": "36"}
+	now := t0.Add(30 * time.Second)
+	first := s.Recycle(now, current, 2)
+	second := s.Recycle(now, current, 2)
+	if len(first) != 2 || len(second) != 2 {
+		t.Fatalf("recycled %v then %v: want 2 a pass of the 4 idle or unregistered machines of version 35", ids(first), ids(second))
+	}
+	for _, id := range []string{"i-0000", "i-0001", "i-0002"} {
+		if m := s.Machine(id); !m.Retire {
+			t.Errorf("%s: an idle runner of the old boot retires (removed first)", id)
+		}
+	}
+	if m := s.Machine("i-0004"); !m.Ending {
+		t.Error("a machine of the old boot with no runner yet ends")
+	}
+	if m := s.Machine("i-0003"); m.Retire || m.Ending {
+		t.Error("a busy machine of the old boot is left to finish its job")
+	}
+	if m := s.Machine("i-0005"); m.Retire || m.Ending {
+		t.Error("a machine of the current boot stays")
+	}
+	if again := s.Recycle(now, current, 2); len(again) != 0 {
+		t.Fatalf("recycled again %v", ids(again))
+	}
+}
+
+// oldBoot is a set of four idle machines of launch template version 35, runners issued at t0, while version 36 is current.
+func oldBoot(assigned int) (*State, map[string]string) {
+	s := newState(0, 1200)
+	s.Observe(stats(assigned, 0), t0)
+	ms := machines(4, t0)
+	for _, m := range ms {
+		m.Template = "35"
+	}
+	launch(s, ms, t0)
+	for i := range 4 {
+		give(s, fmt.Sprintf("i-%04d", i), &Runner{ID: int64(i + 1), Name: fmt.Sprintf("set-i-%04d", i), Issued: t0})
+	}
+	return s, map[string]string{"us-east-1": "36"}
+}
+
+func TestNothingIsRecycledWhileNoReplacementCouldLaunchOrJobsWaitForRunners(t *testing.T) {
+	s, current := oldBoot(0)
+	s.SetCapped(true)
+	if got := s.Recycle(t0.Add(30*time.Second), current, 5); len(got) != 0 {
+		t.Errorf("recycled %v under the spend cap: no replacement launches", ids(got))
+	}
+	s, current = oldBoot(0)
+	if got := s.Recycle(t0.Add(time.Hour), current, 5); len(got) != 0 {
+		t.Errorf("recycled %v with the session's lease lapsed: no replacement launches", ids(got))
+	}
+	s, current = oldBoot(5)
+	if got := s.Recycle(t0.Add(30*time.Second), current, 5); len(got) != 0 {
+		t.Errorf("recycled %v while 5 jobs waited for 4 idle runners", ids(got))
+	}
+	s, current = oldBoot(0)
+	if got := s.Recycle(t0.Add(5*time.Second), current, 5); len(got) != 0 {
+		t.Errorf("recycled %v issued 5 s ago: a runner that new may be taking the job it was registered for", ids(got))
+	}
+}
+
+func TestAMachineAdoptedAfterARestartKnowsTheBootItRan(t *testing.T) {
+	i := ec2types.Instance{InstanceId: aws.String("i-0abc"), LaunchTime: aws.Time(t0), Tags: []ec2types.Tag{
+		{Key: aws.String("superci-pull-set"), Value: aws.String("set")}, {Key: aws.String("aws:ec2launchtemplate:version"), Value: aws.String("35")}}}
+	m := listedMachine(i, "us-east-1")
+	if m.Template != "35" {
+		t.Fatalf("listed machine's template %q, want 35 from EC2's aws:ec2launchtemplate:version tag", m.Template)
+	}
+	s := newState(0, 1200)
+	launch(s, machines(1, t0), t0)
+	listed := machines(1, t0)
+	listed[0].Template = "35"
+	s.Seen("us-east-1", listed, t0, t0)
+	if got := s.Machine("i-0000").Template; got != "35" {
+		t.Fatalf("a machine this process launched learns its template %q from the listing, want 35", got)
 	}
 }

@@ -314,6 +314,10 @@ func run(ctx context.Context, f flags) error {
 // healthyWithin is how long the reconciler may go without finishing a pass before the listener reads as dead.
 const healthyWithin = 2 * time.Minute
 
+// recycleBatch is how many machines of an older boot a set replaces each reconcile pass (10 s): a pool of 100 turns over
+// in about 3 minutes, and its idle runners never drop by more than a launch's worth of passes.
+const recycleBatch = 5
+
 // minute turns the budget's totals since the start into what happened in one minute: each call fills m's Regs, Refused,
 // Failed and Denied with the difference from the call before.
 type minute struct {
@@ -766,6 +770,11 @@ func (l *Listener) reconciler(ctx context.Context, refresh func(context.Context,
 			for _, m := range s.state.Overdue(now, cfg.job(), l.maxAge(), cfg.life()) {
 				slog.Warn("overdue", "set", s.spec.Name, "machine", m.ID, "age_s", int(now.Sub(m.Launched).Seconds()))
 				tlRetired(s.spec.Name, m, "overdue", now)
+			}
+			if s.fleet != nil {
+				for _, m := range s.state.Recycle(now, s.fleet.Versions(), recycleBatch) {
+					tlRetired(s.spec.Name, m, "recycle", now)
+				}
 			}
 			s.state.Surplus(now, 20*time.Second, window, 100)
 			go parallel(s.state.ToFence(now, 100), func(m *Machine) {

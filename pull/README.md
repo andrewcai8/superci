@@ -605,6 +605,12 @@ so the new listener may read and write it, and run `deploy/alarms.sh` for the al
 release finds no saved burst there and starts from the floor once. The policy still grants the old parameter
 `/superci-pull/pool`, which the previous binary uses, so a roll back works; drop it with that binary.
 
+**Recycle.** A release that changes what a machine runs at boot (boot.sh, the image, the disk) makes a new launch
+template version. Each reconcile pass the listener replaces up to 5 idle machines per set that booted from an older
+version (EC2's `aws:ec2launchtemplate:version` tag): an idle runner is removed first, as a retire is, a machine with no
+runner yet ends, and a busy one finishes its job. A pool of 100 turns over in about 3 minutes; the timeline marks each
+`machine.retired` `why` `recycle`. A canary is judged only once no idle machine of the old version is left.
+
 **Roll back.** Release an older commit of main: `build.sh /tmp/rollback <commit>`, then the release scripts.
 
 A build before round 2 does not know the deployment tag, the issued tag or the runner group `superci-pull`: rolling
