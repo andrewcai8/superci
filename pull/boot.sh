@@ -117,6 +117,21 @@ hydrate() {
     [ "$val" = full ] || return 0
     for d in "$HR" /home/runner/externals /usr/lib/git-core /opt/google/chrome; do [ -d "$d" ] && trees+=("$d"); done
     mark_hydrate "$(us)" rewarm.done "$(until_job find "${trees[@]}" -printf '%s')"
+    [ -e "$HR/.pid" ] || return 0
+    # The walk reads inodes, not files: an idle machine's first node took 274-403 ms and docker 1.7-3.8 s (Blacksmith 41
+    # and 813). These binaries in the page cache and dockerd up took them to 11 and 10 ms (Nov 26). One file at a time,
+    # so a job that starts stops it within a file.
+    systemctl start docker.service > /dev/null 2>&1 || :
+    hot() {
+      local f
+      find "$(readlink -f "$(command -v node)")" /usr/bin/docker /usr/bin/dockerd /usr/bin/containerd /usr/bin/containerd-shim-runc-v2 \
+        /usr/bin/runc /usr/bin/git /usr/lib/git-core "$(readlink -f "$(command -v python3)")" /usr/lib/python3 /home/runner/externals \
+        /usr/lib/x86_64-linux-gnu -type f -print0 2> /dev/null | while IFS= read -r -d '' f; do
+        [ -e "$HR/.pid" ] || return 1
+        cat -- "$f" > /dev/null 2>&1
+      done
+    }
+    mark_hydrate "$(us)" warm.done "$(until_job hot)"
   }
   t0=$(us); mark_hydrate "$t0" hydrate.start
   echo $$ > "$HR/.pid"
