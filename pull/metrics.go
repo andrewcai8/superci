@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"math"
+	"sort"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -16,17 +17,18 @@ const Namespace = "superci-pull"
 
 // Metrics is what one minute's publication reads.
 type Metrics struct {
-	Budget  BudgetSnapshot
-	Spend   SpendSnapshot
-	Sets    []Snapshot
-	Waits   []float64 // queue waits of jobs started this minute, seconds
-	Orphans int       // orphaned machines and runners of every set, and machines of no configured set
-	Regs    int       // registrations GitHub made this minute
-	Refused int       // registrations GitHub refused this minute
-	Failed  int       // registrations that failed otherwise this minute
-	Short   int       // machines asked of EC2 this minute that did not start (capacity, quotas)
-	Stalled int       // sets whose jobs have waited 10 minutes with none started
-	AtFloor int       // sets whose pool is at the hour's floor while more jobs wait than it has idle runners
+	Budget   BudgetSnapshot
+	Spend    SpendSnapshot
+	Sets     []Snapshot
+	Waits    []float64            // queue waits of jobs started this minute, seconds
+	SetWaits map[string][]float64 // the same, by set
+	Orphans  int                  // orphaned machines and runners of every set, and machines of no configured set
+	Regs     int                  // registrations GitHub made this minute
+	Refused  int                  // registrations GitHub refused this minute
+	Failed   int                  // registrations that failed otherwise this minute
+	Short    int                  // machines asked of EC2 this minute that did not start (capacity, quotas)
+	Stalled  int                  // sets whose jobs have waited 10 minutes with none started
+	AtFloor  int                  // sets whose pool is at the hour's floor while more jobs wait than it has idle runners
 }
 
 func publish(ctx context.Context, cw *cloudwatch.Client, m Metrics, now time.Time) {
@@ -67,26 +69,49 @@ func publish(ctx context.Context, cw *cloudwatch.Client, m Metrics, now time.Tim
 		od += s.OnDemand
 	}
 	data = append(data, d("Machines", float64(machines), cwtypes.StandardUnitCount), d("OnDemandShare", float64(od)/math.Max(1, float64(machines)), cwtypes.StandardUnitNone))
-	if len(m.Waits) > 0 {
-		counts := map[float64]float64{}
-		for _, w := range m.Waits {
-			counts[math.Round(w)]++
-		}
-		values, weights := make([]float64, 0, len(counts)), make([]float64, 0, len(counts))
-		for v, c := range counts {
-			values, weights = append(values, v), append(weights, c)
-		}
-		for i := 0; i < len(values); i += 150 {
-			j := min(len(values), i+150)
-			data = append(data, cwtypes.MetricDatum{MetricName: aws.String("QueueWait"), Values: values[i:j], Counts: weights[i:j],
-				Unit: cwtypes.StandardUnitSeconds, Timestamp: at})
-		}
-	}
+	data = append(data, queueWaitData(m, at)...)
 	for i := 0; i < len(data); i += 500 {
 		if _, err := cw.PutMetricData(ctx, &cloudwatch.PutMetricDataInput{Namespace: aws.String(Namespace), MetricData: data[i:min(len(data), i+500)]}); err != nil {
 			slog.Error("metrics", "err", err.Error())
 		}
 	}
+}
+
+// queueWaitData is the minute's QueueWait: every set's waits together (what the alarm reads), and each set's own under
+// the Set dimension, so one set's long waits do not hide in the p90 of the rest.
+func queueWaitData(m Metrics, at *time.Time) []cwtypes.MetricDatum {
+	data := waitDatum(m.Waits, at, nil)
+	sets := make([]string, 0, len(m.SetWaits))
+	for set := range m.SetWaits {
+		sets = append(sets, set)
+	}
+	sort.Strings(sets)
+	for _, set := range sets {
+		data = append(data, waitDatum(m.SetWaits[set], at, []cwtypes.Dimension{{Name: aws.String("Set"), Value: aws.String(set)}})...)
+	}
+	return data
+}
+
+// waitDatum is waits as one QueueWait histogram (a value and its count), in as many datums as CloudWatch takes.
+func waitDatum(waits []float64, at *time.Time, dims []cwtypes.Dimension) []cwtypes.MetricDatum {
+	if len(waits) == 0 {
+		return nil
+	}
+	counts := map[float64]float64{}
+	for _, w := range waits {
+		counts[math.Round(w)]++
+	}
+	values, weights := make([]float64, 0, len(counts)), make([]float64, 0, len(counts))
+	for v, c := range counts {
+		values, weights = append(values, v), append(weights, c)
+	}
+	var data []cwtypes.MetricDatum
+	for i := 0; i < len(values); i += 150 {
+		j := min(len(values), i+150)
+		data = append(data, cwtypes.MetricDatum{MetricName: aws.String("QueueWait"), Values: values[i:j], Counts: weights[i:j],
+			Unit: cwtypes.StandardUnitSeconds, Timestamp: at, Dimensions: dims})
+	}
+	return data
 }
 
 func b2f(b bool) float64 {

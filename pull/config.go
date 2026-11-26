@@ -166,9 +166,14 @@ func (c Config) validate() error {
 			return fmt.Errorf("config: size %s needs a name superci-<N>cpu, cpu, split >= 1, max, disk_gb and types", label)
 		}
 	}
-	for label := range c.Pools {
+	for label, p := range c.Pools {
 		if _, ok := c.Sizes[label]; !ok {
 			return fmt.Errorf("config: pools names %s, which is not a size", label)
+		}
+		for h := range p.Floor {
+			if p.Floor[h] < 0 || p.Cap[h] < 0 || p.Floor[h] > p.Cap[h] {
+				return fmt.Errorf("config: pools %s at hour %d: floor %d and cap %d need 0 <= floor <= cap (PoolBounds would let a floor above the cap win silently)", label, h, p.Floor[h], p.Cap[h])
+			}
 		}
 	}
 	if c.Deployment == "" || len(c.Repositories) == 0 {

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Undoes each fix of round 2, of the fence round (audit E) and of the wait round (F1 to F4) in a copy of pull/ and runs the test written for it, which must fail. A fix whose
-test still passes without it is reported as NOT RED. Run it in pull/ where Go is installed:
+"""Undoes each fix of round 2, of the fence round (audit E) and of the wait round (F1 to F4), of the hygiene round (U7) in a copy of pull/ and runs the test written for it, which must fail. A fix whose
+test still passes without it is reported as NOT RED. A path under cache/ runs its test in the cache module. Run it in pull/ where Go is installed:
 
   python3 tools/redfirst.py [name fragment ...]   # only the mutants whose name holds one of them
 """
@@ -99,6 +99,31 @@ MUTANTS = [
      "TestABurstSurvivesRestartsThroughTheSavedParameter"),
     ("F4 a first start with nothing saved fails", "carry.go", f"{T}if errors.As(err, &missing) {{\n{T}{T}return nil\n{T}}}\n", f"{T}if errors.As(err, &missing) {{\n{T}{T}return err\n{T}}}\n",
      "TestLoadingWithNothingSavedStartsFromTheFloor"),
+    ("U7 boot.sh sends a fat batch whole", "boot.sh", '[ "${#m}" -gt 30000 ] && [ "$n"', 'false && [ "$n"', "TestAFatMarkBatchIsCutAndAnOverlongLineSkippedNotResentForEver"),
+    ("U7 boot.sh sends a line over the limit", "boot.sh", '  [ "${#m}" -le 30000 ] || { echo $((took + 1)) > $SP.sent; return 0; }\n', "", "TestAFatMarkBatchIsCutAndAnOverlongLineSkippedNotResentForEver"),
+    ("U7 boot.sh resends a 413 batch for ever", "boot.sh", " 413) echo $((took + 1)) > $SP.sent ;;", "", "TestA413TheSenderDidNotForeseeDropsOneLineAndTheRestGoOn"),
+    ("U7 boot.sh advances on a server error", "boot.sh", "case $code in 204)", "case $code in 5??|204)", "TestA413TheSenderDidNotForeseeDropsOneLineAndTheRestGoOn"),
+    ("U7 a mark's value is not cut at the sender", "cache/internal/cache/marks.go", 'cutEscaped(strings.ReplaceAll(url.QueryEscape(key), "+", "%20"), MarkValMax-len(head))', 'strings.ReplaceAll(url.QueryEscape(key), "+", "%20")',
+     "TestAMarkLineIsCutToWhatTheListenerTakesNeverInsideAnEscape"),
+    ("U7 a mark's value is cut inside an escape", "cache/internal/cache/marks.go", "\t\t\treturn s[:i]\n", "\t\t\treturn s[:n]\n", "TestCutEscapedNeverEndsInsideAnEscape"),
+    ("U7 the janitor plans a family whose HEAD failed", "cache/internal/cache/janitor.go", "\t\tplan = withoutFamilies(plan, failed, lg)\n", "", "TestOneFamilyWhoseHeadFailedIsLeftOutAndTheRestOfTheBucketIsStillTrimmed"),
+    ("U7 one failed HEAD fails the janitor run", "cache/internal/cache/janitor.go", "\t\tplan = withoutFamilies(plan, failed, lg)\n", "\t\tif len(failed) > 0 {\n\t\t\treturn Report{}, fmt.Errorf(\"head\")\n\t\t}\n",
+     "TestOneFamilyWhoseHeadFailedIsLeftOutAndTheRestOfTheBucketIsStillTrimmed"),
+    ("U7 a floor above its cap is accepted", "config.go", " || p.Floor[h] > p.Cap[h] {", " {", "TestAPoolWhoseFloorIsAboveItsCapOrBelowZeroIsRefused"),
+    ("U7 a negative floor is accepted", "config.go", "if p.Floor[h] < 0 || p.Cap[h] < 0", "if p.Cap[h] < 0", "TestAPoolWhoseFloorIsAboveItsCapOrBelowZeroIsRefused"),
+    ("U7 healthy at a minute", "main.go", "const healthyWithin = 2 * time.Minute", "const healthyWithin = time.Minute", "TestTheListenerReadsAliveThroughATwoMinutePassAndDeadPastIt"),
+    ("U7 an unsettled grant is never taken back", "state.go", "if m.Issuing && now.Sub(m.IssuingSince) > issuingMax {", "if false {", "TestAGrantWhoseHandlerNeverSettlesIsTakenBackByOverdueAfterAMinute"),
+    ("U7 a grant is taken back at once", "state.go", "if m.Issuing && now.Sub(m.IssuingSince) > issuingMax {", "if m.Issuing {", "TestAGrantWhoseHandlerNeverSettlesIsTakenBackByOverdueAfterAMinute"),
+    ("U7 a failed removal is tried every pass", "state.go", " && !now.Before(m.FenceAfter) {", " {", "TestARunnerWhoseRemovalKeepsFailingIsTriedWithBackoffAndThenLeftToOverdue"),
+    ("U7 a failed removal is tried for ever", "state.go", "m.FenceFails < fenceTries && ", "", "TestARunnerWhoseRemovalKeepsFailingIsTriedWithBackoffAndThenLeftToOverdue"),
+    ("U7 the removal backoff has no ceiling", "state.go", "min(fenceBackoffMax, fenceBackoff<<(m.FenceFails-1))", "fenceBackoff<<(m.FenceFails-1)", "TestARunnerWhoseRemovalKeepsFailingIsTriedWithBackoffAndThenLeftToOverdue"),
+    ("U7 earlier removal failures are remembered", "state.go", "m.FenceFails, m.FenceAfter = 0, time.Time{}", "_ = m", "TestARemovalThatWorksOrFindsAJobForgetsEarlierFailures"),
+    ("U7 no QueueWait of a set is gathered", "main.go", "m.SetWaits[s.spec.Name] = waits", "_ = waits", "TestMetricsGiveEachSetItsOwnWaits"),
+    ("U7 no QueueWait of a set is published", "metrics.go", "for _, set := range sets {", "for _, set := range sets[:0] {", "TestQueueWaitIsPublishedAlsoForEachSet"),
+    ("U7 the dimensionless QueueWait is dropped", "metrics.go", "data := waitDatum(m.Waits, at, nil)", "var data []cwtypes.MetricDatum", "TestQueueWaitIsPublishedAlsoForEachSet"),
+    ("U7 the offset is the last post's delay", "events.go", "return slices.Min(posts)", "return posts[len(posts)-1] + 0*slices.Min(posts)", "TestAMachinesClockOffsetIsTheSmallestOfItsLastPostsNotThePostsOwnDelay"),
+    ("U7 the offset remembers every post", "events.go", "posts = posts[max(0, len(posts)-offsetPosts):]", "", "TestAMachinesClockOffsetIsTheSmallestOfItsLastPostsNotThePostsOwnDelay"),
+    ("U7 a mark still carries skew_ms", "events.go", '"inst", m.ID, "offset_ms", offset, "val", val}', '"inst", m.ID, "skew_ms", offset, "val", val}', "TestMarkWritesEventsFromTheMachinesClock"),
 ]
 
 here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -115,7 +140,11 @@ for name, path, old, new, test in MUTANTS:
             bad += 1
             continue
         open(os.path.join(dst, path), "w").write(src.replace(old, new))
-        out = subprocess.run(["go", "test", "-count=1", "-run", f"^{test}$", "."], cwd=dst, capture_output=True, text=True)
+        cmd = ["go", "test", "-count=1", "-run", f"^{test}$", "."]
+        cwd = dst
+        if path.startswith("cache/"):
+            cmd[-1], cwd = "./...", os.path.join(dst, "cache")
+        out = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
         red = out.returncode != 0 and f"--- FAIL: {test}" in out.stdout
         print(f"{'red    ' if red else 'NOT RED'}  {name}: {test}")
         if not red:

@@ -163,6 +163,7 @@ type Report struct {
 	Planned         int   // entries the plan names
 	Deleted         int   // of those, deleted
 	Gone, Changed   int   // of those, already gone, or saved again since the listing
+	Skipped         int   // families left out of this run because a HEAD of one of their entries failed
 	Freed           int64 // bytes of the entries deleted
 	Dry             bool
 }
@@ -171,7 +172,7 @@ func (r Report) String() string {
 	if r.Dry {
 		return fmt.Sprintf("dry run, nothing deleted: %d entries, %d MB held, %d would go", r.Entries, r.HeldMB, r.Planned)
 	}
-	return fmt.Sprintf("%d entries, %d MB held: %d planned, %d deleted (%d MB freed), %d already gone, %d saved again since the listing", r.Entries, r.HeldMB, r.Planned, r.Deleted, r.Freed>>20, r.Gone, r.Changed)
+	return fmt.Sprintf("%d entries, %d MB held: %d planned, %d deleted (%d MB freed), %d already gone, %d saved again since the listing, %d families skipped (a HEAD failed)", r.Entries, r.HeldMB, r.Planned, r.Deleted, r.Freed>>20, r.Gone, r.Changed, r.Skipped)
 }
 
 // Janitor holds the bucket to the policy. Any number of janitors may run at once, or one again after a failed run:
@@ -189,15 +190,19 @@ func Janitor(ctx context.Context, st Pruner, p Policy, now time.Time, dry bool, 
 	}
 	marks, junk := ReadMarks(mobjs, now)
 	plan := Plan(objs, marks, p, now)
+	skipped := 0
 	if len(plan) > 0 {
 		// A listing has no save time, and a copy's LastModified is later than its save: before deleting, read the
 		// save time of the entries whose rank depends on it, and plan again.
-		if objs, err = withSaveTimes(ctx, st, objs); err != nil {
-			return Report{}, err
-		}
+		var failed map[string]error
+		objs, failed = withSaveTimes(ctx, st, objs)
 		plan = Plan(objs, marks, p, now)
+		// One entry whose HEAD failed leaves its family's ranking unknown, and the rest of the bucket's eviction should not
+		// wait for it: its family is left out of this run's plan, and the next run tries it again.
+		plan = withoutFamilies(plan, failed, lg)
+		skipped = len(failed)
 	}
-	rep := Report{Entries: len(objs), HeldMB: int(sum(objs) >> 20), Planned: len(plan), Dry: dry}
+	rep := Report{Entries: len(objs), HeldMB: int(sum(objs) >> 20), Planned: len(plan), Skipped: skipped, Dry: dry}
 	lg.Printf("janitor: %d entries, %d MB held, %d markers, cap %d MB, idle limit %s: %d to delete", rep.Entries, rep.HeldMB, len(mobjs), p.CapBytes>>20, p.MaxIdle, len(plan))
 	if dry {
 		for _, o := range junk {
@@ -257,12 +262,24 @@ func deleteJunk(ctx context.Context, st Pruner, junk []Object, lg *log.Logger) {
 	}
 }
 
+// withoutFamilies is plan less the victims of the families in failed, each logged.
+func withoutFamilies(plan []Victim, failed map[string]error, lg *log.Logger) []Victim {
+	if len(failed) == 0 {
+		return plan
+	}
+	for f, err := range failed {
+		lg.Printf("janitor: left family %s out of this run: %v", f, err)
+	}
+	return slices.DeleteFunc(plan, func(v Victim) bool { _, out := failed[familyOf(v.Object)]; return out })
+}
+
 // withSaveTimes is objs with Saved read (a HEAD each, a few at a time) for the entries of the default branch that
 // share a family with another: the mirror's copies are the only entries that carry one, and the newest of a family
-// is the one that matters. Other entries are returned as listed, and cost nothing.
+// is the one that matters. Other entries are returned as listed, and cost nothing. A HEAD that fails leaves its
+// entry as listed and puts its family, with the error, in the map returned.
 func withSaveTimes(ctx context.Context, h interface {
 	Head(ctx context.Context, key string) (Object, bool, error)
-}, objs []Object) ([]Object, error) {
+}, objs []Object) ([]Object, map[string]error) {
 	members := map[string]int{}
 	for _, o := range objs {
 		members[familyOf(o)]++
@@ -270,7 +287,7 @@ func withSaveTimes(ctx context.Context, h interface {
 	out := slices.Clone(objs)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	var first error
+	failed := map[string]error{}
 	slots := make(chan struct{}, 32)
 	for i, o := range out {
 		if e, ok := ParseEntry(o); !ok || e.Class != "d" || members[familyOf(o)] < 2 {
@@ -285,8 +302,8 @@ func withSaveTimes(ctx context.Context, h interface {
 			defer mu.Unlock()
 			switch {
 			case err != nil:
-				if first == nil {
-					first = fmt.Errorf("head %s: %w", o.Key, err)
+				if failed[familyOf(o)] == nil {
+					failed[familyOf(o)] = fmt.Errorf("head %s: %w", o.Key, err)
 				}
 			case ok && got.ETag == o.ETag:
 				out[i].Saved = got.Saved
@@ -294,7 +311,7 @@ func withSaveTimes(ctx context.Context, h interface {
 		}()
 	}
 	wg.Wait()
-	return out, first
+	return out, failed
 }
 
 func sum(objs []Object) (n int64) {

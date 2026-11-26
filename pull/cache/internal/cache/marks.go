@@ -22,9 +22,28 @@ func SpoolMarks(path string, now func() time.Time) func(name string, ms int64, k
 		}
 		defer f.Close()
 		t := now()
-		enc := strings.ReplaceAll(url.QueryEscape(key), "+", "%20")
-		fmt.Fprintf(f, "%s=%d.%06d=%d=%s:%d:%d:%s\n", name, t.Unix(), t.Nanosecond()/1000, ms, kind, bytes, ms, enc)
+		head := fmt.Sprintf("%s:%d:%d:", kind, bytes, ms)
+		enc := cutEscaped(strings.ReplaceAll(url.QueryEscape(key), "+", "%20"), MarkValMax-len(head))
+		fmt.Fprintf(f, "%s=%d.%06d=%d=%s%s\n", name, t.Unix(), t.Nanosecond()/1000, ms, head, enc)
 	}
+}
+
+// MarkValMax is the most a mark's value may hold, the listener's markValMax (pull/events.go): a longer one is cut there, and
+// a spool line the listener cannot take at all (a key of kilobytes) held up every mark behind it.
+const MarkValMax = 256
+
+// cutEscaped cuts a url-escaped text to at most n bytes, never inside a %XX escape.
+func cutEscaped(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	n = max(0, n)
+	for i := max(0, n-2); i < n; i++ {
+		if s[i] == '%' {
+			return s[:i]
+		}
+	}
+	return s[:n]
 }
 
 func (s *Server) mark(name string, ms int64, kind string, bytes int64, key string) {

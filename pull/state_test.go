@@ -194,7 +194,7 @@ func TestSurplusRetiresOnlyIdleRunnersAndOnlyAfterTheHold(t *testing.T) {
 	if n := s.Surplus(now.Add(21*time.Second), 20*time.Second, 10*time.Minute, 100); n != 2 {
 		t.Fatalf("retired %d: want both idle runners", n)
 	}
-	got := s.ToFence(100)
+	got := s.ToFence(t0, 100)
 	if len(got) != 2 {
 		t.Fatalf("to fence %v: want both idle runners", ids(got))
 	}
@@ -203,11 +203,11 @@ func TestSurplusRetiresOnlyIdleRunnersAndOnlyAfterTheHold(t *testing.T) {
 			t.Fatal("a busy runner was taken")
 		}
 	}
-	if again := s.ToFence(100); len(again) != 0 {
+	if again := s.ToFence(t0, 100); len(again) != 0 {
 		t.Fatalf("fenced twice at once: %v", ids(again))
 	}
-	s.Fenced(got[0], HeldJob) // GitHub refused: it took a job meanwhile
-	s.Fenced(got[1], Removed)
+	s.Fenced(got[0], HeldJob, t0) // GitHub refused: it took a job meanwhile
+	s.Fenced(got[1], Removed, t0)
 	if snap := s.Snapshot(now); snap.Ending != 1 || snap.Busy != 2 || snap.Retiring != 0 {
 		t.Fatalf("after one refusal and one removal: %+v", snap)
 	}
@@ -264,7 +264,7 @@ func TestASpotNoticeReplacesTheMachineAndRetiresOnlyAnIdleRunner(t *testing.T) {
 	for _, id := range []string{"i-0000", "i-0001", "i-0002"} {
 		s.Noticed(id)
 	}
-	if fence := s.ToFence(100); len(fence) != 1 || fence[0].ID != "i-0001" {
+	if fence := s.ToFence(t0, 100); len(fence) != 1 || fence[0].ID != "i-0001" {
 		t.Fatalf("to fence %v: only the idle runner is removed, not the busy one under its job", ids(fence))
 	}
 	if _, n := s.Deficit(t0, 100000); n != 3 {

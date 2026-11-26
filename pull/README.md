@@ -409,7 +409,7 @@ pull/deploy/ssh.sh                               # a shell on the listener: a ke
 tail -f /var/log/superci-pull/listener.jsonl    # JSON events: message, fleet, register, ask, budget, state, retire, terminate
                                                 # (also in CloudWatch Logs, group /superci-pull/listener, a stream per instance)
 curl -s localhost:8080/state | jq               # budget, spend, and per set: ready, desired, live, idle, busy, issued, pool, orphans
-curl -s localhost:8080/healthz                  # what the health timer checks (the process's liveness)
+curl -s localhost:8080/healthz                  # what the health timer checks (liveness: the reconciler finished a pass within 2 minutes)
 ```
 
 **Change pool sizes, caps or limits.** Change the override file, `deploy/override.json`, on main, and release (Release,
@@ -435,7 +435,7 @@ set, the registration rates, registrations and errors, spend against the daily c
 CloudWatch, namespace `superci-pull`: `Heartbeat`, `OrgRegistrationRate`, `OthersRegistrationRate`,
 `OurRegistrationRate`, `SpareRegistrationRate`, `RegistrationWindowUse`, `OrgRateKnown`, `Registrations`,
 `RegistrationRefusals`, `RegistrationErrors`, `LaunchShortfall`, `QueueWait` (seconds per started job, with
-percentiles), `StalledSets`, `Orphans`, `SpendTodayUSD`, `SpendDailyCapUSD`, `SpendMonthUSD`, `SpendPerHourUSD`,
+percentiles, and again per set under the dimension `Set`), `StalledSets`, `Orphans`, `SpendTodayUSD`, `SpendDailyCapUSD`, `SpendMonthUSD`, `SpendPerHourUSD`,
 `SpendCapped`, `Machines` and `OnDemandShare`; per set (dimension `Set`): `Machines`, `IdleRunners`, `BusyRunners`,
 `Pool`, `JobsWaiting`.
 

@@ -141,11 +141,19 @@ def first(events, name, **match):
 MACHINE_MARKS = ("boot.start", "cache.start", "cache.up", "doc.got", "jit.sent", "jit.answered", "runner.start", "runner.online", "job.running")
 
 
+def offset_ms(e):
+    """The machine clock offset an event carries: offset_ms, the smallest of the machine's last few posts' recv less sent
+    (a post's own delay is in it, so the smallest is the nearest to the offset), or skew_ms, which lines written before
+    the offset estimate hold: one post's recv less sent."""
+    k = e.get("offset_ms")
+    return e.get("skew_ms") if k is None else k
+
+
 def on_listener_clock(e):
-    """A machine mark on the listener's clock. skew_ms is the listener's clock less the machine's at the post that carried
-    the mark, plus one way latency (a few ms): a machine's clock is seconds off at boot until chrony steps it (1.7 s on the
-    first live run, 36 ms by the end), so each post's own skew moves its marks, not one offset for the machine."""
-    return e["t"] + (e.get("skew_ms") or 0) / 1000
+    """A machine mark on the listener's clock. offset_ms is the listener's clock less the machine's at the post that carried
+    the mark: a machine's clock is seconds off at boot until chrony steps it (1.7 s on the first live run, 36 ms by the
+    end), so each post's own estimate moves its marks, not one offset for the machine."""
+    return e["t"] + (offset_ms(e) or 0) / 1000
 
 
 def machine_milestones(tl, events, created):
@@ -192,7 +200,7 @@ def machine_milestones(tl, events, created):
         e = first(mine, name)
         if e:
             tl.attrs[key] = e.get(field)
-    skews = [e["skew_ms"] for e in mine if e.get("skew_ms") is not None]
+    skews = [offset_ms(e) for e in mine if offset_ms(e) is not None]
     tl.attrs["clock_offset_ms"] = max(skews, key=abs) if skews else None
     tl.attrs["clock_corrected"] = any(abs(k) > CLOCK_FLAG_S * 1000 for k in skews) or None
     tl.cache = [cache_mark(e) for e in sorted(mine, key=lambda e: e["t"]) if e["ev"] in ("cache.restore", "cache.save")]
