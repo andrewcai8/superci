@@ -84,7 +84,8 @@ func TestWithoutARefusalNoMachineWaitsWhateverTheEstimateSays(t *testing.T) {
 }
 
 // GitHub's refusal is the one hard signal. It halves the admitted rate and holds every ask for 5 s; the rate climbs
-// back to the ceiling while GitHub accepts, and a second refusal in a row halves it again and holds twice as long.
+// back to the ceiling once the hold is over (nothing saves up or climbs during it), and a second refusal in a row
+// halves it again and holds twice as long.
 func TestARefusalBacksOffThenTheRateRecovers(t *testing.T) {
 	c := builtIn(t)
 	now := time.Now()
@@ -105,14 +106,14 @@ func TestARefusalBacksOffThenTheRateRecovers(t *testing.T) {
 	if ok, why := b.Try(at.Add(4*time.Second), Asker{P: ForJob}); ok || why != DeniedThrottled {
 		t.Fatalf("4 s after the refusal: %v %v, want held", ok, why)
 	}
-	if ok, _ := b.Try(at.Add(6*time.Second), Asker{P: ForJob}); !ok {
-		t.Fatal("6 s after the refusal the hold is over and tokens have saved up: still turned away")
+	if ok, _ := b.Try(at.Add(7*time.Second), Asker{P: ForJob}); !ok {
+		t.Fatal("7 s after the refusal the hold is over and two seconds of tokens have saved up: still turned away")
 	}
-	b.Done(at.Add(6*time.Second), Made, 0)
+	b.Done(at.Add(7*time.Second), Made, 0)
 	if r := b.Rate(); r >= c.CeilingRate {
-		t.Fatalf("the rate is back at the ceiling 6 s after a refusal: %v", r)
+		t.Fatalf("the rate is back at the ceiling 7 s after a refusal: %v", r)
 	}
-	back := at.Add(time.Duration(c.RecoverS/2+5) * time.Second)
+	back := at.Add(time.Duration(c.RecoverS/2+10) * time.Second)
 	b.Try(back, Asker{P: ForJob})
 	b.Done(back, Made, 0)
 	if r := b.Rate(); r != c.CeilingRate {

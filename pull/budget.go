@@ -314,9 +314,14 @@ func (b *Budget) admit(now time.Time, a Asker) Denial {
 func (b *Budget) burst() float64 { return max(1, float64(b.c.CeilingBurst)) }
 
 // refill adds the tokens the admitted rate saved since the last ask, and climbs the rate back toward the ceiling: from
-// nothing to the ceiling in RecoverS seconds while GitHub refuses nothing.
+// nothing to the ceiling in RecoverS seconds while GitHub refuses nothing. A hold saves nothing and climbs nothing:
+// time counts from the end of the hold, whether or not anyone asked during it.
 func (b *Budget) refill(now time.Time) {
-	dt := max(0, now.Sub(b.refilled).Seconds())
+	from := b.refilled
+	if b.throttledUntil.After(from) {
+		from = b.throttledUntil
+	}
+	dt := max(0, now.Sub(from).Seconds())
 	b.refilled = now
 	if b.c.RecoverS > 0 {
 		b.rate = min(b.c.CeilingRate, b.rate+b.c.CeilingRate*dt/float64(b.c.RecoverS))

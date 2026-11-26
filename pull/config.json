@@ -81,8 +81,8 @@
     "pool_rate": 5,
     "pool_share": 0.9,
     "concurrency": 64,
-    "ceiling_rate": 5,
-    "ceiling_burst": 150,
+    "ceiling_rate": 2,
+    "ceiling_burst": 50,
     "recover_s": 120,
     "critical_reserve": 2
   },

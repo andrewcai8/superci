@@ -247,6 +247,10 @@ func (c Config) validate() error {
 	if r := c.Registration; r.Cap <= 0 || r.WindowS <= 0 || r.CeilingRate <= 0 || r.CeilingBurst < 1 || r.RecoverS < 1 || r.PoolShare < 0 || r.PoolShare > 1 || r.Reserve < 0 {
 		return errors.New("config: registration needs cap, window_s, a ceiling_rate above 0, a ceiling_burst and recover_s of 1 or more, a pool_share in [0, 1] and a critical_reserve of 0 or more")
 	}
+	if r := c.Registration; r.CeilingRate*float64(r.WindowS)+float64(r.CeilingBurst) > float64(r.Cap) {
+		return fmt.Errorf("config: registration ceiling_rate %v x window_s %d + ceiling_burst %d = %.0f registrations in one window, over the cap of %d",
+			r.CeilingRate, r.WindowS, r.CeilingBurst, r.CeilingRate*float64(r.WindowS)+float64(r.CeilingBurst), r.Cap)
+	}
 	if p := c.Pool; p.Quantile <= 0 || p.Quantile > 1 || p.ReadySeconds <= 0 || p.HoldMinutes < 0 {
 		return errors.New("config: pool needs a quantile in (0, 1], ready_seconds above 0 and hold_minutes of 0 or more")
 	}

@@ -90,20 +90,41 @@ issued its runner superci-pull-issued=<when>
 
 GitHub documents a cap of 1,500 runner registrations in 5 minutes per repository, organization or enterprise, not
 raisable (https://docs.github.com/en/actions/reference/limits). The page does not say what a refusal looks like; the
-listener reads a rate-limit answer (429, or 403 with `Retry-After`) or an error naming `ConfigureTooManyRunners` as
-one. The budget admits on that answer, not on a guess:
+listener reads every error of a registration as one (a 429, a 403 with or without a rate-limit header, a 400, 409 or
+422, a 5xx under load), except the answers that say something else: the runner exists, our credential is bad, the scale
+set is gone, or we cancelled the ask. The budget admits on that answer, not on a guess:
 
 - **GitHub's refusal is the one hard signal.** It halves the admitted rate (down to 0.1/s at the least), drops the
-  saved tokens, and holds every ask for 5 s, doubling to a minute while GitHub keeps refusing. The rate climbs back
-  to the ceiling in `recover_s` (120 s) while GitHub refuses nothing. Every refusal is counted
+  saved tokens, and holds every ask for 5 s, doubling to a minute while GitHub keeps refusing. Nothing saves up and
+  the rate does not climb during a hold; the rate climbs back to the ceiling in `recover_s` (120 s) from the end of
+  the hold while GitHub refuses nothing. Every refusal is counted
   (`RegistrationRefusals`, its alarm), logged (`"msg":"registration refused by GitHub"`) and written to the timeline
   (`jit.refused`, `why` `refused`).
 - **Below the admitted rate no machine waits.** The organization's estimated rate decides nothing.
-- **A ceiling of our own** bounds our registrations whatever GitHub answers: `ceiling_rate` 5 a second and
-  `ceiling_burst` 150 at once. 5 a second over 300 s is GitHub's documented 1,500, so a fault of ours alone cannot
-  pass the documented cap; 150 covers the largest simultaneous burst measured (115 jobs within 3 s from four merge
-  queue drafts, Nov 26 03:11Z). Raise both as the share on superci grows: Blacksmith alone started 1,218 runners in
-  one minute that night.
+- **A ceiling of our own** bounds our registrations whatever GitHub answers: `ceiling_rate` a second and
+  `ceiling_burst` at once. It starts at 2 a second and 50 at once, 650 in 300 s, well inside GitHub's documented
+  1,500; 50 covers most simultaneous bursts (the largest measured was 115 jobs within 3 s from four merge queue
+  drafts, Nov 26 03:11Z, which then queue behind the tokens). `ceiling_rate` x `window_s` + `ceiling_burst` must not
+  pass `cap` (1,500): config load and `-validate` refuse a ceiling that could, such as a `ceiling_rate` of 6.
+
+  **Raising it.** Raise one step at a time, set in the override file named by `-config`, and only after 24 hours
+  in which all three hold:
+
+  1. `RegistrationRefusals` is 0 for the whole 24 hours.
+  2. Blacksmith's Linux queue-wait p90 stays under 10 s (the baseline the share on superci must not worsen).
+  3. `denied_tokens` (the listener's budget log line; `BudgetDenied` reason `tokens`) shows we actually
+     hit the ceiling. A ceiling nobody reached is not what held a job back.
+
+  | Step | `ceiling_rate` | `ceiling_burst` | Most in 300 s |
+  | --- | --- | --- | --- |
+  | 0 (default) | 2 | 50 | 650 |
+  | 1 | 3 | 100 | 1,000 |
+  | 2 | 4 | 150 | 1,350 |
+
+  A step that brings a refusal goes back one step. The next step, 5 a second with 150 at once, is 1,650 in one window
+  and is refused by the validation: past step 2 the rate and the burst trade off at `ceiling_rate` x 300 +
+  `ceiling_burst` = 1,500 at most (4 a second with 300 at once, for one), and nothing there leaves room for anyone
+  else's registrations in the organization.
 - **When tokens are short, machines are served in order**: critical before batch before pool, and in each class the
   machine launched first. A machine turned away keeps its place while it keeps asking (6 s, two polls); the next
   tokens are owed to the machines ahead of it (`BudgetDenied` reason `queued`).
@@ -635,7 +656,7 @@ one job), plus the pool. `SpendPerHourUSD` is the listener's live figure.
   a pool registered ahead.
 - **A burst waits on registrations past the pool.** A burst of N jobs on a size whose pool holds P idle runners
   starts P at once; the rest wait for machines (about 15 s from launch to a registered runner) and for
-  registrations at the admitted rate S (`AdmitRate`, the ceiling of 5 a second until GitHub refuses one). The last job of the
+  registrations at the admitted rate S (`AdmitRate`, the ceiling of 2 a second until GitHub refuses one). The last job of the
   burst waits about `15 s + (N - P) / S`: at S = 2/s, a 200-job burst onto a pool of 10 waits up to about 110 s.
 - **gp3 storage.** 40-150 GB disks use 50 TiB per region at about 800 machines; the quota is now 200 TiB in us-east-1
   and 100 TiB in us-east-2 (`LaunchShortfall` and its alarm show the next limit hit).

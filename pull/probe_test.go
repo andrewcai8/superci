@@ -99,8 +99,20 @@ func TestAProbeIsRemovedOnceItGaveTheHead(t *testing.T) {
 	}
 }
 
+// A probe that GitHub answered with anything but "unauthorized", "not found" or "exists" is a refusal: the budget backs off.
+func TestAProbeThatGitHubFailedBacksTheBudgetOff(t *testing.T) {
+	g := &registry{generateErr: errors.New("502 Bad Gateway")}
+	b := probeBudget(t0)
+	if probeOrgHead(context.Background(), g, b, 1, t0) {
+		t.Fatal("a failed registration says it learned the head")
+	}
+	if s := b.Snapshot(t0); s.Refused != 1 || !s.Throttled || s.Failed != 0 {
+		t.Fatalf("%+v: want the 502 counted as a refusal and every ask held", s)
+	}
+}
+
 func TestAProbeThatCouldNotRegisterLeavesNothingAndLearnsNothing(t *testing.T) {
-	g := &registry{generateErr: errors.New("boom")}
+	g := &registry{generateErr: fmt.Errorf("401: %w", scaleset.UnauthorizedError)}
 	b := probeBudget(t0)
 	if probeOrgHead(context.Background(), g, b, 1, t0) {
 		t.Fatal("a failed registration says it learned the head")

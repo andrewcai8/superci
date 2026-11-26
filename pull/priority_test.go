@@ -134,8 +134,8 @@ func TestAnOverrideWithABadBatchPatternOrANegativeReserveIsRefused(t *testing.T)
 	dir := t.TempDir()
 	for name, body := range map[string]string{
 		"pattern": `{"batch": {"jobs": ["("]}}`,
-		"reserve": `{"registration": {"cap": 1500, "window_s": 300, "pool_share": 0.9, "ceiling_rate": 5, "ceiling_burst": 150, "recover_s": 120, "critical_reserve": -1}}`,
-		"ceiling": `{"registration": {"cap": 1500, "window_s": 300, "pool_share": 0.9, "ceiling_rate": 0, "ceiling_burst": 150, "recover_s": 120, "critical_reserve": 2}}`,
+		"reserve": `{"registration": {"cap": 1500, "window_s": 300, "pool_share": 0.9, "ceiling_rate": 2, "ceiling_burst": 50, "recover_s": 120, "critical_reserve": -1}}`,
+		"ceiling": `{"registration": {"cap": 1500, "window_s": 300, "pool_share": 0.9, "ceiling_rate": 0, "ceiling_burst": 50, "recover_s": 120, "critical_reserve": 2}}`,
 	} {
 		p := filepath.Join(dir, name+".json")
 		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {

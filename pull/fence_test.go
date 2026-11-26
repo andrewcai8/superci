@@ -32,7 +32,7 @@ func (g *fakeRegistrar) GenerateJitRunnerConfig(_ context.Context, in *scaleset.
 	defer g.mu.Unlock()
 	if g.fail > 0 {
 		g.fail--
-		return nil, errors.New("502 Bad Gateway")
+		return nil, fmt.Errorf("401 Unauthorized: %w", scaleset.UnauthorizedError)
 	}
 	if g.runners[in.Name] {
 		return nil, scaleset.RunnerExistsError

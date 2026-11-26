@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Undoes each fix of round 2, of the fence round (audit E), of the wait round (F1 to F4), of the visible wait (U2), of the priority classes (U4), of the hygiene round (U7) and of admission on GitHub's answer in a copy of pull/ and runs the test written for it, which must fail. A fix whose
+"""Undoes each fix of round 2, of the fence round (audit E), of the wait round (F1 to F4), of the visible wait (U2), of the priority classes (U4), of the hygiene round (U7) and of admission on GitHub's answer (the refusal shapes, the hold, the 2 and 50 start, the ceiling against the cap) in a copy of pull/ and runs the test written for it, which must fail. A fix whose
 test still passes without it is reported as NOT RED. A path under cache/ runs its test in the cache module. Run it in pull/ where Go is installed:
 
   python3 tools/redfirst.py [name fragment ...]   # only the mutants whose name holds one of them
@@ -186,7 +186,26 @@ MUTANTS = [
     ("admit no ceiling on the rate", "budget.go", "b.rate = min(b.c.CeilingRate, b.rate+b.c.CeilingRate*dt/float64(b.c.RecoverS))", "b.rate = b.rate + b.c.CeilingRate*dt/float64(b.c.RecoverS)",
      "TestTheCeilingHoldsWhenGitHubRefusesNothing"),
     ("admit no ceiling on the burst", "budget.go", "b.tokens = min(b.burst(), b.tokens+dt*b.rate)", "b.tokens = b.tokens + dt*b.rate", "TestTheCeilingHoldsWhenGitHubRefusesNothing"),
-    ("admit a ceiling above the documented cap", "config.json", "\"ceiling_rate\": 5,", "\"ceiling_rate\": 6,", "TestTheCeilingHoldsWhenGitHubRefusesNothing"),
+    ("admit a ceiling above the documented cap", "config.json", "\"ceiling_rate\": 2,", "\"ceiling_rate\": 6,", "TestTheCeilingHoldsWhenGitHubRefusesNothing"),
+    ("admit only a rate-limit answer is a refusal", "server.go", f"{T}{T}}}\n{T}}}\n{T}return true\n}}", f"{T}{T}}}\n{T}}}\n{T}var rl *scaleset.RateLimitError\n{T}return errors.As(err, &rl)\n}}",
+     "TestEveryAnswerButOursIsARefusalThatBacksOff"),
+    ("admit a 401 is a refusal", "server.go", "scaleset.RunnerExistsError, scaleset.UnauthorizedError, scaleset.NotFoundError, context.Canceled", "scaleset.RunnerExistsError, scaleset.NotFoundError, context.Canceled",
+     "TestEveryAnswerButOursIsARefusalThatBacksOff"),
+    ("admit a 404 is a refusal", "server.go", "scaleset.RunnerExistsError, scaleset.UnauthorizedError, scaleset.NotFoundError, context.Canceled", "scaleset.RunnerExistsError, scaleset.UnauthorizedError, context.Canceled",
+     "TestEveryAnswerButOursIsARefusalThatBacksOff"),
+    ("admit our own cancel is a refusal", "server.go", "scaleset.NotFoundError, context.Canceled}", "scaleset.NotFoundError}", "TestOurOwnCancelIsNotARefusal"),
+    ("admit a probe's failure is no refusal", "main.go", "\t\tif refusedRegistration(err) {\n\t\t\toutcome = Refused", "\t\tif false && refusedRegistration(err) {\n\t\t\toutcome = Refused",
+     "TestAProbeThatGitHubFailedBacksTheBudgetOff"),
+    ("admit a hold saves tokens and climbs", "budget.go", f"{T}from := b.refilled\n{T}if b.throttledUntil.After(from) {{\n{T}{T}from = b.throttledUntil\n{T}}}\n", f"{T}from := b.refilled\n",
+     "TestAHoldSavesNoTokensAndLetsTheRateNotClimb"),
+    ("admit a hold saves only while asked", "budget.go", f"{T}from := b.refilled\n{T}if b.throttledUntil.After(from) {{\n{T}{T}from = b.throttledUntil\n{T}}}\n",
+     f"{T}from := b.refilled\n{T}if now.Before(b.throttledUntil) {{\n{T}{T}b.refilled = now\n{T}{T}return\n{T}}}\n", "TestAHoldSavesNoTokensAndLetsTheRateNotClimb"),
+    ("admit the ceiling starts at 3 a second", "config.json", "\"ceiling_rate\": 2,", "\"ceiling_rate\": 3,", "TestTheCeilingStartsAt2And50"),
+    ("admit the burst starts at 60", "config.json", "\"ceiling_burst\": 50,", "\"ceiling_burst\": 60,", "TestTheCeilingStartsAt2And50"),
+    ("admit a ceiling past the cap is accepted", "config.go", "r.CeilingRate*float64(r.WindowS)+float64(r.CeilingBurst) > float64(r.Cap)", "r.CeilingRate*float64(r.WindowS)+float64(r.CeilingBurst) > 1e18",
+     "TestACeilingThatCouldPassTheCapInOneWindowIsRefused"),
+    ("admit the ceiling check forgets the burst", "config.go", "r.CeilingRate*float64(r.WindowS)+float64(r.CeilingBurst) > float64(r.Cap)", "r.CeilingRate*float64(r.WindowS) > float64(r.Cap)",
+     "TestACeilingThatCouldPassTheCapInOneWindowIsRefused"),
     ("admit a zero ceiling is accepted", "config.go", "r.CeilingRate <= 0 || ", "", "TestAnOverrideWithABadBatchPatternOrANegativeReserveIsRefused"),
 ]
 

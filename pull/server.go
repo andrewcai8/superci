@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/actions/scaleset"
@@ -290,8 +289,16 @@ func Admin(status func() Status, healthy func() error, override func(set string,
 	return mux
 }
 
-// refusedRegistration says whether GitHub refused a registration for its organization-wide cap or its rate limit.
+// refusedRegistration says whether GitHub's answer to a registration is a refusal, which backs the listener off. GitHub
+// documents the cap but not what its refusal looks like (429, a 403 with or without a header, a 400, 409 or 422 naming
+// ConfigureTooManyRunners or not, a 5xx under load), so every error is one, except the answers that say something
+// else: the runner exists, our credential is bad, the scale set is gone, or we cancelled the ask ourselves. Counted as
+// a failure, a refusal has no backoff and the listener asks GitHub again at once.
 func refusedRegistration(err error) bool {
-	var rl *scaleset.RateLimitError
-	return errors.As(err, &rl) || strings.Contains(err.Error(), "ConfigureTooManyRunners")
+	for _, other := range []error{scaleset.RunnerExistsError, scaleset.UnauthorizedError, scaleset.NotFoundError, context.Canceled} {
+		if errors.Is(err, other) {
+			return false
+		}
+	}
+	return true
 }
