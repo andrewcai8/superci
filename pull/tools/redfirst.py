@@ -227,7 +227,7 @@ MUTANTS = [
     ("warm reads the binaries into nothing", "boot.sh", "        cat -- \"$f\" > /dev/null 2>&1\n", "        :\n", "TestThePrereadReadsOnlyTheSnapshotsPartOfTheRootAndPostsItsStartAndEnd"),
     ("warm reads on after the job starts", "boot.sh", "        [ -e \"$HR/.pid\" ] || return 1\n", "", "TestAJobThatStartsDuringTheWarmStopsItWithinAFile"),
     ("warm starts after a job that started during the walk", "boot.sh", "    [ -e \"$HR/.pid\" ] || return 0\n    # The walk reads inodes", "    # The walk reads inodes", "TestAJobThatStartsDuringTheWalkStartsNoDaemonAndNoWarm"),
-    ("warm reads the libraries on any machine", "boot.sh", "-lt 12000000 ] || libs=", "-lt 0 ] || libs=", "TestOnlyAMachineOf12GBOrMoreWarmsTheLibraries"),
+    ("warm reads the libraries on any machine", "boot.sh", "-ge 12000000 ] 2> /dev/null && libs=", "-ge 0 ] 2> /dev/null && libs=", "TestOnlyAMachineOf12GBOrMoreWarmsTheLibraries"),
 ]
 
 here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

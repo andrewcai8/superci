@@ -124,7 +124,7 @@ hydrate() {
     # The libraries are 1.2 GB more: only a machine of 12 GB or more reads them, so the warm never presses a smaller one's
     # hydrated trees out of memory.
     local libs=()
-    [ "$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)" -lt 12000000 ] || libs=(/usr/lib/python3 /usr/lib/x86_64-linux-gnu)
+    [ "$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)" -ge 12000000 ] 2> /dev/null && libs=(/usr/lib/python3 /usr/lib/x86_64-linux-gnu)
     systemctl start docker.service > /dev/null 2>&1 || :
     hot() {
       local f
