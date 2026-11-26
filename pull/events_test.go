@@ -78,10 +78,10 @@ func TestListenerEventsMatchSchema(t *testing.T) {
 		tlAcquired("superci-4cpu", []int64{7}, now)
 		tlLaunched("superci-4cpu", "r-1", "spot", now.Add(-2*time.Second), []*Machine{{ID: "i-0abc", Region: "us-east-1", AZ: "us-east-1b", Type: "c7i.xlarge", Lifecycle: "spot"}})
 		tlEnded("us-east-1", "idle", []string{"i-0abc"}, now)
-		tlAsk("superci-4cpu", "i-0abc", Wait, now)
-		tlAsk("superci-4cpu", "i-0abc", Wait, now.Add(3*time.Second))
-		tlAsk("superci-4cpu", "i-0abc", Grant, now.Add(6*time.Second))
-		tlAsk("superci-4cpu", "i-0def", End, now)
+		tlAsk("superci-4cpu", "i-0abc", Wait, "tokens", now)
+		tlAsk("superci-4cpu", "i-0abc", Wait, "tokens", now.Add(3*time.Second))
+		tlAsk("superci-4cpu", "i-0abc", Grant, "", now.Add(6*time.Second))
+		tlAsk("superci-4cpu", "i-0def", End, "", now)
 		tlClaim("superci-4cpu", "i-0abc", nil, now.Add(-30*time.Millisecond), now)
 		tlClaim("superci-4cpu", "i-0abc", ErrClaimed, now, now)
 		tlClaim("superci-4cpu", "i-0abc", errors.New("s3 down"), now, now)
@@ -93,6 +93,8 @@ func TestListenerEventsMatchSchema(t *testing.T) {
 		tlIssued("superci-4cpu", "i-0abc", "superci-4cpu-i-0abc", 3, now.Add(-time.Second), now)
 		tlRefused("superci-4cpu", "i-0abc", "exists", now.Add(-time.Second), now)
 		tlNotice("superci-4cpu", &Machine{ID: "i-0abc", Region: "us-east-1", AZ: "us-east-1b", Type: "c7i.xlarge"}, now)
+		tlAsk("superci-4cpu", "i-0ghi", Wait, "window", now)
+		tlAsk("superci-4cpu", "i-0ghi", Wait, "window", now.Add(31*time.Second))
 	})
 	written := map[string]bool{}
 	for _, l := range lines {

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Undoes each fix of round 2, of the fence round (audit E) and of the wait round (F1 to F4), of the hygiene round (U7) in a copy of pull/ and runs the test written for it, which must fail. A fix whose
+"""Undoes each fix of round 2, of the fence round (audit E), of the wait round (F1 to F4), of the visible wait (U2) and of the hygiene round (U7) in a copy of pull/ and runs the test written for it, which must fail. A fix whose
 test still passes without it is reported as NOT RED. A path under cache/ runs its test in the cache module. Run it in pull/ where Go is installed:
 
   python3 tools/redfirst.py [name fragment ...]   # only the mutants whose name holds one of them
@@ -8,7 +8,7 @@ import os, shutil, subprocess, sys, tempfile
 
 T = "\t"
 MUTANTS = [
-    ("SEC-F1 an issued machine is granted", "state.go", f"{T}case m.Issued || r != nil:\n{T}{T}return End\n", "", "TestARestartNeverGivesAMachineASecondRunner"),
+    ("SEC-F1 an issued machine is granted", "state.go", f"{T}case m.Issued || r != nil:\n{T}{T}return End, \"\"\n", "", "TestARestartNeverGivesAMachineASecondRunner"),
     ("SEC-F1 asking keeps an issued machine", "state.go", "if m.Ending || m.Issuing || m.Checking || now.Sub(m.Launched) < grace {",
      "if m.Ending || m.Issuing || m.Checking || now.Sub(m.Launched) < grace || now.Sub(m.Asked) < quiet {", "TestARestartNeverGivesAMachineASecondRunner"),
     ("SEC-F1 a completed job leaves its machine to end itself", "state.go", f"r.Busy, r.Done = true, true\n{T}{T}{T}m.Ending = true", "r.Busy, r.Done = true, true",
@@ -39,7 +39,7 @@ MUTANTS = [
     ("E9 a dropped set deleted with machines", "state.go", "len(s.machines) > 0 || ", "", "TestADroppedSetIsDeletedOnlyOnceItHoldsNothing"),
     ("SEC-F1 a listed runner does not mark its machine issued", "state.go", f"m.Issued = true\n{T}{T}{T}held[m] = true", "held[m] = true",
      "TestAMachineWithAListedRunnerIsIssuedAndTagged"),
-    ("SEC-F2 a runner that never started is replaced", "state.go", f"{T}case r != nil && !r.Busy:\n{T}{T}m.Retire = true\n{T}{T}return End\n",
+    ("SEC-F2 a runner that never started is replaced", "state.go", f"{T}case r != nil && !r.Busy:\n{T}{T}m.Retire = true\n{T}{T}return End, \"\"\n",
      f"{T}case r != nil && !r.Busy:\n{T}{T}m.Runner = nil\n", "TestARunnerThatNeverStartedIsNeverReplaced"),
     ("OPS-2 no stall is reported", "state.go", "return now.Sub(s.waitingSince) > d && now.Sub(s.lastStart) > d", "return false",
      "TestJobsThatWaitWithNoneStartedAreStalled"),
@@ -124,6 +124,27 @@ MUTANTS = [
     ("U7 the offset is the last post's delay", "events.go", "return slices.Min(posts)", "return posts[len(posts)-1] + 0*slices.Min(posts)", "TestAMachinesClockOffsetIsTheSmallestOfItsLastPostsNotThePostsOwnDelay"),
     ("U7 the offset remembers every post", "events.go", "posts = posts[max(0, len(posts)-offsetPosts):]", "", "TestAMachinesClockOffsetIsTheSmallestOfItsLastPostsNotThePostsOwnDelay"),
     ("U7 a mark still carries skew_ms", "events.go", '"inst", m.ID, "offset_ms", offset, "val", val}', '"inst", m.ID, "skew_ms", offset, "val", val}', "TestMarkWritesEventsFromTheMachinesClock"),
+    ("U2 the oldest waiting job reads 0", "state.go", "return max(0, now.Sub(queued[max(0, len(queued)-n)]))", "return 0",
+     "TestAStarvedBudgetLeavesAJobUnstartedAndItsWaitIsVisibleWhileItLasts"),
+    ("U2 the oldest waiting job reads a cancelled one", "state.go", "queued[max(0, len(queued)-n)]", "queued[0]", "TestTheOldestWaitingJobIsBoundedByWhatTheQueueSaysWaits"),
+    ("U2 the oldest waiting job reads with nothing waiting", "state.go", "if n <= 0 || len(s.available) == 0 {", "if len(s.available) == 0 {",
+     "TestTheOldestWaitingJobIsBoundedByWhatTheQueueSaysWaits"),
+    ("U2 the oldest machine without a runner reads 0", "state.go", "oldest = max(oldest, now.Sub(m.Launched))", "oldest = max(oldest, 0)",
+     "TestAStarvedBudgetLeavesAJobUnstartedAndItsWaitIsVisibleWhileItLasts"),
+    ("U2 a denial is not counted", "budget.go", "\tif why != Allowed {\n\t\tb.denied[why]++\n\t}\n", "", "TestEveryReasonTheBudgetTurnsAwayIsCountedUnderItsOwnName"),
+    ("U2 every denial is counted as tokens", "budget.go", "\t\treturn DeniedWindow\n", "\t\treturn DeniedTokens\n", "TestEveryReasonTheBudgetTurnsAwayIsCountedUnderItsOwnName"),
+    ("U2 a wait never writes jit.wait", "events.go", "if now.Sub(since) >= waitEvery {", "if false {", "TestAMachineStillToldToWaitWritesJitWaitEvery30SecondsWithItsReason"),
+    ("U2 jit.wait every ask", "events.go", "if now.Sub(since) >= waitEvery {", "if true {", "TestAMachineStillToldToWaitWritesJitWaitEvery30SecondsWithItsReason"),
+    ("U2 a wait has no reason", "state.go", "return Wait, why.String()", "return Wait, why.String()[:0]", "TestAStarvedBudgetLeavesAJobUnstartedAndItsWaitIsVisibleWhileItLasts"),
+    ("U2 no denial metric", "metrics.go", "for reason := DeniedWindow; reason < denialKinds; reason++ {", "for reason := denialKinds; reason < denialKinds; reason++ {",
+     "TestThePublishedMetricsCarryTheDenialsAndTheWaitsInProgress"),
+    ("U2 no alarm metric without a set", "metrics.go", "d(\"OldestWaitingJobAgeS\", oldestJob, cwtypes.StandardUnitSeconds)", "d(\"OldestWaitingJobAgeS\", 0, cwtypes.StandardUnitSeconds)",
+     "TestThePublishedMetricsCarryTheDenialsAndTheWaitsInProgress"),
+    ("U2 the denials of a minute are the total", "main.go", "out[reason] = n - before[reason]", "out[reason] = n", "TestTheBudgetsDenialsOfAMinuteAreTheDifferenceOfTwoSnapshots"),
+    ("U2 the alarm needs 10 minutes", "deploy/alarms.sh", "OldestWaitingJobAgeS Maximum GreaterThanThreshold 60 60 2 2 notBreaching", "OldestWaitingJobAgeS Maximum GreaterThanThreshold 60 60 10 10 notBreaching",
+     "TestTheOldestJobAlarmFiresWithinTwoMinutesOfTheCanarysStall"),
+    ("U2 the alarm needs 10 minutes over 600 s", "deploy/alarms.sh", "OldestWaitingJobAgeS Maximum GreaterThanThreshold 60 60 2 2 notBreaching", "OldestWaitingJobAgeS Maximum GreaterThanThreshold 600 60 2 2 notBreaching",
+     "TestTheOldestJobAlarmFiresWithinTwoMinutesOfTheCanarysStall"),
 ]
 
 here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

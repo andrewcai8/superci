@@ -317,6 +317,15 @@ func run(ctx context.Context, f flags) error {
 // healthyWithin is how long the reconciler may go without finishing a pass before the listener reads as dead.
 const healthyWithin = 2 * time.Minute
 
+// deniedSince is what the budget denied between two snapshots, by reason.
+func deniedSince(before, now map[string]int) map[string]int {
+	out := make(map[string]int, len(now))
+	for reason, n := range now {
+		out[reason] = n - before[reason]
+	}
+	return out
+}
+
 // bootData is a machine's user data: boot.sh with the listener's address and key, the longest a machine may live
 // (the oldest a pool machine may be, and the longest job after it), and its set's label, which names the hydration
 // manifest it reads.
@@ -784,14 +793,15 @@ func (l *Listener) reconciler(ctx context.Context, refresh func(context.Context,
 			sp := l.spend.Snapshot()
 			slog.Info("budget", "known", b.Known, "org_rate", b.OrgRate, "others_rate", b.OthersRate, "ours_rate", b.OursRate,
 				"spare_rate", b.SpareRate, "window_use", b.WindowUse, "pending", b.Pending, "made", b.Made, "refused", b.Refused,
-				"failed", b.Failed, "throttled", b.Throttled, "spend_day", sp.DayUSD, "spend_month", sp.MonthUSD, "per_hour", sp.PerHour, "capped", sp.Capped)
+				"failed", b.Failed, "throttled", b.Throttled, "denied_window", b.Denied["window"], "denied_tokens", b.Denied["tokens"],
+				"denied_throttled", b.Denied["throttled"], "denied_blind", b.Denied["blind"], "spend_day", sp.DayUSD, "spend_month", sp.MonthUSD, "per_hour", sp.PerHour, "capped", sp.Capped)
 			for _, s := range l.sets {
 				snap := s.state.Snapshot(now)
 				slog.Info("state", "set", snap.Set, "ready", snap.Ready, "desired", snap.Desired, "live", snap.Live, "inflight", snap.Inflight, "machines", snap.Machines,
 					"booting", snap.Booting, "idle", snap.Idle, "busy", snap.Busy, "issued", snap.Issued, "retiring", snap.Retiring, "ending", snap.Ending,
 					"on_demand", snap.OnDemand, "notices", snap.Notices, "pool", snap.Pool, "orphans", snap.Orphans, "stale_waiting", snap.StaleWaiting,
 					"s_assigned", snap.Stats.TotalAssignedJobs, "s_available", snap.Stats.TotalAvailableJobs, "s_running", snap.Stats.TotalRunningJobs,
-					"launch_s", snap.LaunchS, "launches", snap.Launches)
+					"launch_s", snap.LaunchS, "launches", snap.Launches, "oldest_job_s", snap.OldestJobS, "oldest_unregistered_s", snap.OldestUnregisteredS)
 				tlPoolTarget(snap, now)
 			}
 		}
