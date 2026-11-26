@@ -1128,6 +1128,7 @@ func (l *Listener) metrics() Metrics {
 	cfg := l.config()
 	for i, s := range l.sets {
 		waits := s.state.TakeWaits()
+		m.Jobs = append(m.Jobs, s.state.TakeJobs()...)
 		m.Waits = append(m.Waits, waits...)
 		m.SetWaits[s.spec.Name] = waits
 		if s.state.Stalled(now, 10*time.Minute) {

@@ -30,6 +30,7 @@ type Metrics struct {
 	Stalled  int                  // sets whose jobs have waited 10 minutes with none started
 	AtFloor  int                  // sets whose pool is at the hour's floor while more jobs wait than it has idle runners
 	Denied   map[string]int       // registrations the budget turned away this minute, by reason
+	Jobs     []JobRecord          // jobs that finished this minute, every set
 }
 
 func publish(ctx context.Context, cw *cloudwatch.Client, m Metrics, now time.Time) {
@@ -62,6 +63,8 @@ func metricData(m Metrics, now time.Time) []cwtypes.MetricDatum {
 		d("SpendTodayUSD", m.Spend.DayUSD, cwtypes.StandardUnitNone),
 		d("SpendMonthUSD", m.Spend.MonthUSD, cwtypes.StandardUnitNone),
 		d("SpendPerHourUSD", m.Spend.PerHour, cwtypes.StandardUnitNone),
+		d("SpendBusyPerHourUSD", m.Spend.BusyPerHour, cwtypes.StandardUnitNone),
+		d("SpendIdlePerHourUSD", m.Spend.IdlePerHour, cwtypes.StandardUnitNone),
 		d("SpendCapped", b2f(m.Spend.Capped), cwtypes.StandardUnitCount),
 		d("SpendDailyCapUSD", m.Spend.DailyCap, cwtypes.StandardUnitNone),
 		d("StalledSets", float64(m.Stalled), cwtypes.StandardUnitCount),
@@ -94,6 +97,7 @@ func metricData(m Metrics, now time.Time) []cwtypes.MetricDatum {
 	}
 	data = append(data, d("Machines", float64(machines), cwtypes.StandardUnitCount), d("OnDemandShare", float64(od)/math.Max(1, float64(machines)), cwtypes.StandardUnitNone))
 	data = append(data, queueWaitData(m, at)...)
+	data = append(data, jobData(m.Jobs, at)...)
 	return data
 }
 
@@ -139,4 +143,57 @@ func b2f(b bool) float64 {
 		return 1
 	}
 	return 0
+}
+
+// jobData is the minute's view of the jobs that finished, derived from their job.record events (the same JobRecords the
+// timeline writes, so a count here and a count of the log agree): JobsCompleted by result, JobWall of the jobs that
+// succeeded, and JobCostUSD with the part of it spent outside the job. Each is published for every set together (what the
+// alarms and the totals read) and for each set under the Set dimension, and JobsCompleted by Result under both. A
+// partial record (its start unknown) counts as completed and as cost, and adds no wall time.
+func jobData(jobs []JobRecord, at *time.Time) []cwtypes.MetricDatum {
+	if len(jobs) == 0 {
+		return nil
+	}
+	type key struct{ set, result string }
+	count := map[key]float64{}
+	wall := map[string][]float64{}
+	cost, idle := map[string]float64{}, map[string]float64{}
+	sets := map[string]bool{}
+	for _, j := range jobs {
+		sets[j.Set] = true
+		for _, set := range []string{"", j.Set} {
+			count[key{set, j.Conclusion()}]++
+			cost[set] += j.USD
+			idle[set] += j.IdleUSD()
+			if j.Conclusion() == "success" && !j.Partial() {
+				wall[set] = append(wall[set], float64(j.WallMS())/1000)
+			}
+		}
+	}
+	dims := func(set string, more ...cwtypes.Dimension) []cwtypes.Dimension {
+		var d []cwtypes.Dimension
+		if set != "" {
+			d = append(d, cwtypes.Dimension{Name: aws.String("Set"), Value: aws.String(set)})
+		}
+		return append(d, more...)
+	}
+	names := []string{""}
+	for set := range sets {
+		names = append(names, set)
+	}
+	sort.Strings(names)
+	var data []cwtypes.MetricDatum
+	for _, set := range names {
+		for _, result := range []string{"success", "failure", "cancelled"} {
+			data = append(data, cwtypes.MetricDatum{MetricName: aws.String("JobsCompleted"), Value: aws.Float64(count[key{set, result}]), Unit: cwtypes.StandardUnitCount,
+				Timestamp: at, Dimensions: dims(set, cwtypes.Dimension{Name: aws.String("Result"), Value: aws.String(result)})})
+		}
+		data = append(data, cwtypes.MetricDatum{MetricName: aws.String("JobCostUSD"), Value: aws.Float64(cost[set]), Unit: cwtypes.StandardUnitNone, Timestamp: at, Dimensions: dims(set)},
+			cwtypes.MetricDatum{MetricName: aws.String("JobIdleCostUSD"), Value: aws.Float64(idle[set]), Unit: cwtypes.StandardUnitNone, Timestamp: at, Dimensions: dims(set)})
+		for _, d := range waitDatum(wall[set], at, dims(set)) {
+			d.MetricName = aws.String("JobWall")
+			data = append(data, d)
+		}
+	}
+	return data
 }

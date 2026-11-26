@@ -118,6 +118,7 @@ type State struct {
 	began       map[string]began     // when each running job was queued and taken by its runner, by jobKey, for its record
 	recorded    map[string]time.Time // jobs whose record was made, by jobKey: GitHub redelivers a completion until acknowledged
 	price       func(Machine) float64
+	jobs        []JobRecord // records of the jobs completed since the metrics last took them
 	prunedJobs  time.Time
 	odLaunched  []time.Time
 	allLaunched []time.Time
@@ -572,6 +573,10 @@ func (s *State) Observe(msg *scaleset.RunnerScaleSetMessage, now time.Time) (don
 	} else {
 		s.waitingSince = time.Time{}
 	}
+	s.jobs = append(s.jobs, done...)
+	if len(s.jobs) > maxJobBuffer { // a listener run with metrics off takes none
+		s.jobs = s.jobs[len(s.jobs)-maxJobBuffer:]
+	}
 	return done
 }
 
@@ -771,6 +776,10 @@ func (s *State) Resume(c Carried) {
 	}
 }
 
+// maxJobBuffer bounds the records waiting for the minute's metrics: a minute's jobs are tens, so only a listener whose
+// metrics are off ever reaches it.
+const maxJobBuffer = 10000
+
 // pruneJobs forgets, at most every ten minutes, the jobs recorded or started more than six hours ago, which GitHub no
 // longer redelivers: a started job whose completion never came, and a job's record once it can no longer repeat.
 func (s *State) pruneJobs(now time.Time) {
@@ -805,6 +814,15 @@ func (s *State) SetPricer(f func(Machine) float64) {
 	s.mu.Lock()
 	s.price = f
 	s.mu.Unlock()
+}
+
+// TakeJobs hands over the records of the jobs completed since the last call, for the minute's metrics.
+func (s *State) TakeJobs() []JobRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	j := s.jobs
+	s.jobs = nil
+	return j
 }
 
 // TakeWaits hands over the queue waits recorded since the last call.
@@ -1248,7 +1266,12 @@ func (s *State) Running() []Machine {
 	defer s.mu.Unlock()
 	out := make([]Machine, 0, len(s.machines))
 	for _, m := range s.machines {
-		out = append(out, *m)
+		c := *m
+		if m.Runner != nil {
+			r := *m.Runner
+			c.Runner = &r
+		}
+		out = append(out, c)
 	}
 	return out
 }
