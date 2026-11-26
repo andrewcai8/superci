@@ -107,11 +107,13 @@ type State struct {
 
 	arrivals    []time.Time          // jobs that arrived, for the pool's rate
 	available   map[string]time.Time // when each waiting job was queued, by jobKey, for its queue wait
-	launches    []time.Duration      // launch call to first ask, of the set's last machines
-	held        []heldPool           // the bursts of the last hold, newest last
-	carried     int                  // the burst the last listener saw, held for the first window after a start
-	lost        []JobRef             // jobs that ended on a machine AWS was taking back, for a re-run
-	waits       []float64            // queue waits (s) of jobs started since the metrics last took them
+	batch       map[string]bool      // the waiting jobs (keys of available) the batch rule names
+	batchRule   BatchRule
+	launches    []time.Duration // launch call to first ask, of the set's last machines
+	held        []heldPool      // the bursts of the last hold, newest last
+	carried     int             // the burst the last listener saw, held for the first window after a start
+	lost        []JobRef        // jobs that ended on a machine AWS was taking back, for a re-run
+	waits       []float64       // queue waits (s) of jobs started since the metrics last took them
 	odLaunched  []time.Time
 	allLaunched []time.Time
 }
@@ -119,7 +121,7 @@ type State struct {
 func NewState(set string, pool, max int, regions []string, now time.Time) *State {
 	s := &State{set: set, pool: pool, max: max, started: now, machines: map[string]*Machine{}, gone: map[string]time.Time{}, reserved: map[string]int{},
 		boot: fmt.Sprintf("%x", now.UnixNano()), lastActivity: now, lastStart: now, polled: now, orphanSince: map[string]time.Time{},
-		available: map[string]time.Time{}, listings: map[string]time.Time{}}
+		available: map[string]time.Time{}, batch: map[string]bool{}, listings: map[string]time.Time{}}
 	for _, r := range regions {
 		s.listings[r] = time.Time{}
 	}
@@ -358,16 +360,46 @@ func (s *State) AskWhy(id string, now time.Time, b *Budget, maxAge time.Duration
 		m.Ending = true
 		return End, ""
 	}
-	prio := ForPool
-	if s.waitingJobs() > idle {
-		prio = ForJob
-	}
-	if ok, why := b.Try(now, prio); !ok {
+	if ok, why := b.Try(now, s.class(m, idle)); !ok {
 		return Wait, why.String()
 	}
 	m.Issuing, m.IssuingSince = true, now
 	return Grant, ""
 }
+
+// class is the priority of a machine's registration: that of the job it would take. A machine takes no job in
+// particular, so the waiting jobs are shared out to the machines that wait for a runner in the order they launched,
+// critical jobs first (idle runners take critical jobs first too); a machine with no job left to take fills the pool.
+// With no batch job waiting every job is critical.
+func (s *State) class(m *Machine, idle int) Priority {
+	waiting := s.waitingJobs()
+	if waiting <= idle {
+		return ForPool
+	}
+	batch := min(len(s.batch), waiting)
+	if batch == 0 {
+		return ForJob
+	}
+	critical := waiting - batch
+	open := max(0, critical-idle)
+	batchOpen := max(0, batch-max(0, idle-critical))
+	ahead := 0
+	for _, o := range s.machines {
+		if o != m && !o.Ending && !o.Issued && o.Runner == nil && (o.Launched.Before(m.Launched) || o.Launched.Equal(m.Launched) && o.ID < m.ID) {
+			ahead++
+		}
+	}
+	switch {
+	case ahead < open:
+		return ForJob
+	case ahead < open+batchOpen:
+		return ForBatch
+	}
+	return ForPool
+}
+
+// SetBatch sets the rule that names the batch jobs.
+func (s *State) SetBatch(r BatchRule) { s.mu.Lock(); s.batchRule = r; s.mu.Unlock() }
 
 // Claim is the token of a granted machine's claim: the one its grant made, when it made one, or a new one.
 func (s *State) Claim(m *Machine) string {
@@ -491,6 +523,7 @@ func (s *State) Observe(msg *scaleset.RunnerScaleSetMessage, now time.Time) {
 			s.waits = append(s.waits, max(0, now.Sub(queued).Seconds()))
 		}
 		delete(s.available, jobKey(j.JobMessageBase))
+		delete(s.batch, jobKey(j.JobMessageBase))
 		s.lastStart = now
 		if m := s.machineOf(j.RunnerName); m != nil {
 			if r := runnerOf(m, j.RunnerName, int64(j.RunnerID), now); r.Name == j.RunnerName {
@@ -504,6 +537,7 @@ func (s *State) Observe(msg *scaleset.RunnerScaleSetMessage, now time.Time) {
 	}
 	for _, j := range msg.JobCompletedMessages {
 		delete(s.available, jobKey(j.JobMessageBase))
+		delete(s.batch, jobKey(j.JobMessageBase))
 		if m := s.machineOf(j.RunnerName); m != nil {
 			r := runnerOf(m, j.RunnerName, int64(j.RunnerID), now)
 			r.Busy, r.Done = true, true
@@ -544,6 +578,9 @@ func (s *State) arrived(j scaleset.JobMessageBase, now time.Time) {
 	}
 	if key != "" {
 		s.available[key] = queued
+		if s.batchRule.Matches(j) {
+			s.batch[key] = true
+		}
 	}
 }
 
@@ -643,6 +680,7 @@ func (s *State) Burst(now time.Time, r PoolRule) int {
 	for id, t := range s.available {
 		if now.Sub(t) > 7*time.Hour {
 			delete(s.available, id)
+			delete(s.batch, id)
 		}
 	}
 	launch := s.launchTime(r.ready())

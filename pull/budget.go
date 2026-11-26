@@ -30,6 +30,8 @@ type Budget struct {
 	made, refused  int
 	failed         int
 	denied         [denialKinds]int // asks the budget turned away, by why
+	criticalWait   time.Time        // when a critical ask was last turned away: batch and pool give way to it for a moment
+	leases         map[string]lease // budget leased to a lane that registers runners outside the listener
 }
 
 type head struct {
@@ -37,12 +39,20 @@ type head struct {
 	id int64
 }
 
-// Priority orders a registration: one a waiting job needs comes before one that only fills the hot pool.
+// Priority is the class of a registration. The budget is one allocator for the organization's cap, and a class is what
+// a registration may take of it:
+//
+//   - ForJob is critical: a waiting job of the required check needs it. It has the reserve, and is served first.
+//   - ForBatch is a job that can wait (a cache-warm cron, a load branch). It borrows only what the reserve leaves, and
+//     gives way while a critical ask is waiting.
+//   - ForPool only fills the hot pool: it leaves half the saved-up burst to jobs, keeps its own pace, and gives way to
+//     a waiting critical ask too.
 type Priority int
 
 const (
 	ForJob Priority = iota
 	ForPool
+	ForBatch
 )
 
 // Denial is why the budget turned a registration away. A denial is GitHub never being asked, so none of it reaches
@@ -55,12 +65,16 @@ const (
 	DeniedTokens           // the spare rate has saved up no token
 	DeniedThrottled        // GitHub refused a registration a moment ago
 	DeniedBlind            // the organization's rate is unknown and the blind rate is spent
+	DeniedHeld             // a critical ask was turned away a moment ago: batch and pool give way
 	denialKinds
 )
 
-var denialNames = [denialKinds]string{"", "window", "tokens", "throttled", "blind"}
+var denialNames = [denialKinds]string{"", "window", "tokens", "throttled", "blind", "held"}
 
 func (d Denial) String() string { return denialNames[d] }
+
+// criticalHold is how long batch and pool give way after a critical ask was turned away: two of a machine's polls.
+const criticalHold = 6 * time.Second
 
 // Outcome is what GitHub answered to a registration.
 type Outcome int
@@ -207,16 +221,31 @@ func (b *Budget) Take(now time.Time, p Priority) bool {
 func (b *Budget) Try(now time.Time, p Priority) (bool, Denial) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	why := b.try(now, p)
-	if why != Allowed {
-		b.denied[why]++
-	}
+	why := b.take(now, p)
 	return why == Allowed, why
 }
 
-func (b *Budget) try(now time.Time, p Priority) Denial {
+func (b *Budget) take(now time.Time, p Priority) Denial {
+	b.expire(now)
+	why := b.admit(now, p)
+	if why != Allowed {
+		b.denied[why]++
+	}
+	switch {
+	case p == ForJob && why != Allowed:
+		b.criticalWait = now
+	case p == ForJob:
+		b.criticalWait = time.Time{}
+	}
+	return why
+}
+
+func (b *Budget) admit(now time.Time, p Priority) Denial {
 	if now.Before(b.throttledUntil) {
 		return DeniedThrottled
+	}
+	if p != ForJob && now.Sub(b.criticalWait) < criticalHold {
+		return DeniedHeld
 	}
 	e := b.estimate(now)
 	w := b.window().Seconds()
@@ -234,7 +263,10 @@ func (b *Budget) try(now time.Time, p Priority) Denial {
 	b.refilled = now
 	b.tokens = min(burst, b.tokens+dt*e.SpareRate)
 	b.poolTokens = min(max(1, poolRate*10), b.poolTokens+dt*poolRate)
-	if b.tokens < 1 || (p == ForPool && (b.tokens < 1+burst/2 || b.poolTokens < 1)) {
+	// The critical class keeps a reserve of tokens: a batch registration needs it saved up besides its own, so a
+	// critical ask finds a token when one arrives, not only when batch has left one.
+	reserve := min(float64(b.c.Reserve), burst-1)
+	if b.tokens < 1 || (p == ForBatch && b.tokens < 1+reserve) || (p == ForPool && (b.tokens < 1+burst/2 || b.poolTokens < 1)) {
 		return DeniedTokens
 	}
 	if p == ForPool {
@@ -252,17 +284,7 @@ func (b *Budget) Done(now time.Time, outcome Outcome, runnerID int64) {
 	b.pending--
 	switch outcome {
 	case Made:
-		cut := now.Add(-2 * b.window())
-		i := 0
-		for i < len(b.ours) && b.ours[i].Before(cut) {
-			i++
-		}
-		// Kept sorted for countBetween: registrations that ran at once report their times in any order.
-		b.ours = append(b.ours[i:], now)
-		for j := len(b.ours) - 1; j > 0 && b.ours[j].Before(b.ours[j-1]); j-- {
-			b.ours[j], b.ours[j-1] = b.ours[j-1], b.ours[j]
-		}
-		b.made++
+		b.made1(now)
 		b.throttleWait = 0
 		if runnerID > 0 {
 			b.head(now, runnerID)
@@ -277,6 +299,21 @@ func (b *Budget) Done(now time.Time, outcome Outcome, runnerID int64) {
 	}
 }
 
+// made1 records one registration of ours GitHub made.
+func (b *Budget) made1(now time.Time) {
+	cut := now.Add(-2 * b.window())
+	i := 0
+	for i < len(b.ours) && b.ours[i].Before(cut) {
+		i++
+	}
+	// Kept sorted for countBetween: registrations that ran at once report their times in any order.
+	b.ours = append(b.ours[i:], now)
+	for j := len(b.ours) - 1; j > 0 && b.ours[j].Before(b.ours[j-1]); j-- {
+		b.ours[j], b.ours[j-1] = b.ours[j-1], b.ours[j]
+	}
+	b.made++
+}
+
 // Lost counts a registration GitHub made whose config was withheld (its issued tag could not be written): an error
 // like a failed registration, though it took the organization's registration.
 func (b *Budget) Lost() { b.mu.Lock(); b.failed++; b.mu.Unlock() }
@@ -289,8 +326,9 @@ type BudgetSnapshot struct {
 	Refused   int  `json:"refused"`
 	Failed    int  `json:"failed"`
 	Throttled bool `json:"throttled"`
-	// Denied counts the asks turned away since the start, by reason (window, tokens, throttled, blind).
+	// Denied counts the asks turned away since the start, by reason (window, tokens, throttled, blind, held).
 	Denied map[string]int `json:"denied"`
+	Leased int            `json:"leased"` // registrations held for lanes outside the listener, in flight
 }
 
 func (b *Budget) Snapshot(now time.Time) BudgetSnapshot {
@@ -301,7 +339,7 @@ func (b *Budget) Snapshot(now time.Time) BudgetSnapshot {
 		denied[d.String()] = b.denied[d]
 	}
 	return BudgetSnapshot{Estimate: b.estimate(now), Pending: b.pending, Made: b.made, Refused: b.refused, Failed: b.failed,
-		Throttled: now.Before(b.throttledUntil), Denied: denied}
+		Throttled: now.Before(b.throttledUntil), Denied: denied, Leased: b.leased()}
 }
 
 // countBetween counts the times in (from, to] of a sorted slice.

@@ -228,7 +228,10 @@ type Status struct {
 
 // Admin is for the operator, on localhost only: the status, health, and a set's pool floor and cap to change at run
 // time (the config file is the lasting way).
-func Admin(status func() Status, healthy func() error, override func(set string, pool, max int)) http.Handler {
+//
+// A lane that registers runners outside the listener leases registrations from the budget first (lease.go):
+// POST /lease?n=40&ttl=120 answers {"id", "granted", "expires"}, and POST /lease/settle?id=<id>&made=<k> ends it.
+func Admin(status func() Status, healthy func() error, override func(set string, pool, max int), budget *Budget) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /state", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -252,6 +255,34 @@ func Admin(status func() Status, healthy func() error, override func(set string,
 		}
 		override(q.Get("set"), num("pool"), num("max"))
 		slog.Info("admin override", "set", q.Get("set"), "pool", q.Get("pool"), "max", q.Get("max"))
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("POST /lease", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		n, err1 := strconv.Atoi(q.Get("n"))
+		ttl, err2 := strconv.Atoi(q.Get("ttl"))
+		if err1 != nil || err2 != nil || n < 1 || ttl < 1 {
+			http.Error(w, "n and ttl (seconds) are positive integers", http.StatusBadRequest)
+			return
+		}
+		l := budget.Lease(time.Now(), n, time.Duration(ttl)*time.Second)
+		slog.Info("lease", "asked", n, "granted", l.Granted, "ttl_s", ttl, "id", l.ID)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(l)
+	})
+	mux.HandleFunc("POST /lease/settle", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		made, err := strconv.Atoi(q.Get("made"))
+		if err != nil || made < 0 {
+			http.Error(w, "made is the number of registrations the lane made", http.StatusBadRequest)
+			return
+		}
+		held := budget.Settle(time.Now(), q.Get("id"), made)
+		slog.Info("lease settled", "id", q.Get("id"), "made", made, "held", held)
+		if !held {
+			http.Error(w, "no such lease: it expired or was settled", http.StatusGone)
+			return
+		}
 		w.WriteHeader(http.StatusNoContent)
 	})
 	return mux
