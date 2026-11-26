@@ -136,21 +136,33 @@ func run(ctx context.Context, f flags) error {
 	if err != nil {
 		return fmt.Errorf("app credentials: %w", err)
 	}
-	client, err := scaleset.NewClientWithGitHubApp(scaleset.ClientWithGitHubAppConfig{
-		GitHubConfigURL: "https://github.com/" + cfg.Org,
-		GitHubAppAuth:   scaleset.GitHubAppAuth{ClientID: strconv.FormatInt(app.ID, 10), InstallationID: cfg.Installation, PrivateKey: app.PEM},
-		SystemInfo:      scaleset.SystemInfo{System: "superci-pull", Version: "0.2.0", Subsystem: "listener"},
-	})
+	scaleClient := func(url string) (*scaleset.Client, error) {
+		return scaleset.NewClientWithGitHubApp(scaleset.ClientWithGitHubAppConfig{
+			GitHubConfigURL: url,
+			GitHubAppAuth:   scaleset.GitHubAppAuth{ClientID: strconv.FormatInt(app.ID, 10), InstallationID: cfg.Installation, PrivateKey: app.PEM},
+			SystemInfo:      scaleset.SystemInfo{System: "superci-pull", Version: "0.2.0", Subsystem: "listener"},
+		})
+	}
+	client, err := scaleClient(cfg.scopeURL())
 	if err != nil {
 		return err
 	}
 	specs := cfg.Sets()
-	rest := NewREST(app, cfg.Installation, cfg.Org)
-	group, err := rest.RunnerGroup(ctx, cfg.Deployment, cfg.Repositories)
-	if err != nil {
+	rest := NewREST(app, cfg.Installation, cfg.Org, cfg.repository())
+	group := defaultGroup
+	if cfg.repository() != "" {
+		// A repository has one runner group, its Default: the repository itself bounds who the runners serve.
+		org, err := scaleClient("https://github.com/" + cfg.Org)
+		if err != nil {
+			return err
+		}
+		if err := retireOrgSets(ctx, org, rest, cfg.Deployment); err != nil {
+			return err
+		}
+	} else if group, err = rest.RunnerGroup(ctx, cfg.Deployment, cfg.Repositories); err != nil {
 		return fmt.Errorf("runner group %s: %w", cfg.Deployment, err)
 	}
-	slog.Info("runner group", "name", cfg.Deployment, "id", group, "repositories", cfg.Repositories)
+	slog.Info("runner group", "scope", cfg.scopeURL(), "name", cfg.Deployment, "id", group, "repositories", cfg.Repositories)
 	tlStart(cfg.Deployment, time.Now())
 	if f.deleteSets {
 		for _, spec := range specs {
@@ -425,7 +437,11 @@ func droppedScaleSets(ctx context.Context, client *scaleset.Client, group int, s
 		}
 	}
 	// A set of this form left in the Default group (an earlier build's) takes a share of its label's jobs with no
-	// listener; it is another deployment's to delete, or the operator's.
+	// listener; it is another deployment's to delete, or the operator's. At the repository the Default group is the
+	// sets' own.
+	if group == defaultGroup {
+		return dropped, nil
+	}
 	if old, err := client.ListRunnerScaleSets(ctx, defaultGroup); err == nil {
 		for _, s := range old {
 			if ownSetName.MatchString(s.Name) {
@@ -434,6 +450,54 @@ func droppedScaleSets(ctx context.Context, client *scaleset.Client, group int, s
 		}
 	}
 	return dropped, nil
+}
+
+// orgSets is what retiring the organization's sets needs of a scale set client at the organization.
+type orgSets interface {
+	ListRunnerScaleSets(ctx context.Context, runnerGroupID int) ([]scaleset.RunnerScaleSet, error)
+	DeleteRunnerScaleSet(ctx context.Context, scaleSetID int) error
+}
+
+// retireOrgSets deletes the sets an organization-scoped build of this deployment made in its runner group, before the
+// sets are made at the repository: a set left there would take a share of its label's jobs with no listener. It
+// refuses while a runner of theirs holds a job, since deleting a set fails the jobs it holds; a busy runner ends with
+// its job, so a later start goes on.
+func retireOrgSets(ctx context.Context, sets orgSets, rest interface {
+	orgGroupID(ctx context.Context, name string) (int, error)
+	OrgGroupRunners(ctx context.Context, group int, prefix string) (map[string]ListedRunner, error)
+}, deployment string) error {
+	group, err := rest.orgGroupID(ctx, deployment)
+	if err != nil || group == 0 {
+		return err
+	}
+	runners, err := rest.OrgGroupRunners(ctx, group, "superci-")
+	if err != nil {
+		return fmt.Errorf("runners of the organization's group %s: %w", deployment, err)
+	}
+	busy := 0
+	for _, r := range runners {
+		if r.Busy {
+			busy++
+		}
+	}
+	if busy > 0 {
+		return fmt.Errorf("the organization's runner group %s still has %d runners holding a job: start again once they end", deployment, busy)
+	}
+	list, err := sets.ListRunnerScaleSets(ctx, group)
+	if err != nil {
+		return fmt.Errorf("scale sets of the organization's group %s: %w", deployment, err)
+	}
+	for _, s := range list {
+		if !ownSetName.MatchString(s.Name) {
+			continue
+		}
+		err := sets.DeleteRunnerScaleSet(ctx, s.ID)
+		slog.Warn("deleted the organization's scale set: the sets register at the repository", "name", s.Name, "id", s.ID, "err", errString(err))
+		if err != nil && !errors.Is(err, scaleset.NotFoundError) {
+			return fmt.Errorf("delete the organization's scale set %s: %w", s.Name, err)
+		}
+	}
+	return nil
 }
 
 // drain retires a set the config dropped. Its session asks for no jobs (max 0) and acquires none, so no new job

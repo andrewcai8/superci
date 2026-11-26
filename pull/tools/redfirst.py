@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Undoes each fix of round 2, of the fence round (audit E), of the wait round (F1 to F4), of the visible wait (U2), of the priority classes (U4), of the hygiene round (U7) and of admission on GitHub's answer (the refusal shapes, the hold, the 2 and 50 start, the ceiling against the cap) in a copy of pull/ and runs the test written for it, which must fail. A fix whose
+"""Undoes each fix of round 2, of the fence round (audit E), of the wait round (F1 to F4), of the visible wait (U2), of the priority classes (U4), of the hygiene round (U7) and of admission on GitHub's answer (the refusal shapes, the hold, the 2 and 50 start, the ceiling against the cap), of the repository scope in a copy of pull/ and runs the test written for it, which must fail. A fix whose
 test still passes without it is reported as NOT RED. A path under cache/ runs its test in the cache module. Run it in pull/ where Go is installed:
 
   python3 tools/redfirst.py [name fragment ...]   # only the mutants whose name holds one of them
@@ -223,6 +223,12 @@ MUTANTS = [
     ("fleet the share bounds no size", "fleet.go", 'sf.onDemand(ctx, round, "", n-len(got), odRoom, rest)', 'sf.onDemand(ctx, round, "", n-len(got), n, rest)', "TestASizeWithoutOnDemandFirstKeepsOnDemandUnderItsShare"),
     ("fleet the share-bounded ask repeats the fast types", "fleet.go", 'sf.onDemand(ctx, round, "", n-len(got), odRoom, rest)', 'sf.onDemand(ctx, round, "", n-len(got), odRoom, sf.spec.Types)', "TestTheShareBoundedAskLeavesOutTheTypesAlreadyAskedOnDemand"),
     ("fleet on_demand_first past the types is accepted", "config.go", "s.OnDemandFirst < 0 || s.OnDemandFirst > len(s.Types)", "s.OnDemandFirst < 0", "TestOnDemandFirstPastTheSizesTypesIsRefused"),
+    ("scope the sets stay at the organization", "config.go", "\tif c.Scope == \"repository\" {\n\t\treturn c.Repositories[0]", "\tif false {\n\t\treturn c.Repositories[0]", "TestTheSetsRegisterAtTheRepositoryOnlyWhenTheConfigSaysSoAndNamesOne"),
+    ("scope a repository of several is accepted", "config.go", "\t\tif len(c.Repositories) != 1 {", "\t\tif len(c.Repositories) == 0 {", "TestTheSetsRegisterAtTheRepositoryOnlyWhenTheConfigSaysSoAndNamesOne"),
+    ("scope the repository's runners are listed at the organization", "github.go", "\tif g.repo != \"\" {\n\t\tbase = fmt.Sprintf(\"https://api.github.com/repos/%s/%s/actions/runners\", g.org, g.repo)\n\t}\n\tout, _, pages", "\tout, _, pages", "TestAtTheRepositoryTheListingAndTheHeadAreTheRepositorys"),
+    ("scope the head is the organization's", "github.go", "\tif g.repo != \"\" {\n\t\tbase = fmt.Sprintf(\"https://api.github.com/repos/%s/%s/actions/runners\", g.org, g.repo)\n\t}\n\t_, highest", "\t_, highest", "TestAtTheRepositoryTheListingAndTheHeadAreTheRepositorys"),
+    ("scope retire deletes while a runner holds a job", "main.go", "\tif busy > 0 {\n\t\treturn fmt.Errorf(", "\tif false {\n\t\treturn fmt.Errorf(", "TestMovingToTheRepositoryRetiresTheOrganizationsSetsOnlyWhenNoneHoldsAJob"),
+    ("scope retire deletes another's set", "main.go", "\t\tif !ownSetName.MatchString(s.Name) {\n\t\t\tcontinue\n\t\t}\n\t\terr := sets.DeleteRunnerScaleSet", "\t\terr := sets.DeleteRunnerScaleSet", "TestMovingToTheRepositoryRetiresTheOrganizationsSetsOnlyWhenNoneHoldsAJob"),
 ]
 
 here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
