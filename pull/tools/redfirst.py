@@ -207,7 +207,7 @@ MUTANTS = [
     ("admit the ceiling check forgets the burst", "config.go", "r.CeilingRate*float64(r.WindowS)+float64(r.CeilingBurst) > float64(r.Cap)", "r.CeilingRate*float64(r.WindowS) > float64(r.Cap)",
      "TestACeilingThatCouldPassTheCapInOneWindowIsRefused"),
     ("admit a zero ceiling is accepted", "config.go", "r.CeilingRate <= 0 || ", "", "TestAnOverrideWithABadBatchPatternOrANegativeReserveIsRefused"),
-    ("preread leaves the hydrated trees cold", "boot.sh", '    mark_hydrate "$(us)" rewarm.done "$(until_job find "${trees[@]}" -printf \'\')"\n', "", "TestThePrereadReadsOnlyTheSnapshotsPartOfTheRootAndPostsItsStartAndEnd"),
+    ("preread leaves the hydrated trees cold", "boot.sh", '    mark_hydrate "$(us)" rewarm.done "$(until_job find "${trees[@]}" -printf \'%s\')"\n', "", "TestThePrereadReadsOnlyTheSnapshotsPartOfTheRootAndPostsItsStartAndEnd"),
     ("preread walks beside a job that came first", "boot.sh", '    [ "$val" = full ] || return 0\n', "", "TestAJobThatStartsDuringThePrereadEndsItWithinASecond"),
     ("fleet 4cpu asks no type on demand first", "config.json", '"on_demand_first": 1', '"on_demand_first": 0', "TestSuperci4cpuAsksM8aznOnDemandBeforeASlowerSpotType"),
     ("fleet the fast types skip on demand", "fleet.go", '\t\tgot = append(got, sf.onDemand(ctx, round, "fast-", n-len(got), n, fast)...)\n', "", "TestSuperci4cpuAsksM8aznOnDemandBeforeASlowerSpotType"),

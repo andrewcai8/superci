@@ -123,7 +123,7 @@ func TestThePrereadReadsOnlyTheSnapshotsPartOfTheRootAndPostsItsStartAndEnd(t *t
 		t.Errorf("marks %q, want %q", got, want)
 	}
 	// The direct read dropped the cached inode tables and directories of what hydration wrote: they are walked again.
-	if walked := b.read("find.log"); !strings.HasPrefix(walked, b.hr+" ") || !strings.HasSuffix(walked, "-printf") {
+	if walked := b.read("find.log"); !strings.HasPrefix(walked, b.hr+" ") || !strings.HasSuffix(walked, "-printf %s") {
 		t.Errorf("after the pre-read find walked %q, want the hydrated trees", walked)
 	}
 	if _, err := os.Stat(filepath.Join(b.hr, ".pid")); !os.IsNotExist(err) {

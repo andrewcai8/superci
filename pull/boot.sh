@@ -112,10 +112,11 @@ hydrate() {
     # A direct read drops the block device's cached pages in its range: ext4's inode tables and directories of every tree
     # hydration and the warm reads just wrote. A 117,600-file walk took 0.19 s warm, 8.91 s after the read and 0.18 s
     # again, and a job's first link of the hydrated node_modules 10.2 s against Blacksmith's 0.9 s (Nov 26). So walk them
-    # again while the machine still waits; a job that came first walks them itself.
+    # again while the machine still waits; a job that came first walks them itself. %s stats every file (GNU find stats a
+    # file only for a directive that needs it), so the files' inode tables are read, not only the directories.
     [ "$val" = full ] || return 0
     for d in "$HR" /home/runner/externals /usr/lib/git-core /opt/google/chrome; do [ -d "$d" ] && trees+=("$d"); done
-    mark_hydrate "$(us)" rewarm.done "$(until_job find "${trees[@]}" -printf '')"
+    mark_hydrate "$(us)" rewarm.done "$(until_job find "${trees[@]}" -printf '%s')"
   }
   t0=$(us); mark_hydrate "$t0" hydrate.start
   echo $$ > "$HR/.pid"
