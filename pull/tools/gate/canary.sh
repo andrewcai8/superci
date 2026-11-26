@@ -15,17 +15,27 @@ every=${EVERY:-900}
 log=${LOG:-.}
 [ "$every" -ge 600 ] || { echo "refusing: EVERY under 600 s spends the shared GitHub read budget" >&2; exit 2; }
 [ "$(aws --profile ci-runners sts get-caller-identity --query Account --output text)" = 243891825325 ] || { echo "refusing: not ci-runners" >&2; exit 2; }
-remove() { # job: drop it from SUPERCI_JOBS, and delete the variable when it was the last
-  local now left
-  now=$(gh variable get SUPERCI_JOBS -R $R 2>/dev/null) || { echo "SUPERCI_JOBS already unset"; return; }
+jobs_now() { # prints SUPERCI_JOBS; returns 1 when it is unset, 2 when GitHub did not answer (gh 2.46 has no `variable get`)
+  local out
+  out=$(gh api "repos/$R/actions/variables/SUPERCI_JOBS" --jq .value 2>&1) && { echo "$out"; return 0; }
+  [[ $out == *"Not Found"* ]] && return 1 || return 2
+}
+remove() { # job: drop it from SUPERCI_JOBS, and delete the variable when it was the last; retried while GitHub does not answer
+  local now left code try
+  for try in 1 2 3 4 5; do
+    now=$(jobs_now) && break
+    code=$?
+    [ $code -eq 1 ] && { echo "SUPERCI_JOBS already unset"; return; }
+    echo "GitHub did not answer reading SUPERCI_JOBS (try $try)"; sleep 10
+  done
   left=$(jq -c --arg j "$1" 'map(select(. != $j))' <<<"$now")
   if [ "$left" = "[]" ]; then gh variable delete SUPERCI_JOBS -R $R; else gh variable set SUPERCI_JOBS -R $R --body "$left"; fi
-  echo "SUPERCI_JOBS was $now, now $(gh variable get SUPERCI_JOBS -R $R 2>/dev/null || echo unset)"
+  echo "SUPERCI_JOBS was $now, now $(jobs_now || echo unset)"
 }
 while [ "$(date -u +%s)" -lt "$(date -u -d "$until" +%s)" ]; do
   sleep "$every"
   for job in "$@"; do
-    listed=$(gh variable get SUPERCI_JOBS -R $R 2>/dev/null || echo '[]')
+    listed=$(jobs_now) || { echo "$(date -u +%TZ) $job: SUPERCI_JOBS unset or unread, no check"; continue; }
     jq -e --arg j "$job" 'index($j) != null' <<<"$listed" >/dev/null || continue
     left=$(gh api rate_limit --jq .resources.core.remaining)
     [ "$left" -ge 1500 ] || { echo "$(date -u +%TZ) $job: skipped, $left GitHub reads left"; continue; }
