@@ -18,8 +18,9 @@ DISCOUNT_UNTIL = "2026-11-30"
 
 JOBS_QUERY = (
     'filter msg="tl" and (ev="job.started" or ev="job.completed") '
-    "| stats min(t_ms) as s, max(t_ms) as e, count(*) as n by job, set | filter n=2 "
-    "| stats count(*) as jobs, sum(e-s)/60000 as minutes by datefloor(s, 1d) as day, set"
+    "| stats min(t_ms) as t by job, set, ev, eid "
+    "| stats min(t) as s, max(t) as e, count_distinct(ev) as kinds by job, set | filter kinds=2 "
+    "| stats count(*) as jobs, sum(e-s)/60000 as minutes by datefloor(fromMillis(s), 1d) as day, set"
 )
 
 
@@ -152,8 +153,13 @@ def read_jobs(env, start, end):
     t1 = int(dt.datetime.fromisoformat(end).replace(tzinfo=dt.timezone.utc).timestamp())
     jobs = {}
     for f in run_query(env, t0, t1, JOBS_QUERY):
-        jobs.setdefault(f["day"][:10], {})[f["set"]] = (int(f["jobs"]), float(f["minutes"]))
-    first = run_query(env, t0, t1, FIRST_QUERY)
+        day = f["day"][:10]
+        try:
+            dt.date.fromisoformat(day)
+        except ValueError:
+            sys.exit(f"logs query gave a day key that is not a date: {f['day']!r}")
+        jobs.setdefault(day, {})[f["set"]] = (int(f["jobs"]), float(f["minutes"]))
+    first = run_query(env, t1 - 30 * 86400, t1, FIRST_QUERY)
     since = dt.datetime.fromtimestamp(int(first[0]["first"]) / 1000, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if first and first[0].get("first") else None
     return jobs, since
 
@@ -173,12 +179,12 @@ def render(rows, today):
                      f"{r['vcpu_minutes']:>10.0f}{na(r['avoided_list_usd'], '9.2f'):>9}{na(r['net_list_usd'], '10.2f'):>10}{na(r['net_invoice_usd'], '10.2f'):>10}"
                      f"{na(r['superci_usd_per_job_minute'], '10.4f'):>10}  {top}")
     t = lambda k: sum(r[k] for r in rows)
-    lines.append(f"{'total':<11}{t('superci_usd'):>9.2f}{t('blacksmith_list_usd') if all(r['blacksmith_list_usd'] is not None for r in rows) else 0:>11.0f}"
+    lines.append(f"{'total':<11}{t('superci_usd'):>9.2f}{(format(t('blacksmith_list_usd'), '.0f') if all(r['blacksmith_list_usd'] is not None for r in rows) else '-'):>11}"
                  f"{t('jobs'):>7}{t('job_minutes'):>9.0f}{t('vcpu_minutes'):>10.0f}{sum(r['avoided_list_usd'] or 0 for r in rows):>9.2f}{sum(r['net_list_usd'] or 0 for r in rows):>10.2f}{sum(r['net_invoice_usd'] or 0 for r in rows):>10.2f}")
     unmapped = t("unmapped_minutes")
     lines += ["", "* today, partial: Cost Explorer lags and the day is not over.",
               "~ the listener's job events begin during this day, so job-min and avoided cover only its later hours while superci covers all 24; net is not a day's net. n/a: the day is before the first job event, so its job-minutes are unreadable here.",
-              "total's avoided and net add only days with job events; its superci and blacksmith add every day.",
+              "total's avoided and net add the days with job events, the `~` day among them (its superci is the whole day); its superci and blacksmith add every day, blacksmith `-` if a day has no row.",
               "superci = Cost Explorer UnblendedCost, ci-runners, every record type. blacksmith = list USD of the whole installation (`blacksmith usage`), after the move.",
               f"avoided = superci vCPU-minutes x {BLACKSMITH_USD_PER_VCPU_MIN} USD, Blacksmith's x64 Linux list price per billing minute. net = avoided - superci.",
               f"net(inv) counts avoided at {DISCOUNT:.0%} through {DISCOUNT_UNTIL}, the YC discount on the invoice (audit B), then at list.",

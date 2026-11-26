@@ -28,6 +28,7 @@ queries (under 0.01 USD) and one `blacksmith usage`. It makes no GitHub call.
 
 - **Job events start late on Nov 25.** The listener wrote `tl` events from about 17Z on Nov 25. A day before that has no job-minutes here, so its avoided, net and rate print `n/a` and its superci cost stands alone. The day of the first event is marked `~`.
 - **Every superci job counts as a Blacksmith job that would have run.** The log carries no branch or workflow, so a load replay (`ci/superci-load-pull-*`) is counted as if it were real CI.
+- **A job counts only with both of its events in the window.** A job that started before the window's first day or has not finished is left out. The log ships each line at least once; the query keeps one line per `eid`.
 - **Wall minutes, not rounded minutes.** Blacksmith may round a job up; avoided is a floor on that count.
 - **Sets named `superci-41cpu` and `superci-81cpu`** (the 4 and 8 vCPU sets with an index in the digits) are read as 4 and 8. A name that gives no size (`superci-96cpu`) is left out of avoided and its minutes are printed under the table.
 - **Today is partial**, and Cost Explorer lags a few hours.

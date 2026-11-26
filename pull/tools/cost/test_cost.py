@@ -51,6 +51,11 @@ class Rows(unittest.TestCase):
         self.assertAlmostEqual(c["superci_usd_per_job_minute"], 1.0)
         self.assertAlmostEqual(c["net_list_usd"], 400 * 0.002 - 100.0)
 
+    def test_a_missing_blacksmith_day_prints_a_dash_in_the_total(self):
+        rows = C.build_rows(["2026-11-25", "2026-11-26"], {}, {"2026-11-25": 10.0}, {}, "2026-11-01T00:00:00Z")
+        total = [l for l in C.render(rows, "x").splitlines() if l.startswith("total")][0]
+        self.assertEqual(total.split()[2], "-")
+
     def test_a_day_with_no_jobs_has_no_rate(self):
         r = C.build_rows(["2026-11-20"], {"2026-11-20": {}}, {}, {}, "2026-11-01T00:00:00Z")[0]
         self.assertEqual((r["superci_usd"], r["superci_usd_per_job_minute"], r["net_list_usd"], r["blacksmith_list_usd"]), (0, None, 0, None))
