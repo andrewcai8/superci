@@ -223,6 +223,11 @@ MUTANTS = [
     ("fleet the share bounds no size", "fleet.go", 'sf.onDemand(ctx, round, "", n-len(got), odRoom, rest)', 'sf.onDemand(ctx, round, "", n-len(got), n, rest)', "TestASizeWithoutOnDemandFirstKeepsOnDemandUnderItsShare"),
     ("fleet the share-bounded ask repeats the fast types", "fleet.go", 'sf.onDemand(ctx, round, "", n-len(got), odRoom, rest)', 'sf.onDemand(ctx, round, "", n-len(got), odRoom, sf.spec.Types)', "TestTheShareBoundedAskLeavesOutTheTypesAlreadyAskedOnDemand"),
     ("fleet on_demand_first past the types is accepted", "config.go", "s.OnDemandFirst < 0 || s.OnDemandFirst > len(s.Types)", "s.OnDemandFirst < 0", "TestOnDemandFirstPastTheSizesTypesIsRefused"),
+    ("warm leaves the daemon down", "boot.sh", "    systemctl start docker.service > /dev/null 2>&1 || :\n", "", "TestThePrereadReadsOnlyTheSnapshotsPartOfTheRootAndPostsItsStartAndEnd"),
+    ("warm reads the binaries into nothing", "boot.sh", "        cat -- \"$f\" > /dev/null 2>&1\n", "        :\n", "TestThePrereadReadsOnlyTheSnapshotsPartOfTheRootAndPostsItsStartAndEnd"),
+    ("warm reads on after the job starts", "boot.sh", "        [ -e \"$HR/.pid\" ] || return 1\n", "", "TestAJobThatStartsDuringTheWarmStopsItWithinAFile"),
+    ("warm starts after a job that started during the walk", "boot.sh", "    [ -e \"$HR/.pid\" ] || return 0\n    # The walk reads inodes", "    # The walk reads inodes", "TestAJobThatStartsDuringTheWalkStartsNoDaemonAndNoWarm"),
+    ("warm reads the libraries on any machine", "boot.sh", "-ge 12000000 ] 2> /dev/null && libs=", "-ge 0 ] 2> /dev/null && libs=", "TestOnlyAMachineOf12GBOrMoreWarmsTheLibraries"),
 ]
 
 here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
