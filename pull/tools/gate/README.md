@@ -104,8 +104,24 @@ DRY_RUN=1 replay.sh BRANCH trace.json   prints the schedule and each push's work
 `replay.sh`'s existing mode (`BRANCH WAVES INTERVAL BURST_AT WORKFLOW`) is unchanged. Pass the same trace to
 `gate scale --trace`: "replayed" is the trace's job count.
 
+## First exec: `spawn.py`
+
+A job's first exec of a binary reads it from the machine's volume. On Nov 26 a superci pool machine, idle for minutes,
+started `node` in 274-403 ms and `docker` in 1.7-3.8 s, where Blacksmith took 41 and 813 ms. Four runs of a test that
+spawns child processes timed out at bun's 10 s, all on superci legs. Gate 1's wall rows did not catch it. The spawn row does:
+
+```
+spawn.py <superci run id> <blacksmith run id>      two dispatches of spawn-probe.yml on a load branch, one per fleet
+spawn.py --logs <superci log> <blacksmith log>    the same from saved `gh run view --log` output
+```
+
+The probe prints first-exec times for node, git, python and docker, 500 fork-execs of `true`, and 50 runs of `node -e 0`. A
+measure passes when superci's median is at most Blacksmith's x 1.25 + 5 ms, over at least 3 probe jobs a fleet. Cold reads of
+400 large files outside those binaries are printed and not gated. Exit 0 only when every gated measure passes.
+
 ## Tests
 
 `python3 -I test_gate.py`: a PASS and a FAIL for every criterion of both gates, the canary's rollback rows and alarms (canary 4b's refusals keep it), the noise rule, the exclusion of a failure
 Blacksmith shares (and not one superci or main-on-superci shares), reruns, timeouts and cancellations, the required flags, minute coverage of the registration datapoints, the alarm history, the trace extraction and the bench's per-bucket workflow, and the recorded
-canary fixtures in `fixtures/`.
+canary fixtures in `fixtures/`. `python3 -I test_spawn.py`: the spawn row on the Nov 26 probes (pool machines FAIL on node and
+docker, warmed machines PASS), the 3-job minimum and the probe's echoed script.
