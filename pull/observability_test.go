@@ -172,3 +172,60 @@ func TestEveryMetricTheDashboardAndAlarmsReadIsPublished(t *testing.T) {
 		}
 	}
 }
+
+// Every alarm alarms.sh makes is on the dashboard's alarm panel, pages the one topic the existing alarms use, and the
+// script names no person: the topic's destination is given by the one who runs it, never kept here.
+func TestAlarmsAreOnTheDashboardPageOneTopicAndNameNoPerson(t *testing.T) {
+	script, err := os.ReadFile("deploy/alarms.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	made := map[string]bool{}
+	for _, g := range regexp.MustCompile(`(?m)^(?:alarm|math) (\S+) `).FindAllStringSubmatch(string(script), -1) {
+		made["superci-pull-"+g[1]] = true
+	}
+	for _, want := range []string{"superci-pull-job-failure-rate", "superci-pull-idle-spend-unrouted", "superci-pull-oldest-job-wait"} {
+		if !made[want] {
+			t.Errorf("alarms.sh does not make %s", want)
+		}
+	}
+	dash, err := os.ReadFile("deploy/dashboard.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name := range made {
+		if !strings.Contains(string(dash), ":alarm:"+name+`"`) {
+			t.Errorf("%s is not on the dashboard's alarm panel", name)
+		}
+	}
+	if n := strings.Count(string(script), "create-topic"); n != 1 || !strings.Contains(string(script), "--name superci-pull-alarms") {
+		t.Errorf("the alarms page one topic, superci-pull-alarms: %d create-topic calls", n)
+	}
+	if strings.Contains(string(script), "--alarm-actions") && strings.Count(string(script), `--alarm-actions "$TOPIC"`) != 2 {
+		t.Errorf("both alarm kinds must act on $TOPIC")
+	}
+	if m := regexp.MustCompile(`[A-Za-z0-9._+-]+@[A-Za-z0-9-]+\.[A-Za-z]{2,}`).FindString(string(script)); m != "" {
+		t.Errorf("alarms.sh holds an address: %s", m)
+	}
+	for _, line := range strings.Split(string(script), "\n") {
+		if strings.Contains(line, "sns subscribe") && !strings.HasPrefix(strings.TrimSpace(line), "echo") {
+			t.Errorf("alarms.sh subscribes someone: %s", line)
+		}
+		if strings.Contains(line, "SubscriptionType=EMAIL") || strings.Contains(line, `"EMAIL"`) {
+			t.Errorf("the budget notifies a person, not the topic: %s", line)
+		}
+	}
+}
+
+// The failure alarm reads a rate only from a period with enough jobs, and the idle alarm only while no job started.
+func TestHarmAlarmsReadTheJobMetricsTheyNameWithTheirThresholds(t *testing.T) {
+	script, _ := os.ReadFile("deploy/alarms.sh")
+	s := string(script)
+	for _, want := range []string{`IF(failed + passed >= 10, 100 * failed / (failed + passed), 0)`, `GreaterThanThreshold 20 3 2 notBreaching`,
+		`IF(FILL(started, 0) < 1 AND idle > 8, idle, 0)`, `GreaterThanThreshold 8 6 6 notBreaching`, `"MetricName":"JobsCompleted"`, `"MetricName":"SpendIdlePerHourUSD"`,
+		`"BudgetName": "superci-pull-daily"`, `"TimeUnit": "DAILY"`, `for t in (80, 100)`} {
+		if !strings.Contains(s, want) {
+			t.Errorf("alarms.sh lacks %q", want)
+		}
+	}
+}
