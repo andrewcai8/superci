@@ -115,13 +115,19 @@ spawn.py <superci run id> <blacksmith run id>      two dispatches of spawn-probe
 spawn.py --logs <superci log> <blacksmith log>    the same from saved `gh run view --log` output
 ```
 
-The probe prints first-exec times for node, git, python and docker, 500 fork-execs of `true`, and 50 runs of `node -e 0`. A
-measure passes when superci's median is at most Blacksmith's x 1.25 + 5 ms, over at least 3 probe jobs a fleet. Cold reads of
-400 large files outside those binaries are printed and not gated. Exit 0 only when every gated measure passes.
+The probe prints its runner, then each measure as milliseconds and the command's exit code. A failed or absent command is no
+sample. The bound is Blacksmith's median x 1.25 + 20 ms:
+
+- **First exec** (node, python, docker's CLI): superci's slowest probe job, since one cold machine in five is the failure.
+- **Throughput** (500 fork-execs of `true`, 50 runs of `node -e 0`): superci's median.
+- A gated measure with fewer than 5 samples on either fleet is MISSING, which fails. The probe runs 6 jobs.
+- bun, git, docker's first daemon call and a cold read of 400 large files are printed, not gated.
+- Exit 0 on PASS, 1 on FAIL, 2 when the first run is not superci's or the second not Blacksmith's.
 
 ## Tests
 
 `python3 -I test_gate.py`: a PASS and a FAIL for every criterion of both gates, the canary's rollback rows and alarms (canary 4b's refusals keep it), the noise rule, the exclusion of a failure
 Blacksmith shares (and not one superci or main-on-superci shares), reruns, timeouts and cancellations, the required flags, minute coverage of the registration datapoints, the alarm history, the trace extraction and the bench's per-bucket workflow, and the recorded
-canary fixtures in `fixtures/`. `python3 -I test_spawn.py`: the spawn row on the Nov 26 probes (pool machines FAIL on node and
-docker, warmed machines PASS), the 3-job minimum and the probe's echoed script.
+canary fixtures in `fixtures/`. `python3 -I test_spawn.py`: a warmed fleet passes, one cold machine in five fails, the bound's edge,
+failed commands, the 5-sample minimum per measure and fleet, shown rows, the echoed script with ANSI and CRLF, a retried
+attempt, and `main`'s exit codes.

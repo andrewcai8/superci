@@ -1,5 +1,5 @@
 # gate spawn's probe. Put it on a load branch as a workflow that exists on main (its name and path), dispatch it once
-# with label=<superci label> and once with label=<the Blacksmith label it replaces>, reps=[1,2,3], then run spawn.py on
+# with label=<superci label> and once with label=<the Blacksmith label it replaces> (6 jobs each by default), then run spawn.py on
 # the two run ids.
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ on:
         type: string
       reps:
         type: string
-        default: "[1,2,3]"
+        default: "[1,2,3,4,5,6]"
 permissions:
   contents: read
 jobs:
@@ -21,10 +21,10 @@ jobs:
     steps:
       - name: first exec of the tools a job runs, and fork-exec rate
         run: |
-          ms() { local s e; s=$(date +%s%N); "$@" > /dev/null 2>&1; e=$(date +%s%N); echo $(( (e - s) / 1000000 )); }
+          ms() { local s e rc; [ -n "$1" ] || return 0; s=$(date +%s%N); "$@" > /dev/null 2>&1; rc=$?; e=$(date +%s%N); echo "$(( (e - s) / 1000000 )):$rc"; }
+          loop() { local n=$1 s e rc=0 i; shift; [ -n "$1" ] || return 0; s=$(date +%s%N); for i in $(seq "$n"); do "$@" > /dev/null 2>&1 || rc=$?; done; e=$(date +%s%N); echo "$(( (e - s) / 1000000 )):$rc"; }
           echo "runner=${RUNNER_NAME} uptime=$(cut -d' ' -f1 /proc/uptime) nproc=$(nproc) mem=$(free -m | awk '/Mem/{print $2}')"
-          node=$(command -v node); py=$(command -v python3); gitb=$(command -v git); dk=$(command -v docker)
-          echo "SPAWN node_first=$(ms "$node" -e 0) node_second=$(ms "$node" -e 0) git_first=$(ms "$gitb" --version) python_first=$(ms "$py" -c 0) docker_first=$(ms "$dk" version) bash_first=$(ms bash -c :)"
-          s=$(date +%s%N); for i in $(seq 500); do /bin/true; done; e=$(date +%s%N); echo "SPAWN true500=$(( (e - s) / 1000000 ))"
-          s=$(date +%s%N); for i in $(seq 50); do "$node" -e 0; done; e=$(date +%s%N); echo "SPAWN node50=$(( (e - s) / 1000000 ))"
-          s=$(date +%s%N); find /usr/lib /usr/share -type f -size +100k 2>/dev/null | head -400 | xargs -r cat > /dev/null 2>&1; e=$(date +%s%N); echo "SPAWN coldread400=$(( (e - s) / 1000000 ))"
+          node=$(command -v node); py=$(command -v python3); dk=$(command -v docker); bun=$(command -v bun); gitb=$(command -v git)
+          echo "SPAWN node_first=$(ms "$node" -e 0) python_first=$(ms "$py" -c 0) docker_exec=$(ms "$dk" --version) bun_first=$(ms "$bun" --version) git_first=$(ms "$gitb" --version)"
+          echo "SPAWN docker_daemon=$(ms "$dk" version) true500=$(loop 500 /bin/true) node50=$(loop 50 "$node" -e 0)"
+          s=$(date +%s%N); find /usr/lib /usr/share -type f -size +100k 2>/dev/null | head -400 | xargs -r cat > /dev/null 2>&1; e=$(date +%s%N); echo "SPAWN coldread400=$(( (e - s) / 1000000 )):0"
