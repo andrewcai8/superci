@@ -19,7 +19,8 @@ import (
 var ErrClaimed = errors.New("the machine's runner was claimed by another grant")
 
 // Claims is the fence of "a machine gets one runner, ever": one S3 object, issued/<instance id>, created only if
-// absent (If-None-Match: *) before the runner is registered. S3 is strongly consistent, so of any number of grants,
+// absent (If-None-Match: *) before the runner is registered. A dispatch machine's claim is made before its one job is
+// sent to it, and a job the dispatcher hands has a claim of its own, issued/job-<job id> (dispatch.go). S3 is strongly consistent, so of any number of grants,
 // across restarts and overlapping listeners, exactly one creates it. The object holds the token of the grant that
 // created it, so that grant alone may go on after a lost answer or a refused registration. The bucket refuses any
 // write without If-None-Match and any delete (deploy/up.sh), and expires claims long after a machine's life.
@@ -45,19 +46,35 @@ func (c *Claims) Take(ctx context.Context, instance, token string) error {
 	if err == nil || !errors.As(err, &api) || api.ErrorCode() != "PreconditionFailed" {
 		return err
 	}
+	holder, err := c.Holder(ctx, instance)
+	switch {
+	case err != nil:
+		return err
+	case holder == "":
+		return fmt.Errorf("claim %s refused as made, and read as absent", key)
+	case holder != token:
+		return ErrClaimed
+	}
+	return nil
+}
+
+// Holder is the token of the grant that holds a claim, or "" when nothing has claimed it.
+func (c *Claims) Holder(ctx context.Context, instance string) (string, error) {
+	key := claimKey(instance)
 	got, err := c.store.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(c.bucket), Key: aws.String(key)})
+	var api smithy.APIError
+	if errors.As(err, &api) && api.ErrorCode() == "NoSuchKey" {
+		return "", nil
+	}
 	if err != nil {
-		return fmt.Errorf("read claim %s: %w", key, err)
+		return "", fmt.Errorf("read claim %s: %w", key, err)
 	}
 	defer got.Body.Close()
 	holder, err := io.ReadAll(io.LimitReader(got.Body, 256))
 	if err != nil {
-		return fmt.Errorf("read claim %s: %w", key, err)
+		return "", fmt.Errorf("read claim %s: %w", key, err)
 	}
-	if string(holder) != token {
-		return ErrClaimed
-	}
-	return nil
+	return string(holder), nil
 }
 
 // newToken names one grant: 128 random bits.

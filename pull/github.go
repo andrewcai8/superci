@@ -243,12 +243,14 @@ func (g *REST) RunCompleted(ctx context.Context, owner, repo string, run int64) 
 	return body.Status == "completed", err
 }
 
-// JobOf finds the job of a run that a runner took, by the runner's name, in the run's latest attempt.
-func (g *REST) JobOf(ctx context.Context, owner, repo string, run int64, runner string) (id int64, conclusion string, err error) {
+// JobOf finds the job of a run that a runner took, by the runner's name and, when name is not "", the job's name, in
+// the run's latest attempt. An identity takes many jobs, so its name alone may match more than one of a run.
+func (g *REST) JobOf(ctx context.Context, owner, repo string, run int64, runner, name string) (id int64, conclusion string, err error) {
 	for page := 1; page <= 20; page++ {
 		var body struct {
 			Jobs []struct {
 				ID         int64  `json:"id"`
+				Name       string `json:"name"`
 				RunnerName string `json:"runner_name"`
 				Conclusion string `json:"conclusion"`
 			} `json:"jobs"`
@@ -257,7 +259,7 @@ func (g *REST) JobOf(ctx context.Context, owner, repo string, run int64, runner 
 			return 0, "", err
 		}
 		for _, j := range body.Jobs {
-			if j.RunnerName == runner {
+			if j.RunnerName == runner && (name == "" || j.Name == name) {
 				return j.ID, j.Conclusion, nil
 			}
 		}

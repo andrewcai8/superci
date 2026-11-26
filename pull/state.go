@@ -47,6 +47,7 @@ type Machine struct {
 	Ended        time.Time
 	Notice       bool // AWS gave notice that it takes this spot machine back
 	Missed       int  // complete listings in a row that showed no runner of it while it was never issued one
+	Dispatch     bool // its superci-pull-mode tag names a dispatch set: it takes a job from the dispatcher, never a runner
 }
 
 // A Runner is one just-in-time registration, which takes one job.
@@ -68,6 +69,7 @@ type JobRef struct {
 	RunID       int64
 	Name        string
 	Runner      string
+	Instance    string // the machine it ran on, when the runner's name does not say (an identity's job)
 }
 
 // issuingMax is how long a grant may stay unsettled before Overdue takes the machine back from it.
@@ -106,13 +108,10 @@ type State struct {
 	surplusSince time.Time            // since when the supply has exceeded the demand
 	orphanSince  map[string]time.Time // stale runners, by name, since first listed as such
 
-	arrivals    []time.Time          // jobs that arrived, for the pool's rate
+	meter                            // the jobs that arrived and the launches, for the pool
 	available   map[string]time.Time // when each waiting job was queued, by jobKey, for its queue wait
 	batch       map[string]bool      // the waiting jobs (keys of available) the batch rule names
 	batchRule   BatchRule
-	launches    []time.Duration      // launch call to first ask, of the set's last machines
-	held        []heldPool           // the bursts of the last hold, newest last
-	carried     int                  // the burst the last listener saw, held for the first window after a start
 	lost        []JobRef             // jobs that ended on a machine AWS was taking back, for a re-run
 	waits       []float64            // queue waits (s) of jobs started since the metrics last took them
 	began       map[string]began     // when each running job was queued and taken by its runner, by jobKey, for its record
@@ -435,8 +434,7 @@ func (s *State) Issue(m *Machine, r *Runner) {
 		if ready.IsZero() {
 			ready = r.Issued
 		}
-		s.launches = append(s.launches, ready.Sub(m.Ordered))
-		s.launches = s.launches[max(0, len(s.launches)-launchSamples):]
+		s.sample(ready.Sub(m.Ordered))
 	}
 	if m.Notice {
 		m.Retire = true
@@ -592,10 +590,7 @@ func (s *State) arrived(j scaleset.JobMessageBase, now time.Time) {
 	if t := j.ScaleSetAssignTime; !t.IsZero() && t.Before(now) {
 		at = t
 	}
-	s.arrivals = append(s.arrivals, at)
-	for i := len(s.arrivals) - 1; i > 0 && s.arrivals[i].Before(s.arrivals[i-1]); i-- {
-		s.arrivals[i], s.arrivals[i-1] = s.arrivals[i-1], s.arrivals[i]
-	}
+	s.arrive(at)
 	queued := at
 	if !j.QueueTime.IsZero() && j.QueueTime.Before(now) {
 		queued = j.QueueTime
@@ -679,11 +674,34 @@ type heldPool struct {
 	n  int
 }
 
+// A meter is what sizes a set's pool from its own jobs: when they arrived, how long its launches took, the bursts of
+// the last hold, and the burst the last listener carried.
+type meter struct {
+	arrivals []time.Time     // jobs that arrived, oldest first
+	launches []time.Duration // launch call to the machine's first ask, of the set's last machines
+	held     []heldPool      // the bursts of the last hold, newest last
+	carried  int             // the burst the last listener saw, held for the first window after a start
+}
+
+// arrive takes in a job that arrived at at, keeping the arrivals in order.
+func (s *meter) arrive(at time.Time) {
+	s.arrivals = append(s.arrivals, at)
+	for i := len(s.arrivals) - 1; i > 0 && s.arrivals[i].Before(s.arrivals[i-1]); i-- {
+		s.arrivals[i], s.arrivals[i-1] = s.arrivals[i-1], s.arrivals[i]
+	}
+}
+
+// sample takes in one launch's time to a machine that can take a job.
+func (s *meter) sample(d time.Duration) {
+	s.launches = append(s.launches, d)
+	s.launches = s.launches[max(0, len(s.launches)-launchSamples):]
+}
+
 // launchTime is how long a launch takes to bring a machine that can take a runner: the 90th percentile of the set's
 // last launches, from the launch call to the machine's first ask (its boot), or def until it has eight. The wait for
 // the registration budget is left out: it is a rate the pool cannot buy ahead, and counting it fed back (a longer
 // launch time sized a larger pool, whose registrations lengthened the wait; 244 s measured on a dev set).
-func (s *State) launchTime(def time.Duration) time.Duration {
+func (s *meter) launchTime(def time.Duration) time.Duration {
 	if len(s.launches) < 8 {
 		return def
 	}
@@ -700,13 +718,18 @@ func (s *State) launchTime(def time.Duration) time.Duration {
 func (s *State) Burst(now time.Time, r PoolRule) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.arrivals = since(s.arrivals, now.Add(-r.window()))
 	for id, t := range s.available {
 		if now.Sub(t) > 7*time.Hour {
 			delete(s.available, id)
 			delete(s.batch, id)
 		}
 	}
+	return s.burst(now, s.started, r)
+}
+
+// burst is Burst for a set that started at started.
+func (s *meter) burst(now, started time.Time, r PoolRule) int {
+	s.arrivals = since(s.arrivals, now.Add(-r.window()))
 	launch := s.launchTime(r.ready())
 	counts := make([]int, len(s.arrivals))
 	lo := 0
@@ -730,13 +753,13 @@ func (s *State) Burst(now time.Time, r PoolRule) int {
 	for _, h := range s.held {
 		n = max(n, h.n)
 	}
-	return max(n, s.carriedIn(now, r))
+	return max(n, s.carriedIn(now, started, r))
 }
 
 // carriedIn is the burst the last listener saw while this one is within its first window: after it, the jobs this
 // listener has seen say what the pool needs.
-func (s *State) carriedIn(now time.Time, r PoolRule) int {
-	if now.Sub(s.started) < r.window() {
+func (s *meter) carriedIn(now, started time.Time, r PoolRule) int {
+	if now.Sub(started) < r.window() {
 		return s.carried
 	}
 	return 0
@@ -753,6 +776,10 @@ type Carried struct {
 func (s *State) Carry(now time.Time, r PoolRule) Carried {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.carry(now, s.started, r)
+}
+
+func (s *meter) carry(now, started time.Time, r PoolRule) Carried {
 	c := Carried{Launches: make([]int64, len(s.launches))}
 	for i, d := range s.launches {
 		c.Launches[i] = d.Milliseconds()
@@ -760,7 +787,7 @@ func (s *State) Carry(now time.Time, r PoolRule) Carried {
 	for _, h := range s.held {
 		c.Burst = max(c.Burst, h.n)
 	}
-	c.Burst = max(c.Burst, s.carriedIn(now, r))
+	c.Burst = max(c.Burst, s.carriedIn(now, started, r))
 	return c
 }
 
@@ -769,6 +796,10 @@ func (s *State) Carry(now time.Time, r PoolRule) Carried {
 func (s *State) Resume(c Carried) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.resume(c)
+}
+
+func (s *meter) resume(c Carried) {
 	s.carried = c.Burst
 	s.launches = s.launches[:0]
 	for _, ms := range c.Launches[max(0, len(c.Launches)-launchSamples):] {

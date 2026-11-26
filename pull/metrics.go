@@ -31,6 +31,9 @@ type Metrics struct {
 	AtFloor  int                  // sets whose pool is at the hour's floor while more jobs wait than it has idle runners
 	Denied   map[string]int       // registrations the budget turned away this minute, by reason
 	Jobs     []JobRecord          // jobs that finished this minute, every set
+	// Dispatch is the sets the identity plane serves, and DispatchCounts what each did this minute.
+	Dispatch       []DispatchSnapshot
+	DispatchCounts map[string]DispatchCounts
 }
 
 func publish(ctx context.Context, cw *cloudwatch.Client, m Metrics, now time.Time) {
@@ -87,6 +90,18 @@ func metricData(m Metrics, now time.Time) []cwtypes.MetricDatum {
 		machines += s.Machines
 		od += s.OnDemand
 		oldestJob, oldestMachine = max(oldestJob, s.OldestJobS), max(oldestMachine, s.OldestUnregisteredS)
+	}
+	for _, s := range m.Dispatch {
+		set := cwtypes.Dimension{Name: aws.String("Set"), Value: aws.String(s.Set)}
+		c := m.DispatchCounts[s.Set]
+		data = append(data, d("Machines", float64(s.Machines), cwtypes.StandardUnitCount, set), d("Pool", float64(s.Pool), cwtypes.StandardUnitCount, set),
+			d("JobsWaiting", float64(s.JobsWaiting), cwtypes.StandardUnitCount, set), d("OldestWaitingJobAgeS", s.OldestJobS, cwtypes.StandardUnitSeconds, set),
+			d("DispatchIdleMachines", float64(s.Idle), cwtypes.StandardUnitCount, set), d("DispatchRunning", float64(s.Running), cwtypes.StandardUnitCount, set),
+			d("DispatchHandoffs", float64(c.Handoffs), cwtypes.StandardUnitCount, set), d("DispatchRetries", float64(c.Retries), cwtypes.StandardUnitCount, set),
+			d("DispatchResumes", float64(c.Resumes), cwtypes.StandardUnitCount, set), d("DispatchLostJobs", float64(c.Lost), cwtypes.StandardUnitCount, set),
+			d("DispatchDroppedFrames", float64(c.Dropped), cwtypes.StandardUnitCount, set))
+		machines += s.Machines
+		oldestJob = max(oldestJob, s.OldestJobS)
 	}
 	// The alarms read these without a dimension: the longest waits of any set.
 	data = append(data, d("OldestWaitingJobAgeS", oldestJob, cwtypes.StandardUnitSeconds),

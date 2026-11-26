@@ -1,0 +1,695 @@
+package main
+
+import (
+	"fmt"
+	"log/slog"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+)
+
+// A DispatchSet is a size the identity plane serves (README, Identity plane). It has no scale set and registers no
+// runner: each machine waits on /work for the one job the dispatcher hands it, runs it and ends. Its demand is the jobs
+// waiting for a machine and the jobs running; its pool follows the jobs that arrive at the dispatcher. Its lifecycle
+// is not a runner's (no registration, no GitHub fence before an end), so it is a type of its own, not a mode of State.
+type DispatchSet struct {
+	spec  SetSpec
+	fleet *SetFleet
+	wake  chan struct{} // a job arrived: the launcher looks at the deficit now
+
+	mu       sync.Mutex
+	started  time.Time
+	boot     string
+	rounds   int
+	pool     int
+	max      int
+	capped   bool
+	listings map[string]time.Time // per region, when its last complete listing began
+	machines map[string]*dmachine
+	reserved map[string]int      // per launch round, capacity asked of EC2 and not yet seen
+	idle     []*dmachine         // machines waiting on /work for a job, oldest first (the most likely warm)
+	queue    []*session          // jobs waiting for a machine, oldest first
+	pairs    map[string]*session // by machine: the job a claimed machine was paired with, until it is over
+	byJob    map[string]*session // every job whose message was read, by job id, until it is over
+	meter
+	surplusSince time.Time
+	odLaunched   []time.Time
+	allLaunched  []time.Time
+	counts       DispatchCounts // since the metrics last took them
+	waits        []float64      // seconds from a job's arrival to its hand-off, since the metrics last took them
+}
+
+// A dmachine is one machine of a dispatch set: EC2's facts, and where it is in its one job's life.
+type dmachine struct {
+	*Machine
+	phase     machinePhase
+	wire      *wire     // its /work connection, while one holds
+	session   *session  // the job it was claimed for
+	since     time.Time // when it last had no connection: launched, adopted after a start, or its connection lost
+	firstWork time.Time // its first /work, which ends its launch's time
+}
+
+type machinePhase int
+
+const (
+	mBooting machinePhase = iota // no connection: starting, or lost it before it was paired
+	mWaiting                     // on /work, in the idle queue
+	mPairing                     // taken for a job; its claim is being made
+	mClaimed                     // holds its claim: it runs its one job
+	mEnding                      // spent, done or past a bound: it is terminated
+)
+
+// DispatchCounts is what a dispatch set did, for the metrics.
+type DispatchCounts struct {
+	Handoffs int // jobs handed to a machine
+	Retries  int // pairings that ended before the handed point: the machine spent, the job paired again
+	Resumes  int // connections that rejoined their job after a break
+	Lost     int // handed jobs whose machine or shim did not come back within the window
+	Dropped  int // frames over a job's budgets, dropped
+}
+
+func NewDispatchSet(spec SetSpec, fleet *SetFleet, regions []string, now time.Time) *DispatchSet {
+	st := &DispatchSet{spec: spec, fleet: fleet, wake: make(chan struct{}, 1), started: now, boot: fmt.Sprintf("%x", now.UnixNano()),
+		max: spec.Max, listings: map[string]time.Time{}, machines: map[string]*dmachine{}, reserved: map[string]int{},
+		pairs: map[string]*session{}, byJob: map[string]*session{}}
+	for _, r := range regions {
+		st.listings[r] = time.Time{}
+	}
+	return st
+}
+
+// ready says whether every region has been listed: before then a region's machines read as none, and every one of
+// them would be launched again.
+func (st *DispatchSet) ready() bool {
+	for _, at := range st.listings {
+		if at.IsZero() {
+			return false
+		}
+	}
+	return true
+}
+
+// desired is the machines the set's jobs ask for: those waiting for one, those running, and the pool (none while the
+// spend cap holds), at most max.
+func (st *DispatchSet) desired() int {
+	pool := st.pool
+	if st.capped {
+		pool = 0
+	}
+	return max(0, min(st.max, len(st.queue)+len(st.pairs)+pool))
+}
+
+// live is the machines that are or will be supply: every machine not ending, and the capacity asked of EC2.
+func (st *DispatchSet) live() int {
+	n := 0
+	for _, k := range st.reserved {
+		n += k
+	}
+	for _, m := range st.machines {
+		if m.phase != mEnding {
+			n++
+		}
+	}
+	return n
+}
+
+// Deficit reserves the machines to launch now, under a new round's name.
+func (st *DispatchSet) Deficit(now time.Time) (round string, n int) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.capped || !st.ready() {
+		return "", 0
+	}
+	if n = st.desired() - st.live(); n <= 0 {
+		return "", 0
+	}
+	st.rounds++
+	round = fmt.Sprintf("%s-%d", st.boot, st.rounds)
+	st.reserved[round] = n
+	return round, n
+}
+
+// Launched ends a round's reservation: the machines EC2 started join the set.
+func (st *DispatchSet) Launched(round string, got []*Machine, now time.Time) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	delete(st.reserved, round)
+	for _, m := range got {
+		if _, ok := st.machines[m.ID]; !ok {
+			m.Ordered, m.Dispatch = now, true
+			st.machines[m.ID] = &dmachine{Machine: m, since: now}
+		}
+		st.allLaunched = append(st.allLaunched, now)
+		if m.Lifecycle == "on-demand" {
+			st.odLaunched = append(st.odLaunched, now)
+		}
+	}
+}
+
+// OnDemandRoom is how many on-demand machines may start now without the on-demand share of the last half hour's
+// launches passing frac.
+func (st *DispatchSet) OnDemandRoom(frac float64, more int, now time.Time) int {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	cut := now.Add(-30 * time.Minute)
+	st.allLaunched, st.odLaunched = since(st.allLaunched, cut), since(st.odLaunched, cut)
+	return max(0, int(frac*float64(len(st.allLaunched)+more))-len(st.odLaunched))
+}
+
+// Seen merges one complete listing of a region's machines of the set, begun at began. A machine it does not list is
+// forgotten once it has no connection: a connection that holds says more than a listing that missed it.
+func (st *DispatchSet) Seen(region string, listed []*Machine, began, now time.Time) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.listings[region] = began
+	in := map[string]bool{}
+	for _, l := range listed {
+		in[l.ID] = true
+		m := st.machines[l.ID]
+		if m == nil {
+			st.machines[l.ID] = &dmachine{Machine: l, since: now}
+			if st.reserved[l.Round] > 0 {
+				st.reserved[l.Round]--
+			}
+			continue
+		}
+		m.IP, m.Type, m.AZ, m.Lifecycle, m.Seen = l.IP, l.Type, l.AZ, l.Lifecycle, now
+		if l.Template != "" {
+			m.Template = l.Template
+		}
+		if m.Launched.IsZero() {
+			m.Launched = l.Launched
+		}
+	}
+	for id, m := range st.machines {
+		if m.Region == region && !in[id] && now.Sub(m.Launched) > 90*time.Second && m.wire == nil && m.session == nil {
+			delete(st.machines, id)
+		}
+	}
+}
+
+func (st *DispatchSet) machine(id string) *dmachine {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.machines[id]
+}
+
+// mayWait says whether a machine may wait for a job: it was never taken for one.
+func (st *DispatchSet) mayWait(m *dmachine) bool {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return m.phase == mBooting || m.phase == mWaiting
+}
+
+// waiting puts a machine on mw in the idle queue, or gives a machine already there its new connection in its place.
+func (st *DispatchSet) waiting(m *dmachine, mw *wire, now time.Time) bool {
+	st.mu.Lock()
+	if m.phase != mBooting && m.phase != mWaiting {
+		st.mu.Unlock()
+		return false
+	}
+	old := m.wire
+	m.wire = mw
+	if m.phase == mBooting {
+		m.phase = mWaiting
+		st.idle = append(st.idle, m)
+	}
+	if m.firstWork.IsZero() {
+		m.firstWork = now
+		if !m.Ordered.IsZero() {
+			st.sample(now.Sub(m.Ordered))
+		}
+	}
+	st.mu.Unlock()
+	if old != nil && old != mw {
+		old.close()
+	}
+	return true
+}
+
+// mayResume says whether a machine may rejoin a job: it is not ending.
+func (st *DispatchSet) mayResume(m *dmachine) bool {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return m.phase != mEnding
+}
+
+// rejoined gives a machine that rejoined its job its new connection.
+func (st *DispatchSet) rejoined(m *dmachine, mw *wire, s *session) bool {
+	st.mu.Lock()
+	if m.phase == mEnding {
+		st.mu.Unlock()
+		return false
+	}
+	old := m.wire
+	m.wire, m.session, m.phase = mw, s, mClaimed
+	st.idle = slices.DeleteFunc(st.idle, func(o *dmachine) bool { return o == m })
+	st.counts.Resumes++
+	st.mu.Unlock()
+	if old != nil && old != mw {
+		old.close()
+	}
+	return true
+}
+
+// sessionOf is the job whose frames a machine's connection carries, if any.
+func (st *DispatchSet) sessionOf(m *dmachine, mw *wire) *session {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if m.wire != mw {
+		return nil
+	}
+	return m.session
+}
+
+// machineClosed settles a machine's connection that ended. A machine that waited goes back to booting, and may come
+// again; a job's machine is away until it rejoins.
+func (st *DispatchSet) machineClosed(m *dmachine, mw *wire) {
+	st.mu.Lock()
+	if m.wire != mw {
+		st.mu.Unlock()
+		return
+	}
+	m.wire = nil
+	s := m.session
+	if m.phase == mWaiting {
+		m.phase, m.since = mBooting, time.Now()
+		st.idle = slices.DeleteFunc(st.idle, func(o *dmachine) bool { return o == m })
+	}
+	st.mu.Unlock()
+	if s != nil {
+		s.machineAway(mw)
+	}
+}
+
+// endMachine ends a machine: it is never offered a job again, and is terminated.
+func (st *DispatchSet) endMachine(m *dmachine, why string) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.end(m, why)
+}
+
+func (st *DispatchSet) end(m *dmachine, why string) {
+	if m.phase == mEnding {
+		return
+	}
+	m.phase, m.Ending, m.session = mEnding, true, nil
+	st.idle = slices.DeleteFunc(st.idle, func(o *dmachine) bool { return o == m })
+	if m.wire != nil {
+		go m.wire.end()
+		m.wire = nil
+	}
+	slog.Info("dispatch machine ends", "set", st.spec.Name, "machine", m.ID, "why", why)
+}
+
+// enqueue puts a job whose message was read in the queue. A shim whose connection broke before PAIRED replays its
+// job on a new one, so a job is known by its id: a replay takes a queued job's place, waits for a pairing in flight to
+// settle (wait), or is sent to the pair that has the job (its <instance>.<token>), and is never a second job.
+func (st *DispatchSet) enqueue(s *session, head jobHead, now time.Time) (pair string, wait chan struct{}) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	s.id, s.head = head.ID, head
+	switch h := st.byJob[head.ID]; {
+	case h == nil:
+		s.phase = queued
+		st.queue = append(st.queue, s)
+		st.arrive(now)
+	case h.phase == running:
+		return h.key(), nil
+	case h.phase == pairing:
+		return "", h.settled
+	default:
+		s.phase = queued
+		if i := slices.Index(st.queue, h); i >= 0 {
+			st.queue[i] = s
+		} else {
+			st.queue = append(st.queue, s)
+		}
+		h.phase = over
+		go h.closeAll()
+	}
+	st.byJob[head.ID] = s
+	select {
+	case st.wake <- struct{}{}:
+	default:
+	}
+	return "", nil
+}
+
+// shimClosed settles a shim's connection that ended. A job not yet handed is dropped (its shim starts it again); a
+// handed one is away until the shim rejoins.
+func (st *DispatchSet) shimClosed(s *session, sw *wire) {
+	s.shimAway(sw)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if s.phase == reading || s.phase == queued {
+		s.phase = over
+		st.queue = slices.DeleteFunc(st.queue, func(o *session) bool { return o == s })
+		st.forget(s)
+	}
+}
+
+// forget drops a job that is over from the jobs known by id.
+func (st *DispatchSet) forget(s *session) {
+	if st.byJob[s.id] == s {
+		delete(st.byJob, s.id)
+	}
+}
+
+// next takes the oldest waiting job and the oldest waiting machine for a pairing.
+func (st *DispatchSet) next() (*session, *dmachine, *wire) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if len(st.queue) == 0 || len(st.idle) == 0 {
+		return nil, nil, nil
+	}
+	s, m := st.queue[0], st.idle[0]
+	st.queue, st.idle = st.queue[1:], st.idle[1:]
+	s.phase, s.settled = pairing, make(chan struct{})
+	m.phase = mPairing
+	return s, m, m.wire
+}
+
+// claimed records that a machine's claim is the job's: frames of the machine's connection mw are now the job's.
+func (st *DispatchSet) claimed(s *session, m *dmachine, mw *wire, token string) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	m.phase, m.session = mClaimed, s
+	s.machine, s.token = m.ID, token
+	st.pairs[m.ID] = s
+	s.mu.Lock()
+	s.from = mw
+	s.mu.Unlock()
+}
+
+// retry settles a pairing that failed before the handed point: the machine is spent, and the job goes back to the
+// head of the queue while its shim holds.
+func (st *DispatchSet) retry(s *session, m *dmachine) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.counts.Retries++
+	st.end(m, "spent before the handed point")
+	if st.pairs[m.ID] == s {
+		delete(st.pairs, m.ID)
+	}
+	s.machine, s.token = "", ""
+	close(s.settled)
+	s.settled = nil
+	s.mu.Lock()
+	alive := s.shim != nil && !s.shim.gone()
+	s.from, s.toShim, s.out, s.infos, s.exited = nil, nil, 0, 0, false
+	s.mu.Unlock()
+	if !alive {
+		s.phase = over
+		st.forget(s)
+		return
+	}
+	s.phase = queued
+	st.queue = append([]*session{s}, st.queue...)
+}
+
+// abandon settles a pairing that failed before the handed point with no shim to go on with: the machine is spent and
+// the job dropped, for its shim to start again or rejoin the pair its PAIRED names.
+func (st *DispatchSet) abandon(s *session, m *dmachine) {
+	st.mu.Lock()
+	st.counts.Retries++
+	st.end(m, "spent before the handed point")
+	if st.pairs[m.ID] == s {
+		delete(st.pairs, m.ID)
+	}
+	close(s.settled)
+	s.settled, s.phase = nil, over
+	st.forget(s)
+	st.mu.Unlock()
+	s.closeAll()
+}
+
+// handed records the handed point: the job's claim names its pair.
+func (st *DispatchSet) handed(s *session, now time.Time) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	s.phase, s.handed = running, now
+	st.counts.Handoffs++
+	st.waits = append(st.waits, now.Sub(s.arrived).Seconds())
+	close(s.settled)
+	s.settled = nil
+}
+
+// pairOf is the job a machine was paired with in this process, its token, and while the pairing is still going on a
+// channel closed once it settles.
+func (st *DispatchSet) pairOf(inst string) (*session, string, chan struct{}) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	s := st.pairs[inst]
+	if s == nil {
+		return nil, "", nil
+	}
+	return s, s.token, s.settled
+}
+
+// adopt is the session of a job a previous process handed, rejoined after a restart: its claims name the pair, and
+// both sides are away until they come.
+func (st *DispatchSet) adopt(inst, token, job string, now time.Time) *session {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if s := st.pairs[inst]; s != nil {
+		return s
+	}
+	s := &session{set: st, id: job, machine: inst, token: token, phase: running, handed: now, arrived: now, live: true, away: [2]time.Time{now, now}}
+	st.pairs[inst], st.byJob[job] = s, s
+	return s
+}
+
+// finish ends a job: its exit code reached the shim, or it was lost. Its machine ends.
+func (st *DispatchSet) finish(s *session, lost bool) {
+	st.mu.Lock()
+	if s.phase == over {
+		st.mu.Unlock()
+		return
+	}
+	s.phase = over
+	if st.pairs[s.machine] == s {
+		delete(st.pairs, s.machine)
+	}
+	st.forget(s)
+	why := "its job ended"
+	if lost {
+		why = "its job was lost"
+		st.counts.Lost++
+	}
+	if m := st.machines[s.machine]; m != nil && m.session == s {
+		st.end(m, why)
+	}
+	st.mu.Unlock()
+	s.closeAll()
+	slog.Info("dispatch job over", "set", st.spec.Name, "job", s.id, "machine", s.machine, "lost", lost)
+}
+
+func (st *DispatchSet) count(f func(*DispatchCounts)) {
+	st.mu.Lock()
+	f(&st.counts)
+	st.mu.Unlock()
+}
+
+// dispatchBounds are the ages past which a dispatch machine ends: maxAge waiting for a job, life in all, job for its
+// job from its hand-off; warmup is how long after a start no surplus ends, while the pool is measured.
+type dispatchBounds struct {
+	maxAge, life, job, warmup, window time.Duration
+}
+
+// Reconcile ends what has outlived its bounds and returns the machines to terminate now and the jobs lost. A handed job
+// whose machine has been away past the window, or that ran past its bound, is lost: its shim gets exit code 1. One
+// whose shim has been away past the window is over (the identity's listener failed it when its shim ended). A machine
+// waiting past its age, one that has had no connection past the window, any past its life, and surplus waiting
+// machines end; an ending machine is terminated once, then a minute on if EC2 still lists it.
+func (st *DispatchSet) Reconcile(now time.Time, b dispatchBounds) (end []*Machine, lost []JobRef) {
+	for s, why := range st.expired(now, b) {
+		if why == machineLost {
+			s.lose()
+			if j, ok := s.jobRef(); ok {
+				lost = append(lost, j)
+			}
+		}
+		st.finish(s, why != shimLeftAfterExit)
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if !st.ready() {
+		return nil, lost
+	}
+	for _, m := range st.machines {
+		age := now.Sub(m.Launched)
+		switch {
+		case m.phase == mEnding, m.session != nil:
+		case age > b.life:
+			st.end(m, "past its life")
+		case m.phase == mWaiting && age > b.maxAge:
+			st.end(m, "waited past its age")
+		case m.phase == mBooting && age > bootGrace && now.Sub(m.since) > b.window:
+			st.end(m, "no connection")
+		}
+	}
+	st.surplus(now, b.warmup)
+	for _, m := range st.machines {
+		if m.phase == mEnding && now.Sub(m.Ended) > time.Minute {
+			m.Ended = now
+			end = append(end, m.Machine)
+		}
+	}
+	return end, lost
+}
+
+// expiry is why a handed job ends without its exit code reaching its shim.
+type expiry int
+
+const (
+	machineLost       expiry = iota // its machine was away past the window, or it ran past its bound: its shim gets 1
+	shimLeft                        // its shim was away past the window before the exit code came
+	shimLeftAfterExit               // its shim was away past the window with the exit code held for it
+)
+
+// expired is the handed jobs to end now, and why.
+func (st *DispatchSet) expired(now time.Time, b dispatchBounds) map[*session]expiry {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	out := map[*session]expiry{}
+	for inst, s := range st.pairs {
+		if s.phase != running {
+			continue
+		}
+		s.mu.Lock()
+		machineAway, shimAway, exited := s.away[0], s.away[1], s.exited
+		s.mu.Unlock()
+		m := st.machines[inst]
+		switch {
+		case !shimAway.IsZero() && now.Sub(shimAway) > b.window && exited:
+			out[s] = shimLeftAfterExit
+		case !shimAway.IsZero() && now.Sub(shimAway) > b.window:
+			out[s] = shimLeft
+		case !exited && !machineAway.IsZero() && now.Sub(machineAway) > b.window, now.Sub(s.handed) > b.job,
+			m != nil && now.Sub(m.Launched) > b.life:
+			out[s] = machineLost
+		}
+	}
+	return out
+}
+
+// surplus ends the newest machines with no job, booting or waiting, once the set has had more than its jobs and pool
+// ask for for 20 s, and not in the warmup after a start (a machine that rejoins its job after a start reads as booting
+// until it does). The oldest are kept: a machine that has waited is warm. A machine with no job holds no runner, so
+// its end needs no fence.
+func (st *DispatchSet) surplus(now time.Time, warmup time.Duration) {
+	excess := st.live() - st.desired()
+	if excess <= 0 || now.Sub(st.started) < warmup {
+		st.surplusSince = time.Time{}
+		return
+	}
+	if st.surplusSince.IsZero() {
+		st.surplusSince = now
+	}
+	if now.Sub(st.surplusSince) < 20*time.Second {
+		return
+	}
+	var free []*dmachine
+	for _, m := range st.machines {
+		if m.phase == mBooting || m.phase == mWaiting {
+			free = append(free, m)
+		}
+	}
+	slices.SortFunc(free, func(a, b *dmachine) int { return b.Launched.Compare(a.Launched) })
+	for _, m := range free[:min(len(free), excess, 100)] {
+		st.end(m, "surplus")
+	}
+}
+
+// jobRef is a lost job as the re-run path finds it: its run, its name and the identity that took it.
+func (s *session) jobRef() (JobRef, bool) {
+	owner, repo, ok := strings.Cut(s.head.Repo, "/")
+	if !ok || s.head.Run == 0 {
+		return JobRef{}, false
+	}
+	return JobRef{Owner: owner, Repo: repo, RunID: s.head.Run, Name: s.head.Name, Runner: s.agent, Instance: s.machine}, true
+}
+
+func (st *DispatchSet) SetPool(n int)     { st.mu.Lock(); st.pool = n; st.mu.Unlock() }
+func (st *DispatchSet) SetMax(n int)      { st.mu.Lock(); st.max = n; st.mu.Unlock() }
+func (st *DispatchSet) SetCapped(on bool) { st.mu.Lock(); st.capped = on; st.mu.Unlock() }
+
+// Burst is the pool the set's recent arrivals at the dispatcher ask for (State.Burst's rule).
+func (st *DispatchSet) Burst(now time.Time, r PoolRule) int {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.burst(now, st.started, r)
+}
+
+// Running is a copy of the set's machines, for the spend.
+func (st *DispatchSet) Running() []Machine {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	out := make([]Machine, 0, len(st.machines))
+	for _, m := range st.machines {
+		out = append(out, *m.Machine)
+	}
+	return out
+}
+
+// TakeCounts hands over what the set did since the last call, and TakeWaits its jobs' waits for a machine.
+func (st *DispatchSet) TakeCounts() DispatchCounts {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	c := st.counts
+	st.counts = DispatchCounts{}
+	return c
+}
+
+func (st *DispatchSet) TakeWaits() []float64 {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	w := st.waits
+	st.waits = nil
+	return w
+}
+
+// DispatchSnapshot is a dispatch set as the admin endpoint and the metrics report it.
+type DispatchSnapshot struct {
+	Set         string  `json:"set"`
+	Ready       bool    `json:"ready"`
+	Pool        int     `json:"pool"`
+	Max         int     `json:"max"`
+	Capped      bool    `json:"capped"`
+	Desired     int     `json:"desired"`
+	Live        int     `json:"live"`
+	Inflight    int     `json:"inflight"`
+	Machines    int     `json:"machines"`
+	Booting     int     `json:"booting"`
+	Idle        int     `json:"idle"`
+	Running     int     `json:"running"`
+	Ending      int     `json:"ending"`
+	JobsWaiting int     `json:"jobs_waiting"`
+	OldestJobS  float64 `json:"oldest_job_s"`
+	LaunchS     float64 `json:"launch_s"`
+}
+
+func (st *DispatchSet) Snapshot(now time.Time) DispatchSnapshot {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	out := DispatchSnapshot{Set: st.spec.Name, Ready: st.ready(), Pool: st.pool, Max: st.max, Capped: st.capped, Desired: st.desired(),
+		Live: st.live(), Machines: len(st.machines), Idle: len(st.idle), JobsWaiting: len(st.queue), Running: len(st.pairs),
+		LaunchS: st.launchTime(0).Seconds()}
+	for _, k := range st.reserved {
+		out.Inflight += k
+	}
+	for _, m := range st.machines {
+		switch m.phase {
+		case mBooting:
+			out.Booting++
+		case mEnding:
+			out.Ending++
+		}
+	}
+	if len(st.queue) > 0 {
+		out.OldestJobS = now.Sub(st.queue[0].arrived).Seconds()
+	}
+	return out
+}

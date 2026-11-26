@@ -33,6 +33,8 @@ superci-pull: one process on one c7g.large, an Auto Scaling group of one in us-e
   /jit      : POST with the machine's signed identity document; a runner only for a machine never issued one, only
               once its grant has made the machine's claim (s3://superci-pull-claims-<account>/issued/<instance>),
               and its config leaves only after EC2 has the machine's superci-pull-issued tag
+  /work /shim: the identity plane's dispatcher (Identity plane): a machine of a dispatch set takes the one job an
+              identity's shim brings, with no registration
   lister    : lists the group's runners every 30 s (3 s a page), on its own: a slow GitHub slows only it
   reconciler: every 10 s lists EC2; adopts, ends machines whose job completed, stuck, overdue or shed ones, retires
               surplus idle runners (RemoveRunner first), accrues spend, applies the caps; its GitHub calls run apart
@@ -421,6 +423,79 @@ From fastest and smallest to full. None touches the listener's sessions, `SUPERC
    to a file, then the `put-role-policy` of step 3 with it. Dropping it first makes every launch of a template that
    still names the profile fail.
 4. **Remove the cache itself** (buckets stay): `pull/cache/deploy/down.sh`. Nothing in the listener needs it gone.
+
+## Identity plane
+
+GitHub caps runner registrations at 1,500 in 5 minutes for the organization, and the organization sat at that cap at
+peak on Nov 26: superci jobs waited up to 300 s for a registration and the canaries were rolled back. A size whose
+entry in `config.json` says `"dispatch": true` registers nothing per job. Persistent runner identities, registered
+once on identity hosts, take its jobs, and each job still runs on a fresh single-use machine. A size moved to dispatch
+has no scale set and no message session; its old scale set drains and is deleted, as a dropped set is. A dispatch
+size is one set (`split` 1), since an identity names its size, not a set of it.
+
+- **Identities.** An identity is a classic runner named `superci-id-<size>-<n>`, labelled with its size, on an
+  identity host tagged `superci-pull-role=identity` and `superci-pull-deployment=<deployment>`. Its `bin/Runner.Worker`
+  is the shim (`shim/`). The identity's `.credentials` and `.credentials_rsaparams` never leave its host; its
+  `.runner` holds no secret and goes to the machine.
+- **The dispatcher** is in the listener, on its TLS port (8443). A machine POSTs `/work` and a shim POSTs `/shim`,
+  each with its EC2-signed identity document as the body (16 KiB at most), `Connection: Upgrade` and
+  `Upgrade: superci-dispatch/1`, over HTTP/1.1. The answer is `101` and frames follow:
+  `<u8 type><u32 little-endian length><payload>`.
+
+  | Type | Name | From | Bound |
+  | ---: | --- | --- | --- |
+  | 1, 2 | STDOUT, STDERR | machine | 1 MiB a frame; 4 MiB a job together, past which frames are dropped and counted |
+  | 3 | EXIT | machine | exactly 4 bytes (i32); ends the job |
+  | 4 | INFO | machine | 4 KiB a frame, 64 a job, a JSON object of `instance`, `boot`, `t_hdr`, `t_spawn`, `t_exit`, `rc` only |
+  | 5 | PIPE | shim | 1 MiB a frame; 33 MiB held while the job has no machine |
+  | 6 | JOB | dispatcher | 64 KiB: `{"runner", "token", "job": {run, job, name, repo}}` |
+  | 7 | PING | both | empty, every 20 s; 60 s of silence ends the connection |
+  | 8 | PAIRED | dispatcher | 1 KiB: `{"instance", "token"}` |
+
+  Any other type, or a frame past its bound, ends the connection. A `/shim` caller must be an identity host of this
+  deployment (its tags, read from EC2 and trusted for 5 minutes) and send its `.runner` in base64 as
+  `X-Superci-Runner`; the agent name decides the set, and a `.runner` holding a field of the credential files is
+  refused (403). A `/work` caller must be a machine of a dispatch set that never held a claim (410 otherwise).
+  `/agent` answers a dispatch machine with `agent.py`.
+- **Pairing.** Each dispatch set keeps a queue of waiting machines, oldest first (the warmest), and a queue of jobs.
+  The dispatcher reads the job's id and names from the listener's first message (`NewJobRequest`, at most 32 MiB) and
+  keeps no secret field of it. A shim whose connection broke before PAIRED replays its job on a new connection: the
+  replay takes the queued job's place, so a job is one job however often it arrives. To pair, the dispatcher takes
+  the machine's claim (`issued/<instance>`, made once) with a fresh token, sends JOB to the machine and PAIRED to the
+  shim, takes the job's own claim (`issued/job-<job id>`, holding `<instance>.<token>`), and writes the first PIPE
+  byte. **The job's claim is the handed point.** Before it, any failure spends the machine (it is ended and never
+  offered again) and puts the job back at the head of its queue. After it, the job goes to no other machine, across
+  restarts and overlapping listeners: a replay of a handed job is sent the PAIRED of the pair that has it. A stop
+  lets the hand-offs in flight finish for 5 s first.
+- **Resume.** A side whose connection broke after the handed point reconnects with `X-Superci-Resume:
+  <instance>.<token>` for up to 3 minutes. The token carries the job's id, so a new dispatcher reads the job's claim:
+  it must name the pair (it was taken only once the machine's claim held that token), or the answer is 410. A pair
+  never handed is also 410: the shim drops its job's bytes once PAIRED comes, so it cannot start the job again. Bytes
+  in flight at the break may be lost; the shim sends what it read while away, and the machine sends its EXIT again
+  until a clean close follows it.
+- **Ending a connection.** Once the EXIT reaches the shim, both connections end with TLS close_notify and a FIN, and
+  the dispatcher reads and drops what each peer still sends for up to 5 s before it closes the socket: a socket closed
+  with bytes unread sends a reset, which discards the EXIT still on its way. A stop starts no hand-off, lets those in
+  flight finish for 5 s, and ends every connection, which each side rejoins on the next dispatcher.
+- **Loss.** A machine away for 3 minutes with no EXIT, a job past `job_minutes` + `margin_minutes`, or a machine
+  past its life loses its job: the shim gets exit code 1, which is no TaskResult, and the identity's listener fails
+  the job. A spot reclaim's lost job is re-run as a scale set's is, known by its machine and found in its run by its
+  name (an identity takes many jobs).
+- **Machines.** A dispatch machine carries `superci-pull-mode=dispatch`, so a scale set and a dispatch set of one
+  size never take each other's machines. Its demand is the jobs waiting plus the jobs running, and its pool follows
+  the jobs that arrive at the dispatcher, by the same rule as a scale set's (Pools). It ends when its EXIT has been
+  relayed, when it has had no connection for 3 minutes (and is 5 minutes old), when it has waited past
+  `max_age_hours`, past its life, or as surplus: the newest machines without a job first, after 20 s of surplus,
+  never in the first window after a start. It holds no runner, so its end needs no GitHub fence.
+- **Names.** The lister takes a set's runners by `<set>-i-`, the form of a machine's runner. An identity is never a
+  machine's runner or an orphan, and nothing removes one.
+- **Metrics,** per dispatch set under the `Set` dimension: `JobsWaiting`, `Machines`, `Pool`,
+  `OldestWaitingJobAgeS`, `DispatchIdleMachines`, `DispatchRunning`, and each minute's `DispatchHandoffs`,
+  `DispatchRetries`, `DispatchResumes`, `DispatchLostJobs` and `DispatchDroppedFrames`. Their jobs' waits for a machine
+  are in `QueueWait`, and their oldest wait in the alarms' `OldestWaitingJobAgeS`.
+- **Limits.** A listener that crashes between a PAIRED and the job's claim loses that job (the shim has dropped its
+  bytes, and the claim names no pair): one S3 round trip a hand-off. A dispatch set's pool is not carried across a
+  restart; it starts from the hour's floor. Moving a size back to a scale set fails the jobs its machines run.
 
 ## Hydration
 

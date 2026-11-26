@@ -110,6 +110,8 @@ type Listener struct {
 	modified   time.Time
 	pins       map[string]int // pool pinned by the operator per set, until the config file changes
 	sets       []*Set
+	dsets      []*DispatchSet // the sizes the identity plane serves
+	dispatch   *Dispatcher
 	group      int // the deployment's runner group at GitHub
 	fleet      *Fleet
 	tagger     *Tagger
@@ -209,7 +211,17 @@ func run(ctx context.Context, f flags) error {
 	for _, r := range fleet.regions {
 		regions = append(regions, r.Name)
 	}
+	var scaled []SetSpec
 	for _, spec := range specs {
+		if spec.Dispatch {
+			sf, err := fleet.AddSet(ctx, spec, bootDataMode(cfg, listenAt, id.Pin, spec.Label, "dispatch"), f.groups)
+			if err != nil {
+				return err
+			}
+			l.dsets = append(l.dsets, NewDispatchSet(spec, sf, regions, now))
+			continue
+		}
+		scaled = append(scaled, spec)
 		gid, err := ensureScaleSet(ctx, client, group, spec)
 		if err != nil {
 			return fmt.Errorf("scale set %s: %w", spec.Name, err)
@@ -220,7 +232,8 @@ func run(ctx context.Context, f flags) error {
 		}
 		l.sets = append(l.sets, &Set{spec: spec, id: gid, state: setState(spec, cfg, regions, now), fleet: sf})
 	}
-	dropped, err := droppedScaleSets(ctx, client, group, specs)
+	// A size the identity plane serves has no scale set: one left from before it moved is drained, then deleted.
+	dropped, err := droppedScaleSets(ctx, client, group, scaled)
 	if err != nil {
 		return fmt.Errorf("prune scale sets: %w", err)
 	}
@@ -245,8 +258,10 @@ func run(ctx context.Context, f flags) error {
 	for _, s := range l.sets {
 		byName[s.spec.Name] = s
 	}
+	l.dispatch = NewDispatcher(cfg.Deployment, l.dsets, verifier, claims, fleet, refresh)
+	defer l.dispatch.Close()
 	srv := &Server{sets: byName, budget: l.budget, verifier: verifier, client: client, refresh: refresh, claim: claims.Take, issue: l.tagger.Issue, notices: fleet.TagNoticed,
-		slots: make(chan struct{}, max(1, cfg.Registration.Concurrency)), maxAge: l.maxAge}
+		slots: make(chan struct{}, max(1, cfg.Registration.Concurrency)), maxAge: l.maxAge, dispatch: l.dispatch}
 	go serve(ctx, &http.Server{Addr: f.listen, Handler: srv, ReadHeaderTimeout: 10 * time.Second}, &id)
 	go serve(ctx, &http.Server{Addr: f.admin, Handler: Admin(l.status, l.healthy, l.override, l.budget)}, nil)
 	errs := make(chan error, len(l.sets))
@@ -268,6 +283,9 @@ func run(ctx context.Context, f flags) error {
 				errs <- err
 			}
 		}()
+	}
+	for _, d := range l.dsets {
+		go l.dispatchLauncher(ctx, d)
 	}
 	go l.reconciler(ctx, refresh)
 	go l.lister(ctx)
@@ -656,15 +674,13 @@ func (l *Listener) refresher() func(context.Context, string) {
 			return
 		}
 		now := time.Now()
-		by := map[string][]*Machine{}
-		for _, m := range ms {
-			by[m.Set] = append(by[m.Set], m)
-		}
-		known := map[string]bool{}
+		scaled, dispatched, strays := sortMachines(ms, l.sets, l.dsets)
 		var gone []JobRef
 		for _, s := range l.sets {
-			known[s.spec.Name] = true
-			gone = append(gone, s.state.Seen(region, by[s.spec.Name], began, now)...)
+			gone = append(gone, s.state.Seen(region, scaled[s], began, now)...)
+		}
+		for _, d := range l.dsets {
+			d.Seen(region, dispatched[d], began, now)
 		}
 		for _, j := range gone {
 			l.rerun.Add(j, now, false)
@@ -675,15 +691,78 @@ func (l *Listener) refresher() func(context.Context, string) {
 				delete(l.strays, id)
 			}
 		}
-		for _, m := range ms {
-			if !known[m.Set] {
-				l.strays[m.ID] = m
-			}
+		for _, m := range strays {
+			l.strays[m.ID] = m
 		}
 		l.mu.Unlock()
 		mu.Lock()
 		last[region] = time.Now()
 		mu.Unlock()
+	}
+}
+
+// sortMachines gives each set the listed machines of its own: a scale set those without the dispatch tag, a dispatch
+// set those with it. A size moving from one to the other keeps machines of both for a while, and neither set may take
+// the other's: a scale set ends a machine that never asks for a runner, and a dispatch set one that never comes to
+// /work. The rest are of no configured set.
+func sortMachines(ms []*Machine, sets []*Set, dsets []*DispatchSet) (map[*Set][]*Machine, map[*DispatchSet][]*Machine, []*Machine) {
+	scale, disp := map[string]*Set{}, map[string]*DispatchSet{}
+	for _, s := range sets {
+		scale[s.spec.Name] = s
+	}
+	for _, d := range dsets {
+		disp[d.spec.Name] = d
+	}
+	scaled, dispatched := map[*Set][]*Machine{}, map[*DispatchSet][]*Machine{}
+	var strays []*Machine
+	for _, m := range ms {
+		switch s, d := scale[m.Set], disp[m.Set]; {
+		case m.Dispatch && d != nil:
+			dispatched[d] = append(dispatched[d], m)
+		case !m.Dispatch && s != nil:
+			scaled[s] = append(scaled[s], m)
+		default:
+			strays = append(strays, m)
+		}
+	}
+	return scaled, dispatched, strays
+}
+
+// dispatchLauncher launches a dispatch set's deficit, woken by a job's arrival at the dispatcher. It needs no
+// registration, so nothing but the set's own demand bounds a launch.
+func (l *Listener) dispatchLauncher(ctx context.Context, d *DispatchSet) {
+	slots := make(chan struct{}, 16)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-d.wake:
+		case <-time.After(2 * time.Second):
+		}
+		time.Sleep(300 * time.Millisecond)
+		select {
+		case slots <- struct{}{}:
+		default:
+			continue
+		}
+		now := time.Now()
+		round, n := d.Deficit(now)
+		if n == 0 {
+			<-slots
+			continue
+		}
+		go func() {
+			defer func() { <-slots }()
+			got := d.fleet.Launch(ctx, round, n, d.OnDemandRoom(l.config().OnDemand, n, now))
+			d.Launched(round, got, time.Now())
+			l.mu.Lock()
+			l.short += n - len(got)
+			l.mu.Unlock()
+			slog.Info("launched", "set", d.spec.Name, "round", round, "asked", n, "got", len(got), "ms", time.Since(now).Milliseconds())
+			if len(got) < n {
+				time.Sleep(5 * time.Second)
+			}
+		}()
 	}
 }
 
@@ -706,29 +785,37 @@ func (l *Listener) lister(ctx context.Context) {
 			wait = 10 * time.Second
 			continue
 		}
-		if n := sweepProbes(ctx, l.client, runners, started, probeGrace); n > 0 {
-			l.mu.Lock()
-			l.leaked += n
-			l.mu.Unlock()
-		}
-		for _, s := range l.sets {
-			own := map[string]ListedRunner{}
-			for name, r := range runners {
-				if strings.HasPrefix(name, s.spec.Name+"-i-") {
-					own[name] = r
-				}
+		l.sweep(ctx, l.client, runners, started)
+	}
+}
+
+// sweep takes in one listing of the group's runners, begun at started: each set learns its machines' runners, and
+// leaked probes and stale runners of a set are removed. A set's runners are named <set>-<instance id>; nothing else is
+// any set's, so an identity's runner (superci-id-<size>-<n>, registered once and kept) is never a machine's runner, an
+// orphan, or removed.
+func (l *Listener) sweep(ctx context.Context, c registrar, runners map[string]ListedRunner, started time.Time) {
+	if n := sweepProbes(ctx, c, runners, started, probeGrace); n > 0 {
+		l.mu.Lock()
+		l.leaked += n
+		l.mu.Unlock()
+	}
+	for _, s := range l.sets {
+		own := map[string]ListedRunner{}
+		for name, r := range runners {
+			if strings.HasPrefix(name, s.spec.Name+"-i-") {
+				own[name] = r
 			}
-			var stale []ListedRunner
-			for _, o := range s.state.Listed(own, started) {
-				if !o.Busy {
-					stale = append(stale, o)
-				}
-			}
-			parallel(stale, func(o ListedRunner) {
-				err := l.client.RemoveRunner(ctx, o.ID)
-				slog.Info("remove stale runner", "set", s.spec.Name, "runner", o.Name, "err", errString(err))
-			})
 		}
+		var stale []ListedRunner
+		for _, o := range s.state.Listed(own, started) {
+			if !o.Busy {
+				stale = append(stale, o)
+			}
+		}
+		parallel(stale, func(o ListedRunner) {
+			err := c.RemoveRunner(ctx, o.ID)
+			slog.Info("remove stale runner", "set", s.spec.Name, "runner", o.Name, "err", errString(err))
+		})
 	}
 }
 
@@ -809,6 +896,15 @@ func (l *Listener) reconciler(ctx context.Context, refresh func(context.Context,
 				}
 			})
 		}
+		for _, d := range l.dsets {
+			d.SetCapped(capped)
+			ended, lost := d.Reconcile(now, dispatchBounds{maxAge: l.maxAge(), life: cfg.life(), job: cfg.job(), warmup: window, window: resumeWindow})
+			end = append(end, ended...)
+			for _, j := range lost {
+				l.rerun.Add(j, now, false)
+			}
+			running = append(running, d.Running()...)
+		}
 		l.mu.Lock()
 		for _, m := range l.strays {
 			if now.Sub(m.Launched) > 10*time.Minute && now.Sub(m.Ended) > time.Minute {
@@ -842,6 +938,12 @@ func (l *Listener) reconciler(ctx context.Context, refresh func(context.Context,
 					"s_assigned", snap.Stats.TotalAssignedJobs, "s_available", snap.Stats.TotalAvailableJobs, "s_running", snap.Stats.TotalRunningJobs,
 					"launch_s", snap.LaunchS, "launches", snap.Launches, "oldest_job_s", snap.OldestJobS, "oldest_unregistered_s", snap.OldestUnregisteredS)
 				tlPoolTarget(snap, now)
+			}
+			for _, d := range l.dsets {
+				snap := d.Snapshot(now)
+				slog.Info("dispatch state", "set", snap.Set, "ready", snap.Ready, "desired", snap.Desired, "live", snap.Live, "inflight", snap.Inflight,
+					"machines", snap.Machines, "booting", snap.Booting, "idle", snap.Idle, "running", snap.Running, "ending", snap.Ending,
+					"jobs_waiting", snap.JobsWaiting, "pool", snap.Pool, "oldest_job_s", snap.OldestJobS, "launch_s", snap.LaunchS)
 			}
 		}
 	}
@@ -1039,6 +1141,13 @@ func (l *Listener) setPools(now time.Time) {
 		}
 		s.state.SetPool(n)
 	}
+	for _, d := range l.dsets {
+		n, pinned := pins[d.spec.Name]
+		if !pinned {
+			n = cfg.PoolTarget(d.spec, now, d.Burst(now, cfg.Pool))
+		}
+		d.SetPool(n)
+	}
 }
 
 func maps(m map[string]int) map[string]int {
@@ -1095,24 +1204,36 @@ func (l *Listener) watchConfig() {
 			s.state.SetMax(n)
 		}
 	}
+	for _, d := range l.dsets {
+		if n, ok := maxes[d.spec.Name]; ok {
+			d.SetMax(n)
+		}
+	}
 	l.setPools(time.Now())
 	slog.Info("config reloaded", "path", l.path)
 }
 
 func (l *Listener) override(set string, pool, maxN int) {
+	setMax := map[string]func(int){}
 	for _, s := range l.sets {
-		if set != "" && s.spec.Name != set {
+		setMax[s.spec.Name] = s.state.SetMax
+	}
+	for _, d := range l.dsets {
+		setMax[d.spec.Name] = d.SetMax
+	}
+	for name, setMaxOf := range setMax {
+		if set != "" && name != set {
 			continue
 		}
 		l.mu.Lock()
 		if pool >= 0 {
-			l.pins[s.spec.Name] = pool
+			l.pins[name] = pool
 		} else {
-			delete(l.pins, s.spec.Name)
+			delete(l.pins, name)
 		}
 		l.mu.Unlock()
 		if maxN >= 0 {
-			s.state.SetMax(maxN)
+			setMaxOf(maxN)
 		}
 	}
 	l.setPools(time.Now())
@@ -1124,13 +1245,17 @@ func (l *Listener) status() Status {
 	for _, s := range l.sets {
 		st.Sets = append(st.Sets, s.state.Snapshot(now))
 	}
+	for _, d := range l.dsets {
+		st.Dispatch = append(st.Dispatch, d.Snapshot(now))
+	}
 	return st
 }
 
 func (l *Listener) metrics() Metrics {
 	now := time.Now()
 	st := l.status()
-	m := Metrics{Budget: st.Budget, Spend: st.Spend, Sets: st.Sets, SetWaits: map[string][]float64{}}
+	m := Metrics{Budget: st.Budget, Spend: st.Spend, Sets: st.Sets, SetWaits: map[string][]float64{}, Dispatch: st.Dispatch,
+		DispatchCounts: map[string]DispatchCounts{}}
 	cfg := l.config()
 	for i, s := range l.sets {
 		waits := s.state.TakeWaits()
@@ -1148,6 +1273,17 @@ func (l *Listener) metrics() Metrics {
 	}
 	for _, s := range st.Sets {
 		m.Orphans += s.Orphans
+	}
+	for _, d := range l.dsets {
+		waits := d.TakeWaits()
+		m.Waits = append(m.Waits, waits...)
+		m.SetWaits[d.spec.Name] = waits
+		m.DispatchCounts[d.spec.Name] = d.TakeCounts()
+	}
+	for _, d := range st.Dispatch {
+		if d.OldestJobS > (10 * time.Minute).Seconds() {
+			m.Stalled++
+		}
 	}
 	l.mu.Lock()
 	for _, x := range l.strays {

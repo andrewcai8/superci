@@ -34,12 +34,13 @@ type Server struct {
 	client interface {
 		GenerateJitRunnerConfig(ctx context.Context, setting *scaleset.RunnerScaleSetJitRunnerSetting, scaleSetID int) (*scaleset.RunnerScaleSetJitRunnerConfig, error)
 	}
-	refresh func(ctx context.Context, region string)                // lists a region again, at most once a second
-	claim   func(ctx context.Context, instance, token string) error // Claims.Take: nil once the grant holds the machine's claim
-	issue   func(ctx context.Context, m *Machine) error             // writes the machine's issued tag; nil once EC2 has it
-	notices func(ctx context.Context, m *Machine, j JobRef) error   // records on the machine the job a spot notice found
-	slots   chan struct{}                                           // bounds concurrent registrations
-	maxAge  func() time.Duration
+	refresh  func(ctx context.Context, region string)                // lists a region again, at most once a second
+	claim    func(ctx context.Context, instance, token string) error // Claims.Take: nil once the grant holds the machine's claim
+	issue    func(ctx context.Context, m *Machine) error             // writes the machine's issued tag; nil once EC2 has it
+	notices  func(ctx context.Context, m *Machine, j JobRef) error   // records on the machine the job a spot notice found
+	slots    chan struct{}                                           // bounds concurrent registrations
+	maxAge   func() time.Duration
+	dispatch http.Handler // the identity plane's /work, /shim and /agent (Dispatcher)
 }
 
 func (h *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -54,6 +55,12 @@ func (h *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.notice(w, r)
 	case "/mark":
 		h.mark(w, r)
+	case "/work", "/shim", "/agent":
+		if h.dispatch == nil {
+			http.NotFound(w, r)
+			return
+		}
+		h.dispatch.ServeHTTP(w, r)
 	default:
 		http.NotFound(w, r)
 	}
@@ -222,9 +229,10 @@ func removal(err error) Removal {
 
 // Status is the whole listener as the admin endpoint shows it.
 type Status struct {
-	Budget BudgetSnapshot `json:"budget"`
-	Spend  SpendSnapshot  `json:"spend"`
-	Sets   []Snapshot     `json:"sets"`
+	Budget   BudgetSnapshot     `json:"budget"`
+	Spend    SpendSnapshot      `json:"spend"`
+	Sets     []Snapshot         `json:"sets"`
+	Dispatch []DispatchSnapshot `json:"dispatch"`
 }
 
 // Admin is for the operator, on localhost only: the status, health, and a set's pool floor and cap to change at run
