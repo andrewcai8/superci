@@ -380,6 +380,28 @@
       ],
       "what": "pre-hydration of the machine's caches (pull-prehydrate): ended; val is bytes:entries"
     },
+    "preread.start": {
+      "src": "machine",
+      "fields": [
+        "inst",
+        "set",
+        "offset_ms",
+        "dur_ms",
+        "val"
+      ],
+      "what": "the machine began reading its root volume's snapshot blocks (so no job's first read of one waits on the snapshot); offset_ms is from the hydration's start"
+    },
+    "preread.done": {
+      "src": "machine",
+      "fields": [
+        "inst",
+        "set",
+        "offset_ms",
+        "dur_ms",
+        "val"
+      ],
+      "what": "the read of the root volume ended; val is full when it read all of it and stopped when the job started first"
+    },
     "cache.restore": {
       "src": "machine",
       "fields": [

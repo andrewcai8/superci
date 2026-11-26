@@ -9,9 +9,10 @@ import (
 	"testing"
 )
 
-// runDisk runs boot.sh's disk function in bash with findmnt and lsblk answering for a root on part of disk, and the
-// commands that change the machine recording what they were asked.
-func runDisk(t *testing.T, part, disk string) []string {
+// runDisk runs boot.sh's disk function in bash with findmnt and lsblk answering for a root on part of disk (its size
+// 30083776512 bytes before it grows), and the commands that change the machine recording what they were asked. It returns
+// those calls and the ROOT_BYTES the function exported for the pre-read.
+func runDisk(t *testing.T, part, disk string) ([]string, string) {
 	t.Helper()
 	src, err := os.ReadFile("boot.sh")
 	if err != nil {
@@ -24,11 +25,12 @@ func runDisk(t *testing.T, part, disk string) []string {
 	dir := t.TempDir()
 	script := `log=$1/calls
 findmnt() { echo "$PART"; }
-lsblk() { echo "$DISK"; }
+lsblk() { case "$*" in *SIZE*) echo 30083776512 ;; *) echo "$DISK" ;; esac; }
 mount() { echo "mount $*" >> $log; }
 growpart() { echo "growpart $*" >> $log; }
 resize2fs() { echo "resize2fs $*" >> $log; }
 ` + string(fn) + `wait
+bash -c 'printf %s "$ROOT_BYTES"' > $1/root
 `
 	cmd := exec.Command("bash", "-c", script, "_", dir)
 	cmd.Env = append(os.Environ(), "PART="+part, "DISK="+disk)
@@ -36,12 +38,16 @@ resize2fs() { echo "resize2fs $*" >> $log; }
 		t.Fatalf("%v: %s", err, out)
 	}
 	raw, _ := os.ReadFile(filepath.Join(dir, "calls"))
-	return strings.Split(strings.TrimSpace(string(raw)), "\n")
+	root, _ := os.ReadFile(filepath.Join(dir, "root"))
+	return strings.Split(strings.TrimSpace(string(raw)), "\n"), string(root)
 }
 
 func TestTheRootGrowsToTheVolumeAndARenameNoLongerWritesAFileOut(t *testing.T) {
 	for _, c := range []struct{ part, disk, num string }{{"/dev/nvme0n1p1", "nvme0n1", "1"}, {"/dev/xvda1", "xvda", "1"}, {"/dev/nvme1n1p16", "nvme1n1", "16"}} {
-		calls := runDisk(t, c.part, c.disk)
+		calls, root := runDisk(t, c.part, c.disk)
+		if root != "30083776512" {
+			t.Errorf("root %s: the size exported for the pre-read is %q, want the root's size before it grows", c.part, root)
+		}
 		want := []string{"mount -o remount,noauto_da_alloc /", "growpart /dev/" + c.disk + " " + c.num, "resize2fs " + c.part}
 		if strings.Join(calls, "|") != strings.Join(want, "|") {
 			t.Errorf("root %s: ran %q, want %q", c.part, calls, want)

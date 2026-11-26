@@ -38,12 +38,15 @@ printf '%s\n' kernel.apparmor_restrict_unprivileged_userns=0 kernel.apparmor_res
 sysctl -eqp /etc/sysctl.d/99-superci.conf || :
 # The image's cloud-init leaves out growpart, so its root stays the 29 GB it was built at (7 GB free) on any volume: a
 # hydrated machine ran out of space restoring the Swift toolchain. It grows to the volume in the background (about 1 s).
+# ROOT_BYTES is the root's size before it grows: the part of the volume its snapshot holds, which preread() reads.
 # ext4 writes a file out at once when it is renamed over another (auto_da_alloc): the worker-boundary tests' facts cache
 # does that 27,000 times, which took 36 s on the volume's 3,000 IOPS and 11 s without it. A one-job machine needs no file
 # to survive a crash.
 disk() {
   local root
   root=$(findmnt -no SOURCE /)
+  ROOT_BYTES=$(lsblk -bndo SIZE "$root")
+  export ROOT_BYTES
   mount -o remount,noauto_da_alloc /
   ( growpart "/dev/$(lsblk -no PKNAME "$root")" "${root##*[!0-9]}" && resize2fs "$root" ) > /dev/null 2>&1 &
 }
@@ -84,6 +87,24 @@ hydrate() {
   us() { local n=${EPOCHREALTIME/[.,]/}; echo "$n"; }
   # A mark for the job timeline (the spool of boot.sh's marks, when the listener keeps one): name=epoch=ms since the start[=value].
   mark_hydrate() { local n=$1; [ -w "$sp" ] && printf '%s=%s.%s=%s%s\n' "$2" "${n:0:10}" "${n:10}" "$(( (n - t0) / 1000 ))" "${3:+=$3}" >> "$sp"; return 0; }
+  # The volume is restored from the image's snapshot as its blocks are first read: a first read costs 5 to 16 ms where a
+  # restored block costs 0.5 ms, and libLLVM's 123 MB took 0.3 s or 3.6 to 9.2 s. Reading the snapshot's part of the root
+  # with 32 reads in flight takes 120 to 140 s (the volume's 250 MB/s) and costs nothing, and 85% of jobs start on a machine
+  # older than that. The job-started hook removes the pid file, which ends the read within half a second, so a job that
+  # starts first sees what it would have seen.
+  preread() {
+    local fio
+    [[ ${ROOT_BYTES:-} =~ ^[1-9][0-9]*$ ]] && command -v fio > /dev/null && [ -e "$HR/.pid" ] || return 0
+    mark_hydrate "$(us)" preread.start
+    fio --name=preread --filename="$(findmnt -no SOURCE /)" --size="$ROOT_BYTES" --readonly --rw=read --bs=1M --iodepth=32 --ioengine=libaio --direct=1 &> /dev/null &
+    fio=$!
+    while kill -0 "$fio" 2> /dev/null; do
+      [ -e "$HR/.pid" ] || { kill "$fio" 2> /dev/null; break; }
+      sleep 0.5
+    done
+    wait "$fio" && val=full || val=stopped
+    mark_hydrate "$(us)" preread.done "$val"
+  }
   t0=$(us); mark_hydrate "$t0" hydrate.start
   echo $$ > "$HR/.pid"
   if [ -x /usr/local/bin/pullcache ] && aws s3 cp --only-show-errors --region "$CR" "s3://$PB/bin/hydrate/@LABEL@.json" "$HM" 2> /dev/null; then
@@ -93,6 +114,7 @@ hydrate() {
     val=$(printf '%s\n' "$out" | sed -n 's|^hydrated \([0-9]*\)/\([0-9]*\) entries \([0-9]*\) MB$|\1/\2:\3MB|p' | tail -1)
     mark_hydrate "$(us)" hydrate.done "$val"
   fi
+  preread
   rm -f "$HR/.pid"
 }
 setsid bash -c "$(declare -f hydrate); hydrate" &
