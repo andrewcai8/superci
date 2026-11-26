@@ -249,8 +249,8 @@ func (sr *setRegion) poolsOf(types []string) []ec2types.FleetLaunchTemplateOverr
 const chunk = 250
 
 // Launch starts n machines. The size's leading OnDemandFirst types go first: spot across every region, then on demand,
-// whatever the on-demand share. Then the other types' spot across every region, and only then on-demand of any type, at
-// most odRoom of them. A region's spot shortfall is asked again of the others. It returns what started.
+// whatever the on-demand share. Then the other types' spot across every region, and only then their on-demand, at most
+// odRoom of them. A region's spot shortfall is asked again of the others. It returns what started.
 func (sf *SetFleet) Launch(ctx context.Context, round string, n, odRoom int) []*Machine {
 	fast, rest := sf.spec.Types[:sf.spec.OnDemandFirst], sf.spec.Types[sf.spec.OnDemandFirst:]
 	var got []*Machine
@@ -261,7 +261,7 @@ func (sf *SetFleet) Launch(ctx context.Context, round string, n, odRoom int) []*
 	if len(rest) > 0 {
 		got = append(got, sf.spot(ctx, round, "", n-len(got), rest)...)
 	}
-	got = append(got, sf.onDemand(ctx, round, "", n-len(got), odRoom, sf.spec.Types)...)
+	got = append(got, sf.onDemand(ctx, round, "", n-len(got), odRoom, rest)...)
 	if left := n - len(got); left > 0 {
 		slog.Warn("launch short", "set", sf.spec.Name, "round", round, "asked", n, "short", left)
 	}

@@ -61,7 +61,7 @@ bucket read-only.
 | org registrations per 5 min | `RegistrationWindowUse` (ours and others) and `OrgRateKnown` | peak at most 1,200 (80% of 1,500), with the rate known throughout and a datapoint for every minute of the replay window (a gap fails the row and names its first minute) |
 | one runner per machine | `issued/` objects, `jit.issued` and `jit.claim` events | claimed set equals registered set, no machine registered or claimed twice. A refused duplicate grant is the fence working and is reported |
 | orphans 10 min after | `Orphans` from `to`+10 min | 0 |
-| on-demand share | `machine.launched` lifecycle | at most 10% |
+| on-demand share | `machine.launched` lifecycle and step | at most 10%, not counting a size's `on_demand_first` types (step `fast-*`), which on_demand_share does not bound |
 | alarms at the end | `superci-pull-*` alarm history at `to` | none in ALARM |
 | QueueWait published | `QueueWait` sample count | above 0 |
 
