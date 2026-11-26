@@ -119,6 +119,7 @@ type State struct {
 	began       map[string]began     // when each running job was queued and taken by its runner, by jobKey, for its record
 	recorded    map[string]time.Time // jobs whose record was made, by jobKey: GitHub redelivers a completion until acknowledged
 	price       func(Machine) float64
+	prunedJobs  time.Time
 	odLaunched  []time.Time
 	allLaunched []time.Time
 }
@@ -527,7 +528,9 @@ func (s *State) Observe(msg *scaleset.RunnerScaleSetMessage, now time.Time) (don
 		if ok {
 			s.waits = append(s.waits, max(0, now.Sub(queued).Seconds()))
 		}
-		s.began[jobKey(j.JobMessageBase)] = began{queued: queued, started: firstTime(j.RunnerAssignTime, now)}
+		if _, done := s.recorded[jobKey(j.JobMessageBase)]; !done {
+			s.began[jobKey(j.JobMessageBase)] = began{queued: queued, started: firstTime(j.RunnerAssignTime, now), seen: now}
+		}
 		delete(s.available, jobKey(j.JobMessageBase))
 		delete(s.batch, jobKey(j.JobMessageBase))
 		s.lastStart = now
@@ -545,20 +548,14 @@ func (s *State) Observe(msg *scaleset.RunnerScaleSetMessage, now time.Time) (don
 		delete(s.available, jobKey(j.JobMessageBase))
 		delete(s.batch, jobKey(j.JobMessageBase))
 		m := s.machineOf(j.RunnerName)
-		if key := jobKey(j.JobMessageBase); key != "" {
-			if _, again := s.recorded[key]; !again {
+		key := jobKey(j.JobMessageBase)
+		if _, again := s.recorded[key]; !again || key == "" {
+			if key != "" {
 				s.recorded[key] = now
-				done = append(done, newJobRecord(s.set, j, m, s.price, s.began[key]))
 			}
-			delete(s.began, key)
-			if len(s.recorded) > 20000 {
-				for k, at := range s.recorded {
-					if now.Sub(at) > 6*time.Hour {
-						delete(s.recorded, k)
-					}
-				}
-			}
+			done = append(done, newJobRecord(s.set, j, m, s.price, s.began[key]))
 		}
+		delete(s.began, key)
 		if m != nil {
 			r := runnerOf(m, j.RunnerName, int64(j.RunnerID), now)
 			r.Busy, r.Done = true, true
@@ -568,6 +565,7 @@ func (s *State) Observe(msg *scaleset.RunnerScaleSetMessage, now time.Time) (don
 			}
 		}
 	}
+	s.pruneJobs(now)
 	if s.waitingJobs() > 0 {
 		if s.waitingSince.IsZero() {
 			s.waitingSince = now
@@ -575,7 +573,6 @@ func (s *State) Observe(msg *scaleset.RunnerScaleSetMessage, now time.Time) (don
 	} else {
 		s.waitingSince = time.Time{}
 	}
-	s.jobs = append(s.jobs, done...)
 	return done
 }
 
@@ -775,8 +772,27 @@ func (s *State) Resume(c Carried) {
 	}
 }
 
+// pruneJobs forgets, at most every ten minutes, the jobs recorded or started more than six hours ago, which GitHub no
+// longer redelivers: a started job whose completion never came, and a job's record once it can no longer repeat.
+func (s *State) pruneJobs(now time.Time) {
+	if now.Sub(s.prunedJobs) < 10*time.Minute {
+		return
+	}
+	s.prunedJobs = now
+	for k, at := range s.recorded {
+		if now.Sub(at) > 6*time.Hour {
+			delete(s.recorded, k)
+		}
+	}
+	for k, b := range s.began {
+		if now.Sub(b.seen) > 6*time.Hour {
+			delete(s.began, k)
+		}
+	}
+}
+
 // began is what a started job's message said of it, kept for its record: a completed message does not repeat it.
-type began struct{ queued, started time.Time }
+type began struct{ queued, started, seen time.Time }
 
 func firstTime(t, or time.Time) time.Time {
 	if t.IsZero() {
@@ -790,15 +806,6 @@ func (s *State) SetPricer(f func(Machine) float64) {
 	s.mu.Lock()
 	s.price = f
 	s.mu.Unlock()
-}
-
-// TakeJobs hands over the records of the jobs completed since the last call.
-func (s *State) TakeJobs() []JobRecord {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	j := s.jobs
-	s.jobs = nil
-	return j
 }
 
 // TakeWaits hands over the queue waits recorded since the last call.

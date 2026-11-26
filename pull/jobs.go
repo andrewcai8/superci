@@ -31,6 +31,10 @@ type JobRecord struct {
 	BusyUSD     float64  // the share of it spent while the job ran
 }
 
+// Partial says the record lacks the job's start: its completion came after a listener restart, with no start time in the
+// message and no started message kept. Its queue wait, wall time and busy share are unknown, not zero.
+func (r JobRecord) Partial() bool { return r.Started.IsZero() }
+
 // Conclusion is the job's outcome in GitHub's REST words, so the gate reads superci's and Blacksmith's alike: success,
 // failure or cancelled. A message does not say timed_out, which GitHub's REST does; such a job is a failure here.
 func (r JobRecord) Conclusion() string {
@@ -51,7 +55,12 @@ func (r JobRecord) QueueMS() int64 { return spanMS(r.Queued, r.Started) }
 func (r JobRecord) WallMS() int64 { return spanMS(r.Started, r.Finished) }
 
 // IdleUSD is the machine's cost outside the job: its boot, its time idle in the pool and its shutdown.
-func (r JobRecord) IdleUSD() float64 { return max(0, r.USD-r.BusyUSD) }
+func (r JobRecord) IdleUSD() float64 {
+	if r.Partial() {
+		return 0
+	}
+	return max(0, r.USD-r.BusyUSD)
+}
 
 func spanMS(from, to time.Time) int64 {
 	if from.IsZero() || to.IsZero() {
@@ -84,10 +93,16 @@ func tlJobRecord(r JobRecord, now time.Time) {
 	kv := []any{"set", r.Set, "run", r.Run, "job", r.Job, "name", r.Name, "repo", r.Repo, "workflow_ref", r.WorkflowRef, "event_name", r.Event,
 		"labels", r.Labels, "runner", r.Runner, "inst", r.Inst, "result", r.Result, "conclusion", r.Conclusion(),
 		"queue_time", tlTime(r.Queued), "start_time", tlTime(r.Started), "finish_time", tlTime(r.Finished),
-		"queue_ms", r.QueueMS(), "wall_ms", r.WallMS()}
+		"partial", r.Partial()}
+	if !r.Partial() {
+		kv = append(kv, "queue_ms", r.QueueMS(), "wall_ms", r.WallMS())
+	}
 	if m := r.Machine; m != nil {
 		kv = append(kv, "region", m.Region, "az", m.AZ, "type", m.Type, "lifecycle", m.Lifecycle, "launched", tlTime(m.Launched),
-			"warm", !m.Launched.IsZero() && m.Launched.Before(r.Queued), "usd", r.USD, "busy_usd", r.BusyUSD)
+			"warm", !m.Launched.IsZero() && m.Launched.Before(r.Queued), "usd", r.USD)
+		if !r.Partial() {
+			kv = append(kv, "busy_usd", r.BusyUSD)
+		}
 	}
 	at := r.Finished
 	if at.IsZero() {

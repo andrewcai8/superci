@@ -68,7 +68,7 @@ func TestAFinishedJobsRecordHoldsWhatTheGateAndTheCostReportRead(t *testing.T) {
 }
 
 // GitHub redelivers a completion until the listener acknowledges it; the job has one record, so the metrics and the
-// cost report count it once.
+// cost report count it once. A started message redelivered after the completion keeps nothing.
 func TestARedeliveredCompletionMakesNoSecondRecord(t *testing.T) {
 	s, recs := jobRan(t, t0.Add(-time.Minute), t0, t0, t0.Add(time.Minute), "Succeeded")
 	if len(recs) != 1 || recs[0].Conclusion() != "success" {
@@ -78,11 +78,10 @@ func TestARedeliveredCompletionMakesNoSecondRecord(t *testing.T) {
 	if got := s.Observe(again, t0.Add(2*time.Minute)); len(got) != 0 {
 		t.Errorf("a redelivery made %d records", len(got))
 	}
-	if n := len(s.TakeJobs()); n != 1 {
-		t.Errorf("the metrics take %d records, want 1", n)
-	}
-	if n := len(s.TakeJobs()); n != 0 {
-		t.Errorf("taken twice: %d", n)
+	late := &scaleset.RunnerScaleSetMessage{JobStartedMessages: []*scaleset.JobStarted{{RunnerName: "set-i-0000", JobMessageBase: jobBase("guid-1", t0)}}}
+	s.Observe(late, t0.Add(3*time.Minute))
+	if n := len(s.began); n != 0 {
+		t.Errorf("a started message redelivered after the completion left %d entries kept", n)
 	}
 }
 
@@ -106,5 +105,52 @@ func TestResultsMapToGitHubsConclusions(t *testing.T) {
 		if got := (JobRecord{Result: result}).Conclusion(); got != want {
 			t.Errorf("%q: %s, want %s", result, got, want)
 		}
+	}
+}
+
+// A completion that arrives after a listener restart, with no times in the message, has no start to take from a started
+// message the new process never saw. Its queue wait, wall time and busy share are unknown: the record says so and leaves
+// them out, so the gate does not read a 0 ms wall time and the cost report does not book the whole job as idle.
+func TestACompletionAfterARestartIsPartialNotZero(t *testing.T) {
+	s := newState(0, 10)
+	s.SetPricer(func(Machine) float64 { return 0.40 })
+	m := machines(1, t0.Add(-time.Minute))[0]
+	m.Set = "set"
+	s.Seen("us-east-1", []*Machine{m}, t0.Add(-time.Hour), t0.Add(-time.Hour))
+	rec := s.Observe(&scaleset.RunnerScaleSetMessage{JobCompletedMessages: []*scaleset.JobCompleted{{Result: "Succeeded", RunnerName: "set-i-0000",
+		JobMessageBase: scaleset.JobMessageBase{JobID: "g", FinishTime: t0.Add(time.Minute)}}}}, t0.Add(time.Minute))
+	if len(rec) != 1 || !rec[0].Partial() || rec[0].IdleUSD() != 0 {
+		t.Fatalf("%+v", rec)
+	}
+	lines := capture(t, func() { tlJobRecord(rec[0], t0) })
+	for _, k := range []string{"queue_ms", "wall_ms", "busy_usd"} {
+		if _, has := lines[0][k]; has {
+			t.Errorf("a partial record holds %s: %v", k, lines[0])
+		}
+	}
+	if lines[0]["partial"] != true || lines[0]["usd"] == nil || lines[0]["conclusion"] != "success" {
+		t.Errorf("event: %v", lines[0])
+	}
+}
+
+// What the listener forgot after six hours is pruned, at most every ten minutes, not on every message.
+func TestJobBookkeepingIsPrunedAfterSixHoursAndNotOnEveryMessage(t *testing.T) {
+	s := newState(0, 10)
+	s.recorded["old"], s.began["old"] = t0, began{seen: t0}
+	s.recorded["new"], s.began["new"] = t0.Add(7*time.Hour), began{seen: t0.Add(7 * time.Hour)}
+	s.Observe(stats(0, 0), t0.Add(7*time.Hour))
+	if _, ok := s.recorded["old"]; ok {
+		t.Errorf("a record of seven hours ago is kept")
+	}
+	if _, ok := s.began["old"]; ok {
+		t.Errorf("a started job of seven hours ago is kept")
+	}
+	if len(s.recorded) != 1 || len(s.began) != 1 {
+		t.Errorf("recorded %d began %d, want the new job's alone", len(s.recorded), len(s.began))
+	}
+	s.recorded["old2"] = t0
+	s.Observe(stats(0, 0), t0.Add(7*time.Hour+time.Minute))
+	if _, ok := s.recorded["old2"]; !ok {
+		t.Errorf("pruned again within ten minutes")
 	}
 }
