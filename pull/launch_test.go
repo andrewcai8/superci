@@ -101,9 +101,15 @@ func TestSuperci4cpuAsksM8aznOnDemandBeforeASlowerSpotType(t *testing.T) {
 
 func TestSuperci4cpuTakesM8aznSpotWhenItHasCapacity(t *testing.T) {
 	plenty := map[string]int{"m8azn.xlarge/spot": 100, "m8azn.xlarge/on-demand": 100, "m8a.xlarge/spot": 100}
-	got := shapes(launchSet(t, "superci-4cpu", plenty, maps(plenty)).Launch(context.Background(), "r1", 6, 6))
+	launched := launchSet(t, "superci-4cpu", plenty, maps(plenty)).Launch(context.Background(), "r1", 6, 6)
+	got := shapes(launched)
 	if want := map[string]int{"m8azn.xlarge/spot": 6}; !sameShapes(got, want) {
 		t.Fatalf("got %v, want %v", got, want)
+	}
+	for _, m := range launched {
+		if m.Template != "1" {
+			t.Fatalf("%s booted from template version %q, want its region's current 1: Recycle would replace it at once", m.ID, m.Template)
+		}
 	}
 }
 

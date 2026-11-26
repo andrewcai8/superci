@@ -23,6 +23,7 @@ type Machine struct {
 	AZ        string
 	Lifecycle string // "spot" or "on-demand"
 	Round     string // the launch round that started it (its superci-pull-round tag)
+	Template  string // the version of its region's launch template it booted from (EC2's aws:ec2launchtemplate:version tag)
 	Launched  time.Time
 	Ordered   time.Time // when this process asked EC2 for it; zero for a machine adopted after a start
 	Seen      time.Time // last listed by DescribeInstances
@@ -787,6 +788,9 @@ func (s *State) Seen(region string, listed []*Machine, began, now time.Time) (lo
 			continue
 		}
 		m.IP, m.Type, m.AZ, m.Lifecycle, m.Seen = l.IP, l.Type, l.AZ, l.Lifecycle, now
+		if l.Template != "" {
+			m.Template = l.Template
+		}
 		m.Issued, m.Tagged, m.Notice = m.Issued || l.Issued, m.Tagged || l.Tagged, m.Notice || l.Notice
 		if m.Launched.IsZero() {
 			m.Launched = l.Launched
@@ -984,6 +988,36 @@ func (s *State) Overdue(now time.Time, jobMax, idleMax, lifeMax time.Duration) (
 		}
 	}
 	return ended
+}
+
+// Recycle replaces, at most limit a pass, the idle machines that booted from an older version of their region's launch
+// template than current names: a release changed what a machine runs at boot, and a job should not be judged on the old.
+// An idle runner retires (removed first, fenced by GitHub, then the machine ends), a machine with no runner yet ends, and
+// a busy one finishes its job. Retired machines are no supply, so the pool launches their replacements at once.
+func (s *State) Recycle(current map[string]string, limit int) (out []*Machine) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.ready() {
+		return nil
+	}
+	for _, m := range s.machines {
+		if len(out) >= limit {
+			break
+		}
+		if v := current[m.Region]; m.Template == "" || v == "" || m.Template == v || !supply(m) || m.Issuing {
+			continue
+		}
+		switch r := m.Runner; {
+		case r != nil && !r.Busy && !r.Removing && r.ID != 0:
+			m.Retire = true
+		case r == nil && !m.Issued:
+			m.Ending = true
+		default:
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
 }
 
 // Surplus retires idle runners once the supply has exceeded what the queue asks for for a while (the queue's

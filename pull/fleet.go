@@ -234,6 +234,15 @@ func rankedPools(offers []ec2types.InstanceTypeOffering, subnets map[string]stri
 	return pools
 }
 
+// Versions is the launch template version each region's new machines boot from.
+func (sf *SetFleet) Versions() map[string]string {
+	out := make(map[string]string, len(sf.regions))
+	for name, sr := range sf.regions {
+		out[name] = sr.version
+	}
+	return out
+}
+
 // poolsOf is the region's pools of the given types.
 func (sr *setRegion) poolsOf(types []string) []ec2types.FleetLaunchTemplateOverridesRequest {
 	var out []ec2types.FleetLaunchTemplateOverridesRequest
@@ -409,7 +418,7 @@ func (sf *SetFleet) createFleet(ctx context.Context, r *Region, n int, kind ec2t
 		}
 		for _, id := range i.InstanceIds {
 			ms = append(ms, &Machine{ID: id, Set: sf.spec.Name, Region: r.Name, Type: string(i.InstanceType), AZ: az, Lifecycle: lifecycle,
-				Launched: now, Asked: now, Round: round})
+				Launched: now, Asked: now, Round: round, Template: sr.version})
 		}
 	}
 	errs := map[string]int{}
@@ -471,6 +480,8 @@ func (f *Fleet) Describe(ctx context.Context, r *Region) ([]*Machine, error) {
 						m.Issued, m.Tagged = true, true
 					case tagNoticed:
 						m.Notice = true
+					case "aws:ec2launchtemplate:version":
+						m.Template = aws.ToString(t.Value)
 					}
 				}
 				out = append(out, m)

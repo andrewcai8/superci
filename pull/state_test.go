@@ -478,3 +478,44 @@ func TestTheLaunchTimeEndsAtTheMachinesFirstAsk(t *testing.T) {
 		t.Fatalf("machines that asked 20 s after their launch and waited for the budget until 2 min: launch time %v s, want 20", got)
 	}
 }
+
+func TestAReleaseThatChangesTheBootReplacesTheIdleMachinesOfTheOldOneAFewAtATime(t *testing.T) {
+	s := newState(0, 1200)
+	s.Observe(stats(1, 0), t0)
+	ms := machines(6, t0)
+	for i, m := range ms {
+		m.Template = "35"
+		if i == 5 {
+			m.Template = "36"
+		}
+	}
+	launch(s, ms, t0)
+	for i := range 4 {
+		give(s, fmt.Sprintf("i-%04d", i), &Runner{ID: int64(i + 1), Name: fmt.Sprintf("set-i-%04d", i), Issued: t0})
+	}
+	s.Machine("i-0003").Runner.Busy = true // its job finishes on the old boot
+	// i-0004 has no runner yet; i-0005 booted from the current version.
+	current := map[string]string{"us-east-1": "36"}
+	first := s.Recycle(current, 2)
+	second := s.Recycle(current, 2)
+	if len(first) != 2 || len(second) != 2 {
+		t.Fatalf("recycled %v then %v: want 2 a pass of the 4 idle or unregistered machines of version 35", ids(first), ids(second))
+	}
+	for _, id := range []string{"i-0000", "i-0001", "i-0002"} {
+		if m := s.Machine(id); !m.Retire {
+			t.Errorf("%s: an idle runner of the old boot retires (removed first)", id)
+		}
+	}
+	if m := s.Machine("i-0004"); !m.Ending {
+		t.Error("a machine of the old boot with no runner yet ends")
+	}
+	if m := s.Machine("i-0003"); m.Retire || m.Ending {
+		t.Error("a busy machine of the old boot is left to finish its job")
+	}
+	if m := s.Machine("i-0005"); m.Retire || m.Ending {
+		t.Error("a machine of the current boot stays")
+	}
+	if again := s.Recycle(current, 2); len(again) != 0 {
+		t.Fatalf("recycled again %v", ids(again))
+	}
+}
