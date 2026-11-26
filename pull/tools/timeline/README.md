@@ -51,6 +51,7 @@ ec2, machine, network, runner).
 
 | Event | Written by |
 | --- | --- |
+| `job.record` | `scaler.Scale` (`main.go`), through `tlJobRecord` (`jobs.go`): one line per finished job, the gate's and the cost report's source |
 | `job.assigned` (first sight; GitHub sends JobAssigned, never JobAvailable), `job.acquired`, `job.started`, `job.completed` | `scaler.Scale` (`main.go`), through `tlMessage` |
 | `machine.launched`, `machine.ended` | `SetFleet.ask`, `Fleet.Terminate` (`fleet.go`) |
 | `jit.ask`, `jit.granted` (token wait), `jit.claim` (the fence's claim: taken, refused, error), `jit.issued`, `jit.refused`, `machine.notice` | `Server.jit`, `Server.notice` (`server.go`) |

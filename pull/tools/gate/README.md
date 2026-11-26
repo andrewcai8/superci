@@ -15,6 +15,32 @@ gate replay-trace --hour T [--hours 1] [--bucket 60] [--out trace.json]         
 `--cache DIR` (before the subcommand) keeps GitHub's answers; a finished job never changes, so a rerun costs no calls.
 Exit 0 only when every criterion passes. 1 is FAIL, or INCONCLUSIVE when every miss is a pass inside the noise.
 
+## Where superci's jobs come from: `--superci-source auto|events|github`
+
+By default (`auto`) `gate job` and `gate scale` read superci's jobs from the listener's `job.record` events (one per finished job: queue
+wait, wall time, conclusion, workflow and branch, machine; [timeline](../timeline/README.md#events-and-where-they-are-written)),
+through CloudWatch Logs Insights, so superci's side costs no GitHub call, whenever the window starts a minute or more after the listener's first
+record; before that `auto` reads GitHub's REST API, so a window from before the records is never read as empty. A record is turned into the REST-shaped job the rest of the
+tool reads, so every row below is decided by one code path. What differs from reading GitHub:
+
+- `gate job` still reads Blacksmith's side from GitHub: one listing of the baseline window and the jobs of a spread sample of at most
+  100 runs (`--max-runs`; 300 with `--superci-source github`), cached by `--cache`, so a canary's repeat checks of the same baseline cost
+  nothing. A superci failure is excused by a Blacksmith failure of the same commit, and a record holds no commit: when Blacksmith has
+  a failure in the sample, the head of each failed superci run is read (one call per failed run, cached).
+- `gate scale` reads no GitHub call at all.
+- The branch is the record's `workflow_ref`: `refs/heads/<branch>` for a push (the load branches, main, the merge queue). A pull request's
+  ref is `refs/pull/<n>/merge`, which matches only a glob that fits it.
+- The message has no attempt number, so every record counts as a first attempt: a rerun's queue wait is the one GitHub sent for it. It has no
+  `timed_out` either: a failure that ran to within 5 s of the job's ceiling is read as one and counts at the ceiling, as GitHub's would. Without
+  a ceiling row it is a failure with the wall time it ran.
+- A job cancelled before any runner took it has a partial record (no start) with no runner: it is kept as a queue-wait lower bound, as on GitHub's
+  path. Any other partial record (a completion after a listener restart, start unknown) is left out.
+- A job in a reusable workflow carries the called workflow's file in `workflow_ref`, so `--workflow` must name that file, not the caller's, and the
+  job's name is the message's, which may lack the `caller / ` prefix REST names carry. Neither is checked against live messages yet.
+- Unexplained time is accounted to the moment the job's runner took it (a record has no steps); the row is about the plane's time.
+- A window from before the first record (the listener writes them from the release that carried them) has none: `auto` reads GitHub there.
+  Force one with `--superci-source events` or `github`.
+
 ## gate 1: `gate job`
 
 A job is superci's by its own runner group (`superci-pull`), created from `--since` (default the last 24 h). `--branch-glob` is

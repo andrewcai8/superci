@@ -484,7 +484,7 @@ class GateJobEndToEnd(unittest.TestCase):
                 limits = os.path.join(d, "limits.tsv")
                 with open(limits, "w") as fh:
                     fh.write("lint-test-backend.yml\tverify-tools\t200\tx\n")
-                a = G.build_parser().parse_args(["--cache", d, "job", "verify-tools", "--branch-glob", "ci/*", "--limits", limits, "--since", T.iso(now - 7200)])
+                a = G.build_parser().parse_args(["--cache", d, "job", "verify-tools", "--branch-glob", "ci/*", "--limits", limits, "--since", T.iso(now - 7200), "--superci-source", "github"])
                 buf = io.StringIO()
                 with contextlib.redirect_stdout(buf):
                     code = a.fn(a)
@@ -698,6 +698,228 @@ class RegistrationCoverage(unittest.TestCase):
         early_stop = judge_scale(lo=960.0, hi=1140.0, window_use=[(960.0, 100.0), (1020.0, 100.0)])["org registrations per 5 min"]
         self.assertEqual(early_stop.status, G.FAIL)
         self.assertEqual(judge_scale(lo=960.0, hi=1140.0, window_use=[(960.0, 100.0), (1020.0, 100.0), (1080.0, 100.0)])["org registrations per 5 min"].status, G.PASS)
+
+
+def record(job, queue_s, wall_s, conclusion="success", queued_at=1_000_000.0, name="verify-tools", branch="ci/load-1", run=7, workflow="lint-test-backend.yml"):
+    """The listener's job.record event of a job: queued at queued_at, taken queue_s later, run for wall_s. wall_s None is a job no runner took."""
+    started = queued_at + queue_s
+    finish = started + (wall_s or 0) if wall_s is not None else queued_at + queue_s
+    e = {"msg": "tl", "v": 1, "ev": "job.record", "eid": f"b.{job}", "t": finish, "set": "superci-4cpu", "run": run, "job": job, "name": name,
+         "workflow_ref": f"o/r/.github/workflows/{workflow}@refs/heads/{branch}", "labels": ["superci-4cpu"], "conclusion": conclusion,
+         "queue_time": T.iso(queued_at), "finish_time": T.iso(finish)}
+    if wall_s is not None:
+        e.update(start_time=T.iso(started), runner="superci-4cpu-i-0abc", queue_ms=int(queue_s * 1000), wall_ms=int(wall_s * 1000), partial=False)
+    else:  # the listener's record of a job no runner took: it has no start, so it is partial and has no queue or wall time of its own
+        e.update(partial=True)
+    return e
+
+
+class JobRecords(unittest.TestCase):
+    def obs_of(self, e):
+        return G.is_obs(G.synth_job(e), {"head_branch": G.record_branch(e), "head_sha": ""})
+
+    def test_a_record_gives_the_queue_wait_wall_time_and_outcome_the_rest_job_would(self):
+        o = self.obs_of(record("g1", 3, 81))
+        self.assertEqual((o.queue, o.wall, o.ok, o.cancelled, o.fleet, o.branch, o.run_id), (3.0, 81.0, True, False, "superci", "ci/load-1", 7))
+        f = self.obs_of(record("g2", 1, 30, "failure"))
+        self.assertEqual((f.ok, f.timed_out, f.wall), (False, False, 30.0))
+
+    def test_a_job_cancelled_in_the_queue_is_a_queue_lower_bound_and_one_cancelled_running_a_wall_lower_bound(self):
+        q = self.obs_of(record("g3", 120, None, "cancelled"))
+        self.assertEqual((q.cancelled, q.queue, q.wall, q.fleet), (True, 120.0, None, "superci"))
+        r = self.obs_of(record("g4", 2, 300, "cancelled"))
+        self.assertEqual((r.cancelled, r.queue, r.wall), (True, 2.0, 300.0))
+
+    def test_the_workflow_and_branch_come_from_the_workflow_ref(self):
+        e = record("g5", 1, 1, branch="gh-readonly-queue/main/pr-1-abc", workflow="superci-load.yml")
+        self.assertEqual((G.record_workflow(e), G.record_branch(e)), ("superci-load.yml", "gh-readonly-queue/main/pr-1-abc"))
+        self.assertEqual((G.record_workflow({}), G.record_branch({})), ("", ""))
+
+    def test_a_redelivered_completion_is_one_job(self):
+        a, b = record("g6", 1, 10), dict(record("g6", 1, 10), eid="b.again")
+        saved = G.T.listener_events
+        G.T.listener_events = lambda profile, lo, hi, where=None: [a, b, record("g7", 1, 10)]
+        try:
+            self.assertEqual([e["job"] for e in G.job_records("p", 0, 1)], ["g6", "g7"])
+        finally:
+            G.T.listener_events = saved
+
+    def test_a_partial_record_has_no_times_and_is_not_counted(self):
+        partial = {k: v for k, v in record("g9", 1, 10).items() if k not in ("queue_ms", "wall_ms", "start_time", "queue_time")}
+        saved = G.T.listener_events
+        G.T.listener_events = lambda profile, lo, hi, where=None: [dict(partial, partial=True), record("g10", 1, 10)]
+        try:
+            self.assertEqual([e["job"] for e in G.job_records("p", 0, 1)], ["g10"])
+        finally:
+            G.T.listener_events = saved
+
+    def test_a_timeline_of_a_record_ends_where_its_runner_took_the_job(self):
+        j = G.synth_job(record("g8", 3, 81))
+        self.assertEqual(G.timeline_job(j)["completed_at"], j["started_at"])
+
+
+class GateJobFromRecords(unittest.TestCase):
+    """cmd_job reading superci's side from job.record events: GitHub is asked only about Blacksmith's runs."""
+
+    def run_gate(self, records, blacksmith_runs, extra=()):
+        now = __import__("time").time()
+        FakeGitHub.runs_jobs, runs = {}, []
+        for i, jobs in enumerate(blacksmith_runs):
+            rid = 5000 + i
+            for j in jobs:
+                j["run_id"] = rid
+                for k in ("created_at", "started_at", "completed_at"):
+                    if j[k]:
+                        j[k] = T.iso(T.ts(j[k]) - 1_000_000.0 + now - (1800 if j["runner_group_name"] == "superci-pull" else 10 * 3600))
+            FakeGitHub.runs_jobs[rid] = jobs
+            runs.append({"id": rid, "created_at": jobs[0]["created_at"], "head_branch": "main"})
+        shift = now - 1800 - 1_000_000.0
+        records = [dict(r, t=now, **{k: T.iso(T.ts(r[k]) + shift) for k in ("queue_time", "start_time", "finish_time") if r.get(k)}) for r in records]
+        listed, calls = [], []
+        saved = (G.T.GitHub, G.runs_of, G.T.gather, G.T.build, G.T.listener_events)
+        G.T.GitHub, G.runs_of = FakeGitHub, lambda gh, wf, lo, hi: (listed.append((lo, hi)), runs)[1]
+        G.T.gather = lambda *a, **k: {}
+        G.T.build = lambda j, ev: type("TL", (), {"wall": 1.0, "unexplained": 0.5})()
+        G.T.listener_events = lambda profile, lo, hi, where=None: records
+        orig = FakeGitHub.run_jobs
+        FakeGitHub.run_jobs = lambda self, run_id, attempts="latest": (calls.append(run_id), orig(self, run_id, attempts))[1]
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                limits = os.path.join(d, "limits.tsv")
+                with open(limits, "w") as fh:
+                    fh.write("lint-test-backend.yml\tverify-tools\t200\tx\n")
+                a = G.build_parser().parse_args(["--cache", d, "job", "verify-tools", "--branch-glob", "ci/*", "--limits", limits, "--since", T.iso(now - 7200), "--superci-source", "events", *extra])
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    code = a.fn(a)
+                return code, buf.getvalue(), calls, listed
+        finally:
+            G.T.GitHub, G.runs_of, G.T.gather, G.T.build, G.T.listener_events = saved
+            FakeGitHub.run_jobs = orig
+
+    def blacksmith(self, n):
+        return [[gh_job(5000 + i, 0, 1, "success", 1_000_000.0, 1_000_003.0, 1_000_103.0, fleet="blacksmith")] for i in range(n)]
+
+    def test_superci_runs_are_read_from_records_and_only_blacksmiths_runs_from_github(self):
+        recs = [record(f"g{i}", 1, 81, run=100 + i) for i in range(5)]
+        code, out, calls, listed = self.run_gate(recs, self.blacksmith(8))
+        self.assertEqual(code, 0, out)
+        self.assertRegex(out, r"n \(superci runs\)\s+5")
+        self.assertEqual(sorted(calls), [5000 + i for i in range(8)], "jobs were read for Blacksmith's runs alone")
+        self.assertIn("5 jobs from the listener's job records (no GitHub call)", out)
+        self.assertEqual(len(listed), 1, "one listing, of the baseline window")
+
+    def test_a_record_of_another_workflow_branch_or_job_is_not_the_jobs(self):
+        recs = [record(f"g{i}", 1, 81, run=100 + i) for i in range(5)] + [record("x1", 1, 999, workflow="other.yml"), record("x2", 1, 999, branch="main"), record("x3", 1, 999, name="other-job")]
+        code, out, _, _ = self.run_gate(recs, self.blacksmith(8))
+        self.assertEqual(code, 0, out)
+        self.assertRegex(out, r"n \(superci runs\)\s+5")
+
+    def test_a_slow_record_and_a_failure_fail_the_rows_as_a_rest_job_would(self):
+        recs = [record(f"g{i}", 1, 81, run=100 + i) for i in range(5)] + [record(f"s{i}", 1, 400, run=200 + i) for i in range(3)] + [record("f", 1, 20, "failure", run=300), record("f2", 1, 20, "failure", run=301)]
+        code, out, _, _ = self.run_gate(recs, self.blacksmith(8))
+        self.assertEqual(code, 1, out)
+        self.assertRegex(out, r"FAIL\s+wall p90")
+        self.assertRegex(out, r"FAIL\s+failures \(superci\)\s+2 of 10")
+
+    def test_a_job_cancelled_in_the_queue_fails_queue_wait_from_its_record(self):
+        recs = [record(f"g{i}", 1, 81, run=100 + i) for i in range(5)] + [record(f"c{i}", 120, None, "cancelled", run=400 + i) for i in range(3)]
+        code, out, _, _ = self.run_gate(recs, self.blacksmith(8))
+        self.assertEqual(code, 1, out)
+        self.assertRegex(out, r"FAIL\s+queue wait p90")
+
+    def test_a_job_cancelled_before_a_runner_took_it_is_kept_as_a_queue_lower_bound(self):
+        c = record("c1", 120, None, "cancelled")
+        self.assertTrue(c["partial"] and "runner" not in c, "the listener's record of such a job is partial and has no runner")
+        saved = G.T.listener_events
+        G.T.listener_events = lambda profile, lo, hi, where=None: [c, dict(record("c2", 5, 10, "cancelled"), partial=True, eid="b.c2"), record("g", 1, 10)]
+        try:
+            self.assertEqual([e["job"] for e in G.job_records("p", 0, 1)], ["c1", "g"], "a partial cancel that had a runner is a restart's, and is dropped")
+        finally:
+            G.T.listener_events = saved
+
+    def test_superci_jobs_inside_a_sampled_baseline_run_are_not_counted_twice(self):
+        both = [[gh_job(7000 + i, 0, 1, "success", 1_000_000.0, 1_000_001.0, 1_000_081.0) for _ in range(1)] for i in range(2)]  # superci jobs the REST listing also shows
+        recs = [record(f"g{i}", 1, 81, run=100 + i) for i in range(5)]
+        code, out, _, _ = self.run_gate(recs, self.blacksmith(8) + both)
+        self.assertRegex(out, r"superci\s+wall\s+n=5 ", out)
+        self.assertRegex(out, r"superci\s+queue\s+n=5 ", out)
+
+    def test_a_failure_that_ran_to_the_ceiling_is_a_timeout_and_pushes_wall_p90_over_it(self):
+        recs = [record(f"g{i}", 1, 81, run=100 + i) for i in range(16)] + [record(f"t{i}", 1, 200, "failure", run=300 + i) for i in range(4)]  # ceiling 200
+        code, out, _, _ = self.run_gate(recs, self.blacksmith(8))
+        self.assertRegex(out, r"FAIL\s+wall p90", out)
+
+    def test_a_non_default_runner_group_still_finds_the_records(self):
+        recs = [record(f"g{i}", 1, 81, run=100 + i) for i in range(5)]
+        code, out, _, _ = self.run_gate(recs, self.blacksmith(8), extra=("--superci-group", "other-group"))
+        self.assertRegex(out, r"n \(superci runs\)\s+5")
+
+    def test_the_github_source_is_still_there_for_a_window_before_the_records(self):
+        a = G.build_parser().parse_args(["job", "verify-tools", "--branch-glob", "main"])
+        self.assertEqual(a.superci_source, "auto")
+        self.assertEqual(G.build_parser().parse_args(["job", "verify-tools", "--branch-glob", "main", "--superci-source", "github"]).superci_source, "github")
+
+
+class AutoSource(unittest.TestCase):
+    """auto reads the records only for a window that starts after the first one: a window from before them is never read as empty."""
+    def resolve(self, flag, since, first):
+        saved = G.T.insights
+        G.T.insights = lambda *a, **k: [{"first": str(int(first * 1000))}] if first else []
+        try:
+            a = G.build_parser().parse_args(["job", "verify-tools", "--branch-glob", "main"] + (["--superci-source", flag] if flag else []))
+            return G.resolve_source(a, since, 2_000_000.0)
+        finally:
+            G.T.insights = saved
+
+    def test_a_window_after_the_first_record_reads_records(self):
+        self.assertEqual(self.resolve(None, 1_500_000.0, 1_000_000.0), "events")
+
+    def test_a_window_before_the_first_record_reads_github(self):
+        self.assertEqual(self.resolve(None, 900_000.0, 1_000_000.0), "github")
+        self.assertEqual(self.resolve(None, 1_000_030.0, 1_000_000.0), "github", "a minute of margin: a record written at the edge is not the whole window")
+
+    def test_no_record_at_all_reads_github(self):
+        self.assertEqual(self.resolve(None, 1_500_000.0, None), "github")
+
+    def test_an_explicit_source_is_not_asked_about(self):
+        saved = G.T.insights
+        G.T.insights = lambda *a, **k: self.fail("auto's query ran for an explicit source")
+        try:
+            a = G.build_parser().parse_args(["job", "verify-tools", "--branch-glob", "main", "--superci-source", "events"])
+            self.assertEqual(G.resolve_source(a, 0.0, 1.0), "events")
+        finally:
+            G.T.insights = saved
+
+
+class GateScaleFromRecords(unittest.TestCase):
+    def test_a_replay_is_judged_from_records_with_no_github_call(self):
+        lo = 1_000_000.0
+        recs = [record(f"g{i}", 1 + i % 3, 30, run=i, workflow="superci-load.yml", branch="ci/superci-load-pull-x", queued_at=lo + 5) for i in range(9)]
+        recs.append(record("bad", 2, 30, "failure", workflow="superci-load.yml", branch="ci/superci-load-pull-x", queued_at=lo + 5))
+        recs.append(record("other", 2, 30, workflow="lint-test-backend.yml", branch="ci/superci-load-pull-x", queued_at=lo + 5))
+        saved = (G.T.GitHub, G.T.listener_events, G.T.insights, G.metric, G.claim_objects, G.alarm_states, G.runs_of)
+        boom = lambda *a, **k: self.fail("GitHub was read")
+        G.runs_of = boom
+        windows = []
+        G.T.listener_events = lambda profile, lo_, hi_, where=None: (windows.append((lo_, hi_)), recs if where else [])[1]
+        G.T.insights = lambda *a, **k: []
+        G.metric = lambda *a, **k: []
+        G.claim_objects = lambda *a, **k: set()
+        G.alarm_states = lambda *a, **k: {}
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                trace = os.path.join(d, "t.json")
+                with open(trace, "w") as fh:
+                    json.dump({"jobs": [{}] * 10}, fh)
+                a = G.build_parser().parse_args(["--cache", d, "scale", "--from", T.iso(lo), "--to", T.iso(lo + 60), "--trace", trace, "--superci-source", "events"])
+                s, gh = G.collect_scale(a)
+        finally:
+            G.T.GitHub, G.T.listener_events, G.T.insights, G.metric, G.claim_objects, G.alarm_states, G.runs_of = saved
+        self.assertEqual((s.completed, gh.calls, len(s.waits)), (9, 0, 10))
+        self.assertGreaterEqual(windows[0][1], lo + 60 + 7200, "records are written when jobs finish: the read runs past the replay's end")
+        self.assertEqual(s.stranded, [("verify-tools", "failure")])
+        self.assertEqual(sorted(s.waits)[:3], [1.0, 1.0, 1.0])
 
 
 if __name__ == "__main__":
