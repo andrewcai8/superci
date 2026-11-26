@@ -281,12 +281,9 @@ func run(ctx context.Context, f flags) error {
 	go every(ctx, 30*time.Second, l.watchConfig)
 	if !f.noMetrics {
 		cw := cloudwatch.NewFromConfig(awsCfg)
-		var made, refused, failed int
+		var last minute
 		go every(ctx, time.Minute, func() {
-			m := l.metrics()
-			m.Regs, m.Refused, m.Failed = m.Budget.Made-made, m.Budget.Refused-refused, m.Budget.Failed-failed
-			made, refused, failed = m.Budget.Made, m.Budget.Refused, m.Budget.Failed
-			publish(ctx, cw, m, time.Now())
+			publish(ctx, cw, last.of(l.metrics()), time.Now())
 		})
 	}
 	if l.cfg.Rerun {
@@ -316,6 +313,21 @@ func run(ctx context.Context, f flags) error {
 
 // healthyWithin is how long the reconciler may go without finishing a pass before the listener reads as dead.
 const healthyWithin = 2 * time.Minute
+
+// minute turns the budget's totals since the start into what happened in one minute: each call fills m's Regs, Refused,
+// Failed and Denied with the difference from the call before.
+type minute struct {
+	made, refused, failed int
+	denied                map[string]int
+}
+
+func (p *minute) of(m Metrics) Metrics {
+	b := m.Budget
+	m.Regs, m.Refused, m.Failed = b.Made-p.made, b.Refused-p.refused, b.Failed-p.failed
+	m.Denied = deniedSince(p.denied, b.Denied)
+	p.made, p.refused, p.failed, p.denied = b.Made, b.Refused, b.Failed, b.Denied
+	return m
+}
 
 // deniedSince is what the budget denied between two snapshots, by reason.
 func deniedSince(before, now map[string]int) map[string]int {

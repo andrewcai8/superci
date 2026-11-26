@@ -166,6 +166,36 @@ func TestThePublishedMetricsCarryTheDenialsAndTheWaitsInProgress(t *testing.T) {
 	}
 }
 
+func TestAStarvedBudgetPublishesItsDenialsMinuteByMinute(t *testing.T) {
+	now := t0.Add(6 * time.Minute)
+	b := starved(t0)
+	var last minute
+	published := func() float64 {
+		var total float64
+		for _, d := range metricData(last.of(Metrics{Budget: b.Snapshot(now)}), now) {
+			if *d.MetricName == "BudgetDenied" {
+				total += *d.Value
+			}
+		}
+		return total
+	}
+	for i := 0; i < 20; i++ {
+		b.Take(now, ForJob)
+	}
+	if got := published(); got != 20 {
+		t.Errorf("a starved budget turned away 20 asks and published BudgetDenied %v", got)
+	}
+	if got := published(); got != 0 {
+		t.Errorf("a quiet minute publishes the denials of that minute, not the total: %v", got)
+	}
+	for i := 0; i < 3; i++ {
+		b.Take(now, ForJob)
+	}
+	if got := published(); got != 3 {
+		t.Errorf("the next minute publishes its own 3 denials: %v", got)
+	}
+}
+
 func TestTheBudgetsDenialsOfAMinuteAreTheDifferenceOfTwoSnapshots(t *testing.T) {
 	got := deniedSince(map[string]int{"tokens": 5, "window": 2}, map[string]int{"tokens": 25, "window": 2, "blind": 4})
 	if got["tokens"] != 20 || got["window"] != 0 || got["blind"] != 4 {
