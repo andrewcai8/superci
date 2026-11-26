@@ -1,0 +1,580 @@
+"""Tests of agent.py against a fake dispatcher, a fake instance metadata service and run service, and a fake
+Runner.Worker. Run from this directory: python3 -I -m unittest"""
+import base64
+import http.server
+import importlib.util
+import json
+import os
+import shutil
+import socket
+import ssl
+import struct
+import subprocess
+import tempfile
+import threading
+import time
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+spec = importlib.util.spec_from_file_location("agent", os.path.join(HERE, "agent.py"))
+agent = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(agent)
+
+DOC = "SIGNED-IDENTITY-DOCUMENT"
+INSTANCE = "i-0test"
+CERT_DIR = None
+PIN = None
+
+
+def setUpModule():
+    global CERT_DIR, PIN
+    CERT_DIR = tempfile.mkdtemp()
+    key, crt = os.path.join(CERT_DIR, "key.pem"), os.path.join(CERT_DIR, "cert.pem")
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes", "-days", "2",
+                    "-subj", "/CN=fake", "-keyout", key, "-out", crt], check=True, capture_output=True)
+    pub = subprocess.run(["openssl", "x509", "-in", crt, "-pubkey", "-noout"], check=True, capture_output=True).stdout
+    der = subprocess.run(["openssl", "pkey", "-pubin", "-outform", "der"], input=pub, check=True, capture_output=True).stdout
+    import hashlib
+    PIN = "sha256//" + base64.b64encode(hashlib.sha256(der).digest()).decode()
+
+
+def tearDownModule():
+    shutil.rmtree(CERT_DIR, ignore_errors=True)
+
+
+def wait_for(cond, what, timeout=20):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if cond():
+            return
+        time.sleep(0.01)
+    raise AssertionError("timed out waiting for " + what)
+
+
+class Conn:
+    """One connection the fake dispatcher accepted."""
+
+    def __init__(self, n, path, headers, body, sock, rf):
+        self.n, self.path, self.headers, self.body, self.sock, self.rf = n, path, headers, body, sock, rf
+        self.frames = []
+
+    def up(self):
+        self.sock.sendall(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: superci-dispatch/1\r\n\r\n")
+
+    def status(self, code):
+        self.sock.sendall(f"HTTP/1.1 {code} X\r\nContent-Length: 0\r\n\r\n".encode())
+
+    def send(self, typ, payload=b""):
+        self.sock.sendall(struct.pack("<BI", typ, len(payload)) + payload)
+
+    def header(self, typ, n):
+        self.sock.sendall(struct.pack("<BI", typ, n))
+
+    def job(self, runner='{"agentName":"id-1"}', token="claim-token"):
+        self.send(agent.JOB, json.dumps({"runner": runner, "token": token, "job": {"run": 1, "job": "x", "name": "n", "repo": "r"}}).encode())
+
+    def frame(self):
+        """The next frame, or None once the agent closed the connection."""
+        try:
+            h = self.rf.read(5)
+            if len(h) < 5:
+                return None
+            typ, n = struct.unpack("<BI", h)
+            p = self.rf.read(n)
+        except TimeoutError:
+            raise
+        except OSError:
+            return None
+        self.frames.append((typ, p))
+        return typ, p
+
+    def until_exit(self):
+        """Reads frames until the EXIT; returns its code, or None if the connection ended first."""
+        while True:
+            f = self.frame()
+            if f is None:
+                return None
+            if f[0] == agent.EXIT:
+                return struct.unpack("<i", f[1])[0]
+
+    def drop(self):
+        """Closes the connection now: the buffered reader holds the socket open until it is closed too."""
+        self.rf.close()
+        self.sock.close()
+
+    def closed_within(self, seconds):
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            self.sock.settimeout(max(end - time.monotonic(), 0.01))
+            try:
+                if self.frame() is None:
+                    return True
+            except TimeoutError:
+                return False
+        return False
+
+    def output(self, typ):
+        return b"".join(p for t, p in self.frames if t == typ)
+
+
+class FakeDispatcher:
+    def __init__(self, handler):
+        self.handler = handler
+        self.conns = []
+        self.errors = []
+        self.ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self.ctx.load_cert_chain(os.path.join(CERT_DIR, "cert.pem"), os.path.join(CERT_DIR, "key.pem"))
+        self.srv = socket.socket()
+        self.srv.bind(("127.0.0.1", 0))
+        self.srv.listen(16)
+        self.port = self.srv.getsockname()[1]
+        self.requests_seen = 0
+        self.dirty = False
+        threading.Thread(target=self.accept, daemon=True).start()
+
+    def accept(self):
+        while True:
+            try:
+                raw, _ = self.srv.accept()
+            except OSError:
+                return
+            threading.Thread(target=self.serve, args=(raw,), daemon=True).start()
+
+    def serve(self, raw):
+        try:
+            s = self.ctx.wrap_socket(raw, server_side=True)
+        except (ssl.SSLError, OSError):
+            raw.close()
+            return
+        rf = s.makefile("rb")
+        try:
+            try:
+                line = rf.readline()
+            except OSError:
+                return  # the client left before it asked: a refused pin
+            if not line:
+                return
+            path = line.split()[1].decode()
+            headers = {}
+            while True:
+                h = rf.readline()
+                if h in (b"\r\n", b""):
+                    break
+                k, _, v = h.decode().partition(":")
+                headers[k.strip().lower()] = v.strip()
+            body = rf.read(int(headers.get("content-length", "0"))).decode()
+            self.requests_seen += 1
+            c = Conn(len(self.conns), path, headers, body, s, rf)
+            self.conns.append(c)
+            self.handler(c)
+        except Exception as e:  # noqa: BLE001 - a test failure surfaces through errors
+            self.errors.append(repr(e))
+        finally:
+            if not self.dirty:
+                try:
+                    s.settimeout(1)
+                    s.unwrap()
+                except (OSError, ValueError):
+                    pass
+            try:
+                rf.close()
+                s.close()
+            except OSError:
+                pass
+
+    def close(self):
+        self.srv.close()
+
+
+class Imds(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def do_PUT(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"imds-token")
+
+    def do_GET(self):
+        if self.headers.get("X-aws-ec2-metadata-token") != "imds-token":
+            self.send_response(401)
+            self.end_headers()
+            return
+        body = {"/latest/dynamic/instance-identity/rsa2048": DOC, "/latest/meta-data/instance-id": INSTANCE}.get(self.path)
+        self.send_response(200 if body else 404)
+        self.end_headers()
+        self.wfile.write((body or "").encode())
+
+
+class RunService(http.server.BaseHTTPRequestHandler):
+    calls = []
+    status = 200
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", "0"))
+        type(self).calls.append((self.path, self.headers.get("Authorization"), json.loads(self.rfile.read(n))))
+        self.send_response(type(self).status)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"{}")
+
+
+WORKER = """#!/bin/bash
+echo worker >> "$LOG"
+head -c "$WANT" <&"$2"
+[ -n "$OUT" ] && head -c "$OUT" /dev/zero | tr '\\0' x
+echo stderr-line >&2
+echo "env:$FROM_ENVIRONMENT:$FROM_DOTENV:$PWD" >> "$LOG"
+[ -n "$HOLD" ] && while [ ! -e "$HOLD" ]; do sleep 0.02; done
+[ -n "$SIGNAL" ] && kill -9 $$
+exit "${CODE:-100}"
+"""
+
+
+class AgentCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.home = os.path.join(self.tmp, "home")
+        os.makedirs(os.path.join(self.home, "bin"))
+        self.log = os.path.join(self.tmp, "log")
+        self.hold = os.path.join(self.tmp, "hold")
+        self.spool = os.path.join(self.tmp, "marks")
+        open(self.spool, "w").close()
+        self.put_exec(os.path.join(self.home, "bin", "Runner.Worker"), WORKER)
+        self.put_exec(os.path.join(self.home, "superci-hydrate-stop.sh"), '#!/bin/bash\necho hydrate >> "$LOG"\n')
+        with open(os.path.join(self.tmp, "environment"), "w") as f:
+            f.write('PATH="/usr/bin:/bin"\nFROM_ENVIRONMENT=env\n')
+        self.dotenv(WANT="0")
+        self.imds = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Imds)
+        threading.Thread(target=self.imds.serve_forever, daemon=True).start()
+        self.addCleanup(self.imds.shutdown)
+        RunService.calls = []
+        RunService.status = 200
+        self.runsvc = http.server.ThreadingHTTPServer(("127.0.0.1", 0), RunService)
+        threading.Thread(target=self.runsvc.serve_forever, daemon=True).start()
+        self.addCleanup(self.runsvc.shutdown)
+        self.disp = None
+        self.agent = None
+        self.result = {}
+
+    def put_exec(self, path, text):
+        with open(path, "w") as f:
+            f.write(text)
+        os.chmod(path, 0o755)
+
+    def dotenv(self, **kw):
+        kw.update(LOG=self.log, FROM_DOTENV="dot")
+        kw.setdefault("HOLD", "")
+        with open(os.path.join(self.home, ".env"), "w") as f:
+            f.write("".join(f"{k}={v}\n" for k, v in kw.items()))
+
+    def dispatcher(self, handler):
+        self.disp = FakeDispatcher(handler)
+        self.addCleanup(self.disp.close)
+        return self.disp
+
+    def config(self, **kw):
+        cfg = dict(listener=f"https://127.0.0.1:{self.disp.port}", pin=PIN, imds=f"http://127.0.0.1:{self.imds.server_port}",
+                   home=self.home, user=None, spool=self.spool, environment=os.path.join(self.tmp, "environment"),
+                   ping_every=0.05, silence=5, window=1.0, wait_window=1.0, retry=0.02, renew_every=0.05, exit_settle=0.3,
+                   hydrate_timeout=5)
+        cfg.update(kw)
+        return agent.Config(**cfg)
+
+    def start(self, **kw):
+        self.agent = agent.Agent(self.config(**kw))
+        self.thread = threading.Thread(target=lambda: self.result.update(code=self.agent.run()), daemon=True)
+        self.thread.start()
+
+    def finish(self, timeout=30):
+        self.thread.join(timeout)
+        self.assertFalse(self.thread.is_alive(), "the agent did not finish")
+        self.assertEqual(self.disp.errors, [])
+        return self.result["code"]
+
+    def lines(self, path):
+        try:
+            with open(path) as f:
+                return f.read().split("\n")[:-1]
+        except FileNotFoundError:
+            return []
+
+    def run_job(self, pipe=b"", token="claim-token", code_expected=100, **dot):
+        """A dispatcher that gives its one machine a job and pipes bytes, reads until the EXIT, and closes."""
+        out = {}
+
+        def handler(c):
+            c.up()
+            c.job(token=token)
+            if pipe:
+                c.send(agent.PIPE, pipe)
+            out["code"] = c.until_exit()
+            out["conn"] = c
+        self.dispatcher(handler)
+        self.dotenv(WANT=str(len(pipe)), **dot)
+        self.start()
+        rc = self.finish()
+        return rc, out
+
+
+class TestJob(AgentCase):
+    def test_the_workers_pipe_is_echoed_and_its_exit_code_is_reported(self):
+        rc, out = self.run_job(pipe=b"hello pipe")
+        self.assertEqual(out["code"], 100)
+        self.assertEqual(out["conn"].output(agent.STDOUT), b"hello pipe")
+        self.assertEqual(out["conn"].output(agent.STDERR), b"stderr-line\n")
+        self.assertEqual(rc, 0, "the exit was delivered")
+
+    def test_the_request_proves_the_machine_and_carries_no_resume_before_a_job(self):
+        rc, out = self.run_job(pipe=b"x")
+        c = self.disp.conns[0]
+        self.assertEqual((c.path, c.body), ("/work", DOC))
+        self.assertEqual(c.headers["upgrade"], "superci-dispatch/1")
+        self.assertNotIn("x-superci-resume", c.headers)
+
+    def test_the_runner_file_is_written_and_no_credential_ever_is(self):
+        self.run_job(pipe=b"x")
+        self.assertEqual(open(os.path.join(self.home, ".runner")).read(), '{"agentName":"id-1"}')
+        names = [n for _, _, fs in os.walk(self.home) for n in fs] + [n for _, ds, _ in os.walk(self.home) for n in ds]
+        self.assertEqual([n for n in names if n.startswith(".credentials")], [])
+
+    def test_the_hydration_stop_runs_before_the_worker(self):
+        self.run_job(pipe=b"x")
+        self.assertEqual(self.lines(self.log)[:2], ["hydrate", "worker"])
+
+    def test_the_worker_gets_the_environment_boot_sh_gives_a_runner(self):
+        self.run_job(pipe=b"x")
+        self.assertIn(f"env:env:dot:{os.path.join(self.home, 'bin')}", self.lines(self.log))
+
+    def test_a_worker_killed_by_a_signal_reports_128_plus_it(self):
+        _, out = self.run_job(pipe=b"x", SIGNAL="1")
+        self.assertEqual(out["code"], 128 + 9)
+
+    def test_output_past_four_mebibytes_is_not_sent(self):
+        _, out = self.run_job(pipe=b"x", OUT=str(5 << 20))
+        sent = len(out["conn"].output(agent.STDOUT)) + len(out["conn"].output(agent.STDERR))
+        self.assertLessEqual(sent, agent.OUT_BUDGET)
+        self.assertGreater(sent, agent.OUT_BUDGET - agent.OUT_CHUNK - 100)
+
+    def test_pings_go_out_while_it_waits(self):
+        seen = threading.Event()
+
+        def handler(c):
+            c.up()
+            while True:
+                f = c.frame()
+                if f is None:
+                    return
+                if f[0] == agent.PING:
+                    seen.set()
+                    c.job()
+                    c.send(agent.PIPE, b"x")
+                    c.until_exit()
+                    return
+        self.dispatcher(handler)
+        self.dotenv(WANT="1")
+        self.start()
+        self.finish()
+        self.assertTrue(seen.is_set())
+
+    def test_timeline_marks_are_written_in_the_spool_format(self):
+        self.run_job(pipe=b"x")
+        marks = self.lines(self.spool)
+        self.assertEqual([m.split("=")[0] for m in marks], ["job.got", "worker.start", "worker.exit"])
+        for m in marks:
+            name, epoch, ms, *val = m.split("=")
+            self.assertRegex(epoch, r"^\d{10}\.\d{6}$")
+            self.assertRegex(ms, r"^\d+$")
+        self.assertEqual(marks[2].split("=")[3], "100")
+
+
+class TestFrames(AgentCase):
+    def test_frames_outside_their_bound_end_the_connection_and_start_no_worker(self):
+        bad = {
+            "a PIPE before the job": lambda c: c.send(agent.PIPE, b"x"),
+            "a JOB over 64 KiB": lambda c: c.header(agent.JOB, agent.MAX_JOB + 1),
+            "an unknown type": lambda c: c.header(99, 0),
+            "an EXIT toward the machine": lambda c: c.send(agent.EXIT, b"\0\0\0\0"),
+            "a PING with a body": lambda c: c.send(agent.PING, b"x"),
+            "a malformed JOB": lambda c: c.send(agent.JOB, b"not json"),
+        }
+        for name, frame in bad.items():
+            with self.subTest(name):
+                open(self.log, "w").close()
+                closed = []
+
+                def handler(c):
+                    if c.n > 0:
+                        c.status(410)
+                        return
+                    c.up()
+                    frame(c)
+                    closed.append(c.closed_within(3))
+                self.dispatcher(handler)
+                self.start()
+                self.finish()
+                self.assertEqual(closed, [True], "the agent kept the connection")
+                self.assertEqual(self.lines(self.log), [], "a worker started")
+
+    def test_a_pipe_frame_over_its_bound_ends_the_connection_unread(self):
+        closed = []
+
+        def handler(c):
+            c.up()
+            if c.n > 0:
+                c.job()
+                c.send(agent.PIPE, b"x")
+                c.until_exit()
+                return
+            c.job()
+            c.header(agent.PIPE, agent.MAX_PIPE + 1)
+            closed.append(c.closed_within(3))
+        self.dispatcher(handler)
+        self.dotenv(WANT="1")
+        self.start()
+        self.finish()
+        self.assertEqual(closed, [True])
+        self.assertEqual(self.disp.conns[1].headers["x-superci-resume"], f"{INSTANCE}.claim-token")
+
+
+class TestPairing(AgentCase):
+    def test_a_second_ask_or_a_gone_machine_gets_410_and_runs_nothing(self):
+        self.dispatcher(lambda c: c.status(410))
+        self.start()
+        self.assertEqual(self.finish(), 0)
+        self.assertEqual(self.disp.requests_seen, 1, "asked again after 410")
+        self.assertEqual(self.lines(self.log), [])
+
+    def test_a_listener_that_is_not_the_pinned_one_gets_nothing(self):
+        self.dispatcher(lambda c: c.up())
+        self.start(pin="sha256//" + base64.b64encode(b"x" * 32).decode(), wait_window=0.3)
+        self.finish()
+        self.assertEqual(self.disp.requests_seen, 0, "the identity document went to an unpinned listener")
+
+    def test_the_pin_is_the_hash_curl_takes(self):
+        crt = os.path.join(CERT_DIR, "cert.pem")
+        der = subprocess.run(["openssl", "x509", "-in", crt, "-outform", "der"], check=True, capture_output=True).stdout
+        self.assertTrue(agent.pin_matches(der, PIN))
+        self.assertTrue(agent.pin_matches(der, "sha256//other;" + PIN))
+        self.assertFalse(agent.pin_matches(der, "sha256//" + base64.b64encode(b"x" * 32).decode()))
+
+    def test_a_break_after_the_job_resumes_and_the_exit_waits_for_a_connection(self):
+        allow = threading.Event()
+        got = {}
+
+        def handler(c):
+            if c.n == 0:
+                c.up()
+                c.job(token="tok-7")
+                c.send(agent.PIPE, b"x")
+                wait_for(lambda: os.path.exists(os.path.join(self.tmp, "log")) and "worker" in self.lines(self.log), "worker")
+                c.drop()
+                return
+            allow.wait(10)
+            c.up()
+            got["code"] = c.until_exit()
+        self.dispatcher(handler)
+        self.dotenv(WANT="1", HOLD=self.hold)
+        self.start(window=20, wait_window=20)
+        wait_for(lambda: len(self.disp.conns) >= 1, "the first connection")
+        wait_for(lambda: "worker" in self.lines(self.log), "the worker")
+        wait_for(lambda: self.agent.sock is None, "the break")
+        open(self.hold, "w").close()
+        wait_for(lambda: self.agent.exit_code is not None, "the worker's exit")
+        allow.set()
+        self.finish()
+        self.assertEqual(got["code"], 100, "the exit was lost across the break")
+        self.assertEqual(self.disp.conns[1].headers["x-superci-resume"], f"{INSTANCE}.tok-7")
+        self.assertEqual(self.lines(self.log).count("worker"), 1, "the Worker started again on resume")
+
+    def test_an_exit_on_a_connection_that_resets_is_sent_again(self):
+        got = []
+
+        def handler(c):
+            c.up()
+            if c.n == 0:
+                c.job()
+                c.send(agent.PIPE, b"x")
+                got.append(c.until_exit())
+                self.disp.dirty = True
+                c.sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                c.drop()
+                return
+            self.disp.dirty = False
+            got.append(c.until_exit())
+        self.dispatcher(handler)
+        self.dotenv(WANT="1")
+        self.start()
+        self.assertEqual(self.finish(), 0)
+        self.assertEqual(got, [100, 100], "the EXIT of a reset connection was not sent again")
+        self.assertEqual(self.disp.conns[1].headers["x-superci-resume"], f"{INSTANCE}.claim-token")
+
+
+class TestRenewal(AgentCase):
+    def message(self, url, token="job-secret-token"):
+        body = json.dumps({"plan": {"planId": "plan-guid"}, "jobId": "job-guid", "requestId": 1, "resources": {"endpoints": [
+            {"name": "SystemVssConnection", "url": url, "authorization": {"parameters": {"AccessToken": token}, "scheme": "OAuth"}}]}})
+        raw = body.encode("utf-16-le")
+        return struct.pack("<ii", 1, len(raw)) + raw
+
+    def test_the_job_is_renewed_with_its_own_token(self):
+        msg = self.message(f"http://127.0.0.1:{self.runsvc.server_port}/abc/")
+
+        def handler(c):
+            c.up()
+            c.job()
+            c.send(agent.PIPE, msg[:30])
+            c.send(agent.PIPE, msg[30:])
+            c.until_exit()
+        self.dispatcher(handler)
+        self.dotenv(WANT=str(len(msg)), HOLD=self.hold)
+        self.start()
+        wait_for(lambda: len(RunService.calls) >= 2, "two renewals")
+        open(self.hold, "w").close()
+        self.finish()
+        path, auth, body = RunService.calls[0]
+        self.assertEqual((path, auth, body), ("/abc/renewjob", "Bearer job-secret-token", {"planId": "plan-guid", "jobId": "job-guid"}))
+
+    def test_a_job_the_service_no_longer_knows_is_not_renewed_again(self):
+        RunService.status = 404
+        msg = self.message(f"http://127.0.0.1:{self.runsvc.server_port}/abc/")
+
+        def handler(c):
+            c.up()
+            c.job()
+            c.send(agent.PIPE, msg)
+            c.until_exit()
+        self.dispatcher(handler)
+        self.dotenv(WANT=str(len(msg)), HOLD=self.hold)
+        self.start(renew_every=0.02)
+        wait_for(lambda: self.agent is not None and hasattr(self.agent, "threads"), "the job to start")
+        wait_for(lambda: not self.agent.threads[3].is_alive(), "the renewals to stop")
+        open(self.hold, "w").close()
+        self.finish()
+        self.assertEqual(len(RunService.calls), 1)
+
+    def test_nothing_of_the_message_but_the_renewal_is_kept(self):
+        m = agent.FirstMessage()
+        msg = self.message("http://h/p/")
+        m.feed(msg[:5])
+        self.assertFalse(m.done)
+        m.feed(msg[5:] + struct.pack("<ii", 2, 4) + b"zzzz")
+        self.assertEqual(m.renewal, ("http://h/p/renewjob", "job-secret-token", "plan-guid", "job-guid"))
+        self.assertEqual(len(m.buf), 0)
+        other = agent.FirstMessage()
+        other.feed(struct.pack("<ii", 2, 4) + b"zzzz")
+        self.assertTrue(other.done)
+        self.assertIsNone(other.renewal)
+
+    def test_the_url_joins_as_the_runner_joins_it(self):
+        for url, want in [("https://x/y/", "https://x/y/renewjob"), ("https://x/y", "https://x/renewjob")]:
+            self.assertEqual(agent.FirstMessage.extract({"Plan": {"PlanId": "p"}, "JobId": "j", "Resources": {"Endpoints": [
+                {"Name": "systemvssconnection", "Url": url, "Authorization": {"Parameters": {"accesstoken": "t"}}}]}})[0], want)
+
+
+if __name__ == "__main__":
+    unittest.main()
