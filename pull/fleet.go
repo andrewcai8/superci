@@ -27,9 +27,15 @@ type Region struct {
 	Name    string
 	Weight  int
 	ec2     *ec2.Client
+	fleets  fleetAPI
 	image   string
 	root    string
 	subnets map[string]string // zone -> default subnet
+}
+
+// fleetAPI is the call a launch makes, so a test can stand in for EC2's capacity.
+type fleetAPI interface {
+	CreateFleet(ctx context.Context, in *ec2.CreateFleetInput, opts ...func(*ec2.Options)) (*ec2.CreateFleetOutput, error)
 }
 
 // Fleet is the machines of every scale set. Every instance carries the tags purpose=superci-pull,
@@ -63,7 +69,8 @@ func NewFleet(ctx context.Context, deployment string, weights map[string]int, im
 		if err != nil {
 			return nil, err
 		}
-		r := &Region{Name: name, Weight: weights[name], ec2: ec2.NewFromConfig(cfg), subnets: map[string]string{}}
+		client := ec2.NewFromConfig(cfg)
+		r := &Region{Name: name, Weight: weights[name], ec2: client, fleets: client, subnets: map[string]string{}}
 		if r.image, r.root, err = r.findImage(ctx, img); err != nil {
 			return nil, fmt.Errorf("%s: %w", name, err)
 		}
@@ -227,12 +234,45 @@ func rankedPools(offers []ec2types.InstanceTypeOffering, subnets map[string]stri
 	return pools
 }
 
+// poolsOf is the region's pools of the given types.
+func (sr *setRegion) poolsOf(types []string) []ec2types.FleetLaunchTemplateOverridesRequest {
+	var out []ec2types.FleetLaunchTemplateOverridesRequest
+	for _, p := range sr.pools {
+		if slices.Contains(types, string(p.InstanceType)) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 // chunk is the most capacity one CreateFleet asks for; a burst is a handful of these per region.
 const chunk = 250
 
-// Launch starts n machines: spot across every pool of every region, split by weight, each region's shortfall asked
-// again of the others, and only then on-demand, at most odRoom of them. It returns what started.
+// Launch starts n machines. The size's leading OnDemandFirst types go first: spot across every region, then on demand,
+// whatever the on-demand share. Then the other types' spot across every region, and only then on-demand of any type, at
+// most odRoom of them. A region's spot shortfall is asked again of the others. It returns what started.
 func (sf *SetFleet) Launch(ctx context.Context, round string, n, odRoom int) []*Machine {
+	fast, rest := sf.spec.Types[:sf.spec.OnDemandFirst], sf.spec.Types[sf.spec.OnDemandFirst:]
+	var got []*Machine
+	if len(fast) > 0 {
+		got = append(got, sf.spot(ctx, round, "fast-", n, fast)...)
+		got = append(got, sf.onDemand(ctx, round, "fast-", n-len(got), n, fast)...)
+	}
+	if len(rest) > 0 {
+		got = append(got, sf.spot(ctx, round, "", n-len(got), rest)...)
+	}
+	got = append(got, sf.onDemand(ctx, round, "", n-len(got), odRoom, sf.spec.Types)...)
+	if left := n - len(got); left > 0 {
+		slog.Warn("launch short", "set", sf.spec.Name, "round", round, "asked", n, "short", left)
+	}
+	return got
+}
+
+// spot asks each region for its weighted part of n machines of types, then the other regions for a region's shortfall.
+func (sf *SetFleet) spot(ctx context.Context, round, step string, n int, types []string) []*Machine {
+	if n <= 0 {
+		return nil
+	}
 	var got []*Machine
 	want := sf.fleet.split(n)
 	short := map[string]int{}
@@ -242,7 +282,7 @@ func (sf *SetFleet) Launch(ctx context.Context, round string, n, odRoom int) []*
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			m := sf.ask(ctx, r, want[r.Name], ec2types.DefaultTargetCapacityTypeSpot, round, "spot")
+			m := sf.ask(ctx, r, want[r.Name], ec2types.DefaultTargetCapacityTypeSpot, round, step+"spot", types)
 			mu.Lock()
 			got = append(got, m...)
 			short[r.Name] = want[r.Name] - len(m)
@@ -253,27 +293,26 @@ func (sf *SetFleet) Launch(ctx context.Context, round string, n, odRoom int) []*
 	for _, r := range sf.fleet.regions {
 		for _, other := range sf.fleet.regions {
 			if other != r && short[r.Name] > 0 {
-				m := sf.ask(ctx, other, short[r.Name], ec2types.DefaultTargetCapacityTypeSpot, round, "spot-for-"+r.Name)
+				m := sf.ask(ctx, other, short[r.Name], ec2types.DefaultTargetCapacityTypeSpot, round, step+"spot-for-"+r.Name, types)
 				got = append(got, m...)
 				short[r.Name] -= len(m)
 			}
 		}
 	}
-	left := 0
-	for _, k := range short {
-		left += k
-	}
+	return got
+}
+
+// onDemand asks the regions in turn for n on-demand machines of types, at most room of them.
+func (sf *SetFleet) onDemand(ctx context.Context, round, step string, n, room int, types []string) []*Machine {
+	var got []*Machine
 	for _, r := range sf.fleet.regions {
-		if left <= 0 || odRoom <= 0 {
+		if n <= 0 || room <= 0 {
 			break
 		}
-		m := sf.ask(ctx, r, min(left, odRoom), ec2types.DefaultTargetCapacityTypeOnDemand, round, "on-demand")
+		m := sf.ask(ctx, r, min(n, room), ec2types.DefaultTargetCapacityTypeOnDemand, round, step+"on-demand", types)
 		got = append(got, m...)
-		left -= len(m)
-		odRoom -= len(m)
-	}
-	if left > 0 {
-		slog.Warn("launch short", "set", sf.spec.Name, "round", round, "asked", n, "short", left)
+		n -= len(m)
+		room -= len(m)
 	}
 	return got
 }
@@ -299,8 +338,9 @@ func (f *Fleet) split(n int) map[string]int {
 
 // ask makes the CreateFleet calls for n machines in one region, at most chunk each, all at once. Each call carries a
 // ClientToken unique to this process, round and part, so a call retried after a lost answer starts nothing twice.
-func (sf *SetFleet) ask(ctx context.Context, r *Region, n int, kind ec2types.DefaultTargetCapacityType, round, step string) []*Machine {
-	if n <= 0 {
+func (sf *SetFleet) ask(ctx context.Context, r *Region, n int, kind ec2types.DefaultTargetCapacityType, round, step string, types []string) []*Machine {
+	pools := sf.regions[r.Name].poolsOf(types)
+	if n <= 0 || len(pools) == 0 {
 		return nil
 	}
 	var mu sync.Mutex
@@ -315,7 +355,7 @@ func (sf *SetFleet) ask(ctx context.Context, r *Region, n int, kind ec2types.Def
 			sum := sha256.Sum256(fmt.Appendf(nil, "%s/%s/%s/%s/%d", sf.spec.Name, round, step, r.Name, part))
 			token := hex.EncodeToString(sum[:16])
 			started := time.Now()
-			ms, errs, err := sf.createFleet(ctx, r, k, kind, token, round)
+			ms, errs, err := sf.createFleet(ctx, r, k, kind, token, round, pools)
 			slog.Info("fleet", "set", sf.spec.Name, "region", r.Name, "step", step, "round", round, "part", part, "asked", k, "got", len(ms),
 				"ms", time.Since(started).Milliseconds(), "errors", errs, "err", errString(err), "token", token)
 			tlLaunched(sf.spec.Name, round, step, started, ms)
@@ -328,7 +368,8 @@ func (sf *SetFleet) ask(ctx context.Context, r *Region, n int, kind ec2types.Def
 	return got
 }
 
-func (sf *SetFleet) createFleet(ctx context.Context, r *Region, n int, kind ec2types.DefaultTargetCapacityType, token, round string) ([]*Machine, map[string]int, error) {
+func (sf *SetFleet) createFleet(ctx context.Context, r *Region, n int, kind ec2types.DefaultTargetCapacityType, token, round string,
+	pools []ec2types.FleetLaunchTemplateOverridesRequest) ([]*Machine, map[string]int, error) {
 	sr := sf.regions[r.Name]
 	tags := append([]ec2types.Tag{{Key: aws.String("superci-pull-round"), Value: aws.String(round)}}, sf.tags...)
 	in := &ec2.CreateFleetInput{
@@ -339,14 +380,14 @@ func (sf *SetFleet) createFleet(ctx context.Context, r *Region, n int, kind ec2t
 		OnDemandOptions:             &ec2types.OnDemandOptionsRequest{AllocationStrategy: ec2types.FleetOnDemandAllocationStrategyPrioritized},
 		LaunchTemplateConfigs: []ec2types.FleetLaunchTemplateConfigRequest{{
 			LaunchTemplateSpecification: &ec2types.FleetLaunchTemplateSpecificationRequest{LaunchTemplateId: aws.String(sr.template), Version: aws.String(sr.version)},
-			Overrides:                   sr.pools,
+			Overrides:                   pools,
 		}},
 		TagSpecifications: []ec2types.TagSpecification{{ResourceType: ec2types.ResourceTypeInstance, Tags: tags}, {ResourceType: ec2types.ResourceTypeFleet, Tags: sf.tags}},
 	}
 	var out *ec2.CreateFleetOutput
 	var err error
 	for try := 0; try < 4; try++ {
-		out, err = r.ec2.CreateFleet(ctx, in)
+		out, err = r.fleets.CreateFleet(ctx, in)
 		if err == nil || !retryable(err) {
 			break
 		}

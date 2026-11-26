@@ -207,6 +207,10 @@ MUTANTS = [
     ("admit the ceiling check forgets the burst", "config.go", "r.CeilingRate*float64(r.WindowS)+float64(r.CeilingBurst) > float64(r.Cap)", "r.CeilingRate*float64(r.WindowS) > float64(r.Cap)",
      "TestACeilingThatCouldPassTheCapInOneWindowIsRefused"),
     ("admit a zero ceiling is accepted", "config.go", "r.CeilingRate <= 0 || ", "", "TestAnOverrideWithABadBatchPatternOrANegativeReserveIsRefused"),
+    ("fleet 4cpu asks no type on demand first", "config.json", '"on_demand_first": 1', '"on_demand_first": 0', "TestSuperci4cpuAsksM8aznOnDemandBeforeASlowerSpotType"),
+    ("fleet the fast types skip on demand", "fleet.go", '\t\tgot = append(got, sf.onDemand(ctx, round, "fast-", n-len(got), n, fast)...)\n', "", "TestSuperci4cpuAsksM8aznOnDemandBeforeASlowerSpotType"),
+    ("fleet the share bounds no size", "fleet.go", 'sf.onDemand(ctx, round, "", n-len(got), odRoom, sf.spec.Types)', 'sf.onDemand(ctx, round, "", n-len(got), n, sf.spec.Types)', "TestASizeWithoutOnDemandFirstKeepsOnDemandUnderItsShare"),
+    ("fleet on_demand_first past the types is accepted", "config.go", "s.OnDemandFirst < 0 || s.OnDemandFirst > len(s.Types)", "s.OnDemandFirst < 0", "TestOnDemandFirstPastTheSizesTypesIsRefused"),
 ]
 
 here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
