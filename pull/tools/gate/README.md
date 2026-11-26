@@ -49,6 +49,25 @@ lower bound only under-reports, so a row that fails on them fails on the real ti
 max and IQR. A speed row that passes by less than the superci sample's IQR is `NOISE`, not `PASS`: the spread is wider than
 the gap, so add runs. Nothing is rounded toward either verdict.
 
+## A live canary: `gate job --canary` and `canary.sh`
+
+`gate job <job> --canary` prints the rows, then `canary <job>: KEEP` (exit 0) or `ROLL BACK (reasons)` (exit 3). A canary rolls
+back on harm to superci's own jobs, judged against Blacksmith over the same window, and on nothing else:
+
+- a FAIL of wall p50, wall p90, queue wait p50, queue wait p90 or failures. The speed rows count once n passes, since two
+  runs make no p90; the failures row counts from the first run. NOISE asks for runs and rolls nothing back;
+- one of `superci-pull-oldest-job-wait`, `-jobs-stalled`, `-listener-down` or `-spend-capped` in ALARM: each means a
+  superci job is not being served.
+
+`superci-pull-registration-refusals` is not on the list. GitHub's cap of 1,500 registrations in 5 minutes is the
+organization's, and a job moved from Blacksmith takes one registration on either fleet, so a refusal says the organization
+is at the cap, not that superci harmed a job. It pages and is counted. If the refusals made superci's jobs wait, the
+queue-wait rows and `superci-pull-oldest-job-wait` see it. In canary 4b's minutes over the cap (Nov 26 16:11-16:20Z, the
+organization at 5.03-5.30/s) superci's test-go waited 1-2 s and Blacksmith's 4 vCPU jobs p50 7 s, p90 19 s.
+
+`canary.sh SINCE UNTIL JOB...` runs the check for each job SUPERCI_JOBS still lists, every 15 minutes, until UNTIL. It
+removes a job that gets ROLL BACK from SUPERCI_JOBS, and leaves the other jobs listed.
+
 ## gate 2: `gate scale`
 
 Reads the replay's runs (every run in the window whose workflow file is `--workflow` and whose branch matches `--branch-glob`; a load workflow that exists only on its branch has no name GitHub resolves), the listener's timeline events and CloudWatch, and lists the claims
@@ -84,6 +103,6 @@ DRY_RUN=1 replay.sh BRANCH trace.json   prints the schedule and each push's work
 
 ## Tests
 
-`python3 -I test_gate.py`: a PASS and a FAIL for every criterion of both gates, the noise rule, the exclusion of a failure
+`python3 -I test_gate.py`: a PASS and a FAIL for every criterion of both gates, the canary's rollback rows and alarms (canary 4b's refusals keep it), the noise rule, the exclusion of a failure
 Blacksmith shares (and not one superci or main-on-superci shares), reruns, timeouts and cancellations, the required flags, minute coverage of the registration datapoints, the alarm history, the trace extraction and the bench's per-bucket workflow, and the recorded
 canary fixtures in `fixtures/`.

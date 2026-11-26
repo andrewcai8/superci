@@ -32,7 +32,7 @@ alarm jobs-stalled "A set's jobs have waited 10 minutes with none of its jobs st
   StalledSets Maximum GreaterThanOrEqualToThreshold 1 60 2 2 notBreaching
 alarm oldest-job-wait "The job that has waited longest for a runner has waited over 60 s, two minutes running: registrations the budget turns away, launches or boots are holding a job (a wait the budget causes is no refusal by GitHub, and QueueWait shows a job only once it starts)" \
   OldestWaitingJobAgeS Maximum GreaterThanThreshold 60 60 2 2 notBreaching
-alarm registration-refusals "GitHub refused a runner registration (ConfigureTooManyRunners): the organization reached its cap of 1,500 in 5 minutes" \
+alarm registration-refusals "GitHub refused a runner registration (ConfigureTooManyRunners): the organization reached its cap of 1,500 in 5 minutes. A page, never a canary rollback: the cap is the organization's, and a job moved from Blacksmith takes one registration on either fleet" \
   RegistrationRefusals Sum GreaterThanThreshold 0 300 1 1 notBreaching
 alarm registration-errors "A runner registration failed other than by GitHub's cap: GitHub's API, a runner name GitHub already held, or EC2 refusing the issued tag" \
   RegistrationErrors Sum GreaterThanThreshold 0 300 1 1 notBreaching

@@ -194,6 +194,46 @@ class RecordedCanary(unittest.TestCase):
         self.assertEqual({o.fleet for o in self.B}, {"blacksmith"})
 
 
+class Canary(unittest.TestCase):
+    QUIET = {n: "OK" for n in G.ROLLBACK_ALARMS}
+
+    def test_canary_4b_at_its_rollback_keeps_test_go(self):
+        """16:19Z Nov 26: test-go at parity on every row, while Blacksmith and the organization's other runners held GitHub's
+        registration cap at 5.03-5.26/s and GitHub refused two of superci's registrations. The cause is the organization's."""
+        rows = list(judge(Gate1().good()).values())
+        alarms = {**self.QUIET, "superci-pull-registration-refusals": "ALARM", "superci-pull-registration-errors": "OK"}
+        self.assertEqual(G.canary_verdict(rows, alarms), [])
+
+    def test_a_job_slower_than_blacksmith_rolls_back(self):
+        rows = list(judge(fleet(spread_around(140, 2, 10), spread_around(1, 0.2, 10))).values())
+        self.assertEqual([r.split(":")[0] for r in G.canary_verdict(rows, self.QUIET)], ["wall p50", "wall p90"])
+
+    def test_a_queue_wait_past_blacksmiths_rolls_back(self):
+        rows = list(judge(fleet(spread_around(80, 2, 10), spread_around(30, 1, 10))).values())
+        self.assertEqual([r.split(":")[0] for r in G.canary_verdict(rows, self.QUIET)], ["queue wait p50", "queue wait p90"])
+
+    def test_every_harm_alarm_rolls_back(self):
+        rows = list(judge(Gate1().good()).values())
+        for name in G.ROLLBACK_ALARMS:
+            self.assertEqual(G.canary_verdict(rows, {**self.QUIET, name: "ALARM"}), [f"{name} in ALARM"])
+
+    def test_speed_rows_wait_for_n_but_failures_count_from_the_first_run(self):
+        slow = list(judge(fleet([140.0, 141.0], [1.0, 1.0])).values())
+        self.assertEqual(G.canary_verdict(slow, self.QUIET), [])
+        failing = list(judge(fleet([80.0, 81.0], [1.0, 1.0], ok=False)).values())
+        self.assertEqual([r.split(":")[0] for r in G.canary_verdict(failing, self.QUIET)], ["failures (superci)"])
+
+    def test_noise_asks_for_runs_and_rolls_nothing_back(self):
+        rows = [G.Row("n (superci runs)", "6", ">= 5", G.PASS), G.Row("wall p90", "50 s", "<= 51 s", G.NOISE)]
+        self.assertEqual(G.canary_verdict(rows, self.QUIET), [])
+
+    def test_alarms_sh_creates_every_rollback_alarm(self):
+        with open(os.path.join(HERE, "..", "..", "deploy", "alarms.sh")) as fh:
+            made = {f"superci-pull-{line.split()[1]}" for line in fh if line.startswith(("alarm ", "math "))}
+        self.assertLessEqual(set(G.ROLLBACK_ALARMS), made)
+        self.assertNotIn("superci-pull-registration-refusals", G.ROLLBACK_ALARMS)
+
+
 def scale(**kw):
     base = dict(replayed=100, completed=100, stranded=[], lost=0, waits=spread_around(3, 1, 100), window_use=[(1000.0, 400.0), (1060.0, 700.0)], org_known=[1.0, 1.0],
                 claims={f"i-{n}" for n in range(10)}, issued=collections.Counter({f"i-{n}": 1 for n in range(10)}), claim_taken=collections.Counter({f"i-{n}": 1 for n in range(10)}),
