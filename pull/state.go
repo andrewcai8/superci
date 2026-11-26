@@ -115,7 +115,6 @@ type State struct {
 	carried     int                  // the burst the last listener saw, held for the first window after a start
 	lost        []JobRef             // jobs that ended on a machine AWS was taking back, for a re-run
 	waits       []float64            // queue waits (s) of jobs started since the metrics last took them
-	jobs        []JobRecord          // records of the jobs completed since the metrics last took them
 	began       map[string]began     // when each running job was queued and taken by its runner, by jobKey, for its record
 	recorded    map[string]time.Time // jobs whose record was made, by jobKey: GitHub redelivers a completion until acknowledged
 	price       func(Machine) float64
