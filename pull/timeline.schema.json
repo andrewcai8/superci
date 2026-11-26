@@ -80,6 +80,38 @@
       ],
       "what": "the runner finished the job"
     },
+    "job.record": {
+      "src": "listener",
+      "fields": [
+        "set",
+        "run",
+        "job",
+        "name",
+        "repo",
+        "workflow_ref",
+        "event_name",
+        "labels",
+        "runner",
+        "inst",
+        "result",
+        "conclusion",
+        "queue_time",
+        "start_time",
+        "finish_time",
+        "partial",
+        "queue_ms",
+        "wall_ms",
+        "region",
+        "az",
+        "type",
+        "lifecycle",
+        "launched",
+        "warm",
+        "usd",
+        "busy_usd"
+      ],
+      "what": "the one record of a finished job, written once when JobCompleted arrives (a listener restart forgets which jobs it recorded, so a completion GitHub redelivers after one adds a line with the same job, and a reader keeps the first): the message's times and result joined with the machine that ran it and its estimated cost. t is the job's finish by GitHub's clock. conclusion is GitHub's REST word (success, failure, cancelled; a timed_out job reads failure). queue_ms is queue_time to start_time and wall_ms start_time to finish_time, the gate's queue wait and wall time. warm says the machine was launched before the job was queued. usd is the machine's estimated cost from its launch to the finish and busy_usd the part of it while the job ran; the rest is boot and idle. The machine's fields (region to busy_usd) are absent when the listener held no machine of the runner. partial says the job's start is unknown (its completion arrived after a restart, with no start time in the message): queue_ms, wall_ms and busy_usd are then left out, not zero. workflow_ref names the workflow file and the branch"
+    },
     "machine.launched": {
       "src": "listener",
       "fields": [

@@ -75,6 +75,13 @@ func (s *Spend) price(m Machine) float64 {
 	return p + float64(spec.DiskGB)*gp3PerGBHour + gp3ExtraPerHour + ipv4PerHour
 }
 
+// Price is a machine's estimated cost an hour, for a record of the job it ran.
+func (s *Spend) Price(m Machine) float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.price(m)
+}
+
 // Accrue adds the running machines' cost since the last accrual (at most five minutes of it, so a pause of the
 // listener is not charged at today's fleet).
 func (s *Spend) Accrue(now time.Time, ms []Machine) {
