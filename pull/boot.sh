@@ -140,11 +140,13 @@ while :; do
       export ACTIONS_RUNNER_INPUT_JITCONFIG=$(cat /run/superci-jit)
       rm -f /run/superci-jit
       mark runner.start
+      # The job-started hook runs only after "Set up job", which a running pre-read slowed by 19 s (Nov 26), so the
+      # hydration ends as soon as the runner takes its job, by the same hook as the runner's user.
       (cd /home/runner && sudo --preserve-env=ACTIONS_RUNNER_INPUT_JITCONFIG -u runner -H ./run.sh) 2>&1 | while IFS= read -r line; do
         printf '%s\n' "$line"
         case $line in
           *'Listening for Jobs'*) mark runner.online ;;
-          *'Running job:'*) mark job.running ;;
+          *'Running job:'*) mark job.running; sudo -u runner /home/runner/superci-hydrate-stop.sh || : ;;
           *' completed with result'*) mark job.done ;;
         esac
       done
