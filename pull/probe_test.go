@@ -75,8 +75,7 @@ func (r *registry) held() int {
 // probeBudget is a budget with room for one pool registration.
 func probeBudget(now time.Time) *Budget {
 	c := reg()
-	c.BlindRate = 5
-	c.PoolRate = 5
+	c.CeilingRate, c.CeilingBurst, c.PoolRate = 5, 30, 5
 	return NewBudget(c, now.Add(-time.Hour))
 }
 

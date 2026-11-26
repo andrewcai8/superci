@@ -102,11 +102,14 @@ func (r PoolRule) ready() time.Duration  { return time.Duration(r.ReadySeconds *
 type RegConfig struct {
 	Cap         int     `json:"cap"`
 	WindowS     int     `json:"window_s"`
-	Margin      float64 `json:"margin"`
 	PoolRate    float64 `json:"pool_rate"`
 	PoolShare   float64 `json:"pool_share"`
-	BlindRate   float64 `json:"blind_rate"`
 	Concurrency int     `json:"concurrency"`
+	// CeilingRate and CeilingBurst bound our own registrations whatever GitHub answers: a rate a second, and how many at
+	// once. RecoverS is how long the admitted rate takes to climb from nothing back to the ceiling after GitHub refused.
+	CeilingRate  float64 `json:"ceiling_rate"`
+	CeilingBurst int     `json:"ceiling_burst"`
+	RecoverS     int     `json:"recover_s"`
 	// Reserve is the tokens of the saved-up burst only critical registrations (the required check's jobs) may take:
 	// a batch registration needs them saved up besides its own. It is cut to the burst less one.
 	Reserve int `json:"critical_reserve"`
@@ -241,8 +244,8 @@ func (c Config) validate() error {
 	if c.DailyUSD < 0 || c.MonthlyUSD < 0 || c.OnDemand < 0 || c.OnDemand > 1 {
 		return errors.New("config: caps must not be negative, and on_demand_share is in [0, 1]")
 	}
-	if r := c.Registration; r.Cap <= 0 || r.WindowS <= 0 || r.Margin < 0 || r.Margin >= 1 || r.PoolShare < 0 || r.PoolShare > 1 || r.Reserve < 0 {
-		return errors.New("config: registration needs cap, window_s, a margin in [0, 1), a pool_share in [0, 1] and a critical_reserve of 0 or more")
+	if r := c.Registration; r.Cap <= 0 || r.WindowS <= 0 || r.CeilingRate <= 0 || r.CeilingBurst < 1 || r.RecoverS < 1 || r.PoolShare < 0 || r.PoolShare > 1 || r.Reserve < 0 {
+		return errors.New("config: registration needs cap, window_s, a ceiling_rate above 0, a ceiling_burst and recover_s of 1 or more, a pool_share in [0, 1] and a critical_reserve of 0 or more")
 	}
 	if p := c.Pool; p.Quantile <= 0 || p.Quantile > 1 || p.ReadySeconds <= 0 || p.HoldMinutes < 0 {
 		return errors.New("config: pool needs a quantile in (0, 1], ready_seconds above 0 and hold_minutes of 0 or more")

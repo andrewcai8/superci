@@ -21,8 +21,8 @@
     {"type": "metric", "x": 0, "y": 9, "width": 12, "height": 6, "properties": {"title": "Machines and runners, per set", "region": "us-east-1", "view": "timeSeries", "period": 60,
       "metrics": [[{"expression": "SEARCH('{superci-pull,Set} MetricName=\"Machines\"', 'Maximum', 60)", "id": "machines"}], [{"expression": "SEARCH('{superci-pull,Set} MetricName=\"IdleRunners\"', 'Maximum', 60)", "id": "idle"}], [{"expression": "SEARCH('{superci-pull,Set} MetricName=\"BusyRunners\"', 'Maximum', 60)", "id": "busy"}]]}},
     {"type": "metric", "x": 12, "y": 9, "width": 12, "height": 6, "properties": {"title": "Registration rates (a second): GitHub's cap is 5 for the whole organization", "region": "us-east-1", "view": "timeSeries", "period": 60,
-      "metrics": [["superci-pull", "OrgRegistrationRate", {"stat": "Average"}], [".", "OthersRegistrationRate", {"stat": "Average"}], [".", "OurRegistrationRate", {"stat": "Average"}], [".", "SpareRegistrationRate", {"stat": "Average"}]],
-      "annotations": {"horizontal": [{"value": 4, "label": "4/s: the cap less the 20% margin"}]}}},
+      "metrics": [["superci-pull", "OrgRegistrationRate", {"stat": "Average"}], [".", "OthersRegistrationRate", {"stat": "Average"}], [".", "OurRegistrationRate", {"stat": "Average"}], [".", "SpareRegistrationRate", {"stat": "Average"}], [".", "AdmitRate", {"stat": "Minimum"}], [".", "RegistrationQueue", {"stat": "Maximum"}]],
+      "annotations": {"horizontal": [{"value": 5, "label": "5/s: GitHub's documented 1,500 in 5 minutes"}]}}},
     {"type": "metric", "x": 0, "y": 15, "width": 12, "height": 6, "properties": {"title": "Registrations a minute", "region": "us-east-1", "view": "timeSeries", "period": 60, "stat": "Sum",
       "metrics": [["superci-pull", "Registrations"], [".", "RegistrationRefusals"], [".", "RegistrationErrors"], [".", "LaunchShortfall"], [".", "Orphans", {"stat": "Maximum"}]]}},
     {"type": "metric", "x": 12, "y": 15, "width": 12, "height": 6, "properties": {"title": "Spend (USD): today against the daily cap, and the hour", "region": "us-east-1", "view": "timeSeries", "period": 300, "stat": "Maximum",
@@ -41,6 +41,6 @@
       "metrics": [["superci-pull", "OldestWaitingJobAgeS", {"label": "oldest waiting job"}], [".", "OldestUnregisteredMachineAgeS", {"label": "oldest machine without a runner"}]],
       "annotations": {"horizontal": [{"value": 60, "label": "60 s: the alarm, two minutes running"}]}}},
     {"type": "metric", "x": 12, "y": 39, "width": 12, "height": 6, "properties": {"title": "Registrations the budget turned away a minute, by reason (GitHub was never asked)", "region": "us-east-1", "view": "timeSeries", "period": 60, "stat": "Sum",
-      "metrics": [["superci-pull", "BudgetDenied", "Reason", "window"], ["...", "tokens"], ["...", "throttled"], ["...", "blind"], ["...", "held"]]}}
+      "metrics": [["superci-pull", "BudgetDenied", "Reason", "tokens"], ["...", "throttled"], ["...", "queued"]]}}
   ]
 }

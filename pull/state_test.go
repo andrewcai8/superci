@@ -298,12 +298,12 @@ func TestJobsThatWaitWithNoneStartedAreStalled(t *testing.T) {
 
 // open is a budget that never refuses.
 func open() *Budget {
-	return NewBudget(RegConfig{Cap: 1e9, WindowS: 300, Margin: 0.2, PoolRate: 1e6, PoolShare: 1, BlindRate: 1e6}, t0.Add(-time.Hour))
+	return NewBudget(RegConfig{Cap: 1e9, WindowS: 300, PoolRate: 1e6, PoolShare: 1, CeilingRate: 1e6, CeilingBurst: 1e6, RecoverS: 1}, t0.Add(-time.Hour))
 }
 
 // closed is a budget that registers nothing.
 func closed() *Budget {
-	return NewBudget(RegConfig{Cap: 1, WindowS: 300, Margin: 0.2, BlindRate: 0}, t0.Add(-time.Hour))
+	return NewBudget(RegConfig{Cap: 1, WindowS: 300, CeilingRate: 0, CeilingBurst: 1}, t0.Add(-time.Hour))
 }
 
 func ask(s *State, id string, at time.Time) Verdict {

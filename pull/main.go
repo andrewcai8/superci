@@ -580,7 +580,7 @@ func (l *Listener) launcher(ctx context.Context, s *Set, wake chan struct{}) {
 			continue
 		}
 		now := time.Now()
-		limit := max(10, int(l.budget.Estimate(now).SpareRate*90))
+		limit := max(10, int(l.budget.Rate()*90))
 		for _, other := range l.sets {
 			if other != s {
 				limit -= other.state.Unregistered()
@@ -736,14 +736,13 @@ func (l *Listener) reconciler(ctx context.Context, refresh func(context.Context,
 		capped := l.spend.Over()
 		var running []Machine
 		var end []*Machine
-		// Machines launched for registrations the organization no longer leaves us wait paid for: past twice what the
-		// budget serves in 90 s (once the organization's rate is measured), the excess ends (it holds no runner).
-		est := l.budget.Estimate(now)
-		limit, waiting := max(10, int(est.SpareRate*90)), 0
+		// Machines launched for registrations GitHub no longer leaves us wait paid for: past twice what the budget
+		// serves in 90 s at its admitted rate, the excess ends (it holds no runner).
+		limit, waiting := max(10, int(l.budget.Rate()*90)), 0
 		for _, s := range l.sets {
 			waiting += s.state.Unregistered()
 		}
-		if excess := waiting - limit; est.Known && waiting > 2*limit {
+		if excess := waiting - limit; waiting > 2*limit {
 			for _, s := range l.sets {
 				shed := s.state.Shed(now, excess)
 				excess -= len(shed)
@@ -812,8 +811,8 @@ func (l *Listener) reconciler(ctx context.Context, refresh func(context.Context,
 			sp := l.spend.Snapshot()
 			slog.Info("budget", "known", b.Known, "org_rate", b.OrgRate, "others_rate", b.OthersRate, "ours_rate", b.OursRate,
 				"spare_rate", b.SpareRate, "window_use", b.WindowUse, "pending", b.Pending, "made", b.Made, "refused", b.Refused,
-				"failed", b.Failed, "throttled", b.Throttled, "denied_window", b.Denied["window"], "denied_tokens", b.Denied["tokens"],
-				"denied_throttled", b.Denied["throttled"], "denied_blind", b.Denied["blind"], "spend_day", sp.DayUSD, "spend_month", sp.MonthUSD, "per_hour", sp.PerHour, "capped", sp.Capped)
+				"failed", b.Failed, "throttled", b.Throttled, "rate", b.Rate, "queued", b.Queued, "denied_tokens", b.Denied["tokens"],
+				"denied_throttled", b.Denied["throttled"], "denied_queued", b.Denied["queued"], "spend_day", sp.DayUSD, "spend_month", sp.MonthUSD, "per_hour", sp.PerHour, "capped", sp.Capped)
 			for _, s := range l.sets {
 				snap := s.state.Snapshot(now)
 				slog.Info("state", "set", snap.Set, "ready", snap.Ready, "desired", snap.Desired, "live", snap.Live, "inflight", snap.Inflight, "machines", snap.Machines,

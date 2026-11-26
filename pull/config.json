@@ -78,11 +78,12 @@
   "registration": {
     "cap": 1500,
     "window_s": 300,
-    "margin": 0.2,
     "pool_rate": 5,
     "pool_share": 0.9,
-    "blind_rate": 0.3,
     "concurrency": 64,
+    "ceiling_rate": 5,
+    "ceiling_burst": 150,
+    "recover_s": 120,
     "critical_reserve": 2
   },
   "batch": {

@@ -14,13 +14,12 @@ import (
 	"github.com/actions/scaleset"
 )
 
-// starved is a budget whose organization's rate is known and above what the margin leaves: others register 4.3/s of
-// the 4/s the margin allows, as in the canary of Nov 26 2026. Its use of the window (1,290) is under the guard, so
-// every ask is turned away for want of a token.
+// starved is a budget whose admitted rate saves up no token in the test's time, so every ask is turned away for want
+// of one.
 func starved(at time.Time) *Budget {
-	b := NewBudget(reg(), at)
-	heads(b, 4.3, 6*time.Minute)
-	return b
+	c := reg()
+	c.CeilingRate = 0.001
+	return NewBudget(c, at)
 }
 
 func offered(job string, queued time.Time, waiting int) *scaleset.RunnerScaleSetMessage {
@@ -53,7 +52,7 @@ func TestAStarvedBudgetLeavesAJobUnstartedAndItsWaitIsVisibleWhileItLasts(t *tes
 	if snap.OldestUnregisteredS != 90 {
 		t.Errorf("the machine has had no runner for 90 s: gauge reads %v", snap.OldestUnregisteredS)
 	}
-	if got := b.Snapshot(end).Denied; got["tokens"] != asks || got["window"]+got["throttled"]+got["blind"] != 0 {
+	if got := b.Snapshot(end).Denied; got["tokens"] != asks || got["throttled"]+got["queued"] != 0 {
 		t.Errorf("denied %v, want %d for tokens and nothing else: GitHub was never asked, so refused stays %d", got, asks, b.Snapshot(end).Refused)
 	}
 	if b.Snapshot(end).Refused != 0 || b.Snapshot(end).Throttled {
@@ -62,25 +61,19 @@ func TestAStarvedBudgetLeavesAJobUnstartedAndItsWaitIsVisibleWhileItLasts(t *tes
 }
 
 func TestEveryReasonTheBudgetTurnsAwayIsCountedUnderItsOwnName(t *testing.T) {
-	window := NewBudget(reg(), t0)
-	heads(window, 4.9, 6*time.Minute) // 1,470 of the window, over the 1,350 guard
 	tokens := starved(t0)
 	throttled := NewBudget(reg(), t0)
 	throttled.Done(t0, Refused, 0)
-	blind := NewBudget(RegConfig{Cap: 1500, WindowS: 300, Margin: 0.2, BlindRate: 0.01}, t0.Add(-time.Hour))
-	for i := 0; i < 3; i++ { // the 3 a window the blind rate allows
-		if !blind.Take(t0, ForJob) {
-			t.Fatalf("blind registration %d turned away", i)
-		}
-	}
 	at := t0.Add(6 * time.Minute)
+	queued := NewBudget(reg(), at.Add(-1500*time.Millisecond)) // one token and a half
+	queued.Try(at.Add(-time.Second), Asker{ID: "i-0000", Launched: t0, P: ForJob})
 	for _, c := range []struct {
 		name   string
 		b      *Budget
 		at     time.Time
 		reason Denial
-	}{{"window", window, at, DeniedWindow}, {"tokens", tokens, at, DeniedTokens}, {"throttled", throttled, t0.Add(time.Second), DeniedThrottled}, {"blind", blind, t0, DeniedBlind}} {
-		ok, why := c.b.Try(c.at, ForJob)
+	}{{"tokens", tokens, at, DeniedTokens}, {"throttled", throttled, t0.Add(time.Second), DeniedThrottled}, {"queued", queued, at, DeniedQueued}} {
+		ok, why := c.b.Try(c.at, Asker{ID: "i-0001", Launched: t0.Add(time.Second), P: ForJob})
 		if ok || why != c.reason {
 			t.Errorf("%s: Try says %v for %v, want a no for %v", c.name, ok, why, c.reason)
 		}
@@ -89,8 +82,7 @@ func TestEveryReasonTheBudgetTurnsAwayIsCountedUnderItsOwnName(t *testing.T) {
 		}
 	}
 	open := NewBudget(reg(), t0)
-	heads(open, 1, 6*time.Minute)
-	if ok, why := open.Try(at, ForJob); !ok || why != Allowed || open.Snapshot(at).Denied["tokens"] != 0 {
+	if ok, why := open.Try(at, Asker{P: ForJob}); !ok || why != Allowed || open.Snapshot(at).Denied["tokens"] != 0 {
 		t.Errorf("a registration the budget allows is no denial: %v %v %v", ok, why, open.Snapshot(at).Denied)
 	}
 }
@@ -144,7 +136,7 @@ func TestAMachineStillToldToWaitWritesJitWaitEvery30SecondsWithItsReason(t *test
 }
 
 func TestThePublishedMetricsCarryTheDenialsAndTheWaitsInProgress(t *testing.T) {
-	m := Metrics{Denied: map[string]int{"window": 1, "tokens": 20, "throttled": 3, "blind": 0},
+	m := Metrics{Denied: map[string]int{"tokens": 20, "throttled": 3, "queued": 1},
 		Sets: []Snapshot{{Set: "superci-4cpu", OldestJobS: 480, OldestUnregisteredS: 500}, {Set: "superci-2cpu", OldestJobS: 7, OldestUnregisteredS: 9}}}
 	got := map[string]float64{}
 	for _, d := range metricData(m, t0) {
@@ -155,7 +147,7 @@ func TestThePublishedMetricsCarryTheDenialsAndTheWaitsInProgress(t *testing.T) {
 		got[key] = *d.Value
 	}
 	want := map[string]float64{
-		"BudgetDenied/Reason=window": 1, "BudgetDenied/Reason=tokens": 20, "BudgetDenied/Reason=throttled": 3, "BudgetDenied/Reason=blind": 0,
+		"BudgetDenied/Reason=tokens": 20, "BudgetDenied/Reason=throttled": 3, "BudgetDenied/Reason=queued": 1,
 		"OldestWaitingJobAgeS/Set=superci-4cpu": 480, "OldestWaitingJobAgeS/Set=superci-2cpu": 7, "OldestWaitingJobAgeS": 480,
 		"OldestUnregisteredMachineAgeS/Set=superci-4cpu": 500, "OldestUnregisteredMachineAgeS/Set=superci-2cpu": 9, "OldestUnregisteredMachineAgeS": 500,
 	}
@@ -197,8 +189,8 @@ func TestAStarvedBudgetPublishesItsDenialsMinuteByMinute(t *testing.T) {
 }
 
 func TestTheBudgetsDenialsOfAMinuteAreTheDifferenceOfTwoSnapshots(t *testing.T) {
-	got := deniedSince(map[string]int{"tokens": 5, "window": 2}, map[string]int{"tokens": 25, "window": 2, "blind": 4})
-	if got["tokens"] != 20 || got["window"] != 0 || got["blind"] != 4 {
+	got := deniedSince(map[string]int{"tokens": 5, "queued": 2}, map[string]int{"tokens": 25, "queued": 2, "throttled": 4})
+	if got["tokens"] != 20 || got["queued"] != 0 || got["throttled"] != 4 {
 		t.Errorf("deniedSince %v", got)
 	}
 	if got := deniedSince(nil, map[string]int{"tokens": 7}); got["tokens"] != 7 {

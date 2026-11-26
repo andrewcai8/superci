@@ -25,13 +25,13 @@ const (
 )
 
 // Lease takes up to n registrations for a lane at batch priority, held for ttl. It grants as many as the budget allows
-// now (none when the cap leaves nothing or a critical ask is waiting) and says how many.
+// now (never a token a machine in the queue waits for) and says how many.
 func (b *Budget) Lease(now time.Time, n int, ttl time.Duration) Lease {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	got := 0
 	for ; got < min(max(n, 0), maxLease); got++ {
-		if b.take(now, ForBatch) != Allowed {
+		if b.take(now, Asker{P: ForBatch}) != Allowed {
 			break
 		}
 	}

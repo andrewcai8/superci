@@ -152,6 +152,8 @@ func (h *Server) jit(w http.ResponseWriter, r *http.Request) {
 		case refused:
 			tlRefused(s.spec.Name, m.ID, "refused", started, time.Now())
 			h.budget.Done(time.Now(), Refused, 0)
+			b := h.budget.Snapshot(time.Now())
+			slog.Warn("registration refused by GitHub", "set", s.spec.Name, "machine", m.ID, "refused", b.Refused, "rate", b.Rate, "window_use_estimate", b.WindowUse)
 			s.state.Unissued(m)
 			w.Header().Set("Retry-After", "5")
 			w.WriteHeader(http.StatusTooManyRequests)

@@ -360,7 +360,7 @@ func (s *State) AskWhy(id string, now time.Time, b *Budget, maxAge time.Duration
 		m.Ending = true
 		return End, ""
 	}
-	if ok, why := b.Try(now, s.class(m, idle)); !ok {
+	if ok, why := b.Try(now, Asker{ID: m.ID, Launched: m.Launched, P: s.class(m, idle)}); !ok {
 		return Wait, why.String()
 	}
 	m.Issuing, m.IssuingSince = true, now
