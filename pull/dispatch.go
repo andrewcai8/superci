@@ -217,11 +217,13 @@ func (w *wire) gone() bool {
 
 // jobHead is what the dispatcher reads of a job message: its id and names, never a secret.
 type jobHead struct {
-	ID   string
-	Run  int64
-	Job  string // the github context's job: its key in the workflow
-	Name string // its display name
-	Repo string // owner/name
+	ID          string
+	Run         int64
+	Job         string // the github context's job: its key in the workflow
+	Name        string // its display name
+	Repo        string // owner/name
+	WorkflowRef string // owner/repo/.github/workflows/<file>@<ref>, which the gate selects a job's records by
+	Event       string // the run's trigger
 }
 
 var jobIDForm = regexp.MustCompile(`^[0-9a-f-]{1,64}$`)
@@ -265,8 +267,11 @@ func parseJobRequest(payloads [][]byte, size int) (head jobHead, done bool, err 
 	if len(name) > 1<<10 {
 		name = name[:1<<10]
 	}
-	return jobHead{ID: id, Run: run, Job: gh["job"], Name: name, Repo: gh["repository"]}, true, nil
+	return jobHead{ID: id, Run: run, Job: gh["job"], Name: name, Repo: gh["repository"], WorkflowRef: clip(gh["workflow_ref"], 1<<10),
+		Event: clip(gh["event_name"], 64)}, true, nil
 }
+
+func clip(s string, n int) string { return s[:min(len(s), n)] }
 
 // leading is the first n bytes of payloads, which hold at least n.
 func leading(payloads [][]byte, n int) []byte {
@@ -364,6 +369,8 @@ type jobClaim struct {
 	Name  string `json:"name,omitempty"`
 	Repo  string `json:"repo,omitempty"`
 	Agent string `json:"agent,omitempty"`
+	Ref   string `json:"ref,omitempty"`
+	Event string `json:"event,omitempty"`
 }
 
 func (c jobClaim) String() string {
@@ -893,7 +900,7 @@ func (d *Dispatcher) hand(st *DispatchSet, s *session, m *dmachine, mw *wire) {
 		st.abandon(s, m)
 		return
 	}
-	claim := jobClaim{pair: m.ID + "." + token, Run: s.head.Run, Name: s.head.Name, Repo: s.head.Repo, Agent: s.agent}
+	claim := jobClaim{pair: m.ID + "." + token, Run: s.head.Run, Name: s.head.Name, Repo: s.head.Repo, Agent: s.agent, Ref: s.head.WorkflowRef, Event: s.head.Event}
 	fctx, fcancel := context.WithTimeout(context.Background(), resumeWindow)
 	defer fcancel()
 	// The job's claim is asked again while S3's answer is unknown, for as long as a shim would wait to rejoin: a claim
@@ -984,6 +991,7 @@ type session struct {
 	out      int
 	infos    int
 	exited   bool
+	code     int32        // the Worker's exit code, once exited
 	away     [2]time.Time // since when the machine (0) and the shim (1) have been away, once handed
 	shimDone bool
 }
@@ -1138,6 +1146,9 @@ func (s *session) fromMachine(mw *wire, t frameType, p []byte) bool {
 			return false
 		}
 		s.exited = true
+		if len(p) == 4 {
+			s.code = int32(binary.LittleEndian.Uint32(p))
+		}
 	}
 	s.mu.Unlock()
 	if !keep {

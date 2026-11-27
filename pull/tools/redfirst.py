@@ -319,6 +319,10 @@ MUTANTS = [
      "TestAShimThatDiesAfterTheHandedPointLeavesTheJobRunningToItsExit"),
     ("D-fix-8 an EXIT held for an absent shim keeps its machine", "dispatch.go", "\t\t} else if t == frameExit {\n\t\t\tst.exitHeld(s)", "\t\t} else if false {\n\t\t\tst.exitHeld(s)",
      "TestAShimThatDiesAfterTheHandedPointLeavesTheJobRunningToItsExit"),
+    ("D-rec a dispatched job leaves no record", "dset.go", "\tst.jobs = append(st.jobs, rec)\n", "", "TestADispatchedJobLeavesExactlyOneRecord"),
+    ("D-rec a finished job leaves a second record", "dset.go", "\tif s.phase == over {\n\t\tst.mu.Unlock()\n\t\treturn\n\t}\n\ts.phase = over\n\tif st.pairs", "\ts.phase = over\n\tif st.pairs", "TestALostDispatchedJobLeavesOneFailedRecord"),
+    ("D-rec a lost job reads as its exit code", "dset.go", "\tif exited && why != machineLost {", "\tif exited {", "TestALostDispatchedJobLeavesOneFailedRecord"),
+    ("D-rec the record has no workflow", "dispatch.go", "WorkflowRef: clip(gh[\"workflow_ref\"], 1<<10),", "WorkflowRef: \"\",", "TestADispatchedJobLeavesExactlyOneRecord"),
 ]
 
 here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

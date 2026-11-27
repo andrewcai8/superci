@@ -244,6 +244,9 @@ func run(ctx context.Context, f flags) error {
 	for _, s := range l.sets {
 		s.state.SetPricer(l.spend.Price)
 	}
+	for _, d := range l.dsets {
+		d.SetPricer(l.spend.Price)
+	}
 	poolParam := poolParamName(f.poolParam, cfg.Deployment)
 	if err := loadPools(ctx, ssmc, poolParam, l.sets, cfg.Pool.window(), now); err != nil {
 		slog.Error("load pools", "err", err.Error())
@@ -1288,6 +1291,7 @@ func (l *Listener) metrics() Metrics {
 		m.Orphans += s.Orphans
 	}
 	for _, d := range l.dsets {
+		m.Jobs = append(m.Jobs, d.TakeJobs()...)
 		waits := d.TakeWaits()
 		m.Waits = append(m.Waits, waits...)
 		m.SetWaits[d.spec.Name] = waits

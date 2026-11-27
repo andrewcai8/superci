@@ -189,7 +189,7 @@ func isTimeout(err error) bool {
 // jobMessage is the listener's NewJobRequest as it writes it to the Worker's pipe, with a secret the dispatcher must
 // not keep.
 func jobMessage(id string, run int64, name string) []byte {
-	js := fmt.Sprintf(`{"messageType":"PipelineAgentJobRequest","jobId":%q,"jobDisplayName":%q,"contextData":{"github":{"t":2,"d":[{"k":"run_id","v":"%d"},{"k":"job","v":"unit"},{"k":"repository","v":"acme/mono"}]}},"variables":{"system.accessToken":{"value":"job-secret","isSecret":true}}}`, id, name, run)
+	js := fmt.Sprintf(`{"messageType":"PipelineAgentJobRequest","jobId":%q,"jobDisplayName":%q,"contextData":{"github":{"t":2,"d":[{"k":"run_id","v":"%d"},{"k":"job","v":"unit"},{"k":"repository","v":"acme/mono"},{"k":"workflow_ref","v":"acme/mono/.github/workflows/ci.yml@refs/heads/main"},{"k":"event_name","v":"push"}]}},"variables":{"system.accessToken":{"value":"job-secret","isSecret":true}}}`, id, name, run)
 	units := utf16.Encode([]rune(js))
 	b := binary.LittleEndian.AppendUint32(nil, 1)
 	b = binary.LittleEndian.AppendUint32(b, uint32(2*len(units)))
@@ -1389,5 +1389,61 @@ func TestAShimThatDiesAfterTheHandedPointLeavesTheJobRunningToItsExit(t *testing
 	}
 	if c := p.st.TakeCounts(); c.Lost != 0 {
 		t.Fatalf("counts %+v: a job that ran to its exit code is not lost", c)
+	}
+}
+
+// A dispatched job never passes through State.Observe, so the dispatcher writes its record: exactly one when it is over,
+// with the job's names and workflow from its job message, its result from its Worker's exit code, and its machine.
+func TestADispatchedJobLeavesExactlyOneRecord(t *testing.T) {
+	store := &fakeS3{objects: map[string]string{}}
+	p := startDispatcher(t, store, identityTags(), dispatchSet("i-0m1"))
+	m := p.machine(t, "i-0m1")
+	waitUntil(t, "the machine waits", func() bool { return idleMachines(p.st) == 1 })
+	s := p.shim(t)
+	msg := jobMessage("5f0c3b52-9b8d-4c62-8e31-1a2b3c4d5e6f", 4242, "unit (1/4)")
+	s.sendJob(msg)
+	m.job()
+	s.paired()
+	m.pipeBytes(len(msg))
+	m.send(frameExit, i32(100))
+	s.expect(frameExit)
+	waitUntil(t, "the job is over", func() bool { return phaseOf(p.st, "i-0m1") == mEnding })
+	bounds := dispatchBounds{maxAge: time.Hour, life: 9 * time.Hour, job: 6 * time.Hour, window: 3 * time.Minute}
+	p.st.Reconcile(time.Now(), bounds)
+	p.st.Reconcile(time.Now().Add(time.Hour), bounds)
+	recs := p.st.TakeJobs()
+	if len(recs) != 1 {
+		t.Fatalf("%d records, want one for the one job", len(recs))
+	}
+	r := recs[0]
+	if !r.Dispatched || r.Job != "5f0c3b52-9b8d-4c62-8e31-1a2b3c4d5e6f" || r.Run != 4242 || r.Name != "unit (1/4)" || r.Repo != "acme/mono" ||
+		r.WorkflowRef != "acme/mono/.github/workflows/ci.yml@refs/heads/main" || r.Event != "push" || r.Runner != "superci-id-4cpu-17" ||
+		r.Inst != "i-0m1" || r.Machine == nil || r.Conclusion() != "success" || r.Partial() || r.Started.Before(r.Queued) || r.Finished.Before(r.Started) {
+		t.Fatalf("record %+v", r)
+	}
+	if again := p.st.TakeJobs(); len(again) != 0 {
+		t.Fatalf("%d more records after the job was over", len(again))
+	}
+}
+
+func TestALostDispatchedJobLeavesOneFailedRecord(t *testing.T) {
+	for code, want := range map[int32]string{102: "failure", 103: "cancelled", 1: "failure"} {
+		st := dispatchSet("i-0m1")
+		s := &session{set: st, id: "job-1", agent: "superci-id-4cpu-17", machine: "i-0m1", arrived: time.Now().Add(-time.Minute), handed: time.Now().Add(-50 * time.Second),
+			head: jobHead{ID: "job-1", Run: 7, Name: "n", Repo: "acme/mono"}, phase: running, exited: true, code: code}
+		st.pairs["i-0m1"], st.byJob["job-1"] = s, s
+		st.finish(s, exitRelayed)
+		st.finish(s, exitRelayed)
+		recs := st.TakeJobs()
+		if len(recs) != 1 || recs[0].Conclusion() != want {
+			t.Fatalf("exit %d: records %+v, want one %s", code, recs, want)
+		}
+	}
+	st := dispatchSet("i-0m1")
+	s := &session{set: st, id: "job-2", agent: "superci-id-4cpu-17", machine: "i-0m1", arrived: time.Now(), handed: time.Now(), phase: running, exited: true, code: 100}
+	st.pairs["i-0m1"], st.byJob["job-2"] = s, s
+	st.finish(s, machineLost)
+	if recs := st.TakeJobs(); len(recs) != 1 || recs[0].Conclusion() != "failure" {
+		t.Fatalf("a lost job: records %+v, want one failure", recs)
 	}
 }

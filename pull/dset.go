@@ -7,6 +7,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/actions/scaleset"
 )
 
 // A DispatchSet is a size the identity plane serves (README, Identity plane). It has no scale set and registers no
@@ -38,6 +40,8 @@ type DispatchSet struct {
 	allLaunched  []time.Time
 	counts       DispatchCounts // since the metrics last took them
 	waits        []float64      // seconds from a job's arrival to its hand-off, since the metrics last took them
+	jobs         []JobRecord    // records of the jobs over since the metrics last took them
+	price        func(Machine) float64
 }
 
 // A dmachine is one machine of a dispatch set: EC2's facts, and where it is in its one job's life.
@@ -467,7 +471,7 @@ func (st *DispatchSet) adopt(inst, token, job string, c jobClaim, now time.Time)
 	if s := st.pairs[inst]; s != nil {
 		return s
 	}
-	s := &session{set: st, id: job, head: jobHead{ID: job, Run: c.Run, Name: c.Name, Repo: c.Repo}, agent: c.Agent, machine: inst,
+	s := &session{set: st, id: job, head: jobHead{ID: job, Run: c.Run, Name: c.Name, Repo: c.Repo, WorkflowRef: c.Ref, Event: c.Event}, agent: c.Agent, machine: inst,
 		token: token, phase: running, handed: now, arrived: now, live: true, away: [2]time.Time{now, now}}
 	st.pairs[inst], st.byJob[job] = s, s
 	return s
@@ -492,10 +496,17 @@ func (st *DispatchSet) finish(s *session, why jobEnd) {
 		reason = "its job was lost"
 		st.counts.Lost++
 	}
-	if m := st.machines[s.machine]; m != nil && m.session == s {
-		st.end(m, reason)
+	var mach *Machine
+	if m := st.machines[s.machine]; m != nil {
+		mach = m.Machine
+		if m.session == s {
+			st.end(m, reason)
+		}
 	}
+	rec := st.record(s, why, mach, time.Now())
+	st.jobs = append(st.jobs, rec)
 	st.mu.Unlock()
+	tlJobRecord(rec, time.Now())
 	go func() {
 		if why == machineLost {
 			s.lose()
@@ -503,6 +514,62 @@ func (st *DispatchSet) finish(s *session, why jobEnd) {
 		s.closeAll()
 	}()
 	slog.Info("dispatch job over", "set", st.spec.Name, "job", s.id, "machine", s.machine, "lost", lost)
+}
+
+// record is a dispatched job's one record, made when it is over (finish runs once a session). It has no completed
+// message: the job's names come from its job message, its result from its Worker's exit code (or a failure when its
+// machine was lost, which the identity's listener reports for it), and its machine is the dispatch machine. Queued is
+// when the identity's shim brought the job and Started when the machine took it, so queue_ms is the wait for a machine;
+// GitHub's own queue before an identity took the job is not in it (identities idle at once take a job).
+func (st *DispatchSet) record(s *session, why jobEnd, m *Machine, now time.Time) JobRecord {
+	s.mu.Lock()
+	exited, code := s.exited, s.code
+	s.mu.Unlock()
+	result := "Failed"
+	if exited && why != machineLost {
+		result = dispatchResult(code)
+	}
+	owner, repo, _ := strings.Cut(s.head.Repo, "/")
+	j := &scaleset.JobCompleted{Result: result, RunnerName: s.agent, JobMessageBase: scaleset.JobMessageBase{JobID: s.id, WorkflowRunID: s.head.Run,
+		JobDisplayName: s.head.Name, OwnerName: owner, RepositoryName: repo, JobWorkflowRef: s.head.WorkflowRef, EventName: s.head.Event,
+		RequestLabels: []string{st.spec.Label}, QueueTime: s.arrived, RunnerAssignTime: s.handed, FinishTime: now}}
+	r := newJobRecord(st.spec.Name, j, m, st.price, began{})
+	r.Dispatched = true
+	if m != nil {
+		r.Inst = m.ID
+	}
+	return r
+}
+
+// dispatchResult is the result a Worker's exit code stands for (TaskResult plus 100); any other code is the Worker's
+// crash, which the identity's listener fails the job for.
+func dispatchResult(code int32) string {
+	switch code {
+	case 100, 101:
+		return "Succeeded"
+	case 103:
+		return "Canceled"
+	case 105:
+		return "Abandoned"
+	default:
+		return "Failed"
+	}
+}
+
+// SetPricer sets how this set's job records price a machine (the spend's estimate).
+func (st *DispatchSet) SetPricer(f func(Machine) float64) {
+	st.mu.Lock()
+	st.price = f
+	st.mu.Unlock()
+}
+
+// TakeJobs hands over the records of the jobs over since the last call, for the minute's metrics.
+func (st *DispatchSet) TakeJobs() []JobRecord {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	j := st.jobs
+	st.jobs = nil
+	return j
 }
 
 // exitHeld ends the machine of a handed job whose exit code came while its shim was away: the job is over on the
