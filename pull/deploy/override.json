@@ -1,1 +1,32 @@
-{}
+{
+  "sizes": {
+    "superci-4cpu": {
+      "cpu": 4,
+      "split": 1,
+      "max": 1200,
+      "disk_gb": 60,
+      "disk_mbps": 1000,
+      "disk_iops": 4000,
+      "types": [
+        "m8azn.xlarge",
+        "m8a.xlarge",
+        "r8a.xlarge"
+      ],
+      "on_demand_first": 1,
+      "dispatch": true
+    },
+    "superci-8cpu": {
+      "cpu": 8,
+      "split": 1,
+      "max": 600,
+      "disk_gb": 80,
+      "types": [
+        "m8azn.3xlarge",
+        "m8a.2xlarge",
+        "r8a.2xlarge"
+      ],
+      "on_demand_first": 1,
+      "dispatch": true
+    }
+  }
+}
