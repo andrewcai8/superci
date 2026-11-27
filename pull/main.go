@@ -356,7 +356,13 @@ func setState(spec SetSpec, cfg Config, regions []string, now time.Time) *State 
 // (the oldest a pool machine may be, and the longest job after it), and its set's label, which names the hydration
 // manifest it reads.
 func bootData(c Config, listener, pin, label string) string {
-	return strings.NewReplacer("@LISTENER@", listener, "@PIN@", pin, "@LIFE_SECONDS@", strconv.Itoa(int(c.life().Seconds())), "@LABEL@", label, "@HYDRATE_STOP@", strings.TrimSpace(hydrateStop)).Replace(bootScript)
+	return bootDataMode(c, listener, pin, label, "scaleset")
+}
+
+// bootDataMode is bootData for a mode: "scaleset" asks for a just-in-time runner as always, "dispatch" runs the agent
+// (agent.py) that takes the one job the dispatcher pairs the machine with.
+func bootDataMode(c Config, listener, pin, label, mode string) string {
+	return strings.NewReplacer("@MODE@", mode, "@LISTENER@", listener, "@PIN@", pin, "@LIFE_SECONDS@", strconv.Itoa(int(c.life().Seconds())), "@LABEL@", label, "@HYDRATE_STOP@", strings.TrimSpace(hydrateStop)).Replace(bootScript)
 }
 
 // ensureScaleSet finds or makes the set at GitHub, in the deployment's runner group, with its labels: its name, and

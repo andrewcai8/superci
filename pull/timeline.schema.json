@@ -282,6 +282,37 @@
       ],
       "what": "the runner printed the job's result"
     },
+    "job.got": {
+      "src": "machine",
+      "fields": [
+        "inst",
+        "set",
+        "offset_ms",
+        "dur_ms"
+      ],
+      "what": "dispatch mode: the agent took its job from the dispatcher"
+    },
+    "worker.start": {
+      "src": "machine",
+      "fields": [
+        "inst",
+        "set",
+        "offset_ms",
+        "dur_ms"
+      ],
+      "what": "dispatch mode: the agent started Runner.Worker"
+    },
+    "worker.exit": {
+      "src": "machine",
+      "fields": [
+        "inst",
+        "set",
+        "offset_ms",
+        "val",
+        "dur_ms"
+      ],
+      "what": "dispatch mode: Runner.Worker exited; val is its exit status"
+    },
     "runner.exit": {
       "src": "machine",
       "fields": [
@@ -433,6 +464,28 @@
         "val"
       ],
       "what": "the read of the root volume ended; val is full when it read all of it and stopped when the job started first"
+    },
+    "rewarm.done": {
+      "src": "machine",
+      "fields": [
+        "inst",
+        "set",
+        "offset_ms",
+        "dur_ms",
+        "val"
+      ],
+      "what": "after the pre-read, the walk of the hydrated and image trees ended: full, or stopped by the job"
+    },
+    "warm.done": {
+      "src": "machine",
+      "fields": [
+        "inst",
+        "set",
+        "offset_ms",
+        "dur_ms",
+        "val"
+      ],
+      "what": "after the walk, the binaries jobs start were read into the page cache: full, or stopped by the job"
     },
     "cache.restore": {
       "src": "machine",

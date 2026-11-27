@@ -159,6 +159,26 @@ call() { curl -s -k --pinnedpubkey "$PIN" -m 60 --data-binary "$DOC" -o "$2" -w 
     [ "$(curl -s -m 2 -o /dev/null -w '%{http_code}' -H "X-aws-ec2-metadata-token: $T" http://169.254.169.254/latest/meta-data/spot/instance-action)" = 200 ] || continue
     call notice /dev/null; break
   done ) &
+# Dispatch mode (pull/agent.py): no runner is registered. The machine fetches its agent with the identity document and
+# the pin, which proves itself to the dispatcher and runs the one job it is paired with, and powers off as below.
+if [ '@MODE@' = dispatch ]; then
+  umask 077
+  fails=0
+  while :; do
+    code=$(call agent /run/superci-agent.py)
+    echo "superci-pull: agent $code at $(date -u +%T.%N)"
+    case $code in
+      200) mark runner.start; python3 -I /run/superci-agent.py "$L" "$PIN"; mark runner.exit "$?"; break ;;
+      410) break ;;
+      *) fails=$((fails + 1)); [ $fails -ge 300 ] && break; sleep 3 ;;
+    esac
+  done
+  mark poweroff
+  kill "$SENDER" 2> /dev/null
+  for _ in 1 2 3; do send; [ "$(cat $SP.sent)" = "$(wc -l < $SP)" ] && break; done
+  poweroff
+  exit 0
+fi
 umask 077
 fails=0
 while :; do
