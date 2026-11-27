@@ -79,12 +79,49 @@ lower bound only under-reports, so a row that fails on them fails on the real ti
 | wall p50 | superci p50 of started to completed, over successful runs, timed-out ones at the ceiling and cancelled ones at the time they ran, at or below Blacksmith's |
 | wall p90 | at or below the smaller of Blacksmith's p90 x 1.1 and the job's ceiling in `scripts/verify/ci-limits.tsv` on origin/main |
 | queue wait p50, p90 | created to started (created to completed for a job cancelled in the queue): p50 at or below Blacksmith's, p90 at or below Blacksmith's plus 3 s |
-| failures | at most Blacksmith's failure rate x superci observations + 1; a failure the same commit also has on Blacksmith (main runs there) is not counted. A superci failure never excuses another, main's included |
+| failures | at most Blacksmith's failure rate x superci observations + 1; a failure the same commit also has on Blacksmith (main runs there) is not counted. A superci failure never excuses another, main's included. For `unit-tests` and `integration`, a failure whose every failing test is red on Blacksmith's main too is excluded and listed ([below](#failing-tests-and-window-floors)) |
 | unexplained p50 | under 2 s per `timeline`'s derivation |
 
 **The noise floor.** Every quantile is interpolated, and above the rows the tool prints each fleet's min, p25, p50, p75, p90,
 max and IQR. A speed row that passes by less than the superci sample's IQR is `NOISE`, not `PASS`: the spread is wider than
 the gap, so add runs. Nothing is rounded toward either verdict.
+
+## Failing tests and window floors
+
+**Failing tests (`unit-tests`, `integration`).** A test red on both runners is not a superci regression, so these two jobs'
+failures row reads each failed job's failing tests (`NAME_SOURCES` in `gate.py`; any other job keeps the job-level rule and the
+output says so: `failing tests: no test-name source for <job>`).
+
+- **Source: the job's log**, one `GET actions/jobs/<id>/logs` per failed job, on Actions: read, which the App holds (the timeline
+  already reads logs on it). unit-tests: bun's `(fail) <suite > test> [ms]` lines under each `== bun test --isolate <file>` header
+  that `scripts/verify/test-files.ts` replays, names `<file> :: <suite > test>`; a file that failed with no such line (load error,
+  time limit, signal) is named by its file. integration: the same lines inside each `[integration] ── target N/M (...): <target>`
+  block; a target killed by its watchdog, or left unfinished when the shard was cut short, is named by itself. Check-run
+  annotations would be smaller, but need Checks: read, which the App is not documented to hold, and unit-tests has none that names a test.
+- **Cost.** One call per failed job, kept in `--cache` (names, not logs; a finished job never changes), plus one jobs listing per
+  failed superci run in `events` mode to find a record's REST job (a record has only a GUID), and one per failed Blacksmith main
+  run not already in the baseline sample. A job whose steps show the tests' step succeeded (`Run tests`, `Run integration tests`)
+  names no test and costs no call. `--max-test-reads` (150) bounds the logs one check reads, superci's first. A canary's second and later
+  checks cost only the jobs that failed since: Blacksmith's baseline ends at `SINCE`, so its reads happen once.
+- **Rule.** Blacksmith's side is every failed job of this name (any matrix leg) in every main run of the baseline window that
+  ended red, read from the run listing the gate already holds, not only the sample the rates use. A superci failure counts when at
+  least one of its failing tests is in no failed Blacksmith main job of that window (a test never seen failing there passed on every
+  main run; the failing-test source cannot say where a test ran, so absence is a pass). A failure whose tests are all red there is
+  excluded and printed under the failures row: `excluded (red on Blacksmith main too): <tests> in <superci run ids>`, then the
+  Blacksmith runs. Counted failures are printed too (`counted, green on Blacksmith main`). Fail closed: a failure whose log cannot be read,
+  names no test, or whose job record matches no REST job counts and says why; a failure in a step other than the tests' counts and says
+  which. A Blacksmith main failure that cannot be read draws no exclusion and is reported.
+  An exclusion that rests on one Blacksmith main failure of that test in the window is tagged `(1 Blacksmith failure: flaky?)`.
+  **The allowance is symmetric.** The same exclusion applies to Blacksmith's failure rate: a failed main job that was read and names a
+  failing test (red on main, by definition: the excluded set is every test red on Blacksmith main in the window) is left out of the
+  numerator, the denominator stays every Blacksmith run. A Blacksmith failure on another branch, one whose log could not be read and one that names no
+  test (failed in setup) still counts, so a failure the gate cannot explain makes the allowance stricter. Both rates are printed under
+  the failures row, before and after the exclusion; the allowance uses the rate after.
+
+**Window floors (`WINDOW_FLOORS`).** A job's parity window may not include runs from before its floor: `--since` and Blacksmith's
+baseline start are clamped to it (the output says so), and a Blacksmith window that ends before it is refused. `integration` starts at
+megpt-mono `4e75d94` (#36944, 2026-11-27T20:33:52Z, its committer time on main), which ended 5-25 minute resets between targets.
+The floor is by run creation time: a run on a branch cut before that commit and created after it is not caught.
 
 ## A live canary: `gate job --canary` and `canary.sh`
 
