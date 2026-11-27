@@ -22,6 +22,8 @@
       "split": 1,
       "max": 1200,
       "disk_gb": 60,
+      "disk_mbps": 1000,
+      "disk_iops": 4000,
       "types": ["m8azn.xlarge", "m8a.xlarge", "r8a.xlarge"],
       "on_demand_first": 1
     },

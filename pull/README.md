@@ -910,6 +910,30 @@ dilute it.
 A busy hour costs what its jobs run for at those prices, plus about 30 s of boot and shutdown per job (a machine runs
 one job), plus the pool. `SpendPerHourUSD` is the listener's live figure.
 
+**The root volume.** gp3, 250 MiB/s and 3,000 IOPS unless a size sets `disk_mbps` and `disk_iops` (gp3 takes 125 to 1,000 MiB/s and 3,000 to 16,000
+IOPS, at most 0.25 MiB/s for each IOPS; the config refuses a size EC2 would refuse). `superci-4cpu` sets 1,000 and 4,000. The gate found
+mind-snapshot shard 3 about 10 s slower than on Blacksmith, with 41 to 43 CPU-seconds in iowait against under 1, and a 1 GiB `fdatasync` write of
+3.2 to 4.3 s against 0.5 to 0.6 s: the device, not the page cache. `pull/tools/disk/lab.sh` times it on lab instances (one per setting: an `m8azn.xlarge`
+on the superci image with a 60 GB root, boot.sh's `vm.dirty_ratio=50` and `noauto_da_alloc`, the root grown), Nov 27:
+
+| MiB/s : IOPS | 1 GiB `fdatasync` write, 3 runs | 4 GiB | 4 KiB random writes, 20 s |
+| --- | --- | --- | --- |
+| 250 : 3,000 (before) | 3.21, 4.06, 4.06 s | 16.35 s | 3,149 IOPS |
+| 500 : 3,000 | 1.16, 2.01, 2.02 s | 8.16 s | 3,149 IOPS |
+| 750 : 3,000 | 0.57, 1.26, 1.34 s | 5.43 s | 3,069 IOPS |
+| **1,000 : 4,000** | **0.46, 0.68, 1.00 s** | **4.07 s** | 4,095 IOPS |
+| 1,000 : 16,000 | 0.46, 0.67, 0.99 s | 4.06 s | 16,800 IOPS |
+
+Each step is device-bound (4 GiB takes 4.07 s at 1,000 MiB/s, 16.35 s at 250). 1,000 MiB/s is the smallest setting that brings the 1 GiB write to
+Blacksmith's 0.5 to 0.6 s on its first run and within about 1 s on the later ones, and 4,000 IOPS is the least gp3 allows with it. 16,000 IOPS
+does nothing for these writes (the random-write row is the IOPS limit) and costs 0.082 USD an hour more; it is not set. Throughput over 125 MiB/s
+is 0.04 USD a MiB/s-month and IOPS over 3,000 are 0.005 USD an IOPS-month, so 1,000 and 4,000 cost 0.0548 USD an hour beyond storage against 0.0068
+for the defaults: **+0.048 USD per machine-hour** (+0.0016 for a machine that lives 2 minutes), +32% on an `m8azn.xlarge` spot machine (about 0.15) and
++12% on one on demand (0.41). The listener's spend estimate uses the size's volume. The 5.4 GB that shard 3 writes is 21 s of device time at 250
+MiB/s and 5.4 s at 1,000: that the shard gets its 10 s back is a prediction until the gate measures it. `m8azn.xlarge` bursts to 1,875 MiB/s of EBS
+for 30 minutes a day (312 MiB/s baseline), and a single-use machine always has its burst; `m8a.xlarge` and `r8a.xlarge` burst to 1,250 (156
+baseline) and were not measured. Machines running when this ships keep their old volume: a changed template makes new machines.
+
 ## Known limits
 
 - **GitHub's registration cap is the fleet's real limit.** Every job is a JIT registration, and the rest of the
