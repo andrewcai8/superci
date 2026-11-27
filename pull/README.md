@@ -508,7 +508,7 @@ size is one set (`split` 1), since an identity names its size, not a set of it.
 - **Machines.** A dispatch machine carries `superci-pull-mode=dispatch`, so a scale set and a dispatch set of one size
   never take each other's machines. Its demand is the jobs waiting plus the jobs running, and its pool follows the
   jobs that arrive at the dispatcher, by the same rule as a scale set's (Pools). It ends when its EXIT has been
-  relayed or held for a shim that is away, when it has had no connection for 3 minutes (and is 5 minutes old), when it
+  relayed or held for a shim that is away, when it has had no connection for 3 minutes (and is 8 minutes old: its warm takes up to 5), when it
   has waited past `max_age_hours`, past its life, or as surplus: the newest machines without a job first, after 20 s
   of surplus, never in the first window after a start. It holds no runner, so its end needs no GitHub fence. A
   dispatch machine left with no dispatch set, as when its size moved back to a scale set, may be running its job: it
