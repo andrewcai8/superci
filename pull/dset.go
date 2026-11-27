@@ -817,6 +817,7 @@ type DispatchSnapshot struct {
 	Idle        int     `json:"idle"`
 	Running     int     `json:"running"`
 	Ending      int     `json:"ending"`
+	OnDemand    int     `json:"on_demand"`
 	JobsWaiting int     `json:"jobs_waiting"`
 	OldestJobS  float64 `json:"oldest_job_s"`
 	LaunchS     float64 `json:"launch_s"`
@@ -837,6 +838,9 @@ func (st *DispatchSet) Snapshot(now time.Time) DispatchSnapshot {
 			out.Booting++
 		case mEnding:
 			out.Ending++
+		}
+		if m.Lifecycle == "on-demand" {
+			out.OnDemand++
 		}
 	}
 	if len(st.queue) > 0 {
