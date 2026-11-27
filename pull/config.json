@@ -30,7 +30,8 @@
       "split": 1,
       "max": 600,
       "disk_gb": 80,
-      "types": ["m8azn.3xlarge", "m8a.2xlarge", "r8a.2xlarge"]
+      "types": ["m8azn.3xlarge", "m8a.2xlarge", "r8a.2xlarge"],
+      "on_demand_first": 1
     },
     "superci-16cpu": {
       "cpu": 16,

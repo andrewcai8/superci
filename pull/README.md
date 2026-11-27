@@ -26,10 +26,14 @@ superci-pull: one process on one c7g.large, an Auto Scaling group of one in us-e
               then m8a and r8a; the others: c8a and m8a, then c8i, m8i, c7a and m7a, then older families) x every zone of us-east-1 that
               offers them (5 of 6: use1-az3 offers none) at weight 2 and of us-east-2 (3 of 3) at weight 1; a
               region's spot shortfall goes to the other, then on-demand, at most 10% of the last half hour's
-              launches. A size's `on_demand_first` leading types (superci-4cpu: m8azn) go first, spot then on
-              demand outside that 10%, before any slower type: m8azn spot is thin (10 of 11 m8azn-only asks
+              launches. A size's `on_demand_first` leading types (superci-4cpu and superci-8cpu: m8azn) go first, spot then
+              on demand outside that 10%, before any slower type: m8azn spot is thin (10 of 11 m8azn-only asks
               failed, Nov 26), on-demand m8azn.xlarge is $0.41/h against Blacksmith's $0.48/h for 4 vCPUs, and
-              unit legs ran 12% slower on m8a and r8a (93 s against 83 s); a ClientToken on every call
+              unit legs ran 12% slower on m8a and r8a (93 s against 83 s). superci-8cpu had no such rule: 1,062 of
+              its 1,461 launches in 14 hours to Nov 27 04:00Z (73%) were m8a.2xlarge or r8a.2xlarge. On demand its
+              m8azn.3xlarge (12 vCPUs, 48 GiB) is $1.2388/h (AWS price list, us-east-1) against Blacksmith's $0.96/h for
+              8 vCPUs, and spot $0.36 to $0.62 against $0.14 to $0.25 for the slower types, so the rule adds about
+              $0.33 per machine-hour (below); a ClientToken on every call
   /jit      : POST with the machine's signed identity document; a runner only for a machine never issued one, only
               once its grant has made the machine's claim (s3://superci-pull-claims-<account>/issued/<instance>),
               and its config leaves only after EC2 has the machine's superci-pull-issued tag
@@ -885,6 +889,17 @@ whose message says "burst"); `bench/measure.py BRANCH SINCE UNTIL listener.jsonl
 
 Spot prices on Nov 25 2026 08:00Z (median of each size's 10 cheapest pools), with its gp3 volume, a machine-hour:
 2 vCPU $0.035, 4 vCPU $0.062, 8 vCPU $0.106, 16 vCPU $0.190, 32 vCPU $0.351.
+
+These are the median of the cheapest pools, not what a size launches into. 8 vCPU runs m8azn.3xlarge (12 vCPUs, 48 GiB) first, with its `on_demand_first`
+rule: spot $0.36 to $0.62 (about $0.48 across the regions, weight 2 to 1) against $0.14 to $0.25 for m8a.2xlarge and r8a.2xlarge, and $1.2388 on demand
+(AWS price list, Nov 27). Over the 14 hours to Nov 27 04:00Z, before the rule, 27% of its machines were m8azn spot, 41% m8a and 32% r8a: about $0.27 a
+machine-hour. With the rule, at 4 vCPU's observed split of 84% spot and 16% on demand (a guess for 8 vCPU), about $0.61: +$0.33 a machine-hour, +$0.017 for a
+machine that lives 3 minutes, under Blacksmith's $0.96 an hour for 8 vCPUs on average and over it ($1.24) for a machine that lands on demand. The rule is
+bounded by the cost cap and nothing else: m8azn on demand is not limited by `on_demand_share`, so a long m8azn spot shortage in both regions puts every 8 vCPU
+machine on demand, and about 33 of them running all day reach the 1,000 USD daily cap, after which the listener launches nothing until 00:00 UTC.
+`spend-daily` (80% of the cap) pages first; no alarm watches the on-demand share. Every on-demand launch, m8azn included, counts toward the
+`on_demand_share` the slower types are held to, so after a burst of m8azn on demand the slower types get none on demand until the half hour's launches
+dilute it.
 
 | | Per hour |
 | --- | --- |

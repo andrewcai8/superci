@@ -121,6 +121,45 @@ func TestSuperci4cpuFallsToSlowerSpotOnlyWhenM8aznIsOutEntirely(t *testing.T) {
 	}
 }
 
+// superci-8cpu leads with m8azn.3xlarge as superci-4cpu leads with m8azn.xlarge, and its spot is as thin: from about 17:40Z
+// Nov 26, 1,062 of its 1,461 launches in 14 hours (73%) were m8a.2xlarge or r8a.2xlarge, the slower types.
+func TestSuperci8cpuAsksM8aznOnDemandBeforeASlowerSpotType(t *testing.T) {
+	thin := map[string]int{"m8azn.3xlarge/spot": 1, "m8azn.3xlarge/on-demand": 100, "m8a.2xlarge/spot": 100, "r8a.2xlarge/spot": 100}
+	got := shapes(launchSet(t, "superci-8cpu", thin, maps(thin)).Launch(context.Background(), "r1", 6, 0))
+	if want := map[string]int{"m8azn.3xlarge/spot": 2, "m8azn.3xlarge/on-demand": 4}; !sameShapes(got, want) {
+		t.Fatalf("with m8azn spot thin and the on-demand share spent, 6 machines started as %v, want %v", got, want)
+	}
+}
+
+func TestSuperci8cpuTakesM8aznSpotWhenItHasCapacityAndFallsToSlowerOnlyWhenM8aznIsOut(t *testing.T) {
+	plenty := map[string]int{"m8azn.3xlarge/spot": 100, "m8azn.3xlarge/on-demand": 100, "m8a.2xlarge/spot": 100}
+	if got, want := shapes(launchSet(t, "superci-8cpu", plenty, maps(plenty)).Launch(context.Background(), "r1", 6, 6)), map[string]int{"m8azn.3xlarge/spot": 6}; !sameShapes(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	out := map[string]int{"m8a.2xlarge/spot": 2, "r8a.2xlarge/spot": 100, "m8a.2xlarge/on-demand": 100}
+	if got, want := shapes(launchSet(t, "superci-8cpu", out, maps(out)).Launch(context.Background(), "r1", 6, 0)), map[string]int{"m8a.2xlarge/spot": 4, "r8a.2xlarge/spot": 2}; !sameShapes(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
+// A size whose first type is an m8azn asks it on demand before a slower spot type: the shipped config says so for every
+// such size, so a size added or reordered without the rule fails here and not in production's launch mix.
+func TestEverySizeThatLeadsWithM8aznAsksItOnDemandFirst(t *testing.T) {
+	c := shippedConfig(t)
+	seen := 0
+	for label, s := range c.Sizes {
+		if len(s.Types) > 0 && strings.HasPrefix(s.Types[0], "m8azn.") {
+			seen++
+			if s.OnDemandFirst < 1 {
+				t.Errorf("%s leads with %s and has on_demand_first %d: its m8azn spot is thin and 73%% of its machines land on slower types", label, s.Types[0], s.OnDemandFirst)
+			}
+		}
+	}
+	if seen < 2 {
+		t.Fatalf("only %d sizes lead with m8azn: superci-4cpu and superci-8cpu do", seen)
+	}
+}
+
 func TestTheShareBoundedAskLeavesOutTheTypesAlreadyAskedOnDemand(t *testing.T) {
 	east := &capacity{left: map[string]int{"m8azn.xlarge/on-demand": 2, "m8a.xlarge/on-demand": 100}}
 	sf := launchSet(t, "superci-4cpu", map[string]int{}, map[string]int{})
