@@ -139,6 +139,16 @@ elif svc == "kms" and cmd == "describe-key":
         sys.exit(254)
     print(KEY_ARN)
 elif svc == "kms" and cmd == "create-key":
+    # FAKE_KEY_LAG=n: the first n answer as KMS does while a role just made is not yet a principal it knows.
+    lag, seen = int(os.environ.get("FAKE_KEY_LAG", "0")), os.path.join(state, "create-key.tries")
+    tries = int(open(seen).read()) + 1 if os.path.exists(seen) else 1
+    open(seen, "w").write(str(tries))
+    if tries <= lag:
+        sys.stderr.write("An error occurred (MalformedPolicyDocumentException) when calling the CreateKey operation: Policy contains a statement with one or more invalid principals.\n")
+        sys.exit(254)
+    if os.environ.get("FAKE_KEY_DENIED"):
+        sys.stderr.write("An error occurred (AccessDeniedException) when calling the CreateKey operation: not authorized\n")
+        sys.exit(254)
     open(os.path.join(state, "key"), "w").write("")
     open(os.path.join(state, "key-policy.json"), "w").write(opt("--policy"))
     print(KEY_ARN)

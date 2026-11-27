@@ -628,6 +628,12 @@ each job to a fresh machine. Its listener runs on an **identity host**, and no j
   the same version. IMDSv2 only, hop limit 1. Tags: `superci-pull-role=identity`, `superci-pull-deployment`,
   `purpose=superci-pull`, `Name=superci-pull-identity-<az>`. The shim's `/shim` endpoint serves only an instance with
   the first two.
+- **Hardened at boot.** The image leaves much of `/usr/share`, `/usr/local` and `/opt` writable by others (mode 777)
+  and its runner tree the runner user's, so boot runs `superci-id harden` first. Instance Connect's key command and
+  every directory above it become root's, writable by neither group nor others (sshd refuses it otherwise, so no
+  operator could log in); then every path others may write, outside `/proc`, `/sys`, `/dev`, `/run` and sticky
+  directories, loses group and other write, and the runner tree becomes root's. Boot fails while a path stays writable
+  by others or the chain is not root's alone. A path writable by its group alone is left.
 
 ```bash
 pull/deploy/identity.sh up us-east-1a                         # bucket, role, group, host (r7i.4xlarge; --type T for another); waits until it has restored its share

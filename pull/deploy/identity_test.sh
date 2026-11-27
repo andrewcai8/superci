@@ -7,6 +7,9 @@ here=$(cd "$(dirname "$0")" && pwd)
 F=$here/testdata/identity
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 export FAKE=$T/fake FAKE_RUNNER=$T/runner PATH=$F:$PATH SSH=$F/listener-ssh AWS_ACCESS_KEY_ID= AWS_SECRET_ACCESS_KEY= AWS_SESSION_TOKEN=
+# harden walks FS_ROOT: never this machine's own /, whichever way a test reaches the host script (the fake ssh points it
+# at the fake host's tree), and HARDEN_OWNER is whoever runs the test, so no chown needs root.
+mkdir -p "$T/fsroot-none"; export FS_ROOT=$T/fsroot-none HARDEN_OWNER=$(id -u):$(id -g)
 export READY_TRIES=2 READY_SLEEP=0 LEASE_WAIT=0 LEASE_TRIES=2 RUN_RETRY_SLEEP=0 PEAK_TRIES=2 PEAK_WAIT=0 IDENTITY_LOCK=$T/lock
 # identity.sh under a timeout, so a loop that never ends fails the test instead of hanging it
 printf '#!/bin/bash\nexec timeout 120 %s "$@"\n' "$here/identity.sh" > "$T/id"; chmod 755 "$T/id"; ID=$T/id
@@ -44,6 +47,17 @@ refuses "a key whose alias cannot be made is scheduled for deletion, not left to
 grep -q 'kms schedule-key-deletion' "$FAKE/calls.log" && [ ! -e "$FAKE/state/key" ]; check $? "and no key is left"
 [ "$(count 'run-instances' "$FAKE/calls.log")" = 0 ]; check $? "and no host is launched"
 flog
+# A role up just made is not a principal KMS knows for some seconds (measured Nov 27: create-key refused 3 s after
+# create-role). That answer is asked again; any other refusal is not. Each in a world of its own, which holds no shim,
+# so up stops once the key is settled.
+K1=$T/fake-key-lag; mkdir -p "$K1/state"
+refuses "up waits out a role KMS does not know yet (and then refuses for want of a released shim)" "no released shim" env FAKE=$K1 FAKE_KEY_LAG=2 "$ID" up us-east-1a
+[ "$(count 'kms create-key' "$K1/calls.log")" = 3 ] && [ -e "$K1/state/key" ] && [ "$(count 'kms create-alias' "$K1/calls.log")" = 1 ]
+check $? "and makes the key on the third ask, under one alias"
+K2=$T/fake-key-denied; mkdir -p "$K2/state"
+refuses "a create-key refused for any other reason is not asked again" "refusing: create-key failed" env FAKE=$K2 FAKE_KEY_DENIED=1 "$ID" up us-east-1a
+[ "$(count 'kms create-key' "$K2/calls.log")" = 1 ] && [ ! -e "$K2/state/key" ] && [ "$(count 'run-instances' "$K2/calls.log")" = 0 ]
+check $? "and is asked once, makes no key and launches nothing"
 
 # ---- up ----
 refuses "up refuses while the release holds no shim" "refusing" "$ID" up us-east-1a
@@ -64,7 +78,7 @@ has "KMS_KEY=$KEY" "$U" "and names the key the hosts upload under"
 hasnt "PRIVATE KEY" "$U" "and holds no private key"
 [ "$(wc -c < "$U")" -le 16000 ]; check $? "user data fits EC2's 16 KB"
 has "https://203.0.113.9:8443" "$U" "and names the listener's address"
-python3 -I -c 'import re,sys,base64; sys.stdout.buffer.write(base64.b64decode(re.search(r"echo .([A-Za-z0-9+/=]+). \| base64 -d", open(sys.argv[1]).read()).group(1)))' "$U" | cmp -s - "$here/identity-host.sh"
+python3 -I -c 'import re,sys,base64,gzip; sys.stdout.buffer.write(gzip.decompress(base64.b64decode(re.search(r"echo .([A-Za-z0-9+/=]+). \| base64 -d \| gunzip", open(sys.argv[1]).read()).group(1))))' "$U" | cmp -s - "$here/identity-host.sh"
 check $? "and carries the host script of this checkout"
 grep -q 'superci-id boot' "$U"; check $? "and runs its boot"
 ok "up again changes nothing" "$ID" up us-east-1a
@@ -383,6 +397,54 @@ done
 printf 'tampered\n' >> "$REL/bin/superci-shim"; rm -rf "$N/id" "$N/enabled" "$N/ready" "$N/shim"
 refuses "a replacement host refuses a shim that is not the release's" "refusing s3://superci-pull-$ACCOUNT/bin/superci-shim" newhost boot
 { [ ! -e "$N/id" ] || [ -z "$(ls "$N/id")" ]; } && [ ! -e "$N/enabled" ]; check $? "and starts nothing"
+
+# ---- harden: nothing is left writable by others where root runs ----
+# The machines' image as measured Nov 27: /usr/local/bin and /opt mode 777, the runner tree the runner user's, and
+# Instance Connect's chain writable. Here the chain is 775, writable by its group alone, which no sweep of what others
+# may write would touch and sshd still refuses. A sticky /tmp, /proc and a symlink are left as they are.
+H2=$T/harden; R=$H2/fs; RS=$H2/runner; NL=$(printf 'a\nb')
+mkdir -p "$R/usr/share/ec2-instance-connect" "$R/usr/local/bin" "$R/opt/hostedtoolcache/go" "$R/tmp" "$R/proc" "$R/etc" "$RS/bin" "$RS/externals"
+for f in usr/share/ec2-instance-connect/eic_run_authorized_keys usr/share/ec2-instance-connect/eic_parse_authorized_keys usr/local/bin/node opt/hostedtoolcache/go/go etc/ok "opt/$NL"; do printf 'x\n' > "$R/$f"; done
+chmod 777 "$R/usr/local/bin" "$R/usr/local/bin/node" "$R/opt" "$R/opt/hostedtoolcache" "$R/opt/hostedtoolcache/go" "$R/opt/hostedtoolcache/go/go" "$R/opt/$NL"
+chmod 775 "$R/usr" "$R/usr/share" "$R/usr/share/ec2-instance-connect" "$R/usr/share/ec2-instance-connect/eic_run_authorized_keys" "$R/usr/share/ec2-instance-connect/eic_parse_authorized_keys"
+chmod 1777 "$R/tmp"; printf 'p\n' > "$R/proc/x"; chmod 777 "$R/proc/x"; chmod 644 "$R/etc/ok"
+ln -s /tmp "$R/usr/local/bin/link"
+[ "$(id -u)" = 0 ] || { mkdir -m 000 "$R/opt/unreadable"; }
+printf '#!/bin/sh\n' > "$RS/bin/Runner.Listener"; printf '#!/bin/sh\n' > "$RS/run.sh"; printf 't\n' > "$RS/run-helper.sh.template"; printf 'e\n' > "$RS/externals/node"
+chmod 777 "$RS/bin" "$RS/bin/Runner.Listener" "$RS/run.sh" "$RS/externals/node"; chmod 775 "$RS/run-helper.sh.template"
+hostenv=(ID_ROOT=$H2/id ID_CONF=$N/conf ID_LOG=$H2/log ID_LOCK=$H2/lock ID_AZ=us-east-1b)
+hardened() { env FS_ROOT=$R RUNNER_SRC=$RS "${hostenv[@]}" bash "$HS" harden; }
+ok "harden takes write from others everywhere, past a name with a newline and a directory it cannot read" hardened
+left=$(find "$R" -path "$R/proc" -prune -o ! -type l -perm -0002 \( -type f -o \( -type d ! -perm -1000 \) \) -print 2> /dev/null)
+[ -z "$left" ]; check $? "and leaves none outside /proc and sticky directories${left:+ (left: $left)}"
+[ "$(stat -c %a "$R/usr/local/bin/node")" = 755 ] && [ "$(stat -c %a "$R/opt")" = 755 ] && [ "$(stat -c %a "$R/opt/$NL")" = 755 ] && [ "$(stat -c %a "$R/etc/ok")" = 644 ]
+check $? "a 777 binary, /opt and the newline name become 755, a path already safe is as it was"
+for p in "$R" "$R/usr" "$R/usr/share" "$R/usr/share/ec2-instance-connect" "$R/usr/share/ec2-instance-connect/eic_run_authorized_keys" "$R/usr/share/ec2-instance-connect/eic_parse_authorized_keys"; do
+  [ $(( 0$(stat -c %a "$p") & 022 )) = 0 ] || echo "$p"
+done | grep -q . ; check $((1 - $?)) "Instance Connect's scripts and every directory above them, writable by their group alone, are writable by neither group nor others, as sshd requires"
+[ "$(stat -c %a "$R/tmp")" = 1777 ] && [ "$(stat -c %a "$R/proc/x")" = 777 ] && [ -L "$R/usr/local/bin/link" ]; check $? "a sticky /tmp, /proc and a symlink are left alone"
+bad=$(find "$RS" ! -type l -perm /022 -print); [ -z "$bad" ]; check $? "the runner tree root runs is writable by its owner alone${bad:+ (left: $bad)}"
+[ "$(id -u)" = 0 ] || chmod 755 "$R/opt/unreadable"
+# A chmod that changes nothing: the sweep cannot clear the tree, and harden, and boot with it, refuse to go on.
+mkdir -p "$H2/nochmod"; printf '#!/bin/sh\nexit 0\n' > "$H2/nochmod/chmod"; chmod 755 "$H2/nochmod/chmod"
+chmod 777 "$R/opt"
+refuses "harden fails while a path stays writable by others" "is still writable by others" env PATH="$H2/nochmod:$PATH" FS_ROOT=$R RUNNER_SRC=$RS "${hostenv[@]}" bash "$HS" harden
+rm -rf "$N/id" "$N/enabled" "$N/ready"
+refuses "and boot fails with it" "is still writable by others" env PATH="$H2/nochmod:$PATH" FS_ROOT=$R ID_ROOT=$N/id RUNNER_SRC=$RS SHIM_BIN=$N/shim SHIM_ENV=$N/shim.env ID_CONF=$N/conf UNIT_DIR=$N/units ID_LOG=$N/log ID_AZ=us-east-1b ID_LOCK=$N/lock READY_FILE=$N/ready FAKE_UNITS=$N/enabled bash "$HS" boot
+[ ! -e "$N/enabled" ] && [ ! -e "$N/ready" ] && { [ ! -e "$N/id" ] || [ -z "$(ls "$N/id")" ]; }; check $? "and starts and restores nothing"
+chmod 755 "$R/opt"
+if [ "$(id -u)" != 0 ]; then
+  # A chown that changes nothing leaves the chain this test's user's, not root's: sshd would refuse it, so harden does.
+  mkdir -p "$H2/nochown"; printf '#!/bin/sh\nexit 0\n' > "$H2/nochown/chown"; chmod 755 "$H2/nochown/chown"
+  refuses "harden fails while Instance Connect's chain is not root's" "is not root's alone" env PATH="$H2/nochown:$PATH" HARDEN_OWNER=root:root FS_ROOT=$R RUNNER_SRC=$RS "${hostenv[@]}" bash "$HS" harden
+  for spelling in / // /. /tmp/..; do
+    # (were the guard ever broken, the no-op chmod and chown and the timeout keep this machine as it is)
+    refuses "harden walks / only as root, however FS_ROOT spells it ($spelling)" "harden walks / only as root" env PATH="$H2/nochmod:$H2/nochown:$PATH" FS_ROOT=$spelling RUNNER_SRC=$RS "${hostenv[@]}" timeout 10 bash "$HS" harden
+  done
+fi
+first() { awk -v pat="$1" '/^boot\(\) \{/{b=1; next} b && /^}/{exit} b{n++; if ($0 ~ pat) {print n; exit}}' "$HS"; }
+h=$(first '^  harden$'); o=$(first 'install |aws |cat >|systemctl|restore|start|chmod|chown')
+[ -n "$h" ] && [ -n "$o" ] && [ "$h" -lt "$o" ]; check $? "boot hardens the host before it installs, restores or starts anything (line $h of boot, the first other action at $o)"
 
 # ---- two runs on a host at once never delete each other's identity ----
 C=$T/conc; mkdir -p "$C/units"
