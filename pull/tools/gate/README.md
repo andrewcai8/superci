@@ -17,6 +17,7 @@ GitHub is read on the superci App's installation budget through a token the list
 with no App token `gate job` and `gate replay-trace` exit 2 before reading anything, unless `--personal-token` (before the
 subcommand) spends the shared personal budget on purpose. `canary.sh` takes `SUPERCI_PERSONAL_TOKEN=1` for the same. `ci-limits.tsv` is read on the App's
 `contents` token (a refusal says to pass `--limits FILE`).
+Every call on an App token (the gate's and `canary.sh`'s) also sets `GH_SHIM_KEEP_TOKEN=1`, so a host `gh` wrapper that routes reads through another App keeps superci's token; the personal-token paths do not set it.
 
 `--cache DIR` (before the subcommand) keeps GitHub's answers; a finished job never changes, so a rerun costs no calls.
 Exit 0 only when every criterion passes. 1 is FAIL, or INCONCLUSIVE when every miss is a pass inside the noise.

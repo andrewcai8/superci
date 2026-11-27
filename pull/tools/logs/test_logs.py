@@ -205,7 +205,7 @@ class GitHubAccess(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.log = os.path.join(self.tmp, "gh.log")
         os.makedirs(os.path.join(self.tmp, "bin"))
-        for name, body in {"gh": 'printf "%s\\t%s\\n" "${GH_TOKEN-UNSET}" "$*" >> "$GHLOG"\necho \'{"id":55,"run_id":9,"name":"unit","runner_name":null,"created_at":"2026-11-25T17:00:00Z"}\'\n',
+        for name, body in {"gh": 'printf "%s\\t%s\\n" "${GH_TOKEN-UNSET}" "$*" >> "$GHLOG"\nprintf "%s\\n" "${GH_SHIM_KEEP_TOKEN-UNSET}" >> "$GHLOG.keep"\necho \'{"id":55,"run_id":9,"name":"unit","runner_name":null,"created_at":"2026-11-25T17:00:00Z"}\'\n',
                            "aws": 'case "$*" in *get-caller-identity*) echo 243891825325 ;; *) echo "stub aws" >&2; exit 1 ;; esac\n',
                            "down": "echo 'ssh: timed out' >&2\nexit 255\n"}.items():
             path = os.path.join(self.tmp, "bin", name)
@@ -252,6 +252,24 @@ class GitHubAccess(unittest.TestCase):
         self.assertIn("spending the shared personal", err)
         self.assertNotIn("refusing", err)
         self.assertEqual(self.calls(), ["UNSET"])
+
+    def keeps(self):
+        with open(self.log + ".keep") as fh:
+            return fh.read().split()
+
+    def test_the_job_read_on_the_app_token_asks_a_host_wrapper_to_keep_it(self):
+        tok = os.path.join(self.tmp, "bin", "tok")
+        with open(tok, "w") as fh:
+            fh.write("#!/bin/sh\nprintf '{\"token\":\"ghs_x\",\"expires\":\"2999-01-01T00:00:00Z\"}\\n200\\n'\n")
+        os.chmod(tok, 0o755)
+        os.environ["SUPERCI_APP_TOKEN_CMD"] = tok
+        code, out, err = self.run_logs()
+        self.assertEqual(self.calls(), ["ghs_x"], (code, out, err))
+        self.assertEqual(self.keeps(), ["1"])
+
+    def test_the_personal_job_read_does_not_set_it(self):
+        self.run_logs("--personal-token")
+        self.assertEqual(self.keeps(), ["UNSET"])
 
 
 if __name__ == "__main__":

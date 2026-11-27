@@ -1318,6 +1318,7 @@ class CachedRunListing(unittest.TestCase):
 
 PULL = os.path.normpath(os.path.join(HERE, "..", ".."))
 GH_STUB = """printf '%s\\t%s\\n' "${GH_TOKEN-UNSET}" "$*" >> "$GHLOG"
+printf '%s\\t%s\\t%s\\n' "${GH_TOKEN-UNSET}" "${GH_SHIM_KEEP_TOKEN-UNSET}" "$*" >> "$GHLOG.env"
 case "$*" in
   *rate_limit*) if [ "${GH_TOKEN-}" = "@TOKEN@" ]; then echo ${APP_REMAINING:-4000}; else echo ${PERSONAL_REMAINING:-0}; fi ;;
   *actions/variables/SUPERCI_JOBS*) echo '["verify-tools"]' ;;
@@ -1352,6 +1353,20 @@ class Sandbox(unittest.TestCase):
     def gh_calls(self):
         with open(self.log) as fh:
             return [tuple(line.rstrip("\n").split("\t", 1)) for line in fh if line.strip()]
+
+    def gh_envs(self):
+        """(GH_TOKEN, GH_SHIM_KEEP_TOKEN, args) of every gh call: what the stub saw in its environment."""
+        path = self.log + ".env"
+        if not os.path.exists(path):
+            return []
+        with open(path) as fh:
+            return [tuple(line.rstrip("\n").split("\t", 2)) for line in fh if line.strip()]
+
+    def assert_app_calls_keep_the_token(self, token, only=None):
+        calls = [c for c in self.gh_envs() if c[0] == token and (only is None or only in c[2])]
+        self.assertTrue(calls, (token, only, self.gh_envs()))
+        for tok, keep, args in calls:
+            self.assertEqual(keep, "1", f"GH_SHIM_KEEP_TOKEN=1 on the App-token call `gh {args}`")
 
 
 class GateReadsOnTheAppBudget(Sandbox):
@@ -1404,6 +1419,17 @@ class GateReadsOnTheAppBudget(Sandbox):
         self.assertTrue(calls, (code, out, err))
         self.assertEqual({tok for tok, _ in calls}, {APP_TOKEN}, calls)
         self.assertNotIn(APP_TOKEN, out + err, "the token is never printed")
+
+    def test_with_an_app_token_every_gh_call_keeps_it_past_a_host_wrapper(self):
+        code, out, err = self.run_gate(*self.job_args())
+        self.assert_app_calls_keep_the_token(APP_TOKEN)
+        self.assertEqual({tok for tok, _, _ in self.gh_envs()}, {APP_TOKEN})
+
+    def test_a_personal_token_call_does_not_ask_the_wrapper_to_keep_anything(self):
+        self.run_gate(*self.job_args("--personal-token"), token_cmd=TOKEN_DOWN)
+        envs = self.gh_envs()
+        self.assertTrue(envs)
+        self.assertEqual({keep for _, keep, _ in envs}, {"UNSET"}, envs)
 
     def test_a_scale_window_the_records_cover_needs_no_token_to_start(self):
         code, out, err = self.run_gate("scale", "--from", "2026-11-25T14:00:00Z", "--to", "2026-11-25T14:01:00Z", "--trace", os.path.join(self.tmp, "none.json"),
@@ -1469,6 +1495,17 @@ class CanaryReadsOnTheAppBudget(Sandbox):
         self.assertEqual(set(rate), {APP_TOKEN}, "the floor read another token's budget than the checks spend")
         self.assertIn("skipped, 100 GitHub reads left", out, "and it is the App's budget the floor compares with 1,500")
         self.assertNotIn(APP_TOKEN, out + err)
+
+    def test_the_floor_read_and_the_variable_read_keep_their_tokens_past_a_host_wrapper(self):
+        self.canary(TOKEN_SCOPED, APP_REMAINING="100")
+        self.assert_app_calls_keep_the_token(APP_TOKEN, "rate_limit")
+        self.assert_app_calls_keep_the_token(VARS_TOKEN, "actions/variables/SUPERCI_JOBS")
+
+    def test_the_personal_canary_reads_do_not_ask_the_wrapper_to_keep_anything(self):
+        self.canary(TOKEN_DOWN, SUPERCI_PERSONAL_TOKEN="1", PERSONAL_REMAINING="100")
+        envs = self.gh_envs()
+        self.assertTrue(envs)
+        self.assertEqual({keep for _, keep, _ in envs}, {"UNSET"}, envs)
 
     def test_a_canary_without_an_app_token_refuses_and_reads_nothing(self):
         code, out, err = self.canary(TOKEN_DOWN)
@@ -1567,6 +1604,19 @@ class RollbackWritesOnTheVariablesToken(CanaryTree):
         self.assertIn("SUPERCI_PERSONAL_TOKEN=1", p.stdout, "it says how to roll back on the personal token")
         self.assertEqual(self.writes(), [], "nothing was written, with any token")
         self.assertNotIn("ghs_", p.stdout + p.stderr)
+
+    def test_the_rollbacks_read_and_delete_keep_the_variables_token_past_a_host_wrapper(self):
+        p = self.rollback()
+        self.assertIn("SUPERCI_JOBS was", p.stdout, (p.stdout, p.stderr))
+        self.assert_app_calls_keep_the_token(VARS_TOKEN, "actions/variables/SUPERCI_JOBS")
+        self.assert_app_calls_keep_the_token(VARS_TOKEN, "variable delete")
+        self.assert_app_calls_keep_the_token(APP_TOKEN, "rate_limit")
+
+    def test_the_personal_rollback_write_does_not_ask_the_wrapper_to_keep_anything(self):
+        self.rollback(SUPERCI_PERSONAL_TOKEN="1", PERSONAL_REMAINING="4000", VT_TTL="0", TOKEN_TIMEOUT="5", **self.refuse_after(0))
+        writes = [c for c in self.gh_envs() if c[2].startswith("variable ")]
+        self.assertTrue(writes)
+        self.assertEqual({(tok, keep) for tok, keep, _ in writes}, {("UNSET", "UNSET")}, writes)
 
     def test_the_personal_token_is_used_for_the_rollback_only_when_the_operator_set_it(self):
         p = self.rollback(SUPERCI_PERSONAL_TOKEN="1", PERSONAL_REMAINING="4000", VT_TTL="0", TOKEN_TIMEOUT="5", **self.refuse_after(0))
@@ -1791,6 +1841,20 @@ class TheRerouteHelper(Sandbox):
                          ['variable set SUPERCI_JOBS -R Authentic-Intelligence/megpt-mono --body ["test-go","verify-tools"]', "variable delete SUPERCI_JOBS -R Authentic-Intelligence/megpt-mono"])
         self.assertEqual({tok for tok, _ in calls}, {VARS_TOKEN}, "the reads and both writes carry the variables token")
         self.assertNotIn(VARS_TOKEN, p.stdout + p.stderr + p2.stdout + p2.stderr)
+
+    def test_set_and_unset_keep_the_variables_token_past_a_host_wrapper(self):
+        self.run_helper("set", '["test-go"]')
+        self.run_helper("unset")
+        self.assert_app_calls_keep_the_token(VARS_TOKEN, "variable set")
+        self.assert_app_calls_keep_the_token(VARS_TOKEN, "variable delete")
+        self.assert_app_calls_keep_the_token(VARS_TOKEN, "actions/variables/SUPERCI_JOBS")
+        self.assertEqual({keep for _, keep, _ in self.gh_envs()}, {"1"})
+
+    def test_a_personal_set_does_not_ask_the_wrapper_to_keep_anything(self):
+        self.run_helper("set", '["test-go"]', REFUSE_SCOPES="variables", SUPERCI_PERSONAL_TOKEN="1")
+        writes = [c for c in self.gh_envs() if c[2].startswith("variable ")]
+        self.assertTrue(writes)
+        self.assertEqual({(tok, keep) for tok, keep, _ in writes}, {("UNSET", "UNSET")}, writes)
 
     def test_unset_of_an_unset_variable_is_not_a_failure(self):
         gh = os.path.join(self.bin, "gh")

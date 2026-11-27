@@ -208,7 +208,7 @@ class AppToken(unittest.TestCase):
         for k in ("GH_TOKEN", "GITHUB_TOKEN"):
             os.environ.pop(k, None)
         os.makedirs(os.path.join(self.tmp, "bin"))
-        self.script("bin/gh", 'printf "%s\\t%s\\n" "${GH_TOKEN-UNSET}" "$*" >> "$GHLOG"\necho \'{"total_count":0,"jobs":[]}\'\n')
+        self.script("bin/gh", 'printf "%s\\t%s\\n" "${GH_TOKEN-UNSET}" "$*" >> "$GHLOG"\nprintf "%s\\t%s\\n" "${GH_SHIM_KEEP_TOKEN-UNSET}" "$*" >> "$GHLOG.keep"\necho \'{"total_count":0,"jobs":[]}\'\n')
         os.environ.update(PATH=os.path.join(self.tmp, "bin") + os.pathsep + os.environ["PATH"], GHLOG=self.log)
 
     def tearDown(self):
@@ -247,6 +247,24 @@ class AppToken(unittest.TestCase):
         gh.api("actions/runs/2/jobs", keep=False)
         self.assertEqual(self.calls(), ["ghs_1", "ghs_1"])
         self.assertEqual(minted(), 1, "a token with a day left is minted once, not for each call")
+
+    def keeps(self):
+        with open(self.log + ".keep") as fh:
+            return [line.split("\t")[0] for line in fh]
+
+    def test_an_app_token_call_also_asks_a_host_wrapper_to_keep_the_token(self):
+        self.listener()
+        gh = T.GitHub("o/r", T.Cache(os.path.join(self.tmp, "cache")))
+        gh.api("actions/runs/1/jobs", keep=False)
+        T.AUTH.gh(["api", "x"], scope="contents")
+        self.assertEqual(self.keeps(), ["1", "1"], "GH_SHIM_KEEP_TOKEN=1 on every call that carries the App's token")
+
+    def test_a_personal_token_call_does_not_set_it(self):
+        self.listener(status=502, body="down")
+        T.AUTH.personal = True
+        with contextlib.redirect_stderr(io.StringIO()):
+            T.GitHub("o/r", T.Cache(os.path.join(self.tmp, "cache"))).api("actions/runs/1/jobs", keep=False)
+        self.assertEqual(self.keeps(), ["UNSET"])
 
     def test_a_token_near_expiry_is_replaced_before_it_is_used(self):
         soon = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 120))

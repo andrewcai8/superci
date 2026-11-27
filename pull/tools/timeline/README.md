@@ -53,6 +53,7 @@ Every GitHub read goes through `apptoken.py`: an installation token of one scope
 (`deploy/ssh.sh`), kept in memory and given to `gh` as `GH_TOKEN`. With none, the command exits 2 and says why;
 `--personal-token` (before the subcommand) spends the shared personal budget instead. See the
 [README](../../README.md#the-tools-read-github-on-the-apps-budget).
+Each call on the App's token also sets `GH_SHIM_KEEP_TOKEN=1`, so a host `gh` wrapper that routes reads through another App keeps this token instead of replacing it; a `--personal-token` call does not set it.
 
 ## Events and where they are written
 

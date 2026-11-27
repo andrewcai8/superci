@@ -12,6 +12,9 @@
 # the floor reads that token's own budget. With no App token the watch refuses to start, and a check that cannot get one is
 # skipped aloud; SUPERCI_PERSONAL_TOKEN=1 spends the shared personal token instead and says so.
 #
+# Every call on an App token also sets GH_SHIM_KEEP_TOKEN=1: a host `gh` wrapper that routes reads through another App keeps this token
+# instead of replacing it. The personal-token paths do not set it; the wrapper's routing is the operator's policy there.
+#
 # SUPERCI_JOBS, the fleet switch, is read and written with the App's `variables` token (actions_variables: write on megpt-mono
 # alone). The listener hands out a token it holds while it has over 10 minutes left, so the watch keeps one at most 300 s and drops
 # it the moment GitHub refuses a call made with it (401/403), asks once more and tries again. The watch does not start when it
@@ -41,7 +44,7 @@ apperr=$(mktemp) || exit 2
 trap 'rm -f "$apperr"' EXIT # on every way out: a refusal, the end of the watch, and (below) a signal, which bash does not run EXIT for by default
 trap 'exit 130' INT
 trap 'exit 143' TERM HUP
-ghr() { if [ "$personal_ok" = 1 ]; then gh "$@"; else GH_TOKEN=$app gh "$@"; fi; } # a read or write on the budget the watch spends
+ghr() { if [ "$personal_ok" = 1 ]; then gh "$@"; else GH_TOKEN=$app GH_SHIM_KEEP_TOKEN=1 gh "$@"; fi; } # a read or write on the budget the watch spends
 exec 9>&2 # the log of an exception goes to the watch's own stderr, not into the captured output of the call
 # The variables token: SUPERCI_JOBS is read and written with it, never with the App's read token.
 vt=""        # this shell's copy of it, never printed
@@ -72,7 +75,7 @@ get_vt() { # [tries]: the variables token in $vt; 1 when there is none. Bounded:
 }
 vt_why() { echo "$vt_err"; }
 vgh() { # a gh read of SUPERCI_JOBS: on the variables token ($vt, got by get_vt); with none, on the personal token only under SUPERCI_PERSONAL_TOKEN=1; else 98
-  if [ -n "$vt" ]; then GH_TOKEN=$vt gh "$@"; elif [ "$personal_ok" = 1 ]; then gh "$@"; else return 98; fi
+  if [ -n "$vt" ]; then GH_TOKEN=$vt GH_SHIM_KEEP_TOKEN=1 gh "$@"; elif [ "$personal_ok" = 1 ]; then gh "$@"; else return 98; fi
 }
 personal_fallback() { local name=$1; shift; echo "personal-token exception $name: the variables token was refused and SUPERCI_PERSONAL_TOKEN=1; this call is on the shared personal budget" >&9; gh "$@"; }
 vwrite() { # a gh write of SUPERCI_JOBS (gh args): on the variables token; GitHub refusing it (the token expired or was revoked) drops it, asks once more and writes again; the personal token only under SUPERCI_PERSONAL_TOKEN=1 (the one named exception), said aloud. 1 with $fail_cause when nothing works
@@ -80,7 +83,7 @@ vwrite() { # a gh write of SUPERCI_JOBS (gh args): on the variables token; GitHu
   fail_cause=""
   while [ -n "$vt" ]; do
     err=$(mktemp)
-    GH_TOKEN=$vt gh "$@" 2> "$err" && { rm -f "$err"; return 0; }
+    GH_TOKEN=$vt GH_SHIM_KEEP_TOKEN=1 gh "$@" 2> "$err" && { rm -f "$err"; return 0; }
     wr_err=$(head -c 200 "$err" | tr '\n' ' ' | sed -E 's/ +$//; s/gh[pousr]_[A-Za-z0-9_]+/<token>/g'); rm -f "$err"
     echo "writing SUPERCI_JOBS with the variables token failed: $wr_err" >&9
     if [ "$fresh" = 1 ]; then fail_cause="GitHub refused the write with a fresh variables token ($wr_err)"; break; fi
