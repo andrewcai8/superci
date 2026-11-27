@@ -80,6 +80,29 @@ math idle-spend-unrouted "Over 8 USD an hour of estimated spend sat on machines 
     {"Id":"started","MetricStat":{"Metric":{"Namespace":"superci-pull","MetricName":"QueueWait"},"Period":300,"Stat":"SampleCount"},"ReturnData":false},
     {"Id":"unrouted","Expression":"IF(FILL(started, 0) < 1 AND idle > 8, idle, 0)","Label":"Idle spend an hour with no job started","ReturnData":true}]' \
   GreaterThanThreshold 8 6 6 notBreaching
+# A dispatch size's job waits at GitHub for a free identity before its identity's shim brings it to the dispatcher, where
+# OldestWaitingJobAgeS and the job's queue time start, so a size short of identities waits unseen by every alarm above. The
+# listener lists the identities group every 5 minutes and publishes each dispatch size's IdentitiesOnline and IdentitiesBusy; running
+# and waiting jobs (DispatchRunning, JobsWaiting) over 70% of the identities online for 10 minutes means the size is close to
+# having none free. Jobs only count here once an identity's shim has brought them, so a size with no identity online reads 0 jobs: identity-none
+# below is the alarm for that. A size that is not dispatched publishes none of these, reads no data and stays OK; so does a size whose
+# identities were not listed for 15 minutes.
+starved() { # size
+  math "identity-starved-$1" "Superci-$1's running and waiting jobs are over 70% of its identities online for 10 minutes: its jobs will wait at GitHub for a free identity, unseen by oldest-job-wait (register more identities, or relabel parked ones)" \
+    '[{"Id":"running","MetricStat":{"Metric":{"Namespace":"superci-pull","MetricName":"DispatchRunning","Dimensions":[{"Name":"Set","Value":"superci-'"$1"'"}]},"Period":60,"Stat":"Maximum"},"ReturnData":false},
+      {"Id":"waiting","MetricStat":{"Metric":{"Namespace":"superci-pull","MetricName":"JobsWaiting","Dimensions":[{"Name":"Set","Value":"superci-'"$1"'"}]},"Period":60,"Stat":"Maximum"},"ReturnData":false},
+      {"Id":"online","MetricStat":{"Metric":{"Namespace":"superci-pull","MetricName":"IdentitiesOnline","Dimensions":[{"Name":"Set","Value":"superci-'"$1"'"}]},"Period":60,"Stat":"Minimum"},"ReturnData":false},
+      {"Id":"share","Expression":"IF(online > 0, 100 * (FILL(running, 0) + FILL(waiting, 0)) / online, IF(FILL(running, 0) + FILL(waiting, 0) > 0, 1000, 0))","Label":"Running and waiting jobs, % of identities online","ReturnData":true}]' \
+    GreaterThanThreshold 70 10 10 notBreaching
+}
+# A size with no identity online takes no job: its jobs queue at GitHub, where no shim has brought them, so nothing above counts them. IdentitiesOnline
+# alone is read, and a size with every identity offline or parked publishes 0, not nothing.
+none() { # size
+  math "identity-none-$1" "Superci-$1 has no identity online for 5 minutes: no job of the size can start, and none is counted by identity-starved or oldest-job-wait (identities offline, parked, or their hosts down)" \
+    '[{"Id":"online","MetricStat":{"Metric":{"Namespace":"superci-pull","MetricName":"IdentitiesOnline","Dimensions":[{"Name":"Set","Value":"superci-'"$1"'"}]},"Period":60,"Stat":"Minimum"},"ReturnData":true}]' \
+    LessThanThreshold 1 5 5 notBreaching
+}
+for size in 2cpu 4cpu 8cpu 16cpu 32cpu; do starved "$size"; none "$size"; done
 # The daily AWS budget publishes to the topic the alarms use. A topic accepts a budget's message only with a policy that
 # names the service, which is added to the topic's own policy once.
 POLICY=$($A sns get-topic-attributes --topic-arn "$TOPIC" --query Attributes.Policy --output text)

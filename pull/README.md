@@ -756,7 +756,8 @@ percentiles, and again per set under the dimension `Set`), `StalledSets`, `Orpha
 `SpendCapped`, `Machines`, `OnDemandShare`, `OldestWaitingJobAgeS` and `OldestUnregisteredMachineAgeS` (the longest
 waits in progress of any set); `BudgetDenied` (registrations the budget turned away, GitHub never asked; dimension
 `Reason`: `tokens`, `throttled`, `queued`); per set (dimension `Set`): `Machines`, `IdleRunners`,
-`BusyRunners`, `Pool`, `JobsWaiting`, `OldestWaitingJobAgeS`, `OldestUnregisteredMachineAgeS`. A wait is published
+`BusyRunners`, `Pool`, `JobsWaiting`, `OldestWaitingJobAgeS`, `OldestUnregisteredMachineAgeS`; per dispatch size (dimension `Set`) `IdentitiesOnline`
+and `IdentitiesBusy`, from one listing of the identities group every 5 minutes (a count older than 15 minutes is not published). A wait is published
 while it lasts: `OldestWaitingJobAgeS` is the age of the oldest job that was offered or assigned and has not started,
 and a machine still told to wait writes a `jit.wait` timeline event every 30 s with the reason.
 
@@ -775,6 +776,8 @@ aws --profile ci-runners --region us-east-1 sns subscribe --topic-arn arn:aws:sn
 | superci-pull-oldest-job-wait | the oldest job waiting for a runner is over 60 s old, two minutes running | yes |
 | superci-pull-queue-wait-p90 | queue wait p90 over 60 s in two 5-minute periods running | no |
 | superci-pull-orphans | orphans above 0 for 10 minutes (a probe runner left registered more than 3 minutes counts, and the lister removes it) | no |
+| superci-pull-identity-starved-`<size>` (2cpu to 32cpu) | a dispatch size's running and waiting jobs (`DispatchRunning` + `JobsWaiting`) are over 70% of its `IdentitiesOnline` for 10 minutes: its jobs wait at GitHub for a free identity, before the dispatcher sees them, which `oldest-job-wait` and the record's queue time cannot show | no |
+| superci-pull-identity-none-`<size>` (2cpu to 32cpu) | a dispatch size has no identity online (`IdentitiesOnline` under 1) for 5 minutes: no job of the size can start, and the starved alarm sees no job, since none has reached the dispatcher | no |
 | superci-pull-pool-at-floor | a set's pool at the hour's floor for 5 minutes while more of its jobs waited than it had idle runners | no |
 | superci-pull-spend-daily | today's spend past 80% of the daily cap the listener runs with (`SpendDailyCapUSD`) | no |
 | superci-pull-spend-capped | a spend cap is reached: CI on superci stops | yes |

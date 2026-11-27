@@ -450,7 +450,7 @@ class FakeGitHub:
     def __init__(self, repo, cache):
         self.calls = 0
 
-    def run_jobs(self, run_id, attempts="latest"):
+    def run_jobs(self, run_id, attempts="latest", fresh=False):
         jobs = FakeGitHub.runs_jobs[run_id]
         if attempts == "all":
             return list(jobs)
@@ -761,7 +761,7 @@ class JobRecords(unittest.TestCase):
 class GateJobFromRecords(unittest.TestCase):
     """cmd_job reading superci's side from job.record events: GitHub is asked only about Blacksmith's runs."""
 
-    def run_gate(self, records, blacksmith_runs, extra=()):
+    def run_gate(self, records, blacksmith_runs, extra=(), github_runs=None):
         now = __import__("time").time()
         FakeGitHub.runs_jobs, runs = {}, []
         for i, jobs in enumerate(blacksmith_runs):
@@ -774,6 +774,8 @@ class GateJobFromRecords(unittest.TestCase):
             FakeGitHub.runs_jobs[rid] = jobs
             runs.append({"id": rid, "created_at": jobs[0]["created_at"], "head_branch": "main"})
         shift = now - 1800 - 1_000_000.0
+        for rid, jobs in (github_runs or {}).items():  # the REST jobs of runs the superci records name, in the records' own times
+            FakeGitHub.runs_jobs[rid] = [dict(j, **{k: T.iso(T.ts(j[k]) + shift) for k in ("created_at", "started_at", "completed_at") if j.get(k)}) for j in jobs]
         records = [dict(r, t=now, **{k: T.iso(T.ts(r[k]) + shift) for k in ("queue_time", "start_time", "finish_time") if r.get(k)}) for r in records]
         listed, calls = [], []
         saved = (G.T.GitHub, G.runs_of, G.T.gather, G.T.build, G.T.listener_events)
@@ -782,7 +784,7 @@ class GateJobFromRecords(unittest.TestCase):
         G.T.build = lambda j, ev: type("TL", (), {"wall": 1.0, "unexplained": 0.5})()
         G.T.listener_events = lambda profile, lo, hi, where=None: records
         orig = FakeGitHub.run_jobs
-        FakeGitHub.run_jobs = lambda self, run_id, attempts="latest": (calls.append(run_id), orig(self, run_id, attempts))[1]
+        FakeGitHub.run_jobs = lambda self, run_id, attempts="latest", fresh=False: (calls.append(run_id), orig(self, run_id, attempts))[1]
         try:
             with tempfile.TemporaryDirectory() as d:
                 limits = os.path.join(d, "limits.tsv")
@@ -920,6 +922,229 @@ class GateScaleFromRecords(unittest.TestCase):
         self.assertGreaterEqual(windows[0][1], lo + 60 + 7200, "records are written when jobs finish: the read runs past the replay's end")
         self.assertEqual(s.stranded, [("verify-tools", "failure")])
         self.assertEqual(sorted(s.waits)[:3], [1.0, 1.0, 1.0])
+
+
+def dispatched(e, identity="superci-id-4cpu-0001"):
+    """A job.record of a job the identity plane ran: queue_time is when the identity's shim brought it, the runner is the identity."""
+    return dict(e, dispatch=True, runner=identity)
+
+
+def rest_of_dispatched(e, created_before, jid, attempt=1, identity="superci-id-4cpu-0001"):
+    """The REST job a dispatched record is: created created_before seconds before the shim's arrival, completed a second after the record's finish."""
+    j = gh_job(jid, e["run"], attempt, "success", T.ts(e["queue_time"]) - created_before, T.ts(e["start_time"]), T.ts(e["finish_time"]) + 1, name=e["name"])
+    j.update(runner_name=identity)
+    return j
+
+
+class StubGitHub:
+    """The jobs listing of canned runs, counting the runs it was asked about."""
+    runs = {}
+    asked = []
+
+    def __init__(self, repo="", cache=None):
+        self.calls = 0
+
+    def run_jobs(self, run_id, attempts="latest", fresh=False):
+        StubGitHub.asked.append((run_id, attempts))
+        self.calls += 1
+        return list(StubGitHub.runs[run_id])
+
+
+class DispatchedWaitFromGitHub(unittest.TestCase):
+    """A dispatched job waits for a free identity at GitHub, before its shim brings it to the dispatcher: its record's queue_time is the
+    shim's arrival, so the wait is measured from GitHub's own created_at or a size short of identities reads as fast."""
+
+    def setUp(self):
+        StubGitHub.runs, StubGitHub.asked = {}, []
+
+    def test_a_dispatched_jobs_wait_starts_at_githubs_created_at_not_the_shims_arrival(self):
+        e = dispatched(record("g1", 1, 81, run=7))
+        StubGitHub.runs[7] = [rest_of_dispatched(e, 300, 11)]
+        jobs, n, unmatched = G.with_github_created(StubGitHub(), [e])
+        o = G.is_obs(jobs[0], {"head_branch": "", "head_sha": ""})
+        self.assertEqual((n, unmatched, o.queue, o.wall), (1, [], 301.0, 81.0), "queued 300 s at GitHub, 1 s from the shim's arrival to a machine")
+        self.assertEqual(G.is_obs(G.synth_job(e), {"head_branch": "", "head_sha": ""}).queue, 1.0, "the record alone reads 1 s")
+
+    def test_one_listing_serves_every_job_of_a_run_and_a_record_that_is_not_dispatched_asks_nothing(self):
+        legs = [dispatched(record(f"g{i}", 1, 81, run=7, name=f"verify-tools ({i})")) for i in range(3)]
+        plain = record("p", 1, 81, run=8)
+        StubGitHub.runs[7] = [rest_of_dispatched(e, 40, 20 + i) for i, e in enumerate(legs)]
+        jobs, n, unmatched = G.with_github_created(StubGitHub(), legs + [plain])
+        self.assertEqual((n, unmatched, StubGitHub.asked), (3, [], [(7, "all")]), "one call for the run, every attempt, and none for run 8")
+        self.assertEqual([G.is_obs(j, {"head_branch": "", "head_sha": ""}).queue for j in jobs], [41.0, 41.0, 41.0, 1.0])
+
+    def test_a_rerun_is_told_from_its_first_attempt_and_has_no_queue_wait(self):
+        first = dispatched(record("g1", 1, 81, run=7, queued_at=1_000_000.0))
+        again = dispatched(record("g2", 1, 81, run=7, queued_at=1_000_600.0))
+        StubGitHub.runs[7] = [rest_of_dispatched(first, 5, 11, 1), dict(rest_of_dispatched(again, 5, 12, 2), created_at=T.iso(1_000_000.0 - 5))]
+        jobs, _, unmatched = G.with_github_created(StubGitHub(), [first, again])
+        a, b = (G.is_obs(j, {"head_branch": "", "head_sha": ""}) for j in jobs)
+        self.assertEqual((unmatched, a.queue, a.attempt, b.queue, b.attempt), ([], 6.0, 1, None, 2), "the attempt is the one that completed at the record's finish, and a rerun keeps its first attempt's created_at")
+
+    def test_a_job_of_another_identity_or_name_is_not_the_record(self):
+        e = dispatched(record("g1", 1, 81, run=7))
+        StubGitHub.runs[7] = [rest_of_dispatched(e, 300, 11, identity="superci-id-4cpu-0002"), dict(rest_of_dispatched(e, 300, 12), name="other")]
+        _, _, unmatched = G.with_github_created(StubGitHub(), [e])
+        self.assertEqual(unmatched, [e])
+
+    def test_a_dispatched_record_no_rest_job_fits_fails_a_row_and_keeps_the_arrival_as_its_lower_bound(self):
+        e = dispatched(record("g1", 1, 81, run=7))
+        StubGitHub.runs[7] = []
+        jobs, n, unmatched = G.with_github_created(StubGitHub(), [e])
+        self.assertEqual(G.is_obs(jobs[0], {"head_branch": "", "head_sha": ""}).queue, 1.0)
+        row = G.dispatched_row(n, unmatched)[0]
+        self.assertEqual((row.name, row.value, row.status), ("dispatched wait from GitHub", "0 of 1", G.FAIL))
+        self.assertEqual(G.dispatched_row(0, []), [], "no dispatched job, no row")
+        self.assertEqual(G.dispatched_row(2, [])[0].status, G.PASS)
+
+    def test_the_timeline_of_a_dispatched_job_still_starts_where_the_dispatcher_saw_it(self):
+        e = dispatched(record("g1", 1, 81, run=7))
+        StubGitHub.runs[7] = [rest_of_dispatched(e, 300, 11)]
+        j = G.with_github_created(StubGitHub(), [e])[0][0]
+        self.assertEqual(G.timeline_job(j)["created_at"], e["queue_time"])
+        self.assertEqual(G.timeline_job(G.synth_job(record("g2", 1, 81)))["created_at"], T.iso(1_000_000.0))
+
+
+class GateJobDispatched(unittest.TestCase):
+    """cmd_job over dispatched records: a size starved of identities fails the gate."""
+    run_gate = GateJobFromRecords.run_gate
+    blacksmith = GateJobFromRecords.blacksmith
+
+    def dispatched_records(self, n, created_before):
+        recs = [dispatched(record(f"g{i}", 1, 81, run=100 + i)) for i in range(n)]
+        return recs, {100 + i: [rest_of_dispatched(e, created_before, 900 + i)] for i, e in enumerate(recs)}
+
+    def test_jobs_that_waited_five_minutes_for_an_identity_fail_queue_wait_though_every_record_says_one_second(self):
+        recs, github = self.dispatched_records(5, 300)
+        code, out, calls, _ = self.run_gate(recs, self.blacksmith(8), github_runs=github)
+        self.assertEqual(code, 1, out)
+        self.assertRegex(out, r"FAIL\s+queue wait p50\s+301\.0 s")
+        self.assertRegex(out, r"PASS\s+dispatched wait from GitHub\s+5 of 5")
+        self.assertEqual(sorted(c for c in calls if c < 5000), [100 + i for i in range(5)], "one listing for each dispatched run")
+        self.assertIn("GitHub read for the created_at of 5 dispatched jobs", out)
+
+    def test_jobs_an_identity_took_at_once_pass_as_the_record_says(self):
+        recs, github = self.dispatched_records(5, 1)
+        code, out, _, _ = self.run_gate(recs, self.blacksmith(8), github_runs=github)
+        self.assertEqual(code, 0, out)
+        self.assertRegex(out, r"PASS\s+queue wait p50\s+2\.0 s")
+
+    def test_a_dispatched_record_with_no_job_at_github_fails_the_gate(self):
+        recs, github = self.dispatched_records(5, 1)
+        github[100] = []
+        code, out, _, _ = self.run_gate(recs, self.blacksmith(8), github_runs=github)
+        self.assertEqual(code, 1, out)
+        self.assertRegex(out, r"FAIL\s+dispatched wait from GitHub\s+4 of 5")
+
+
+class GateScaleDispatched(unittest.TestCase):
+    def collect(self, recs, github):
+        lo = 1_000_000.0
+        StubGitHub.runs, StubGitHub.asked = github, []
+        saved = (G.T.GitHub, G.T.listener_events, G.T.insights, G.metric, G.claim_objects, G.alarm_states, G.runs_of)
+        G.T.GitHub = StubGitHub
+        G.runs_of = lambda *a, **k: self.fail("runs were listed")
+        G.T.listener_events = lambda profile, lo_, hi_, where=None: recs if where else []
+        G.T.insights = lambda *a, **k: []
+        G.metric = lambda *a, **k: []
+        G.claim_objects = lambda *a, **k: set()
+        G.alarm_states = lambda *a, **k: {}
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                trace = os.path.join(d, "t.json")
+                with open(trace, "w") as fh:
+                    json.dump({"jobs": [{}] * len(recs)}, fh)
+                a = G.build_parser().parse_args(["--cache", d, "scale", "--from", T.iso(lo), "--to", T.iso(lo + 60), "--trace", trace, "--superci-source", "events"])
+                return G.collect_scale(a)[0]
+        finally:
+            G.T.GitHub, G.T.listener_events, G.T.insights, G.metric, G.claim_objects, G.alarm_states, G.runs_of = saved
+
+    def test_a_replay_of_dispatched_jobs_reads_each_wait_from_github_and_fails_queue_wait_for_a_starved_size(self):
+        recs = [dispatched(record(f"g{i}", 1, 30, run=i + 1, workflow="superci-load.yml", branch="ci/superci-load-pull-x", queued_at=1_000_005.0)) for i in range(10)]
+        s = self.collect(recs, {i + 1: [rest_of_dispatched(e, 120, 50 + i)] for i, e in enumerate(recs)})
+        self.assertEqual((s.dispatched, s.dispatched_unmatched, sorted(set(s.waits))), (10, [], [121.0]))
+        rows = rows_by_name(G.evaluate_scale(s))
+        self.assertEqual((rows["queue wait p50"].status, rows["queue wait p90"].status, rows["dispatched wait from GitHub"].status), (G.FAIL, G.FAIL, G.PASS))
+
+    def test_scale_sets_records_still_ask_github_nothing(self):
+        recs = [record(f"g{i}", 1, 30, run=i + 1, workflow="superci-load.yml", branch="ci/superci-load-pull-x", queued_at=1_000_005.0) for i in range(3)]
+        s = self.collect(recs, {})
+        self.assertEqual((s.dispatched, StubGitHub.asked, s.waits), (0, [], [1.0, 1.0, 1.0]))
+        self.assertNotIn("dispatched wait from GitHub", rows_by_name(G.evaluate_scale(s)))
+
+
+class FakeHTTP:
+    """What `gh api` answers for a run's jobs listing, counting the calls: the only stub under the real Cache and GitHub."""
+
+    def __init__(self):
+        self.runs, self.calls = {}, []
+
+    def __call__(self, argv, capture_output=True, text=True):
+        run = int(__import__("re").search(r"runs/(\d+)/jobs", argv[2]).group(1))
+        self.calls.append(run)
+        jobs = self.runs[run]
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"total_count": len(jobs), "jobs": jobs}), stderr="")
+
+
+def in_progress(j):
+    return dict(j, completed_at=None, conclusion=None, status="in_progress", runner_name=None)
+
+
+class CachedRunListing(unittest.TestCase):
+    """A listing read while its run was in flight, or before a rerun began, must not stay as it was: the check that follows reads it again."""
+
+    def setUp(self):
+        self.http, self.saved = FakeHTTP(), subprocess.run
+        subprocess.run = self.http
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cache = T.Cache(self.tmp.name)
+
+    def tearDown(self):
+        subprocess.run = self.saved
+        self.tmp.cleanup()
+
+    def check(self, recs):
+        """One check of the gate: a new GitHub over the same cache directory, as a rerun of the command has."""
+        before = len(self.http.calls)
+        jobs, n, unmatched = G.with_github_created(T.GitHub("o/r", self.cache), recs)
+        return jobs, unmatched, len(self.http.calls) - before
+
+    def test_a_run_in_flight_at_the_first_check_is_matched_at_the_next_with_one_new_call(self):
+        a, b = (dispatched(record(f"g{i}", 1, 81, run=7, name=f"verify-tools ({i})")) for i in (1, 2))
+        done_a, done_b = rest_of_dispatched(a, 40, 11), rest_of_dispatched(b, 40, 12)
+        self.http.runs[7] = [done_a, in_progress(done_b)]
+        _, unmatched, calls = self.check([a])
+        self.assertEqual((unmatched, calls), ([], 1))
+        self.http.runs[7] = [done_a, done_b]
+        jobs, unmatched, calls = self.check([a, b])
+        self.assertEqual((unmatched, calls), ([], 1), "the in-flight listing was not kept, so b is read from GitHub once")
+        self.assertEqual(G.is_obs(jobs[1], {"head_branch": "", "head_sha": ""}).queue, 41.0)
+        self.assertEqual(self.check([a, b])[1:], ([], 0), "now every job has completed, and the listing is kept")
+
+    def test_a_listing_kept_complete_is_read_again_once_for_a_rerun_attempt_it_lacks(self):
+        first = dispatched(record("g1", 1, 81, run=7, queued_at=1_000_000.0))
+        again = dispatched(record("g2", 1, 81, run=7, queued_at=1_000_600.0))
+        j1 = rest_of_dispatched(first, 5, 11, 1)
+        self.http.runs[7] = [j1]
+        self.assertEqual(self.check([first])[1:], ([], 1))
+        self.assertEqual(self.check([first])[1:], ([], 0), "the complete listing is kept")
+        self.http.runs[7] = [j1, dict(rest_of_dispatched(again, 5, 12, 2), created_at=T.iso(1_000_000.0 - 5))]
+        jobs, unmatched, calls = self.check([first, again])
+        self.assertEqual((unmatched, calls), ([], 1), "attempt 2 is not in the kept listing: one uncached read")
+        self.assertEqual([G.is_obs(j, {"head_branch": "", "head_sha": ""}).attempt for j in jobs], [1, 2])
+        self.assertEqual(self.check([first, again])[1:], ([], 0), "the read replaced the kept listing")
+
+    def test_a_run_whose_jobs_all_match_makes_no_new_call(self):
+        recs = [dispatched(record(f"g{i}", 1, 81, run=7, name=f"verify-tools ({i})")) for i in (1, 2, 3)]
+        self.http.runs[7] = [rest_of_dispatched(e, 30, 20 + i) for i, e in enumerate(recs)]
+        self.assertEqual(self.check(recs)[1:], ([], 1))
+        self.assertEqual(self.check(recs)[1:], ([], 0))
+
+    def test_records_no_listing_matches_cost_one_extra_read_a_run_not_one_a_record(self):
+        recs = [dispatched(record(f"g{i}", 1, 81, run=7, name=f"verify-tools ({i})")) for i in (1, 2)]
+        self.http.runs[7] = []
+        _, unmatched, calls = self.check(recs)
+        self.assertEqual((len(unmatched), calls), (2, 2), "the listing, and its one second read")
 
 
 if __name__ == "__main__":

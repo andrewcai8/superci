@@ -12,7 +12,7 @@ import (
 	cwtypes "github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 )
 
-// Namespace holds every metric the listener publishes, once a minute. The alarms in deploy/alarms.sh read them.
+// Namespace holds every metric the listener publishes, once a minute (the identities' counts are read from GitHub every 5). The alarms in deploy/alarms.sh read them.
 const Namespace = "superci-pull"
 
 // Metrics is what one minute's publication reads.
@@ -35,6 +35,9 @@ type Metrics struct {
 	// Dispatch is the sets the identity plane serves, and DispatchCounts what each did this minute.
 	Dispatch       []DispatchSnapshot
 	DispatchCounts map[string]DispatchCounts
+	// Identities is the identities online and busy at GitHub per dispatch size, from the listener's last listing of the
+	// identities group; empty when that listing is older than identityCountFresh or has not yet been made.
+	Identities []IdentityCount
 }
 
 func publish(ctx context.Context, cw *cloudwatch.Client, m Metrics, now time.Time) {
@@ -110,6 +113,12 @@ func metricData(m Metrics, now time.Time) []cwtypes.MetricDatum {
 			fastMachines, fastOD = fastMachines+s.Machines, fastOD+s.OnDemand
 		}
 		oldestJob = max(oldestJob, s.OldestJobS)
+	}
+	// A dispatch size's jobs wait at GitHub for a free identity before the dispatcher sees them (OldestWaitingJobAgeS and
+	// JobsWaiting count from the dispatcher's side only), so the identities are the size's capacity the alarm reads.
+	for _, c := range m.Identities {
+		set := cwtypes.Dimension{Name: aws.String("Set"), Value: aws.String(c.Set)}
+		data = append(data, d("IdentitiesOnline", float64(c.Online), cwtypes.StandardUnitCount, set), d("IdentitiesBusy", float64(c.Busy), cwtypes.StandardUnitCount, set))
 	}
 	// The alarms read these without a dimension: the longest waits of any set.
 	data = append(data, d("OldestWaitingJobAgeS", oldestJob, cwtypes.StandardUnitSeconds),

@@ -275,13 +275,14 @@ class Cache:
         self.path = path
         os.makedirs(path, exist_ok=True)
 
-    def get(self, key, fetch, keep=True):
+    def get(self, key, fetch, keep=True, fresh=False, worth=None):
+        """The cached value of key, or fetch()'s. fresh skips the read and replaces the entry; worth(v), when given, decides whether a fetched value is stored at all."""
         f = os.path.join(self.path, hashlib.sha1(key.encode()).hexdigest() + ".json")
-        if keep and os.path.exists(f):
+        if keep and not fresh and os.path.exists(f):
             with open(f) as fh:
                 return json.load(fh)
         v = fetch()
-        if keep:
+        if keep and (worth is None or worth(v)):
             with open(f + ".tmp", "w") as fh:
                 json.dump(v, fh)
             os.replace(f + ".tmp", f)
@@ -309,15 +310,20 @@ class GitHub:
     def job(self, job_id):
         return self.api(f"actions/jobs/{job_id}")
 
-    def run_jobs(self, run_id, attempts="latest"):
-        """The jobs of a run: those of its latest attempt, or (attempts="all") of every attempt."""
-        out, page = [], 1
-        while True:
-            d = self.api(f"actions/runs/{run_id}/jobs?per_page=100&filter={attempts}&page={page}")
-            out += d["jobs"]
-            if len(out) >= d["total_count"] or not d["jobs"]:
-                return out
-            page += 1
+    def run_jobs(self, run_id, attempts="latest", fresh=False):
+        """The jobs of a run: those of its latest attempt, or (attempts="all") of every attempt. The listing is cached only once every job in it
+        has completed: a run in flight, or a rerun's attempt not yet started, would otherwise stay as the first read saw it. fresh reads GitHub
+        again and replaces the entry."""
+        def fetch():
+            out, page = [], 1
+            while True:
+                d = self.api(f"actions/runs/{run_id}/jobs?per_page=100&filter={attempts}&page={page}", keep=False)
+                out += d["jobs"]
+                if len(out) >= d["total_count"] or not d["jobs"]:
+                    return out
+                page += 1
+
+        return self.cache.get(f"gh:{self.repo}actions/runs/{run_id}/jobs:{attempts}", fetch, fresh=fresh, worth=lambda jobs: all(j.get("completed_at") for j in jobs))
 
     def runs(self, workflow, since, until):
         out, page = [], 1

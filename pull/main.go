@@ -124,6 +124,8 @@ type Listener struct {
 	strays     map[string]*Machine // machines of the deployment of no configured set, by id
 	short      int                 // machines asked of EC2 and not started (capacity, quotas), since the metrics last took them
 	leaked     int                 // probe runners found registered past their grace, since the metrics last took them
+	identities []IdentityCount     // identities online and busy per dispatch size, as the last listing of the identities group counted them
+	counted    time.Time           // when that listing was read
 }
 
 // defaultGroup is the organization's Default runner group, where an earlier build made the sets.
@@ -268,7 +270,8 @@ func run(ctx context.Context, f flags) error {
 	srv := &Server{sets: byName, budget: l.budget, verifier: verifier, client: client, refresh: refresh, claim: claims.Take, issue: l.tagger.Issue, notices: fleet.TagNoticed,
 		slots: make(chan struct{}, max(1, cfg.Registration.Concurrency)), maxAge: l.maxAge, dispatch: l.dispatch, dispatchMachine: l.dispatchMachine}
 	go serve(ctx, publicServer(f.listen, srv), &id)
-	go serve(ctx, &http.Server{Addr: f.admin, Handler: Admin(l.status, l.healthy, l.override, l.budget, NewIdentities(rest, l.budget, cfg).Routes)}, nil)
+	ids := NewIdentities(rest, l.budget, cfg)
+	go serve(ctx, &http.Server{Addr: f.admin, Handler: Admin(l.status, l.healthy, l.override, l.budget, ids.Routes)}, nil)
 	errs := make(chan error, len(l.sets))
 	var sessions sync.WaitGroup
 	for _, s := range l.sets {
@@ -311,6 +314,12 @@ func run(ctx context.Context, f flags) error {
 		go every(ctx, time.Minute, func() {
 			publish(ctx, cw, last.of(l.metrics()), time.Now())
 		})
+		if len(l.dsets) > 0 {
+			go func() {
+				l.countIdentities(ctx, ids)
+				every(ctx, identityCountEvery, func() { l.countIdentities(ctx, ids) })
+			}()
+		}
 	}
 	if l.cfg.Rerun {
 		if jobs, err := fleet.NoticedJobs(ctx); err != nil {
@@ -1300,6 +1309,32 @@ func (l *Listener) status() Status {
 	return st
 }
 
+// identityCountEvery is how often the identities group is listed to count a size's identities: one GitHub call a page.
+// A count older than identityCountFresh (three missed listings) is not published, so an alarm reads no number rather than a stale one.
+const (
+	identityCountEvery = 5 * time.Minute
+	identityCountFresh = 3 * identityCountEvery
+)
+
+// countIdentities lists the identities group once and keeps what each dispatch size has online and busy.
+func (l *Listener) countIdentities(ctx context.Context, ids *Identities) {
+	lctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	_, runners, err := ids.Listing(lctx)
+	if err != nil {
+		slog.Error("count identities", "err", err.Error())
+		return
+	}
+	labels := map[string]string{}
+	for _, d := range l.dsets {
+		labels[d.spec.Name] = d.spec.Label
+	}
+	counts := CountIdentities(runners, labels)
+	l.mu.Lock()
+	l.identities, l.counted = counts, time.Now()
+	l.mu.Unlock()
+}
+
 func (l *Listener) metrics() Metrics {
 	now := time.Now()
 	st := l.status()
@@ -1345,7 +1380,18 @@ func (l *Listener) metrics() Metrics {
 	m.Short, l.short = l.short, 0
 	m.Orphans, l.leaked = m.Orphans+l.leaked, 0
 	l.mu.Unlock()
+	m.Identities = l.identityCounts(now)
 	return m
+}
+
+// identityCounts is the last count of the identities, or none when it is older than identityCountFresh.
+func (l *Listener) identityCounts(now time.Time) []IdentityCount {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if now.Sub(l.counted) >= identityCountFresh {
+		return nil
+	}
+	return slices.Clone(l.identities)
 }
 
 // healthy says whether the process is alive: its reconciler has finished a pass within the last two minutes. GitHub's
