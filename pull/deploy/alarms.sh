@@ -10,11 +10,12 @@ A="aws --profile ci-runners --region us-east-1"
 [ "$($A sts get-caller-identity --query Account --output text)" = 243891825325 ] || { echo "refusing: not ci-runners" >&2; exit 1; }
 here=$(cd "$(dirname "$0")" && pwd)
 TOPIC=$($A sns create-topic --name superci-pull-alarms --tags Key=purpose,Value=superci-pull --query TopicArn --output text)
-alarm() { # name description metric statistic comparison threshold period evaluations datapoints missing
-  local stat=(--statistic "$4")
+alarm() { # name description metric statistic comparison threshold period evaluations datapoints missing [set]
+  local stat=(--statistic "$4") dim=()
   [[ $4 == p* ]] && stat=(--extended-statistic "$4")
+  [ -n "${11:-}" ] && dim=(--dimensions "Name=Set,Value=${11}")
   $A cloudwatch put-metric-alarm --alarm-name "superci-pull-$1" --alarm-description "$2" --namespace superci-pull --metric-name "$3" \
-    "${stat[@]}" --comparison-operator "$5" --threshold "$6" --period "$7" --evaluation-periods "$8" --datapoints-to-alarm "$9" \
+    "${stat[@]}" ${dim[@]+"${dim[@]}"} --comparison-operator "$5" --threshold "$6" --period "$7" --evaluation-periods "$8" --datapoints-to-alarm "$9" \
     --treat-missing-data "${10}" --alarm-actions "$TOPIC" --ok-actions "$TOPIC" --tags Key=purpose,Value=superci-pull
   echo "alarm superci-pull-$1"
 }
@@ -30,9 +31,12 @@ math listener-down "No heartbeat from the listener for 3 minutes: the process or
   '[{"Id":"beat","MetricStat":{"Metric":{"Namespace":"superci-pull","MetricName":"Heartbeat"},"Period":60,"Stat":"Sum"},"ReturnData":false},
     {"Id":"filled","Expression":"FILL(beat, 0)","Label":"Heartbeat, gaps as 0","ReturnData":true}]' \
   LessThanThreshold 1 3 3 breaching
-alarm jobs-stalled "A set's jobs have waited 10 minutes with none of its jobs started: launches, registrations or the spend cap are stuck" \
+# jobs-stalled and oldest-job-wait below are the listener-wide pages: the worst set's reading, whichever set it is. A canary
+# rolls back on its own sets' alarms (jobs-stalled-<size>, oldest-job-wait-<size>, further down) and on listener-down and
+# spend-capped, which stop every set, never on another size's wait.
+alarm jobs-stalled "A set's jobs have waited 10 minutes with none of its jobs started: launches, registrations or the spend cap are stuck. A page; each set's own is jobs-stalled-<size>" \
   StalledSets Maximum GreaterThanOrEqualToThreshold 1 60 2 2 notBreaching
-alarm oldest-job-wait "The job that has waited longest for a runner has waited over 60 s, two minutes running: registrations the budget turns away, launches or boots are holding a job (a wait the budget causes is no refusal by GitHub, and QueueWait shows a job only once it starts)" \
+alarm oldest-job-wait "The job that has waited longest for a runner, of any set, has waited over 60 s, two minutes running: registrations the budget turns away, launches or boots are holding a job (a wait the budget causes is no refusal by GitHub, and QueueWait shows a job only once it starts). A page; each set's own is oldest-job-wait-<size>" \
   OldestWaitingJobAgeS Maximum GreaterThanThreshold 60 60 2 2 notBreaching
 alarm registration-refusals "GitHub refused a runner registration (ConfigureTooManyRunners): the organization reached its cap of 1,500 in 5 minutes. A page, never a canary rollback: the cap is the organization's, and a job moved from Blacksmith takes one registration on either fleet" \
   RegistrationRefusals Sum GreaterThanThreshold 0 300 1 1 notBreaching
@@ -102,7 +106,16 @@ none() { # size
     '[{"Id":"online","MetricStat":{"Metric":{"Namespace":"superci-pull","MetricName":"IdentitiesOnline","Dimensions":[{"Name":"Set","Value":"superci-'"$1"'"}]},"Period":60,"Stat":"Minimum"},"ReturnData":true}]' \
     LessThanThreshold 1 5 5 notBreaching
 }
-for size in 2cpu 4cpu 8cpu 16cpu 32cpu; do starved "$size"; none "$size"; done
+# One set's own wait and stall, on the Set dimension, with the listener-wide alarms' threshold, periods and missing-data rule. A canary
+# reads these for the sets its job ran on (pull/tools/gate/gate.py), so a size with a cold machine or a stuck launch pages
+# and rolls back its own jobs and no other size's.
+perset() { # size
+  alarm "oldest-job-wait-$1" "Superci-$1's longest-waiting job has waited over 60 s, two minutes running: its registrations, launches or boots are holding a job. Rolls back a canary that ran on this set, and no other" \
+    OldestWaitingJobAgeS Maximum GreaterThanThreshold 60 60 2 2 notBreaching "superci-$1"
+  alarm "jobs-stalled-$1" "Superci-$1's jobs have waited 10 minutes with none of its jobs started: its launches, registrations or the spend cap are stuck. Rolls back a canary that ran on this set, and no other" \
+    StalledSets Maximum GreaterThanOrEqualToThreshold 1 60 2 2 notBreaching "superci-$1"
+}
+for size in 2cpu 4cpu 8cpu 16cpu 32cpu; do starved "$size"; none "$size"; perset "$size"; done
 # The daily AWS budget publishes to the topic the alarms use. A topic accepts a budget's message only with a policy that
 # names the service, which is added to the topic's own policy once.
 POLICY=$($A sns get-topic-attributes --topic-arn "$TOPIC" --query Attributes.Policy --output text)

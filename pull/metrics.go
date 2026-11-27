@@ -29,6 +29,7 @@ type Metrics struct {
 	Failed        int                  // registrations that failed otherwise this minute
 	Short         int                  // machines asked of EC2 this minute that did not start (capacity, quotas)
 	Stalled       int                  // sets whose jobs have waited 10 minutes with none started
+	StalledBy     map[string]bool      // the same, by set: each set's own StalledSets, which its canary's alarm reads
 	AtFloor       int                  // sets whose pool is at the hour's floor while more jobs wait than it has idle runners
 	Denied        map[string]int       // registrations the budget turned away this minute, by reason
 	Jobs          []JobRecord          // jobs that finished this minute, every set
@@ -88,7 +89,8 @@ func metricData(m Metrics, now time.Time) []cwtypes.MetricDatum {
 		set := cwtypes.Dimension{Name: aws.String("Set"), Value: aws.String(s.Set)}
 		data = append(data, d("Machines", float64(s.Machines), cwtypes.StandardUnitCount, set), d("IdleRunners", float64(s.Idle), cwtypes.StandardUnitCount, set),
 			d("BusyRunners", float64(s.Busy), cwtypes.StandardUnitCount, set), d("Pool", float64(s.Pool), cwtypes.StandardUnitCount, set),
-			d("JobsWaiting", float64(max(0, s.Stats.TotalAssignedJobs-s.Stats.TotalRunningJobs+s.Stats.TotalAvailableJobs)), cwtypes.StandardUnitCount, set))
+			d("JobsWaiting", float64(max(0, s.Stats.TotalAssignedJobs-s.Stats.TotalRunningJobs+s.Stats.TotalAvailableJobs)), cwtypes.StandardUnitCount, set),
+			d("StalledSets", b2f(m.StalledBy[s.Set]), cwtypes.StandardUnitCount, set))
 		data = append(data, d("OldestWaitingJobAgeS", s.OldestJobS, cwtypes.StandardUnitSeconds, set),
 			d("OldestUnregisteredMachineAgeS", s.OldestUnregisteredS, cwtypes.StandardUnitSeconds, set))
 		machines += s.Machines
@@ -106,7 +108,7 @@ func metricData(m Metrics, now time.Time) []cwtypes.MetricDatum {
 			d("DispatchIdleMachines", float64(s.Idle), cwtypes.StandardUnitCount, set), d("DispatchRunning", float64(s.Running), cwtypes.StandardUnitCount, set),
 			d("DispatchHandoffs", float64(c.Handoffs), cwtypes.StandardUnitCount, set), d("DispatchRetries", float64(c.Retries), cwtypes.StandardUnitCount, set),
 			d("DispatchResumes", float64(c.Resumes), cwtypes.StandardUnitCount, set), d("DispatchLostJobs", float64(c.Lost), cwtypes.StandardUnitCount, set),
-			d("DispatchDroppedFrames", float64(c.Dropped), cwtypes.StandardUnitCount, set))
+			d("DispatchDroppedFrames", float64(c.Dropped), cwtypes.StandardUnitCount, set), d("StalledSets", b2f(m.StalledBy[s.Set]), cwtypes.StandardUnitCount, set))
 		machines += s.Machines
 		od += s.OnDemand
 		if m.OnDemandFirst[s.Set] {
@@ -120,7 +122,7 @@ func metricData(m Metrics, now time.Time) []cwtypes.MetricDatum {
 		set := cwtypes.Dimension{Name: aws.String("Set"), Value: aws.String(c.Set)}
 		data = append(data, d("IdentitiesOnline", float64(c.Online), cwtypes.StandardUnitCount, set), d("IdentitiesBusy", float64(c.Busy), cwtypes.StandardUnitCount, set))
 	}
-	// The alarms read these without a dimension: the longest waits of any set.
+	// The listener-wide alarms read these without a dimension: the longest waits of any set (the per-set alarms read each set's own, above).
 	data = append(data, d("OldestWaitingJobAgeS", oldestJob, cwtypes.StandardUnitSeconds),
 		d("OldestUnregisteredMachineAgeS", oldestMachine, cwtypes.StandardUnitSeconds))
 	for reason := DeniedTokens; reason < denialKinds; reason++ {

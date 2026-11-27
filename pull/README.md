@@ -752,7 +752,7 @@ CloudWatch, namespace `superci-pull`: `Heartbeat`, `OrgRegistrationRate`, `Other
 `OurRegistrationRate`, `SpareRegistrationRate`, `RegistrationWindowUse`, `OrgRateKnown`, `AdmitRate` (the admitted
 rate a second), `RegistrationQueue` (machines that wait in order), `Registrations`,
 `RegistrationRefusals`, `RegistrationErrors`, `LaunchShortfall`, `QueueWait` (seconds per started job, with
-percentiles, and again per set under the dimension `Set`), `StalledSets`, `Orphans`, `SpendTodayUSD`, `SpendDailyCapUSD`, `SpendMonthUSD`, `SpendPerHourUSD`,
+percentiles, and again per set under the dimension `Set`), `StalledSets` (also per set, under the dimension `Set`: 1 while that set's jobs have waited 10 minutes with none started), `Orphans`, `SpendTodayUSD`, `SpendDailyCapUSD`, `SpendMonthUSD`, `SpendPerHourUSD`,
 `SpendCapped`, `Machines`, `OnDemandShare`, `OldestWaitingJobAgeS` and `OldestUnregisteredMachineAgeS` (the longest
 waits in progress of any set); `BudgetDenied` (registrations the budget turned away, GitHub never asked; dimension
 `Reason`: `tokens`, `throttled`, `queued`); per set (dimension `Set`): `Machines`, `IdleRunners`,
@@ -769,18 +769,20 @@ aws --profile ci-runners --region us-east-1 sns subscribe --topic-arn arn:aws:sn
 
 | Alarm | Fires when | Rolls a canary back |
 | --- | --- | --- |
-| superci-pull-listener-down | no heartbeat for 3 minutes | yes |
-| superci-pull-jobs-stalled | a set's jobs have waited 10 minutes with none of its jobs started, for 2 minutes | yes |
+| superci-pull-listener-down | no heartbeat for 3 minutes | yes, every canary |
+| superci-pull-jobs-stalled | any set's jobs have waited 10 minutes with none of its jobs started, for 2 minutes (listener-wide: a page) | no |
+| superci-pull-jobs-stalled-`<size>` (2cpu to 32cpu) | that set's own `StalledSets` (dimension `Set`) at 1 for 2 minutes | yes, a canary whose job ran on the set |
 | superci-pull-registration-refusals | GitHub refused a registration in a 5-minute period | no |
 | superci-pull-registration-errors | a registration failed otherwise in a 5-minute period (GitHub's API, a name GitHub already held, the issued tag refused) | no |
-| superci-pull-oldest-job-wait | the oldest job waiting for a runner is over 60 s old, two minutes running | yes |
+| superci-pull-oldest-job-wait | the oldest job waiting for a runner, of any set, is over 60 s old, two minutes running (listener-wide: a page) | no |
+| superci-pull-oldest-job-wait-`<size>` (2cpu to 32cpu) | the oldest job waiting for a runner of that set (`OldestWaitingJobAgeS`, dimension `Set`) is over 60 s old, two minutes running | yes, a canary whose job ran on the set |
 | superci-pull-queue-wait-p90 | queue wait p90 over 60 s in two 5-minute periods running | no |
 | superci-pull-orphans | orphans above 0 for 10 minutes (a probe runner left registered more than 3 minutes counts, and the lister removes it) | no |
 | superci-pull-identity-starved-`<size>` (2cpu to 32cpu) | a dispatch size's running and waiting jobs (`DispatchRunning` + `JobsWaiting`) are over 70% of its `IdentitiesOnline` for 10 minutes: its jobs wait at GitHub for a free identity, before the dispatcher sees them, which `oldest-job-wait` and the record's queue time cannot show | no |
 | superci-pull-identity-none-`<size>` (2cpu to 32cpu) | a dispatch size has no identity online (`IdentitiesOnline` under 1) for 5 minutes: no job of the size can start, and the starved alarm sees no job, since none has reached the dispatcher | no |
 | superci-pull-pool-at-floor | a set's pool at the hour's floor for 5 minutes while more of its jobs waited than it had idle runners | no |
 | superci-pull-spend-daily | today's spend past 80% of the daily cap the listener runs with (`SpendDailyCapUSD`) | no |
-| superci-pull-spend-capped | a spend cap is reached: CI on superci stops | yes |
+| superci-pull-spend-capped | a spend cap is reached: CI on superci stops | yes, every canary |
 | superci-pull-launch-shortfall | EC2 started fewer machines than asked for 15 minutes running | no |
 | superci-pull-org-rate-unknown | the organization's rate unmeasured for 15 minutes | no |
 

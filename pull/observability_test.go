@@ -191,9 +191,11 @@ func TestAlarmsAreOnTheDashboardPageOneTopicAndNameNoPerson(t *testing.T) {
 		for _, size := range strings.Fields(g[1]) {
 			made["superci-pull-identity-starved-"+size] = true
 			made["superci-pull-identity-none-"+size] = true
+			made["superci-pull-oldest-job-wait-"+size] = true
+			made["superci-pull-jobs-stalled-"+size] = true
 		}
 	}
-	for _, want := range []string{"superci-pull-job-failure-rate", "superci-pull-idle-spend-unrouted", "superci-pull-on-demand-share", "superci-pull-oldest-job-wait", "superci-pull-identity-starved-4cpu", "superci-pull-identity-none-4cpu"} {
+	for _, want := range []string{"superci-pull-job-failure-rate", "superci-pull-idle-spend-unrouted", "superci-pull-on-demand-share", "superci-pull-oldest-job-wait", "superci-pull-identity-starved-4cpu", "superci-pull-identity-none-4cpu", "superci-pull-oldest-job-wait-4cpu", "superci-pull-jobs-stalled-32cpu"} {
 		if !made[want] {
 			t.Errorf("alarms.sh does not make %s", want)
 		}

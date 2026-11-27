@@ -89,13 +89,24 @@ back on harm to superci's own jobs, judged against Blacksmith over the same wind
 - a FAIL of wall p50, wall p90, queue wait p50, queue wait p90 or failures. A p50 row counts once n passes (5 runs) and a
   p90 row at 20 runs, since a p90 of six runs is one job; the failures row counts from the first run. NOISE asks for runs
   and a row with no Blacksmith runs to compare has no verdict: neither rolls anything back;
-- one of `superci-pull-oldest-job-wait`, `-jobs-stalled`, `-listener-down` or `-spend-capped` in ALARM: each means a
-  superci job is not being served. These are the plane's, so they send back every job listed.
+- `superci-pull-listener-down` or `superci-pull-spend-capped` in ALARM: each stops every set, so it sends back every job listed;
+- `superci-pull-oldest-job-wait-<size>` or `superci-pull-jobs-stalled-<size>` in ALARM, for a set the job ran on: a wait or a
+  stall is one set's, so a canary reads the alarms of its own sets alone. The sets are the `set` of the job's superci records in
+  the window (the superci-`<n>`cpu label of a job read from GitHub); with no superci record yet, the set of the label the job
+  ran under on Blacksmith (`blacksmith-4vcpu-ubuntu-2404` is `superci-4cpu`), read from Blacksmith's listing with no further call;
+  with neither, only the two above. A set with no alarm of its own (alarms.sh not yet run, `StalledSets` not yet published, a split
+  set such as `superci-4cpu-2`), and a job with no set known, are judged on the listener-wide `superci-pull-oldest-job-wait` and
+  `-jobs-stalled`, so the gate is never blind, only less partitioned where it cannot be; the line `judged on:` before the canary
+  line says which alarm each set was judged on. Another set's alarm never sends the job back, so a new or unrelated size, or a cold machine
+  of superci-8cpu, cannot make a superci-4cpu canary fragile (Nov 27 17:43Z: test-go's canary was rolled back on the
+  listener-wide `oldest-job-wait`, which 8cpu's `net-tools` had tripped, with every test-go row passing). The reason names the
+  alarm and so the set (`superci-pull-oldest-job-wait-4cpu in ALARM`). The listener-wide `oldest-job-wait` and `jobs-stalled`
+  alarms still page, and the canary line lists them as `paging, no rollback`.
 
 `superci-pull-registration-refusals` is not on the list. GitHub's cap of 1,500 registrations in 5 minutes is the
 organization's, and a job moved from Blacksmith takes one registration on either fleet, so a refusal says the organization
 is at the cap, not that superci harmed a job. It pages and is counted. If the refusals made superci's jobs wait, the
-queue-wait rows and `superci-pull-oldest-job-wait` see it. In canary 4b's minutes over the cap (Nov 26 16:11-16:20Z, the
+queue-wait rows and the per-set `superci-pull-oldest-job-wait-<size>` see it. In canary 4b's minutes over the cap (Nov 26 16:11-16:20Z, the
 organization at 5.03-5.30/s) superci's test-go waited 1-2 s and Blacksmith's 4 vCPU jobs p50 7 s, p90 19 s.
 
 `canary.sh SINCE UNTIL JOB...` runs the check for each job SUPERCI_JOBS still lists, every 15 minutes, until UNTIL, with

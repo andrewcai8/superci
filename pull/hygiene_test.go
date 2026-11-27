@@ -184,6 +184,18 @@ func TestMetricsGiveEachSetItsOwnWaits(t *testing.T) {
 	}
 }
 
+// Only the set whose jobs stalled is marked stalled for its own alarm; the listener-wide count still counts it.
+func TestMetricsMarkOnlyTheStalledSetInStalledBy(t *testing.T) {
+	a, b := newState(0, 10), newState(0, 10)
+	a.Observe(stats(2, 0), time.Now().Add(-11*time.Minute))
+	l := &Listener{sets: []*Set{{spec: SetSpec{Name: "superci-4cpu"}, state: a}, {spec: SetSpec{Name: "superci-8cpu"}, state: b}},
+		budget: NewBudget(reg(), t0), spend: NewSpend(0, 0, nil, t0), strays: map[string]*Machine{}}
+	m := l.metrics()
+	if m.Stalled != 1 || !m.StalledBy["superci-4cpu"] || m.StalledBy["superci-8cpu"] {
+		t.Errorf("stalled %d by set %v, want only superci-4cpu", m.Stalled, m.StalledBy)
+	}
+}
+
 // sendFn is boot.sh's send function and mark spool, run in bash against a curl that answers as the listener does: 413 to
 // a marks header over 32 KiB, else 204.
 func runSend(t *testing.T, lines []string, rounds int, curlCode string) (posts []string, left []string) {

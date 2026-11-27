@@ -152,3 +152,30 @@ func TestEachDispatchSizeHasAnAlarmForHavingNoIdentityOnline(t *testing.T) {
 		}
 	}
 }
+
+// A canary rolls back on the wait and the stall of the sets its job ran on, so each size has its own alarm of each, on the Set
+// dimension, with the listener-wide alarm's threshold, periods and missing-data rule (which still pages, over every set).
+func TestEachSizeHasItsOwnOldestJobWaitAndJobsStalledAlarmOnTheSetDimension(t *testing.T) {
+	alarms := starvedAlarms(t)
+	for _, c := range []struct{ alarm, metric string }{{"oldest-job-wait", "OldestWaitingJobAgeS"}, {"jobs-stalled", "StalledSets"}} {
+		global := alarms["superci-pull-"+c.alarm]
+		if global == nil || global["--dimensions"] != "" || global["--metric-name"] != c.metric {
+			t.Fatalf("the listener-wide %s must stay, on %s with no dimension: %v", c.alarm, c.metric, global)
+		}
+		for _, size := range []string{"2cpu", "4cpu", "8cpu", "16cpu", "32cpu"} {
+			a := alarms["superci-pull-"+c.alarm+"-"+size]
+			if a == nil {
+				t.Errorf("no %s alarm for superci-%s", c.alarm, size)
+				continue
+			}
+			if a["--metric-name"] != c.metric || a["--dimensions"] != "Name=Set,Value=superci-"+size || a["--namespace"] != "superci-pull" {
+				t.Errorf("%s-%s reads %s %s in %s, want %s of the Set superci-%s", c.alarm, size, a["--metric-name"], a["--dimensions"], a["--namespace"], c.metric, size)
+			}
+			for _, f := range []string{"--statistic", "--comparison-operator", "--threshold", "--period", "--evaluation-periods", "--datapoints-to-alarm", "--treat-missing-data", "--alarm-actions", "--ok-actions"} {
+				if a[f] != global[f] {
+					t.Errorf("%s-%s %s is %q, the listener-wide alarm's is %q", c.alarm, size, f, a[f], global[f])
+				}
+			}
+		}
+	}
+}
