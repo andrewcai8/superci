@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -259,28 +260,80 @@ func (ids *Identities) labels(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// list is for the operator: every identity of the scope, with its labels and status.
-func (ids *Identities) list(w http.ResponseWriter, r *http.Request) {
+var (
+	errGroups  = errors.New("runner groups could not be listed")
+	errRunners = errors.New("runners could not be listed")
+)
+
+// Listing reads the identities of the scope: its runner group (0 when there is none yet, and then no identity) and every
+// identity in it, one GitHub call a page. The operator's GET /identities and the listener's own count of identities per
+// size are both this one read.
+func (ids *Identities) Listing(ctx context.Context) (group int, runners []IdentityRunner, err error) {
 	base := ids.rest.runnersURL(ids.repo)
-	group := 1
+	group = 1
 	if ids.repo == "" {
-		var err error
-		if group, err = ids.rest.GroupID(r.Context(), ids.groupName()); err != nil {
-			http.Error(w, "runner groups could not be listed", http.StatusBadGateway)
-			return
+		if group, err = ids.rest.GroupID(ctx, ids.groupName()); err != nil {
+			return 0, nil, fmt.Errorf("%w: %v", errGroups, err)
 		}
 		base = fmt.Sprintf("https://api.github.com/orgs/%s/actions/runner-groups/%d/runners", ids.rest.org, group)
 	}
-	runners := []IdentityRunner{}
+	runners = []IdentityRunner{}
 	if group != 0 {
-		var err error
-		if runners, err = ids.rest.IdentityRunners(r.Context(), base, identityPrefix); err != nil {
-			slog.Error("identities list", "err", err.Error())
-			http.Error(w, "runners could not be listed", http.StatusBadGateway)
-			return
+		if runners, err = ids.rest.IdentityRunners(ctx, base, identityPrefix); err != nil {
+			return 0, nil, fmt.Errorf("%w: %v", errRunners, err)
 		}
 	}
+	return group, runners, nil
+}
+
+// list is for the operator: every identity of the scope, with its labels and status.
+func (ids *Identities) list(w http.ResponseWriter, r *http.Request) {
+	group, runners, err := ids.Listing(r.Context())
+	if err != nil {
+		slog.Error("identities list", "err", err.Error())
+		if errors.Is(err, errGroups) {
+			http.Error(w, errGroups.Error(), http.StatusBadGateway)
+		} else {
+			http.Error(w, errRunners.Error(), http.StatusBadGateway)
+		}
+		return
+	}
 	writeJSON(w, map[string]any{"group": group, "runners": runners})
+}
+
+// IdentityCount is how many identities of a dispatch size are online at GitHub and how many of them hold a job. An
+// identity serves the size whose label it carries; a parked one (superci-park) serves none and is counted nowhere.
+type IdentityCount struct {
+	Set          string
+	Online, Busy int
+}
+
+// CountIdentities counts the identities of each dispatch set, given its label by set name. Every set has a count, zero
+// when no identity carries its label: a size with none to take its jobs is the starvation this exists to show.
+func CountIdentities(runners []IdentityRunner, labels map[string]string) []IdentityCount {
+	by := make(map[string]*IdentityCount, len(labels))
+	out := make([]IdentityCount, 0, len(labels))
+	for set := range labels {
+		out = append(out, IdentityCount{Set: set})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Set < out[j].Set })
+	for i := range out {
+		by[out[i].Set] = &out[i]
+	}
+	for _, r := range runners {
+		if r.Status != "online" {
+			continue
+		}
+		for set, label := range labels {
+			if slices.Contains(r.Labels, label) {
+				by[set].Online++
+				if r.Busy {
+					by[set].Busy++
+				}
+			}
+		}
+	}
+	return out
 }
 
 // limited answers 429, with GitHub's Retry-After, when GitHub's answer was a limit (403 or 429), and says whether it

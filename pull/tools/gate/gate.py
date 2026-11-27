@@ -277,7 +277,7 @@ def matches(job_name, wanted):
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# The listener's job records: what superci's side of every comparison is read from, with no GitHub call.
+# The listener's job records: what superci's side of every comparison is read from, with no GitHub call (but for a dispatched job's created_at).
 # ---------------------------------------------------------------------------------------------------------------------
 
 RECORDS_WHERE = 'msg = "tl" and ev = "job.record"'
@@ -338,8 +338,65 @@ def synth_job(e, group=T.SUPERCI_RUNNER_GROUP):
 
 def timeline_job(j):
     """The job as `timeline` accounts it: up to the moment its runner took it. A record has no steps to explain the job's own
-    run, which the gate's unexplained row is not about (the row is the plane's time)."""
-    return dict(j, completed_at=j["started_at"])
+    run, which the gate's unexplained row is not about (the row is the plane's time). A dispatched job's timeline starts where
+    the dispatcher saw it: the wait before that, for a free identity, is the queue wait rows' and the starvation alarm's."""
+    return dict(j, completed_at=j["started_at"], created_at=j.get("arrived_at") or j["created_at"])
+
+
+MATCH_S = 120.0  # a record's finish and GitHub's completed_at of the same job are seconds apart; another attempt's are not
+
+
+def rest_job_of(e, jobs):
+    """The REST job a dispatched record is, among the jobs of its run (every attempt): the one of its name that its identity
+    ran and that completed nearest its finish, within MATCH_S. None when no job fits, or when a record with no finish fits two."""
+    mine = [g for g in jobs if g.get("name") == (e.get("name") or "") and g.get("created_at") and (not e.get("runner") or g.get("runner_name") == e["runner"])]
+    done = T.ts(e.get("finish_time"))
+    if done is None:
+        return mine[0] if len(mine) == 1 else None
+    near = [g for g in mine if g.get("completed_at") and abs(T.ts(g["completed_at"]) - done) <= MATCH_S]
+    return min(near, key=lambda g: abs(T.ts(g["completed_at"]) - done)) if near else None
+
+
+def with_github_created(gh, recs, group=T.SUPERCI_RUNNER_GROUP):
+    """(jobs, dispatched, unmatched): synth_job of each record, a dispatched record's created_at being GitHub's own.
+
+    A dispatched job waits for a free identity at GitHub, before its identity's shim brings it to the dispatcher, and the
+    record's queue_time is when the shim did. A size short of identities would read as fast, so the wait is measured from the
+    REST job's created_at, found by one jobs listing per run (all attempts, cached: a finished run never changes). A rerun
+    attempt keeps its first attempt's created_at, so it counts for failures and wall time and not for queue wait, as on GitHub's
+    path. `unmatched` are the dispatched records no REST job was found for: they keep the shim's arrival, a lower bound, and a
+    row fails on them."""
+    runs = sorted({e["run"] for e in recs if e.get("dispatch") and e.get("run")})
+    listed = jobs_of(gh, [{"id": r} for r in runs], attempts="all") if runs else {}
+    found = lambda e: rest_job_of(e, listed.get(e.get("run"), []))
+    # A cached listing can be older than the job: read while its run was in flight, or before a rerun's attempt began. A record it
+    # does not match has its run listed again, once and uncached, which also replaces the entry.
+    stale = sorted({e["run"] for e in recs if e.get("dispatch") and e.get("run") and found(e) is None})
+    if stale:
+        again = jobs_of(gh, [{"id": r} for r in stale], attempts="all", fresh=True)
+        listed.update({r: again[r] or listed.get(r, []) for r in stale})
+    jobs, dispatched, unmatched = [], 0, []
+    for e in recs:
+        j = synth_job(e, group)
+        if e.get("dispatch"):
+            dispatched += 1
+            g = found(e)
+            if g is None:
+                unmatched.append(e)
+            else:
+                j = dict(j, created_at=g["created_at"], arrived_at=j["created_at"], run_attempt=g.get("run_attempt") or 1)
+        jobs.append(j)
+    return jobs, dispatched, unmatched
+
+
+def dispatched_row(dispatched, unmatched):
+    """A row that fails when a dispatched record's wait could not be measured from GitHub's created_at: it would read from the
+    shim's arrival and hide the wait for an identity. No row when no record was dispatched."""
+    if not dispatched:
+        return []
+    miss = len(unmatched)
+    return [Row("dispatched wait from GitHub", f"{dispatched - miss} of {dispatched}", "all read from GitHub's created_at", PASS if not miss else FAIL,
+                "" if not miss else f"no REST job found for {[e.get('job') for e in unmatched[:3]]}: their wait reads from the shim's arrival, a lower bound that hides a wait for an identity")]
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -369,6 +426,8 @@ class Scale:
     queuewait_samples: float  # QueueWait datapoints published in the window
     waited_asks: int = 0
     max_wait_s: float = 0.0
+    dispatched: int = 0           # replayed jobs the identity plane ran, whose waits are read from GitHub's created_at
+    dispatched_unmatched: list = dataclasses.field(default_factory=list)
 
 
 def evaluate_scale(s):
@@ -421,7 +480,7 @@ def evaluate_scale(s):
                     f"firing: {firing}" if firing else "" if s.alarms else "no alarms listed"))
     pub = s.queuewait_samples or 0
     rows.append(Row("QueueWait published", f"{pub:.0f} samples", "> 0", PASS if pub > 0 else FAIL, f"{len(s.waits)} jobs started in the replay"))
-    return rows
+    return rows + dispatched_row(s.dispatched, s.dispatched_unmatched)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -499,7 +558,7 @@ def sample(items, n):
     return [items[int(i * len(items) / n)] for i in range(n)]
 
 
-def jobs_of(gh, runs, workers=12, attempts="latest"):
+def jobs_of(gh, runs, workers=12, attempts="latest", fresh=False):
     """{run id: its jobs} for a list of runs. A run GitHub will not list (a 5xx that outlasts the retries) is left out and
     recorded in gh.skipped; an exhausted rate limit stops the command, since every later call fails the same way."""
     skipped = getattr(gh, "skipped", None)
@@ -508,7 +567,7 @@ def jobs_of(gh, runs, workers=12, attempts="latest"):
 
     def one(r):
         try:
-            return gh.run_jobs(r["id"], attempts)
+            return gh.run_jobs(r["id"], attempts, fresh=True) if fresh else gh.run_jobs(r["id"], attempts)
         except SystemExit as e:
             if "budget is used up" in str(e) or "rate limit" in str(e).lower():
                 raise SystemExit(f"stopping: {e}")
@@ -613,11 +672,13 @@ def cmd_job(a):
     runs = s_runs + b_runs
     by_run = {r["id"]: r for r in runs}
     jobs = [(j, by_run[rid]) for rid, js in jobs_of(gh, runs, attempts="all").items() for j in js if matches(j["name"], a.job)]
+    dispatched, unmatched = 0, []
     if events:
         jobs = [(j, r) for j, r in jobs if not is_superci(j, a.superci_group)]  # a sampled baseline run can hold superci jobs too: they come from the records alone
         recs = [e for e in job_records(a.profile, since, now + 600) if record_workflow(e) == a.workflow and fnmatch.fnmatch(record_branch(e), a.branch_glob)
                 and matches(e.get("name") or "", a.job) and (T.ts(e.get("queue_time") or e.get("finish_time")) or 0) >= since]
-        jobs += [(j, {"head_branch": j["head_branch"], "head_sha": ""}) for j in (synth_job(e, a.superci_group) for e in recs)]
+        records, dispatched, unmatched = with_github_created(gh, recs, a.superci_group)
+        jobs += [(j, {"head_branch": j["head_branch"], "head_sha": ""}) for j in records]
     jobs_all = [j for j, r in jobs]
     S_jobs = [j for j, r in jobs if is_superci(j, a.superci_group) and T.ts(j["created_at"]) >= since]
     B_jobs = [j for j, r in jobs if fleet_or_label(j) == "blacksmith" and b_lo <= T.ts(j["created_at"]) <= b_hi]
@@ -638,7 +699,7 @@ def cmd_job(a):
         ev = T.gather(a.profile, finished, before=3 * 3600, legacy=a.legacy)
         unexplained = [t.unexplained for t in (T.build(j, ev) for j in finished) if t.wall is not None]
     print(f"gate job {a.job}  workflow {a.workflow}  ({len(listed)} runs listed, jobs read from {len(s_runs)} superci-window and {len(b_runs)} baseline runs, {gh.calls} GitHub calls)")
-    print(f"  superci: " + (f"{len(S_jobs)} jobs from the listener's job records (no GitHub call), on branches {a.branch_glob}" if events
+    print(f"  superci: " + (f"{len(S_jobs)} jobs from the listener's job records ({'no GitHub call' if not dispatched else f'GitHub read for the created_at of {dispatched} dispatched jobs'}), on branches {a.branch_glob}" if events
                             else f"runner group {a.superci_group}, runs read whole from branches {a.branch_glob}") + f", created {T.iso(since)} to {T.iso(now)}")
     print(f"  blacksmith: created {T.iso(b_lo)} to {T.iso(b_hi)}; ceiling " + (f"{ceiling:g} s ({LIMITS_PATH})" if ceiling is not None else f"none (no {a.workflow} / {a.job} row)"))
     print(f"  rerun attempts: {sum(1 for j in S_jobs + B_jobs if (j.get('run_attempt') or 1) > 1)} counted for failures and wall time, not for queue wait (a rerun keeps its first attempt's created_at, so its queue wait is not real)")
@@ -648,7 +709,7 @@ def cmd_job(a):
     show_spread("superci", S, ceiling)
     show_spread("blacksmith", B, ceiling)
     print()
-    rows = evaluate_job(S, B, ceiling, unexplained) + unread(gh, a.allow_unread)
+    rows = evaluate_job(S, B, ceiling, unexplained) + dispatched_row(dispatched, unmatched) + unread(gh, a.allow_unread)
     code = print_rows("criteria", rows, f"gate 1 for {a.job}")
     if not a.canary:
         return code
@@ -669,8 +730,9 @@ def collect_scale(a):
         # finish, so the read runs 2 hours past `hi`, longer than any replayed job
         recs = [e for e in job_records(a.profile, lo - 60, hi + 7200) if record_workflow(e) == a.workflow and fnmatch.fnmatch(record_branch(e), a.branch_glob)
                 and lo - 60 <= (T.ts(e.get("queue_time") or e.get("finish_time")) or 0) <= hi + 300]
-        jobs = [synth_job(e, a.superci_group) for e in recs]
+        jobs, dispatched, unmatched = with_github_created(gh, recs, a.superci_group)
     else:
+        dispatched, unmatched = 0, []
         # a workflow that lives only on the load branches has no file name GitHub resolves, so every run is listed and matched by path
         runs = [r for r in runs_of(gh, None, lo - 60, hi) if os.path.basename(r.get("path") or "") == a.workflow and fnmatch.fnmatch(r.get("head_branch") or "", a.branch_glob)]
         jobs = [j for js in jobs_of(gh, runs).values() for j in js if j.get("conclusion") != "skipped"]
@@ -697,7 +759,8 @@ def collect_scale(a):
                  orphans=[p for p in metric(a.profile, "Orphans", due, due + 120) if p[0] <= now], orphans_due=due, lo=lo, hi=hi,
                  alarms=alarm_states(a.profile, hi, now),
                  queuewait_samples=sum(v for _, v in metric(a.profile, "QueueWait", lo, hi + tail, "SampleCount")),
-                 waited_asks=len(grants), max_wait_s=max((e.get("waited_ms") or 0 for e in grants), default=0) / 1000), gh
+                 waited_asks=len(grants), max_wait_s=max((e.get("waited_ms") or 0 for e in grants), default=0) / 1000,
+                 dispatched=dispatched, dispatched_unmatched=unmatched), gh
 
 
 def cmd_scale(a):

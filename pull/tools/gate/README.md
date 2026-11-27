@@ -27,10 +27,16 @@ tool reads, so every row below is decided by one code path. What differs from re
   100 runs (`--max-runs`; 300 with `--superci-source github`), cached by `--cache`, so a canary's repeat checks of the same baseline cost
   nothing. A superci failure is excused by a Blacksmith failure of the same commit, and a record holds no commit: when Blacksmith has
   a failure in the sample, the head of each failed superci run is read (one call per failed run, cached).
-- `gate scale` reads no GitHub call at all.
+- `gate scale` reads no GitHub call for jobs the scale sets ran.
+- A job the identity plane ran (a record with `dispatch`) waited for a free identity at GitHub before its identity's shim brought it to the
+  dispatcher, and the record's `queue_time` is when the shim did: a size short of identities would read as fast. Both commands read such a
+  job's `created_at` from GitHub instead: one jobs listing per run (all attempts, cached), the job matched by name, by the runner the
+  record names and by the completion nearest the record's finish. The row `dispatched wait from GitHub` fails when a record finds no job.
+  A rerun attempt keeps its first attempt's `created_at`, so it counts for failures and wall time, not queue wait, as on GitHub's path.
+  The timeline's unexplained row still starts where the dispatcher saw the job.
 - The branch is the record's `workflow_ref`: `refs/heads/<branch>` for a push (the load branches, main, the merge queue). A pull request's
   ref is `refs/pull/<n>/merge`, which matches only a glob that fits it.
-- The message has no attempt number, so every record counts as a first attempt: a rerun's queue wait is the one GitHub sent for it. It has no
+- The message has no attempt number, so every record counts as a first attempt (a dispatched one takes its attempt from its REST job): a rerun's queue wait is the one GitHub sent for it. It has no
   `timed_out` either: a failure that ran to within 5 s of the job's ceiling is read as one and counts at the ceiling, as GitHub's would. Without
   a ceiling row it is a failure with the wall time it ran.
 - A job cancelled before any runner took it has a partial record (no start) with no runner: it is kept as a queue-wait lower bound, as on GitHub's
