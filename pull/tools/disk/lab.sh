@@ -31,7 +31,7 @@ sleep 150
 for n in "${!CFGS[@]}"; do
   out=""
   for _ in 1 2 3 4 5 6; do
-    out=$($A ec2 get-console-output --instance-id "${ids[$n]}" --latest --output text --query Output | grep -a "^LAB:" | sort -u)
+    out=$($A ec2 get-console-output --instance-id "${ids[$n]}" --latest --output text --query Output | grep -a "^LAB:" | awk "!seen[\$0]++")
     grep -aq "LAB: end" <<< "$out" && break; sleep 20
   done
   echo "== ${CFGS[$n]} (MiB/s:IOPS) on $TYPE"; sed 's/^LAB: //' <<< "$out" | grep -av "^begin\|^root"
