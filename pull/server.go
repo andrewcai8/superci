@@ -91,14 +91,22 @@ func (h *Server) document(r *http.Request) (InstanceDocument, error) {
 // no set knows it.
 func (h *Server) machineOf(r *http.Request, doc InstanceDocument) (*Set, *Machine, error) {
 	for try := 0; try < 3; try++ {
-		for _, s := range h.sets {
-			if m := s.state.Machine(doc.InstanceID); m != nil {
-				return s, m, nil
-			}
+		if s, m := h.scaleMachine(doc.InstanceID); m != nil {
+			return s, m, nil
 		}
 		h.refresh(r.Context(), doc.Region)
 	}
 	return nil, nil, fmt.Errorf("instance %s is no machine of ours", doc.InstanceID)
+}
+
+// scaleMachine is the scale set and machine an instance is, if some set holds it.
+func (h *Server) scaleMachine(id string) (*Set, *Machine) {
+	for _, s := range h.sets {
+		if m := s.state.Machine(id); m != nil {
+			return s, m
+		}
+	}
+	return nil, nil
 }
 
 // jit answers a machine's ask for its runner. A machine gets one runner, ever: its grant claims it (Claims), the
