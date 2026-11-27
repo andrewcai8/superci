@@ -919,7 +919,7 @@ whose message says "burst"); `bench/measure.py BRANCH SINCE UNTIL listener.jsonl
 
 ### The tools read GitHub on the App's budget
 
-The gate, the timeline and the canary (`tools/gate/gate.py`, `tools/timeline/timeline.py`, `tools/gate/canary.sh`) read GitHub
+The gate, the timeline, the logs tool and the canary (`tools/gate/gate.py`, `tools/timeline/timeline.py`, `tools/logs/logs.py`, `tools/gate/canary.sh`) read GitHub
 on the App's installation budget, not on the operator's personal token, which every session on the operator's host shares
 (it reached 0 on Nov 27 at 18:13Z, writes refused too, and a re-route and the canary's checks waited on it).
 
@@ -928,10 +928,14 @@ on the App's installation budget, not on the operator's personal token, which ev
   not served on the public port. The tools reach it through `deploy/ssh.sh`, so the App's key never leaves the listener and
   the tools never read the SSM parameter. `tools/timeline/apptoken.py` keeps the token in the process's memory and gives it to
   each `gh` call as `GH_TOKEN`; `canary.sh` takes it into a shell variable and sets it for each call. Nothing writes or prints it.
-- **Refusal.** With no App token (ssh or the endpoint down, the permission not granted) `gate.py` and `canary.sh` exit 2 and
-  say why; they never fall back. `gate.py --personal-token` and `SUPERCI_PERSONAL_TOKEN=1 canary.sh` spend the shared personal
-  budget on purpose and print that they do. `gate scale` reads no GitHub for a window the listener's job records cover, and
-  refuses at its first call otherwise.
+- **Refusal.** With no App token (ssh or the endpoint down, the permission not granted) `gate.py`, `timeline.py`, `logs.py` and
+  `canary.sh` exit 2 and say why; they never fall back. A refusal in the middle of a command (a token refresh that fails during
+  a long gate) is `apptoken.AppTokenRefused`, not a `SystemExit`, so no per-run "skip this run" catch can swallow it and judge a
+  sample that lost runs; each tool's `main` ends with exit 2. A message about a token never holds one (ssh failing after curl
+  printed a token says only the exit code and status). `--personal-token` (`gate.py`, `timeline.py`, `logs.py`, before the
+  subcommand for the first two) and `SUPERCI_PERSONAL_TOKEN=1 canary.sh` spend the shared personal budget on purpose and print
+  that they do. `gate scale` reads no GitHub for a window the listener's job records cover, and refuses at its first call
+  otherwise. `SUPERCI_APP_TOKEN_CMD` (a stub for the ssh call) is honoured only with `SUPERCI_TEST=1`, which the tests set.
 - **The floor.** `canary.sh` reads `rate_limit` with the token its checks use, so its 1,500 floor is that token's own budget.
   A tick that cannot get a token is skipped and logged; the watch does not stop.
 

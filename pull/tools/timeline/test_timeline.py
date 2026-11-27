@@ -226,6 +226,7 @@ class AppToken(unittest.TestCase):
     def listener(self, expires="2999-01-01T00:00:00Z", status=200, body=None):
         """A token command that counts its runs and numbers its tokens."""
         out = f"printf '%s\\n%s\\n' '{body}' {status}" if body else f"printf '{{\"token\":\"ghs_%s\",\"expires\":\"{expires}\"}}\\n{status}\\n' \"$n\""
+        os.environ["SUPERCI_TEST"] = "1"
         os.environ["SUPERCI_APP_TOKEN_CMD"] = self.script("listener", f"n=$(($(cat {self.count} 2>/dev/null || echo 0)+1)); echo $n > {self.count}\n{out}\n")
         def minted():
             if not os.path.exists(self.count):
@@ -257,15 +258,23 @@ class AppToken(unittest.TestCase):
         self.assertEqual(minted(), 2)
 
     def test_no_token_refuses_before_any_gh_call_and_names_the_override(self):
+        self.assertTrue(hasattr(T.apptoken, "AppTokenRefused"), "a refusal is its own exception, which no skip-this-run catch of SystemExit swallows")
+        self.listener(status=502, body="installation token: 422 Unprocessable Entity: permissions not granted")
+        with self.assertRaises(T.apptoken.AppTokenRefused) as raised:
+            T.GitHub("o/r", T.Cache(os.path.join(self.tmp, "cache"))).api("actions/runs/1/jobs", keep=False)
+        self.assertIn("refusing: no GitHub App token", str(raised.exception))
+        self.assertIn("permissions not granted", str(raised.exception), "the listener's reason is shown")
+        self.assertIn("--personal-token", str(raised.exception))
+        self.assertFalse(os.path.exists(self.log), "gh was never run")
+
+    def test_the_command_exits_2_with_the_reason(self):
         self.listener(status=502, body="installation token: 422 Unprocessable Entity: permissions not granted")
         err = io.StringIO()
         with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as raised:
-            T.GitHub("o/r", T.Cache(os.path.join(self.tmp, "cache"))).api("actions/runs/1/jobs", keep=False)
+            T.main(["--cache", os.path.join(self.tmp, "cache"), "critical-path", "--run", "1"])
         self.assertEqual(raised.exception.code, 2)
         self.assertIn("refusing: no GitHub App token", err.getvalue())
-        self.assertIn("permissions not granted", err.getvalue(), "the listener's reason is shown")
-        self.assertIn("--personal-token", err.getvalue())
-        self.assertFalse(os.path.exists(self.log), "gh was never run")
+        self.assertFalse(os.path.exists(self.log))
 
     def test_the_personal_override_leaves_the_environment_alone(self):
         self.listener(status=502, body="down")
@@ -279,6 +288,31 @@ class AppToken(unittest.TestCase):
         with self.assertRaises(T.apptoken.NoAppToken) as raised:
             T.apptoken.mint()
         self.assertNotIn("ghs_secret", str(raised.exception))
+
+    def test_the_token_command_hook_is_ignored_without_the_test_flag(self):
+        marker = os.path.join(self.tmp, "ran")
+        os.environ["SUPERCI_APP_TOKEN_CMD"] = self.script("hook", f"touch {marker}\n")
+        os.environ.pop("SUPERCI_TEST", None)
+        cmd = T.apptoken._command()
+        self.assertNotIn(os.environ["SUPERCI_APP_TOKEN_CMD"], cmd, "the hook was honoured without SUPERCI_TEST=1")
+        self.assertTrue(cmd[0].endswith("deploy/ssh.sh"), cmd)
+        os.environ["SUPERCI_TEST"] = "1"
+        self.assertEqual(T.apptoken._command(), [os.environ["SUPERCI_APP_TOKEN_CMD"]], "and with the flag it is")
+
+    def test_a_good_answer_followed_by_a_failed_exit_is_not_quoted_in_the_message(self):
+        os.environ["SUPERCI_TEST"] = "1"
+        os.environ["SUPERCI_APP_TOKEN_CMD"] = self.script("leaky", "printf '{\"token\":\"ghs_leak\",\"expires\":\"2999-01-01T00:00:00Z\"}\\n200\\n'\necho 'ssh: connection reset' >&2\nexit 255\n")
+        with self.assertRaises(T.apptoken.NoAppToken) as raised:
+            T.apptoken.mint()
+        self.assertNotIn("ghs_leak", str(raised.exception))
+        self.assertIn("exit 255", str(raised.exception))
+
+    def test_any_token_shaped_text_in_a_refusal_is_removed(self):
+        os.environ["SUPERCI_TEST"] = "1"
+        os.environ["SUPERCI_APP_TOKEN_CMD"] = self.script("odd", "printf 'oops ghs_abc123 in a 502 body\\n502\\n'\n")
+        with self.assertRaises(T.apptoken.NoAppToken) as raised:
+            T.apptoken.mint()
+        self.assertNotIn("ghs_abc123", str(raised.exception))
 
     def test_only_a_named_exception_may_use_the_personal_token_by_name(self):
         with self.assertRaises(ValueError):

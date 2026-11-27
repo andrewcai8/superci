@@ -875,6 +875,7 @@ def build_parser():
     return p
 
 
+@T.apptoken.refuse_as_exit
 def main(argv=None):
     a = build_parser().parse_args(argv)
     T.AUTH.personal = a.personal_token

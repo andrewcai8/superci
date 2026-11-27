@@ -687,6 +687,7 @@ def cmd_export(a):
         print(f"export task {t['taskId']}: {region} {group} {a.day} to s3://{bucket}/timeline/{region}{group}/{a.day}")
 
 
+@apptoken.refuse_as_exit
 def main(argv=None):
     p = argparse.ArgumentParser(prog="timeline", description=__doc__.split("\n")[0])
     p.add_argument("--profile", default=os.environ.get("AWS_PROFILE", "ci-runners"), help="AWS profile of the superci account")

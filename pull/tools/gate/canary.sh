@@ -25,8 +25,10 @@ refresh_token() { # the App's token, in $app (this shell's memory, never printed
   app=""
   return 1
 }
-apperr=$(mktemp)
-trap 'rm -f "$apperr"' EXIT
+apperr=$(mktemp) || exit 2
+trap 'rm -f "$apperr"' EXIT # on every way out: a refusal, the end of the watch, and (below) a signal, which bash does not run EXIT for by default
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
 ghr() { if [ "$personal_ok" = 1 ]; then gh "$@"; else GH_TOKEN=$app gh "$@"; fi; } # a read or write on the budget the watch spends
 exec 9>&2 # the log of an exception goes to the watch's own stderr, not into the captured output of the call
 personal() { local name=$1; shift; echo "personal-token exception $name: the App lacks Variables: read and write; this call is on the shared personal budget" >&9; gh "$@"; }
