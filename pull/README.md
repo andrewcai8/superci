@@ -26,14 +26,14 @@ superci-pull: one process on one c7g.large, an Auto Scaling group of one in us-e
               then m8a and r8a; the others: c8a and m8a, then c8i, m8i, c7a and m7a, then older families) x every zone of us-east-1 that
               offers them (5 of 6: use1-az3 offers none) at weight 2 and of us-east-2 (3 of 3) at weight 1; a
               region's spot shortfall goes to the other, then on-demand, at most 10% of the last half hour's
-              launches. A size's `on_demand_first` leading types (superci-4cpu and superci-8cpu: m8azn) go first, spot then
+              launches. A size's `on_demand_first` leading types (superci-4cpu: m8azn.xlarge) go first, spot then
               on demand outside that 10%, before any slower type: m8azn spot is thin (10 of 11 m8azn-only asks
               failed, Nov 26), on-demand m8azn.xlarge is $0.41/h against Blacksmith's $0.48/h for 4 vCPUs, and
-              unit legs ran 12% slower on m8a and r8a (93 s against 83 s). superci-8cpu had no such rule: 1,062 of
-              its 1,461 launches in 14 hours to Nov 27 04:00Z (73%) were m8a.2xlarge or r8a.2xlarge. On demand its
-              m8azn.3xlarge (12 vCPUs, 48 GiB) is $1.2388/h (AWS price list, us-east-1) against Blacksmith's $0.96/h for
-              8 vCPUs, and spot $0.36 to $0.62 against $0.14 to $0.25 for the slower types, so the rule adds about
-              $0.33 per machine-hour (below); a ClientToken on every call
+              unit legs ran 12% slower on m8a and r8a (93 s against 83 s). A size's `spot_first` leading types
+              (superci-8cpu: m8azn.3xlarge) go first as spot alone and never on demand, then the others' spot: one
+              spot ask over all of them is capacity-optimized, and superci-8cpu's jobs ran on r8a.2xlarge 33 times
+              and m8a.2xlarge 4 times from one (Nov 26-27). m8azn.3xlarge on demand ($1.2388/h) would cost 2.40x
+              Blacksmith per unit-tests leg; a ClientToken on every call
   /jit      : POST with the machine's signed identity document; a runner only for a machine never issued one, only
               once its grant has made the machine's claim (s3://superci-pull-claims-<account>/issued/<instance>),
               and its config leaves only after EC2 has the machine's superci-pull-issued tag
@@ -219,7 +219,7 @@ offering them first, and a job is known by its job id. Before Nov 25 19:00Z ever
 read as none and each pool stayed at its floor; the load tests above pinned their pools, which hid it.
 
 The pool is the measured burst of the jobs routed to the set, bounded by a cap for the hour (UTC) and a floor that ships at 0 for every size and
-hour: the caps are flat spend guards (120, 200, 130, 40 and 12) above the largest pool the weekday model below asks for, and a split size divides
+hour: the caps are flat spend guards (120, 200, 250, 40 and 12) above the largest pool the weekday model below asks for, and a split size divides
 its bounds among its sets. A burst of 0 (no job arrived in the last `window_minutes`, none is held or carried from before a restart) means nothing
 is routed to the set, and its pool is 0 whatever a floor says. No idle runner is trimmed in the first window after a start, while the set has seen too
 few jobs to size its pool.
@@ -286,7 +286,7 @@ A push's jobs arrive together, so it is warm more often than independent jobs wo
 | --- | --- | --- | --- |
 | superci-2cpu | 18 `.large` of c5, c5a, c6a, c6i, c7a, c7i, c7i-flex, c8a, c8i, m5, m5a, m6a, m6i, m7a, m7i, m7i-flex, m8a, m8i | 600 | 40 GB |
 | superci-4cpu | m8azn.xlarge (5 GHz), m8a.xlarge, r8a.xlarge | 1,200 | 60 GB |
-| superci-8cpu | m8azn.3xlarge (12 vCPU, 5 GHz), m8a.2xlarge, r8a.2xlarge | 600 | 80 GB |
+| superci-8cpu | m8azn.3xlarge (12 vCPU, 5 GHz) spot first, then m8a.2xlarge | 600 | 80 GB |
 | superci-16cpu | `.4xlarge` | 100 | 120 GB |
 | superci-32cpu | 17 `.8xlarge` (no c5) | 50 | 150 GB |
 
@@ -899,16 +899,14 @@ whose message says "burst"); `bench/measure.py BRANCH SINCE UNTIL listener.jsonl
 Spot prices on Nov 25 2026 08:00Z (median of each size's 10 cheapest pools), with its gp3 volume, a machine-hour:
 2 vCPU $0.035, 4 vCPU $0.062, 8 vCPU $0.106, 16 vCPU $0.190, 32 vCPU $0.351.
 
-These are the median of the cheapest pools, not what a size launches into. 8 vCPU runs m8azn.3xlarge (12 vCPUs, 48 GiB) first, with its `on_demand_first`
-rule: spot $0.36 to $0.62 (about $0.48 across the regions, weight 2 to 1) against $0.14 to $0.25 for m8a.2xlarge and r8a.2xlarge, and $1.2388 on demand
-(AWS price list, Nov 27). Over the 14 hours to Nov 27 04:00Z, before the rule, 27% of its machines were m8azn spot, 41% m8a and 32% r8a: about $0.27 a
-machine-hour. With the rule, at 4 vCPU's observed split of 84% spot and 16% on demand (a guess for 8 vCPU), about $0.61: +$0.33 a machine-hour, +$0.017 for a
-machine that lives 3 minutes, under Blacksmith's $0.96 an hour for 8 vCPUs on average and over it ($1.24) for a machine that lands on demand. The rule is
-bounded by the cost cap and nothing else: m8azn on demand is not limited by `on_demand_share`, so a long m8azn spot shortage in both regions puts every 8 vCPU
-machine on demand, and about 33 of them running all day reach the 1,000 USD daily cap, after which the listener launches nothing until 00:00 UTC.
-`spend-daily` (80% of the cap) pages first; no alarm watches the on-demand share. Every on-demand launch, m8azn included, counts toward the
-`on_demand_share` the slower types are held to, so after a burst of m8azn on demand the slower types get none on demand until the half hour's launches
-dilute it.
+These are the median of the cheapest pools, not what a size launches into. 8 vCPU carries unit-tests' 8 vCPU legs
+(microvm-design-v5, Nov 27): m8azn.3xlarge spot first (`spot_first`), then m8a.2xlarge spot, then m8a.2xlarge on demand
+within `on_demand_share`. Measured on the same commit and legs as Blacksmith, their tests ran at 0.75x Blacksmith's time
+on m8azn.3xlarge (n=3) and 1.03x on m8a.2xlarge (n=5). At spot $0.51 and $0.175 an hour (us-east-1, Nov 27) with the read
+set's 65 s to a warm machine, a leg costs $0.0234 (1.01x Blacksmith's $0.0232) on m8azn and $0.0092 (0.40x) on m8a; with
+half on each, about $0.016 (0.71x) and a wall p50 at or under Blacksmith's 60 s (m8azn about 50 s, m8a about 61 s). A
+leg on m8azn.3xlarge on demand would cost $0.0557 (2.40x), so it is never asked for. The pool cap of 250 holds the
+warm-first pool v5 sized at 242 for the Nov 26 peak (146 legs a minute).
 
 | | Per hour |
 | --- | --- |

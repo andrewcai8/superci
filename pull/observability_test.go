@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -312,6 +313,51 @@ func TestTheOnDemandShareTheAlarmReadsIsOverTheSetsThatAskOnDemandFirst(t *testi
 	for _, d := range quiet {
 		if aws.ToString(d.MetricName) == "OnDemandFirstShare" && aws.ToFloat64(d.Value) != 0 {
 			t.Errorf("no on-demand-first set: share %v, want 0", aws.ToFloat64(d.Value))
+		}
+	}
+}
+
+// superci-8cpu asks m8azn.3xlarge spot alone and never on demand (spot_first): the alarm keeps reading superci-4cpu, whose
+// m8azn.xlarge is still asked on demand first, and the 8 vCPU machines neither enter its share nor dilute it.
+func TestTheOnDemandAlarmStillWatchesSuperci4cpuOnceSuperci8cpuIsSpotFirst(t *testing.T) {
+	scope := onDemandFirstSets(shippedConfig(t).Sets())
+	if !scope["superci-4cpu"] || scope["superci-8cpu"] {
+		t.Fatalf("the alarm's sets are %v, want superci-4cpu and not superci-8cpu", scope)
+	}
+	m := Metrics{
+		Sets:          []Snapshot{{Set: "superci-2cpu", Machines: 300}},
+		Dispatch:      []DispatchSnapshot{{Set: "superci-4cpu", Machines: 20, OnDemand: 10}, {Set: "superci-8cpu", Machines: 200, OnDemand: 5}},
+		OnDemandFirst: scope,
+		SetWaits:      map[string][]float64{}, Denied: map[string]int{},
+	}
+	got := map[string]float64{}
+	for _, d := range metricData(m, t0) {
+		if len(d.Dimensions) == 0 {
+			got[aws.ToString(d.MetricName)] = aws.ToFloat64(d.Value)
+		}
+	}
+	if got["OnDemandFirstMachines"] != 20 || got["OnDemandFirstShare"] != 0.5 {
+		t.Errorf("superci-4cpu's 10 on-demand of 20 read as %v machines, share %v; want 20 and 0.5, which the alarm (10 or more machines, over 0.4) sees",
+			got["OnDemandFirstMachines"], got["OnDemandFirstShare"])
+	}
+}
+
+// The dispatch sizes (superci-4cpu and superci-8cpu since #52) are dispatch sets, not scale sets: their types must be priced,
+// or every spot machine of theirs accrues spend at the on-demand rate.
+func TestSpotPricesAreFetchedForTheDispatchSetsTypesToo(t *testing.T) {
+	c := shippedConfig(t)
+	l := &Listener{}
+	for _, spec := range c.Sets() {
+		if spec.Dispatch {
+			l.dsets = append(l.dsets, &DispatchSet{spec: spec})
+		} else {
+			l.sets = append(l.sets, &Set{spec: spec})
+		}
+	}
+	got := l.priceTypes()
+	for _, want := range []string{"m8azn.3xlarge", "m8a.2xlarge", "m8azn.xlarge", "c8a.large"} {
+		if !slices.Contains(got, want) {
+			t.Errorf("spot prices are fetched for %v, without %s", got, want)
 		}
 	}
 }

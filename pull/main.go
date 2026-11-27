@@ -1048,16 +1048,7 @@ func (l *Listener) sampleOrg(ctx context.Context) {
 
 // price refreshes the spot prices the spend accrues at.
 func (l *Listener) price(ctx context.Context) {
-	types := map[string]bool{}
-	for _, s := range l.sets {
-		for _, t := range s.spec.Types {
-			types[t] = true
-		}
-	}
-	names := make([]string, 0, len(types))
-	for t := range types {
-		names = append(names, t)
-	}
+	names := l.priceTypes()
 	for _, r := range l.fleet.regions {
 		p, err := l.fleet.SpotPrices(ctx, r, names)
 		if err != nil {
@@ -1066,6 +1057,35 @@ func (l *Listener) price(ctx context.Context) {
 		}
 		l.spend.SetPrices(p)
 	}
+}
+
+// specs is every set's spec, scale sets and dispatch sets.
+func (l *Listener) specs() []SetSpec {
+	var out []SetSpec
+	for _, s := range l.sets {
+		out = append(out, s.spec)
+	}
+	for _, d := range l.dsets {
+		out = append(out, d.spec)
+	}
+	return out
+}
+
+// priceTypes is every type a set launches, dispatch sets included: a type with no spot price accrues at the on-demand
+// rate ($1.24 an hour for 8 vCPUs against m8azn.3xlarge's $0.51 spot), which at superci-8cpu's 250 machines would reach
+// the daily cap in about 3 hours of what is really 7.
+func (l *Listener) priceTypes() []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, s := range l.specs() {
+		for _, t := range s.Types {
+			if !seen[t] {
+				seen[t] = true
+				out = append(out, t)
+			}
+		}
+	}
+	return out
 }
 
 // probePrefix names the probe runners: the time of the registration, in nanoseconds, follows it.
@@ -1278,13 +1298,7 @@ func (l *Listener) metrics() Metrics {
 	m := Metrics{Budget: st.Budget, Spend: st.Spend, Sets: st.Sets, SetWaits: map[string][]float64{}, Dispatch: st.Dispatch,
 		DispatchCounts: map[string]DispatchCounts{}}
 	cfg := l.config()
-	m.OnDemandFirst = map[string]bool{}
-	for _, s := range l.sets {
-		m.OnDemandFirst[s.spec.Name] = s.spec.OnDemandFirst > 0
-	}
-	for _, d := range l.dsets {
-		m.OnDemandFirst[d.spec.Name] = d.spec.OnDemandFirst > 0
-	}
+	m.OnDemandFirst = onDemandFirstSets(l.specs())
 	for i, s := range l.sets {
 		waits := s.state.TakeWaits()
 		m.Jobs = append(m.Jobs, s.state.TakeJobs()...)

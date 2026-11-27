@@ -121,37 +121,63 @@ func TestSuperci4cpuFallsToSlowerSpotOnlyWhenM8aznIsOutEntirely(t *testing.T) {
 	}
 }
 
-// superci-8cpu leads with m8azn.3xlarge as superci-4cpu leads with m8azn.xlarge, and its spot is as thin: from about 17:40Z
-// Nov 26, 1,062 of its 1,461 launches in 14 hours (73%) were m8a.2xlarge or r8a.2xlarge, the slower types.
-func TestSuperci8cpuAsksM8aznOnDemandBeforeASlowerSpotType(t *testing.T) {
-	thin := map[string]int{"m8azn.3xlarge/spot": 1, "m8azn.3xlarge/on-demand": 100, "m8a.2xlarge/spot": 100, "r8a.2xlarge/spot": 100}
-	got := shapes(launchSet(t, "superci-8cpu", thin, maps(thin)).Launch(context.Background(), "r1", 6, 0))
-	if want := map[string]int{"m8azn.3xlarge/spot": 2, "m8azn.3xlarge/on-demand": 4}; !sameShapes(got, want) {
-		t.Fatalf("with m8azn spot thin and the on-demand share spent, 6 machines started as %v, want %v", got, want)
+// superci-8cpu carries unit-tests' 8 vCPU legs (microvm-design-v5): m8azn.3xlarge ran their tests at 0.75x Blacksmith's
+// time and m8a.2xlarge at 1.03x, and per leg they cost 1.01x and 0.40x of Blacksmith on spot. m8azn.3xlarge on demand
+// costs 2.40x, so it is asked spot alone first and never on demand; m8a.2xlarge's spot comes next, and only its on-demand
+// is left to on_demand_share.
+func TestSuperci8cpuAsksM8aznSpotThenM8aSpotAndNeverM8aznOnDemand(t *testing.T) {
+	thin := map[string]int{"m8azn.3xlarge/spot": 1, "m8azn.3xlarge/on-demand": 100, "m8a.2xlarge/spot": 100, "m8a.2xlarge/on-demand": 100}
+	east, west := thin, maps(thin)
+	sf := launchSet(t, "superci-8cpu", east, west)
+	got := shapes(sf.Launch(context.Background(), "r1", 6, 6))
+	if want := map[string]int{"m8azn.3xlarge/spot": 2, "m8a.2xlarge/spot": 4}; !sameShapes(got, want) {
+		t.Fatalf("with m8azn spot thin, 6 machines started as %v, want %v", got, want)
 	}
-}
-
-func TestSuperci8cpuTakesM8aznSpotWhenItHasCapacityAndFallsToSlowerOnlyWhenM8aznIsOut(t *testing.T) {
 	plenty := map[string]int{"m8azn.3xlarge/spot": 100, "m8azn.3xlarge/on-demand": 100, "m8a.2xlarge/spot": 100}
 	if got, want := shapes(launchSet(t, "superci-8cpu", plenty, maps(plenty)).Launch(context.Background(), "r1", 6, 6)), map[string]int{"m8azn.3xlarge/spot": 6}; !sameShapes(got, want) {
-		t.Fatalf("got %v, want %v", got, want)
+		t.Fatalf("with m8azn spot to spare: got %v, want %v", got, want)
 	}
-	out := map[string]int{"m8a.2xlarge/spot": 2, "r8a.2xlarge/spot": 100, "m8a.2xlarge/on-demand": 100}
-	if got, want := shapes(launchSet(t, "superci-8cpu", out, maps(out)).Launch(context.Background(), "r1", 6, 0)), map[string]int{"m8a.2xlarge/spot": 4, "r8a.2xlarge/spot": 2}; !sameShapes(got, want) {
-		t.Fatalf("got %v, want %v", got, want)
+	out := map[string]int{"m8azn.3xlarge/on-demand": 100, "m8a.2xlarge/spot": 2, "m8a.2xlarge/on-demand": 100}
+	east, west = out, maps(out)
+	sf = launchSet(t, "superci-8cpu", east, west)
+	if got, want := shapes(sf.Launch(context.Background(), "r1", 6, 1)), map[string]int{"m8a.2xlarge/spot": 4, "m8a.2xlarge/on-demand": 1}; !sameShapes(got, want) {
+		t.Fatalf("with no m8azn spot and m8a's spot short: got %v, want %v", got, want)
+	}
+	for _, r := range sf.fleet.regions {
+		for _, call := range r.fleets.(*capacity).asked {
+			if strings.HasPrefix(call, "on-demand") && strings.Contains(call, "m8azn") {
+				t.Fatalf("superci-8cpu asked m8azn on demand: %q", call)
+			}
+		}
 	}
 }
 
-// A size whose first type is an m8azn asks it on demand before a slower spot type: the shipped config says so for every
-// such size, so a size added or reordered without the rule fails here and not in production's launch mix.
-func TestEverySizeThatLeadsWithM8aznAsksItOnDemandFirst(t *testing.T) {
+// The shipped superci-8cpu, as the listener loads it (deploy/override.json over config.json): unit-tests' mix and nothing
+// else, a dispatch size, and a pool cap that holds the warm-first pool v5 sized at 242 for the Nov 26 peak.
+func TestTheShippedSuperci8cpuIsTheUnitTestsMix(t *testing.T) {
+	c := shippedConfig(t)
+	s := c.Sizes["superci-8cpu"]
+	if want := []string{"m8azn.3xlarge", "m8a.2xlarge"}; !slices.Equal(s.Types, want) || s.SpotFirst != 1 || s.OnDemandFirst != 0 || !s.Dispatch {
+		t.Fatalf("superci-8cpu: types %v spot_first %d on_demand_first %d dispatch %v; want types %v, spot_first 1, on_demand_first 0, dispatch",
+			s.Types, s.SpotFirst, s.OnDemandFirst, s.Dispatch, want)
+	}
+	for h, cap := range c.Pools["superci-8cpu"].Cap {
+		if cap != 250 {
+			t.Fatalf("superci-8cpu's pool cap at %02dZ is %d, want 250", h, cap)
+		}
+	}
+}
+
+// A size whose first type is an m8azn asks it first, alone (spot_first) or spot then on demand (on_demand_first): asked
+// with slower types in one spot fleet, 73% of superci-8cpu's machines landed on the slower ones (Nov 26-27).
+func TestEverySizeThatLeadsWithM8aznAsksItFirst(t *testing.T) {
 	c := shippedConfig(t)
 	seen := 0
 	for label, s := range c.Sizes {
 		if len(s.Types) > 0 && strings.HasPrefix(s.Types[0], "m8azn.") {
 			seen++
-			if s.OnDemandFirst < 1 {
-				t.Errorf("%s leads with %s and has on_demand_first %d: its m8azn spot is thin and 73%% of its machines land on slower types", label, s.Types[0], s.OnDemandFirst)
+			if s.OnDemandFirst < 1 && s.SpotFirst < 1 {
+				t.Errorf("%s leads with %s and asks it with the slower types: on_demand_first %d, spot_first %d", label, s.Types[0], s.OnDemandFirst, s.SpotFirst)
 			}
 		}
 	}
@@ -193,6 +219,24 @@ func TestOnDemandFirstPastTheSizesTypesIsRefused(t *testing.T) {
 	c.Sizes["superci-4cpu"] = s
 	if err := c.validate(); err == nil {
 		t.Fatal("on_demand_first past the size's types passed validation")
+	}
+}
+
+func TestSpotFirstPastTheTypesOrBesideOnDemandFirstIsRefused(t *testing.T) {
+	for name, set := range map[string]func(*SizeConfig){
+		"past its types":           func(s *SizeConfig) { s.SpotFirst = len(s.Types) + 1 },
+		"with on_demand_first too": func(s *SizeConfig) { s.SpotFirst, s.OnDemandFirst = 1, 1 },
+	} {
+		c, err := LoadConfig("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := c.Sizes["superci-8cpu"]
+		set(&s)
+		c.Sizes["superci-8cpu"] = s
+		if err := c.validate(); err == nil {
+			t.Errorf("spot_first %s passed validation", name)
+		}
 	}
 }
 
