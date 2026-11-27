@@ -17,20 +17,21 @@ const Namespace = "superci-pull"
 
 // Metrics is what one minute's publication reads.
 type Metrics struct {
-	Budget   BudgetSnapshot
-	Spend    SpendSnapshot
-	Sets     []Snapshot
-	Waits    []float64            // queue waits of jobs started this minute, seconds
-	SetWaits map[string][]float64 // the same, by set
-	Orphans  int                  // orphaned machines and runners of every set, and machines of no configured set
-	Regs     int                  // registrations GitHub made this minute
-	Refused  int                  // registrations GitHub refused this minute
-	Failed   int                  // registrations that failed otherwise this minute
-	Short    int                  // machines asked of EC2 this minute that did not start (capacity, quotas)
-	Stalled  int                  // sets whose jobs have waited 10 minutes with none started
-	AtFloor  int                  // sets whose pool is at the hour's floor while more jobs wait than it has idle runners
-	Denied   map[string]int       // registrations the budget turned away this minute, by reason
-	Jobs     []JobRecord          // jobs that finished this minute, every set
+	Budget        BudgetSnapshot
+	Spend         SpendSnapshot
+	Sets          []Snapshot
+	OnDemandFirst map[string]bool      // the sets whose size asks its leading types on demand first (on_demand_first), by name
+	Waits         []float64            // queue waits of jobs started this minute, seconds
+	SetWaits      map[string][]float64 // the same, by set
+	Orphans       int                  // orphaned machines and runners of every set, and machines of no configured set
+	Regs          int                  // registrations GitHub made this minute
+	Refused       int                  // registrations GitHub refused this minute
+	Failed        int                  // registrations that failed otherwise this minute
+	Short         int                  // machines asked of EC2 this minute that did not start (capacity, quotas)
+	Stalled       int                  // sets whose jobs have waited 10 minutes with none started
+	AtFloor       int                  // sets whose pool is at the hour's floor while more jobs wait than it has idle runners
+	Denied        map[string]int       // registrations the budget turned away this minute, by reason
+	Jobs          []JobRecord          // jobs that finished this minute, every set
 	// Dispatch is the sets the identity plane serves, and DispatchCounts what each did this minute.
 	Dispatch       []DispatchSnapshot
 	DispatchCounts map[string]DispatchCounts
@@ -78,7 +79,7 @@ func metricData(m Metrics, now time.Time) []cwtypes.MetricDatum {
 			d("OthersRegistrationRate", m.Budget.OthersRate, cwtypes.StandardUnitCountSecond),
 			d("RegistrationWindowUse", m.Budget.WindowUse, cwtypes.StandardUnitCount))
 	}
-	machines, od := 0, 0
+	machines, od, fastMachines, fastOD := 0, 0, 0, 0
 	var oldestJob, oldestMachine float64
 	for _, s := range m.Sets {
 		set := cwtypes.Dimension{Name: aws.String("Set"), Value: aws.String(s.Set)}
@@ -89,6 +90,9 @@ func metricData(m Metrics, now time.Time) []cwtypes.MetricDatum {
 			d("OldestUnregisteredMachineAgeS", s.OldestUnregisteredS, cwtypes.StandardUnitSeconds, set))
 		machines += s.Machines
 		od += s.OnDemand
+		if m.OnDemandFirst[s.Set] {
+			fastMachines, fastOD = fastMachines+s.Machines, fastOD+s.OnDemand
+		}
 		oldestJob, oldestMachine = max(oldestJob, s.OldestJobS), max(oldestMachine, s.OldestUnregisteredS)
 	}
 	for _, s := range m.Dispatch {
@@ -101,6 +105,10 @@ func metricData(m Metrics, now time.Time) []cwtypes.MetricDatum {
 			d("DispatchResumes", float64(c.Resumes), cwtypes.StandardUnitCount, set), d("DispatchLostJobs", float64(c.Lost), cwtypes.StandardUnitCount, set),
 			d("DispatchDroppedFrames", float64(c.Dropped), cwtypes.StandardUnitCount, set))
 		machines += s.Machines
+		od += s.OnDemand
+		if m.OnDemandFirst[s.Set] {
+			fastMachines, fastOD = fastMachines+s.Machines, fastOD+s.OnDemand
+		}
 		oldestJob = max(oldestJob, s.OldestJobS)
 	}
 	// The alarms read these without a dimension: the longest waits of any set.
@@ -110,7 +118,10 @@ func metricData(m Metrics, now time.Time) []cwtypes.MetricDatum {
 		data = append(data, d("BudgetDenied", float64(m.Denied[reason.String()]), cwtypes.StandardUnitCount,
 			cwtypes.Dimension{Name: aws.String("Reason"), Value: aws.String(reason.String())}))
 	}
-	data = append(data, d("Machines", float64(machines), cwtypes.StandardUnitCount), d("OnDemandShare", float64(od)/math.Max(1, float64(machines)), cwtypes.StandardUnitNone))
+	// OnDemandFirstMachines and OnDemandFirstShare are over the sets whose size asks m8azn on demand before a slower spot type: the share the alarm reads, which
+	// the spot-only sets' machines (2 vCPU, 600 at most) do not dilute.
+	data = append(data, d("Machines", float64(machines), cwtypes.StandardUnitCount), d("OnDemandShare", float64(od)/math.Max(1, float64(machines)), cwtypes.StandardUnitNone),
+		d("OnDemandFirstMachines", float64(fastMachines), cwtypes.StandardUnitCount), d("OnDemandFirstShare", float64(fastOD)/math.Max(1, float64(fastMachines)), cwtypes.StandardUnitNone))
 	data = append(data, queueWaitData(m, at)...)
 	data = append(data, jobData(m.Jobs, at)...)
 	return data

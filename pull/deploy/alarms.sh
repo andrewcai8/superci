@@ -51,6 +51,15 @@ math spend-daily "Today's estimated spend passed 80% of the daily cap the listen
   GreaterThanThreshold 80 1 1 notBreaching
 alarm spend-capped "A spend cap is reached: the listener launches nothing and keeps no pool until the day or month turns, or the cap is raised" \
   SpendCapped Maximum GreaterThanOrEqualToThreshold 1 300 1 1 notBreaching
+# Spot is thin for the m8azn types, and superci-4cpu and superci-8cpu ask m8azn on demand before a slower spot type (on_demand_first), outside
+# on_demand_share: a long shortage in both regions puts their machines on demand (m8azn.3xlarge 1.24 USD an hour against 0.48 spot and
+# Blacksmith's 0.96). 4 vCPU alone ran 16% on demand on Nov 26. The share is over those sets alone (superci-2cpu, spot only, would dilute a fleet-wide
+# one), and fewer than 10 of their machines make a share of nothing, so it reads 0.
+math on-demand-share "Over 40% of the machines of the sets that ask m8azn on demand first (superci-4cpu and superci-8cpu) were on demand for 30 minutes, with at least 10 running: m8azn spot is short, and the rule is paying on-demand prices (m8azn.3xlarge: 1.24 USD an hour against 0.48 spot) with nothing but the daily cap behind it" \
+  '[{"Id":"machines","MetricStat":{"Metric":{"Namespace":"superci-pull","MetricName":"OnDemandFirstMachines"},"Period":300,"Stat":"Maximum"},"ReturnData":false},
+    {"Id":"share","MetricStat":{"Metric":{"Namespace":"superci-pull","MetricName":"OnDemandFirstShare"},"Period":300,"Stat":"Average"},"ReturnData":false},
+    {"Id":"od","Expression":"IF(machines >= 10, share, 0)","Label":"On-demand share of the on-demand-first sets machines","ReturnData":true}]' \
+  GreaterThanThreshold 0.4 6 6 notBreaching
 alarm launch-shortfall "EC2 started fewer machines than asked for 15 minutes running (spot capacity, or a quota: vCPUs, gp3 storage)" \
   LaunchShortfall Sum GreaterThanThreshold 0 300 3 3 notBreaching
 alarm org-rate-unknown "The listener has not measured the organization's registration rate for 15 minutes, so the estimate gauges nothing (admission does not read it)" \

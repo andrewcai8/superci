@@ -186,7 +186,7 @@ func TestAlarmsAreOnTheDashboardPageOneTopicAndNameNoPerson(t *testing.T) {
 	for _, g := range regexp.MustCompile(`(?m)^(?:alarm|math) (\S+) `).FindAllStringSubmatch(string(script), -1) {
 		made["superci-pull-"+g[1]] = true
 	}
-	for _, want := range []string{"superci-pull-job-failure-rate", "superci-pull-idle-spend-unrouted", "superci-pull-oldest-job-wait"} {
+	for _, want := range []string{"superci-pull-job-failure-rate", "superci-pull-idle-spend-unrouted", "superci-pull-on-demand-share", "superci-pull-oldest-job-wait"} {
 		if !made[want] {
 			t.Errorf("alarms.sh does not make %s", want)
 		}
@@ -223,7 +223,7 @@ func TestAlarmsAreOnTheDashboardPageOneTopicAndNameNoPerson(t *testing.T) {
 func TestHarmAlarmsReadTheJobMetricsTheyNameWithTheirThresholds(t *testing.T) {
 	script, _ := os.ReadFile("deploy/alarms.sh")
 	s := string(script)
-	for _, want := range []string{`IF(failed + passed >= 20, 100 * failed / (failed + passed), 0)`, `GreaterThanThreshold 20 3 2 notBreaching`,
+	for _, want := range []string{`IF(machines >= 10, share, 0)`, `GreaterThanThreshold 0.4 6 6 notBreaching`, `"MetricName":"OnDemandFirstShare"`, `"MetricName":"OnDemandFirstMachines"`, `IF(failed + passed >= 20, 100 * failed / (failed + passed), 0)`, `GreaterThanThreshold 20 3 2 notBreaching`,
 		`IF(FILL(started, 0) < 1 AND idle > 8, idle, 0)`, `GreaterThanThreshold 8 6 6 notBreaching`, `"MetricName":"JobsCompleted"`, `"MetricName":"SpendIdlePerHourUSD"`,
 		`"BudgetName": "superci-pull-daily"`, `"TimeUnit": "DAILY"`, `for t in (80, 100)`} {
 		if !strings.Contains(s, want) {
@@ -283,5 +283,35 @@ func TestTheRecordsWaitingForTheMetricsAreBounded(t *testing.T) {
 	}
 	if n := len(s.TakeJobs()); n != maxJobBuffer {
 		t.Errorf("%d records kept, want %d", n, maxJobBuffer)
+	}
+}
+
+// The on-demand alarm reads the share over the sets that ask m8azn on demand first, scale sets and dispatch sets alike, so a spot-only
+// 2 vCPU fleet (600 machines at most) does not dilute it: 150 on-demand 4 vCPU machines beside 300 spot 2 vCPU machines are a fleet-wide
+// share of 33% and a share of 100% of the sets the rule applies to.
+func TestTheOnDemandShareTheAlarmReadsIsOverTheSetsThatAskOnDemandFirst(t *testing.T) {
+	m := Metrics{
+		Sets:          []Snapshot{{Set: "superci-2cpu", Machines: 300}, {Set: "superci-4cpu", Machines: 100, OnDemand: 100}},
+		Dispatch:      []DispatchSnapshot{{Set: "superci-8cpu", Machines: 50, OnDemand: 50}},
+		OnDemandFirst: map[string]bool{"superci-4cpu": true, "superci-8cpu": true},
+		SetWaits:      map[string][]float64{}, Denied: map[string]int{},
+	}
+	got := map[string]float64{}
+	for _, d := range metricData(m, t0) {
+		if len(d.Dimensions) == 0 {
+			got[aws.ToString(d.MetricName)] = aws.ToFloat64(d.Value)
+		}
+	}
+	if got["OnDemandFirstMachines"] != 150 || got["OnDemandFirstShare"] != 1 {
+		t.Errorf("the on-demand-first sets: %v machines, share %v, want 150 and 1 (a dispatch set's on-demand machines count)", got["OnDemandFirstMachines"], got["OnDemandFirstShare"])
+	}
+	if want := 150.0 / 450; got["OnDemandShare"] < want-1e-9 || got["OnDemandShare"] > want+1e-9 {
+		t.Errorf("the fleet-wide share is %v, want %v: the 2 vCPU machines dilute it", got["OnDemandShare"], want)
+	}
+	quiet := metricData(Metrics{Sets: []Snapshot{{Set: "superci-2cpu", Machines: 5}}, OnDemandFirst: map[string]bool{}, SetWaits: map[string][]float64{}, Denied: map[string]int{}}, t0)
+	for _, d := range quiet {
+		if aws.ToString(d.MetricName) == "OnDemandFirstShare" && aws.ToFloat64(d.Value) != 0 {
+			t.Errorf("no on-demand-first set: share %v, want 0", aws.ToFloat64(d.Value))
+		}
 	}
 }

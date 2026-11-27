@@ -1278,6 +1278,13 @@ func (l *Listener) metrics() Metrics {
 	m := Metrics{Budget: st.Budget, Spend: st.Spend, Sets: st.Sets, SetWaits: map[string][]float64{}, Dispatch: st.Dispatch,
 		DispatchCounts: map[string]DispatchCounts{}}
 	cfg := l.config()
+	m.OnDemandFirst = map[string]bool{}
+	for _, s := range l.sets {
+		m.OnDemandFirst[s.spec.Name] = s.spec.OnDemandFirst > 0
+	}
+	for _, d := range l.dsets {
+		m.OnDemandFirst[d.spec.Name] = d.spec.OnDemandFirst > 0
+	}
 	for i, s := range l.sets {
 		waits := s.state.TakeWaits()
 		m.Jobs = append(m.Jobs, s.state.TakeJobs()...)
