@@ -468,8 +468,12 @@ print(top + 1)' "$size")
 # GitHub's write limits are secondary ones: relabel makes at most one PUT a second (60 a minute), stops at the first 403 or
 # 429 and keeps its Retry-After in a file beside the lock, which the next relabel waits out.
 relabel() {
-  local size=${1:-} from=${2:-} to=${3:-} ids bad=0 out chunk ok stopline pause not_before now
+  local size=${1:-} from=${2:-} to=${3:-} l ids bad=0 out chunk ok stopline pause not_before now
   check_size "$size"; check_label "$from"; check_label "$to"
+  # The dispatcher trusts an identity's label for its size, so a label of another size would send its jobs to the wrong machines.
+  for l in "$from" "$to"; do
+    [ "$l" = "$PARK" ] || [ "$l" = "superci-$size" ] || die "label is $PARK or superci-$size, not $l"
+  done
   not_before=$(cat "$LOCK.retry-after" 2> /dev/null || echo 0); now=$(date +%s)
   [[ $not_before =~ ^[0-9]+$ ]] || not_before=0
   [ "$now" -ge "$not_before" ] || die "GitHub asked for a pause: wait $((not_before - now)) s more (until $(date -d "@$not_before" +%T)), then run the same command again"

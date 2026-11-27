@@ -291,3 +291,35 @@ func TestADispatchMachinesMarksAreWrittenAndListNoRegion(t *testing.T) {
 		t.Errorf("finding a dispatch machine listed its region %d times, want none", describes)
 	}
 }
+
+// A dispatch machine that posts before any listing holds it is found by the listing its own post causes: after each
+// refresh the dispatch sets are looked up again, not only the scale sets. Before, the refresh listed it into its
+// dispatch set and /mark still answered 403, since only the scale sets were looked up again.
+func TestADispatchMachineKnownOnlyAfterTheRefreshGetsItsMarksWritten(t *testing.T) {
+	describes := 0
+	listed := false
+	h := &Server{sets: map[string]*Set{}, verifier: trusting{},
+		refresh: func(context.Context, string) { describes++; listed = true },
+		dispatchMachine: func(id string) (string, *Machine) {
+			if listed && id == "i-0d" {
+				return "superci-4cpu", &Machine{ID: "i-0d"}
+			}
+			return "", nil
+		}}
+	now := time.Now()
+	var code int
+	lines := capture(t, func() {
+		req := httptest.NewRequest(http.MethodPost, "/mark", strings.NewReader("i-0d"))
+		req.Header.Set("X-Superci-Marks", "warm.ready="+epoch(now)+"=1500")
+		req.Header.Set("X-Superci-Sent", epoch(now))
+		rec := httptest.NewRecorder()
+		h.mark(rec, req)
+		code = rec.Code
+	})
+	if code != http.StatusNoContent || len(lines) != 1 || lines[0]["set"] != "superci-4cpu" || lines[0]["inst"] != "i-0d" {
+		t.Fatalf("status %d, lines %v: want 204 and the dispatch set's mark", code, lines)
+	}
+	if describes != 1 {
+		t.Errorf("the machine's own post listed its region %d times, want once", describes)
+	}
+}

@@ -267,7 +267,7 @@ func run(ctx context.Context, f flags) error {
 	defer l.dispatch.Close()
 	srv := &Server{sets: byName, budget: l.budget, verifier: verifier, client: client, refresh: refresh, claim: claims.Take, issue: l.tagger.Issue, notices: fleet.TagNoticed,
 		slots: make(chan struct{}, max(1, cfg.Registration.Concurrency)), maxAge: l.maxAge, dispatch: l.dispatch, dispatchMachine: l.dispatchMachine}
-	go serve(ctx, &http.Server{Addr: f.listen, Handler: srv, ReadHeaderTimeout: 10 * time.Second}, &id)
+	go serve(ctx, publicServer(f.listen, srv), &id)
 	go serve(ctx, &http.Server{Addr: f.admin, Handler: Admin(l.status, l.healthy, l.override, l.budget, NewIdentities(rest, l.budget, cfg).Routes)}, nil)
 	errs := make(chan error, len(l.sets))
 	var sessions sync.WaitGroup
@@ -499,6 +499,14 @@ func labelNames(ls []scaleset.Label) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// publicServer is the listener's server on the public port. A request is read within 30 s (headers within 10), so a
+// client that trickles a body holds no goroutine or descriptor for longer. The identity plane's /work and /shim
+// connections are hijacked after their body is read: Hijack clears the connection's deadlines, and each wire sets its
+// own (dispatch.go).
+func publicServer(addr string, h http.Handler) *http.Server {
+	return &http.Server{Addr: addr, Handler: h, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second}
 }
 
 func serve(ctx context.Context, s *http.Server, id *Identity) {

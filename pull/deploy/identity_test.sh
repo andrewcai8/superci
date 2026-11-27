@@ -355,6 +355,11 @@ ok "relabel runs on once the pause is over" "$ID" relabel 4cpu superci-park supe
 [ "$(count '^labels' "$FAKE/curl.log")" = "$((N4 - 2))" ]; check $? "relabelling the rest: the 2 that went through before the 429 are not touched again"
 flog; "$ID" relabel 4cpu superci-4cpu superci-park > /dev/null 2>&1
 refuses "relabel refuses a label that is not a name" "label is letters" "$ID" relabel 4cpu 'a;b' c
+flog
+refuses "relabel refuses another size's label as its target (8cpu jobs would reach 4cpu machines)" "label is superci-park or superci-4cpu, not superci-8cpu" "$ID" relabel 4cpu superci-park superci-8cpu
+refuses "relabel refuses another size's label as its source" "label is superci-park or superci-4cpu, not superci-8cpu" "$ID" relabel 4cpu superci-8cpu superci-park
+refuses "relabel refuses a well-formed label that is neither the park label nor the size's" "label is superci-park or superci-4cpu, not custom" "$ID" relabel 4cpu superci-park custom
+[ ! -s "$FAKE/curl.log" ] && [ ! -s "$FAKE/ssh.log" ]; check $? "and each refusal comes before any call to GitHub or the listener"
 
 # ---- status ----
 H=$FAKE/hosts/$ip_a; mkdir -p "$H/proc/101" "$H/proc/102"; printf '101\n102\n' > "$H/proc/pids"

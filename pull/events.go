@@ -261,24 +261,27 @@ func (h *Server) mark(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// marker is the set and machine a /mark comes from. A dispatch machine is no scale set's: it is looked up in the
-// dispatch sets first, so its marks are written and cost no listing of EC2. Before, every one was refused (403), and
-// boot.sh sent the batch again each second, each time a describe of the region.
+// marker is the set and machine a /mark comes from. A dispatch machine is no scale set's: the dispatch sets are looked
+// up with the scale sets, first and again after each listing of EC2, so a machine that posts before the listing that
+// holds it is found by the listing it caused, which is the only one it costs. Before, every dispatch machine was refused
+// (403), and boot.sh sent the batch again each second, each time a describe of the region.
 func (h *Server) marker(r *http.Request) (string, *Machine, error) {
 	doc, err := h.document(r)
 	if err != nil {
 		return "", nil, err
 	}
-	if h.dispatchMachine != nil {
-		if set, m := h.dispatchMachine(doc.InstanceID); m != nil {
-			return set, m, nil
+	for try := 0; try < 3; try++ {
+		if h.dispatchMachine != nil {
+			if set, m := h.dispatchMachine(doc.InstanceID); m != nil {
+				return set, m, nil
+			}
 		}
+		if s, m := h.scaleMachine(doc.InstanceID); m != nil {
+			return s.spec.Name, m, nil
+		}
+		h.refresh(r.Context(), doc.Region)
 	}
-	s, m, err := h.machineOf(r, doc)
-	if err != nil {
-		return "", nil, err
-	}
-	return s.spec.Name, m, nil
+	return "", nil, fmt.Errorf("instance %s is no machine of ours", doc.InstanceID)
 }
 
 // markEvents writes the marks of one request, received at recv.

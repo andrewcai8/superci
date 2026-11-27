@@ -1,0 +1,11 @@
+#!/bin/bash
+# date, on the test's clock: the scripts' pacing reads `date +%s` and `date +%s.%N`, which answer $FAKE/clock (seconds,
+# started from the real clock on first use and moved on only by the fake sleep), so a loaded host cannot change how
+# long the scripts wait. Any other use (parsing a timestamp, formatting one) is the real date's.
+clock=$FAKE/clock
+[ -s "$clock" ] || /bin/date +%s.%N > "$clock"
+case "$*" in
+  +%s) cut -d. -f1 "$clock" ;;
+  +%s.%N) cat "$clock" ;;
+  *) exec /bin/date "$@" ;;
+esac
