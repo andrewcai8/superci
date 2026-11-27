@@ -398,33 +398,53 @@ printf 'tampered\n' >> "$REL/bin/superci-shim"; rm -rf "$N/id" "$N/enabled" "$N/
 refuses "a replacement host refuses a shim that is not the release's" "refusing s3://superci-pull-$ACCOUNT/bin/superci-shim" newhost boot
 { [ ! -e "$N/id" ] || [ -z "$(ls "$N/id")" ]; } && [ ! -e "$N/enabled" ]; check $? "and starts nothing"
 
-# ---- harden: nothing root runs from is writable by anyone else ----
-# The machines' image as measured Nov 27: /usr/share, Instance Connect's scripts, /usr/local/bin and /opt mode 777, the
-# runner tree the runner user's. A sticky /tmp, /proc and a symlink are left as they are.
-H2=$T/harden; R=$H2/fs; RS=$H2/runner
+# ---- harden: nothing is left writable by others where root runs ----
+# The machines' image as measured Nov 27: /usr/local/bin and /opt mode 777, the runner tree the runner user's, and
+# Instance Connect's chain writable. Here the chain is 775, writable by its group alone, which no sweep of what others
+# may write would touch and sshd still refuses. A sticky /tmp, /proc and a symlink are left as they are.
+H2=$T/harden; R=$H2/fs; RS=$H2/runner; NL=$(printf 'a\nb')
 mkdir -p "$R/usr/share/ec2-instance-connect" "$R/usr/local/bin" "$R/opt/hostedtoolcache/go" "$R/tmp" "$R/proc" "$R/etc" "$RS/bin" "$RS/externals"
-for f in usr/share/ec2-instance-connect/eic_run_authorized_keys usr/local/bin/node opt/hostedtoolcache/go/go etc/ok; do printf 'x\n' > "$R/$f"; done
-chmod 777 "$R/usr" "$R/usr/share" "$R/usr/share/ec2-instance-connect" "$R/usr/share/ec2-instance-connect/eic_run_authorized_keys" "$R/usr/local/bin" "$R/usr/local/bin/node" \
-  "$R/opt" "$R/opt/hostedtoolcache" "$R/opt/hostedtoolcache/go" "$R/opt/hostedtoolcache/go/go"
-chmod 775 "$R/usr/share/ec2-instance-connect"; chmod 1777 "$R/tmp"; printf 'p\n' > "$R/proc/x"; chmod 777 "$R/proc/x"; chmod 644 "$R/etc/ok"
+for f in usr/share/ec2-instance-connect/eic_run_authorized_keys usr/share/ec2-instance-connect/eic_parse_authorized_keys usr/local/bin/node opt/hostedtoolcache/go/go etc/ok "opt/$NL"; do printf 'x\n' > "$R/$f"; done
+chmod 777 "$R/usr/local/bin" "$R/usr/local/bin/node" "$R/opt" "$R/opt/hostedtoolcache" "$R/opt/hostedtoolcache/go" "$R/opt/hostedtoolcache/go/go" "$R/opt/$NL"
+chmod 775 "$R/usr" "$R/usr/share" "$R/usr/share/ec2-instance-connect" "$R/usr/share/ec2-instance-connect/eic_run_authorized_keys" "$R/usr/share/ec2-instance-connect/eic_parse_authorized_keys"
+chmod 1777 "$R/tmp"; printf 'p\n' > "$R/proc/x"; chmod 777 "$R/proc/x"; chmod 644 "$R/etc/ok"
 ln -s /tmp "$R/usr/local/bin/link"
+[ "$(id -u)" = 0 ] || { mkdir -m 000 "$R/opt/unreadable"; }
 printf '#!/bin/sh\n' > "$RS/bin/Runner.Listener"; printf '#!/bin/sh\n' > "$RS/run.sh"; printf 't\n' > "$RS/run-helper.sh.template"; printf 'e\n' > "$RS/externals/node"
 chmod 777 "$RS/bin" "$RS/bin/Runner.Listener" "$RS/run.sh" "$RS/externals/node"; chmod 775 "$RS/run-helper.sh.template"
-hardened() { env FS_ROOT=$R RUNNER_SRC=$RS ID_ROOT=$H2/id ID_CONF=$N/conf ID_LOG=$H2/log ID_LOCK=$H2/lock ID_AZ=us-east-1b bash "$HS" harden; }
-ok "harden takes every path anyone may write from others" hardened
-left=$(find "$R" -path "$R/proc" -prune -o ! -type l -perm -0002 \( -type f -o \( -type d ! -perm -1000 \) \) -print)
+hostenv=(ID_ROOT=$H2/id ID_CONF=$N/conf ID_LOG=$H2/log ID_LOCK=$H2/lock ID_AZ=us-east-1b)
+hardened() { env FS_ROOT=$R RUNNER_SRC=$RS "${hostenv[@]}" bash "$HS" harden; }
+ok "harden takes write from others everywhere, past a name with a newline and a directory it cannot read" hardened
+left=$(find "$R" -path "$R/proc" -prune -o ! -type l -perm -0002 \( -type f -o \( -type d ! -perm -1000 \) \) -print 2> /dev/null)
 [ -z "$left" ]; check $? "and leaves none outside /proc and sticky directories${left:+ (left: $left)}"
-[ "$(stat -c %a "$R/usr/local/bin/node")" = 755 ] && [ "$(stat -c %a "$R/opt")" = 755 ] && [ "$(stat -c %a "$R/etc/ok")" = 644 ]; check $? "a 777 binary and /opt become 755, a path already safe is as it was"
-for p in "$R/usr" "$R/usr/share" "$R/usr/share/ec2-instance-connect" "$R/usr/share/ec2-instance-connect/eic_run_authorized_keys"; do
+[ "$(stat -c %a "$R/usr/local/bin/node")" = 755 ] && [ "$(stat -c %a "$R/opt")" = 755 ] && [ "$(stat -c %a "$R/opt/$NL")" = 755 ] && [ "$(stat -c %a "$R/etc/ok")" = 644 ]
+check $? "a 777 binary, /opt and the newline name become 755, a path already safe is as it was"
+for p in "$R" "$R/usr" "$R/usr/share" "$R/usr/share/ec2-instance-connect" "$R/usr/share/ec2-instance-connect/eic_run_authorized_keys" "$R/usr/share/ec2-instance-connect/eic_parse_authorized_keys"; do
   [ $(( 0$(stat -c %a "$p") & 022 )) = 0 ] || echo "$p"
-done | grep -q . ; check $((1 - $?)) "Instance Connect's key command and every directory above it are writable by neither group nor others, as sshd requires"
+done | grep -q . ; check $((1 - $?)) "Instance Connect's scripts and every directory above them, writable by their group alone, are writable by neither group nor others, as sshd requires"
 [ "$(stat -c %a "$R/tmp")" = 1777 ] && [ "$(stat -c %a "$R/proc/x")" = 777 ] && [ -L "$R/usr/local/bin/link" ]; check $? "a sticky /tmp, /proc and a symlink are left alone"
 bad=$(find "$RS" ! -type l -perm /022 -print); [ -z "$bad" ]; check $? "the runner tree root runs is writable by its owner alone${bad:+ (left: $bad)}"
+[ "$(id -u)" = 0 ] || chmod 755 "$R/opt/unreadable"
+# A chmod that changes nothing: the sweep cannot clear the tree, and harden, and boot with it, refuse to go on.
 mkdir -p "$H2/nochmod"; printf '#!/bin/sh\nexit 0\n' > "$H2/nochmod/chmod"; chmod 755 "$H2/nochmod/chmod"
 chmod 777 "$R/opt"
-refuses "harden fails, and boot with it, while a path stays writable by others" "is still writable by others" env PATH="$H2/nochmod:$PATH" FS_ROOT=$R RUNNER_SRC=$RS ID_ROOT=$H2/id ID_CONF=$N/conf ID_LOG=$H2/log ID_LOCK=$H2/lock ID_AZ=us-east-1b bash "$HS" harden
-if [ "$(id -u)" != 0 ]; then refuses "harden walks / only as root" "harden walks / only as root" env FS_ROOT=/ RUNNER_SRC=$RS ID_ROOT=$H2/id ID_CONF=$N/conf ID_LOG=$H2/log ID_LOCK=$H2/lock ID_AZ=us-east-1b bash "$HS" harden; fi
-grep -A3 '^boot() {' "$HS" | grep -q '^  harden$'; check $? "boot hardens the host before it installs or starts anything"
+refuses "harden fails while a path stays writable by others" "is still writable by others" env PATH="$H2/nochmod:$PATH" FS_ROOT=$R RUNNER_SRC=$RS "${hostenv[@]}" bash "$HS" harden
+rm -rf "$N/id" "$N/enabled" "$N/ready"
+refuses "and boot fails with it" "is still writable by others" env PATH="$H2/nochmod:$PATH" FS_ROOT=$R ID_ROOT=$N/id RUNNER_SRC=$RS SHIM_BIN=$N/shim SHIM_ENV=$N/shim.env ID_CONF=$N/conf UNIT_DIR=$N/units ID_LOG=$N/log ID_AZ=us-east-1b ID_LOCK=$N/lock READY_FILE=$N/ready FAKE_UNITS=$N/enabled bash "$HS" boot
+[ ! -e "$N/enabled" ] && [ ! -e "$N/ready" ] && { [ ! -e "$N/id" ] || [ -z "$(ls "$N/id")" ]; }; check $? "and starts and restores nothing"
+chmod 755 "$R/opt"
+if [ "$(id -u)" != 0 ]; then
+  # A chown that changes nothing leaves the chain this test's user's, not root's: sshd would refuse it, so harden does.
+  mkdir -p "$H2/nochown"; printf '#!/bin/sh\nexit 0\n' > "$H2/nochown/chown"; chmod 755 "$H2/nochown/chown"
+  refuses "harden fails while Instance Connect's chain is not root's" "is not root's alone" env PATH="$H2/nochown:$PATH" HARDEN_OWNER=root:root FS_ROOT=$R RUNNER_SRC=$RS "${hostenv[@]}" bash "$HS" harden
+  for spelling in / // /. /tmp/..; do
+    # (were the guard ever broken, the no-op chmod and chown and the timeout keep this machine as it is)
+    refuses "harden walks / only as root, however FS_ROOT spells it ($spelling)" "harden walks / only as root" env PATH="$H2/nochmod:$H2/nochown:$PATH" FS_ROOT=$spelling RUNNER_SRC=$RS "${hostenv[@]}" timeout 10 bash "$HS" harden
+  done
+fi
+first() { awk -v pat="$1" '/^boot\(\) \{/{b=1; next} b && /^}/{exit} b{n++; if ($0 ~ pat) {print n; exit}}' "$HS"; }
+h=$(first '^  harden$'); o=$(first 'install |aws |cat >|systemctl|restore|start|chmod|chown')
+[ -n "$h" ] && [ -n "$o" ] && [ "$h" -lt "$o" ]; check $? "boot hardens the host before it installs, restores or starts anything (line $h of boot, the first other action at $o)"
 
 # ---- two runs on a host at once never delete each other's identity ----
 C=$T/conc; mkdir -p "$C/units"

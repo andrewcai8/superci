@@ -10,7 +10,7 @@
 #   superci-id register <label> <url> <group|-> <name>...   registers each name not held yet; token on stdin
 #   superci-id adopt <name>...                           uploads and starts identities already registered here; no token
 #   superci-id status                                    identities, listeners running, private memory per listener against its 64 MiB
-#   superci-id harden                                    no path root runs from stays writable by anyone else (boot runs it first)
+#   superci-id harden                                    no path is left writable by others (boot runs it first)
 set -euo pipefail
 umask 077
 ROOT=${ID_ROOT:-/opt/id}
@@ -116,33 +116,59 @@ adopt() {
   done
 }
 
-# writable_by_others: the paths under FSROOT, outside /proc, /sys, /dev and /run, that anyone may write: every file and
-# every directory but a sticky one (/tmp's kind, where only an owner may remove or rename). The first one, with -q.
-writable_by_others() {
-  local r=${FSROOT%/} quit=()
-  [ "${1:-}" != -q ] || quit=(-quit)
-  find "${r:-/}" -xdev \( -path "$r/proc" -o -path "$r/sys" -o -path "$r/dev" -o -path "$r/run" \) -prune -o \
-    ! -type l -perm -0002 \( -type f -o \( -type d ! -perm -1000 \) \) -print "${quit[@]}"
+# fsroot: FSROOT resolved, "" for the real / (so "$r/proc" is /proc), whatever spelling FS_ROOT used ("//", "/.").
+fsroot() {
+  local r
+  r=$(realpath -m "$FSROOT")
+  [ "$r" = / ] && r=""
+  echo "$r"
 }
 
-# harden: nothing root runs from may be written by anyone but root, since this host holds long-lived credentials. The
+# writable_by_others: the paths under FSROOT, outside /proc, /sys, /dev and /run, that others may write: every file and
+# every directory but a sticky one (/tmp's kind, where only an owner may remove or rename). NUL-separated; the first
+# one alone with -q. A path that vanishes mid-walk is no error.
+writable_by_others() {
+  local r quit=()
+  r=$(fsroot)
+  [ "${1:-}" != -q ] || quit=(-quit)
+  find "${r:-/}" -xdev \( -path "$r/proc" -o -path "$r/sys" -o -path "$r/dev" -o -path "$r/run" \) -prune -o \
+    ! -type l -perm -0002 \( -type f -o \( -type d ! -perm -1000 \) \) -print0 "${quit[@]}" 2> /dev/null || :
+}
+
+# eic_chain: Instance Connect's key command and every directory above it, the paths sshd checks before it runs it.
+eic_chain() {
+  local r=$1 d
+  for d in / /usr /usr/share /usr/share/ec2-instance-connect; do echo "${r}${d}"; done
+  for d in "$r"/usr/share/ec2-instance-connect/*; do [ ! -e "$d" ] || echo "$d"; done
+}
+
+# harden: nothing others may write is left where root runs, since this host holds long-lived credentials. The
 # machines' image leaves much of /usr/share, /usr/local and /opt (/opt/id's parent) mode 777 for jobs' tool installs,
-# and its runner tree, which every identity hard-links and root runs, the runner user's. sshd refuses Instance Connect's
-# key command on such a path ("Unsafe AuthorizedKeysCommand"), so before this no operator could log in either. Every
-# path anyone may write loses group and other write, Instance Connect's scripts and each directory above them lose
-# group write too (sshd refuses either), and the runner tree becomes root's. It fails while any path stays writable.
+# and its runner tree, which every identity hard-links and root runs, the runner user's. sshd refuses Instance
+# Connect's key command when it or a directory above it is not root's or is writable by group or others ("Unsafe
+# AuthorizedKeysCommand"), so before this no operator could log in either.
+#
+# Instance Connect's chain comes first, so a login works whatever the sweep meets. Then every path others may write
+# loses group and other write, a path that cannot be changed is no stop, and the runner tree becomes root's. A path
+# writable by group alone is left. It fails, and boot with it, while a path stays writable by others or the chain is
+# not root's alone.
 harden() {
-  local r=${FSROOT%/} d p left
+  local r p owner uid bad=""
+  r=$(fsroot)
   [ -n "$r" ] || [ "$(id -u)" = 0 ] || { echo "superci-id: harden walks / only as root" >&2; exit 1; }
-  writable_by_others | xargs -r -d '\n' chmod go-w
-  for d in "" /usr /usr/share /usr/share/ec2-instance-connect; do p=${r}${d:-/}; [ ! -e "$p" ] || chmod go-w "$p"; done
-  for d in "$r"/usr/share/ec2-instance-connect/*; do [ ! -e "$d" ] || chmod go-w "$d"; done
-  chown "${HARDEN_OWNER:-root:root}" "$SRC"
-  chown -R "${HARDEN_OWNER:-root:root}" "$SRC/bin" "$SRC/externals" "$SRC"/*.sh "$SRC/run-helper.sh.template"
+  owner=${HARDEN_OWNER:-root:root}; uid=$(id -u "${owner%%:*}")
+  while read -r p; do [ ! -e "$p" ] || { chown "$owner" "$p"; chmod go-w "$p"; }; done < <(eic_chain "$r")
+  writable_by_others | xargs -0 -r chmod go-w 2> /dev/null || :
+  chown "$owner" "$SRC"
+  chown -R "$owner" "$SRC/bin" "$SRC/externals" "$SRC"/*.sh "$SRC/run-helper.sh.template"
   chmod -R go-w "$SRC/bin" "$SRC/externals" "$SRC"/*.sh "$SRC/run-helper.sh.template"
   chmod go-w "$SRC"
-  left=$(writable_by_others -q)
-  [ -z "$left" ] || { echo "superci-id: $left is still writable by others; starting nothing" >&2; exit 1; }
+  while read -r p; do
+    [ ! -e "$p" ] || { [ "$(stat -c %u "$p")" = "$uid" ] && [ $(( 0$(stat -c %a "$p") & 022 )) = 0 ]; } || bad="$bad $p"
+  done < <(eic_chain "$r")
+  [ -z "$bad" ] || { echo "superci-id: Instance Connect's key command is not root's alone:$bad; starting nothing" >&2; exit 1; }
+  p=$(writable_by_others -q | tr -d '\0')
+  [ -z "$p" ] || { echo "superci-id: $p is still writable by others; starting nothing" >&2; exit 1; }
   echo "hardened: nothing outside /proc, /sys, /dev, /run and sticky directories is writable by others"
 }
 
