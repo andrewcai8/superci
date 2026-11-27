@@ -2,9 +2,12 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strconv"
 	"strings"
@@ -176,7 +179,7 @@ func TestMarkWritesEventsFromTheMachinesClock(t *testing.T) {
 	now := time.Now()
 	h := &Server{}
 	lines := capture(t, func() {
-		h.markEvents(&Set{spec: SetSpec{Name: "superci-4cpu"}}, &Machine{ID: "i-0abc"}, now,
+		h.markEvents("superci-4cpu", &Machine{ID: "i-0abc"}, now,
 			"boot.start=1700000000.5=0=12.3,cache.up="+epoch(now.Add(-2*time.Second))+"=1500,bogus="+epoch(now)+",doc.got=nope,runner.exit="+epoch(now)+"=5=0",
 			epoch(now.Add(-100*time.Millisecond)))
 	})
@@ -237,7 +240,7 @@ func TestMarksOfOneMachineAreBounded(t *testing.T) {
 		marks = append(marks, "runner.online="+epoch(now))
 	}
 	lines := capture(t, func() {
-		h.markEvents(&Set{spec: SetSpec{Name: "s"}}, &Machine{ID: "i-bounded"}, now, strings.Join(marks, ","), "")
+		h.markEvents("s", &Machine{ID: "i-bounded"}, now, strings.Join(marks, ","), "")
 	})
 	if len(lines) != markLimit {
 		t.Fatalf("wrote %d marks, want the limit %d", len(lines), markLimit)
@@ -249,12 +252,42 @@ func TestAMarkValueIsCutShortSoAJobCannotFillTheListenersDisk(t *testing.T) {
 	h := &Server{}
 	huge := strings.Repeat("x", 1<<20)
 	lines := capture(t, func() {
-		h.markEvents(&Set{spec: SetSpec{Name: "s"}}, &Machine{ID: "i-huge"}, now, "cache.restore="+epoch(now)+"=1="+huge, "")
+		h.markEvents("s", &Machine{ID: "i-huge"}, now, "cache.restore="+epoch(now)+"=1="+huge, "")
 	})
 	if len(lines) != 1 {
 		t.Fatalf("want the one mark, cut short: %d lines", len(lines))
 	}
 	if v := lines[0]["val"].(string); len(v) != markValMax {
 		t.Fatalf("a mark value of 1 MiB was written as %d bytes, want at most %d", len(v), markValMax)
+	}
+}
+
+// A dispatch machine's marks are written under its dispatch set, and finding it lists EC2 not once. Before, /mark knew
+// only scale sets' machines: every dispatch machine's batch was refused (403), with a describe of its region each time,
+// and boot.sh sent it again each second, so the plane's timeline never showed a dispatch machine's warm.
+func TestADispatchMachinesMarksAreWrittenAndListNoRegion(t *testing.T) {
+	describes := 0
+	h := &Server{sets: map[string]*Set{}, verifier: trusting{}, refresh: func(context.Context, string) { describes++ },
+		dispatchMachine: func(id string) (string, *Machine) {
+			if id == "i-0d" {
+				return "superci-4cpu", &Machine{ID: "i-0d"}
+			}
+			return "", nil
+		}}
+	now := time.Now()
+	var code int
+	lines := capture(t, func() {
+		req := httptest.NewRequest(http.MethodPost, "/mark", strings.NewReader("i-0d"))
+		req.Header.Set("X-Superci-Marks", "warm.ready="+epoch(now)+"=1500")
+		req.Header.Set("X-Superci-Sent", epoch(now))
+		rec := httptest.NewRecorder()
+		h.mark(rec, req)
+		code = rec.Code
+	})
+	if code != http.StatusNoContent || len(lines) != 1 || lines[0]["ev"] != "warm.ready" || lines[0]["set"] != "superci-4cpu" || lines[0]["inst"] != "i-0d" {
+		t.Fatalf("status %d, lines %v: want 204 and the dispatch set's warm.ready", code, lines)
+	}
+	if describes != 0 {
+		t.Errorf("finding a dispatch machine listed its region %d times, want none", describes)
 	}
 }

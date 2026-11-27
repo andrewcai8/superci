@@ -247,7 +247,7 @@ var markCounts = struct {
 // the listener's is dropped.
 func (h *Server) mark(w http.ResponseWriter, r *http.Request) {
 	recv := time.Now()
-	s, m, err := h.machine(r)
+	set, m, err := h.marker(r)
 	if err != nil {
 		http.Error(w, "unknown machine", http.StatusForbidden)
 		return
@@ -257,12 +257,32 @@ func (h *Server) mark(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "marks too long", http.StatusRequestEntityTooLarge)
 		return
 	}
-	h.markEvents(s, m, recv, marks, r.Header.Get("X-Superci-Sent"))
+	h.markEvents(set, m, recv, marks, r.Header.Get("X-Superci-Sent"))
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// marker is the set and machine a /mark comes from. A dispatch machine is no scale set's: it is looked up in the
+// dispatch sets first, so its marks are written and cost no listing of EC2. Before, every one was refused (403), and
+// boot.sh sent the batch again each second, each time a describe of the region.
+func (h *Server) marker(r *http.Request) (string, *Machine, error) {
+	doc, err := h.document(r)
+	if err != nil {
+		return "", nil, err
+	}
+	if h.dispatchMachine != nil {
+		if set, m := h.dispatchMachine(doc.InstanceID); m != nil {
+			return set, m, nil
+		}
+	}
+	s, m, err := h.machineOf(r, doc)
+	if err != nil {
+		return "", nil, err
+	}
+	return s.spec.Name, m, nil
+}
+
 // markEvents writes the marks of one request, received at recv.
-func (h *Server) markEvents(s *Set, m *Machine, recv time.Time, marks, sentAt string) {
+func (h *Server) markEvents(set string, m *Machine, recv time.Time, marks, sentAt string) {
 	offset := clockOffset(m.ID, recv, parseEpoch(sentAt))
 	for _, kv := range strings.Split(marks, ",") {
 		name, rest, _ := strings.Cut(kv, "=")
@@ -287,7 +307,7 @@ func (h *Server) markEvents(s *Set, m *Machine, recv time.Time, marks, sentAt st
 		if over {
 			break
 		}
-		fields := []any{"set", s.spec.Name, "inst", m.ID, "offset_ms", offset, "val", val}
+		fields := []any{"set", set, "inst", m.ID, "offset_ms", offset, "val", val}
 		if ms, err := strconv.ParseInt(dur, 10, 64); err == nil {
 			fields = append(fields, "dur_ms", ms)
 		}

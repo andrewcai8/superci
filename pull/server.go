@@ -41,6 +41,8 @@ type Server struct {
 	slots    chan struct{}                                           // bounds concurrent registrations
 	maxAge   func() time.Duration
 	dispatch http.Handler // the identity plane's /work, /shim and /agent (Dispatcher)
+	// dispatchMachine is the dispatch set and machine an instance is, if it is one; nil when the identity plane is off.
+	dispatchMachine func(id string) (set string, m *Machine)
 }
 
 func (h *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -69,14 +71,25 @@ func (h *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // machine verifies the request's identity document and returns the set and machine it names, listing EC2 again if
 // the instance is too new for the last listing.
 func (h *Server) machine(r *http.Request) (*Set, *Machine, error) {
+	doc, err := h.document(r)
+	if err != nil {
+		return nil, nil, err
+	}
+	return h.machineOf(r, doc)
+}
+
+// document is the request's verified identity document.
+func (h *Server) document(r *http.Request) (InstanceDocument, error) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, 16<<10))
 	if err != nil {
-		return nil, nil, err
+		return InstanceDocument{}, err
 	}
-	doc, err := h.verifier.Verify(body)
-	if err != nil {
-		return nil, nil, err
-	}
+	return h.verifier.Verify(body)
+}
+
+// machineOf is the scale set's machine the document names, listing its region again (at most once a second) while
+// no set knows it.
+func (h *Server) machineOf(r *http.Request, doc InstanceDocument) (*Set, *Machine, error) {
 	for try := 0; try < 3; try++ {
 		for _, s := range h.sets {
 			if m := s.state.Machine(doc.InstanceID); m != nil {

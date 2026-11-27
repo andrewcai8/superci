@@ -266,7 +266,7 @@ func run(ctx context.Context, f flags) error {
 	l.dispatch = NewDispatcher(cfg.Deployment, l.dsets, verifier, claims, fleet, refresh)
 	defer l.dispatch.Close()
 	srv := &Server{sets: byName, budget: l.budget, verifier: verifier, client: client, refresh: refresh, claim: claims.Take, issue: l.tagger.Issue, notices: fleet.TagNoticed,
-		slots: make(chan struct{}, max(1, cfg.Registration.Concurrency)), maxAge: l.maxAge, dispatch: l.dispatch}
+		slots: make(chan struct{}, max(1, cfg.Registration.Concurrency)), maxAge: l.maxAge, dispatch: l.dispatch, dispatchMachine: l.dispatchMachine}
 	go serve(ctx, &http.Server{Addr: f.listen, Handler: srv, ReadHeaderTimeout: 10 * time.Second}, &id)
 	go serve(ctx, &http.Server{Addr: f.admin, Handler: Admin(l.status, l.healthy, l.override, l.budget, NewIdentities(rest, l.budget, cfg).Routes)}, nil)
 	errs := make(chan error, len(l.sets))
@@ -1337,4 +1337,14 @@ func (l *Listener) healthy() error {
 		return fmt.Errorf("reconciler idle for %s", d.Round(time.Second))
 	}
 	return nil
+}
+
+// dispatchMachine is the dispatch set and machine an instance is, if it is one.
+func (l *Listener) dispatchMachine(id string) (string, *Machine) {
+	for _, d := range l.dsets {
+		if m := d.machine(id); m != nil {
+			return d.spec.Name, m.Machine
+		}
+	}
+	return "", nil
 }
