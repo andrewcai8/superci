@@ -244,19 +244,25 @@ def evaluate_job(S, B, ceiling, unexplained, min_runs=MIN_RUNS, tests=None):
     if tests is not None:
         counted, more, detail = judge_by_tests(counted, tests)
         notes += more
-        # The same exclusion on Blacksmith's side: a failed main job that was read and names a failing test (red on main, by definition)
-        # is not a failure the allowance is drawn from. One on another branch, one not read, or one naming no test still counts.
-        b_counted = [o for o in b_failed if not tests.b_reads.get(o.job_id, Read(frozenset())).names]
+        # Blacksmith's side leaves out only the red cluster superci's failures were excused by: a failed main job whose every failing test is among
+        # the tests that excused a superci failure here (so a failure is not counted on both sides). Scattered Blacksmith failures on other tests, one
+        # on another branch, one not read, one naming no test and one with a hard reason still count toward the allowance.
+        b_counted = [o for o in b_failed if not _cluster_failure(tests.b_reads.get(o.job_id), tests.excused)]
     b_rate = len(b_counted) / len(B_done) if B_done else 0.0
     allowed = b_rate * len(S_done) + EXTRA_FAILURES
     rows.append(Row("failures (superci)", f"{len(counted)} of {len(S_done)}", f"<= B rate {100 * b_rate:.1f}% x {len(S_done)} + {EXTRA_FAILURES} = {allowed:.1f}",
                     PASS if len(counted) <= allowed else FAIL, "; ".join(notes), tuple(detail) + (
                         (f"Blacksmith failure rate: {100 * len(b_failed) / len(B_done) if B_done else 0.0:.1f}% ({len(b_failed)} of {len(B_done)}) before, {100 * b_rate:.1f}% ({len(b_counted)} of {len(B_done)}) "
-                         f"after excluding {len(b_failed) - len(b_counted)} failed main job{'' if len(b_failed) - len(b_counted) == 1 else 's'} whose failing tests are red on main; the allowance uses the rate after",) if tests is not None else ())))
+                         f"after excluding {len(b_failed) - len(b_counted)} failed main job{'' if len(b_failed) - len(b_counted) == 1 else 's'} whose every failing test excused a superci failure; the allowance uses the rate after",) if tests is not None else ())))
     p50u = T.q(unexplained, 50)
     rows.append(Row("unexplained p50 (timeline)", fmt_s(p50u), f"< {MAX_UNEXPLAINED_S:g} s", PASS if p50u is not None and p50u < MAX_UNEXPLAINED_S else FAIL,
                     "" if unexplained else "no superci timelines"))
     return rows
+
+
+def _cluster_failure(read, excused):
+    """Whether a Blacksmith main job's failure is only tests that excused a superci failure: read, test-level names only, no hard reason."""
+    return bool(read and read.tests and not read.coarse and not read.hard and read.tests <= excused)
 
 
 def set_alarm(alarm, superci_set):
@@ -365,11 +371,15 @@ def clamp_window(job, since, b_lo, b_hi, floors=None):
     return max(since, at), max(b_lo, at), [f"{name}; " + "; ".join(lines)] if lines else [f"{name}; the window starts after it, nothing clamped"]
 
 
-PARSER_VERSION = 1  # bump with a parser change: the cache keeps names by job and version
+PARSER_VERSION = 2  # bump with a parser change: the cache keeps what was read by job and version
 MAX_TEST_READS = 150
 _STAMP = re.compile(r"^\d{4}-\d\d-\d\dT[\d:.]+Z ")
 _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _FAIL = re.compile(r"^\s*\(fail\) (.*?)(?: \[[\d.]+ ?m?s\])?$")
+_SUMMARY = re.compile(r"^\s*(\d+) (?:fail|errors?)$")  # bun's ` 1 fail` and ` 2 errors` lines, one of each at the end of a file's run
+_UNHANDLED = re.compile(r"^# Unhandled error between tests")
+_CUT = re.compile(r"(The operation was canceled|has exceeded the maximum execution time|received a shutdown signal)")
+BUN_FAILED_EXIT = 1  # bun test's exit code when tests failed; any other code of a file or target is a crash, a kill or a harness failure
 
 
 def log_lines(text):
@@ -377,48 +387,113 @@ def log_lines(text):
     return [_ANSI.sub("", _STAMP.sub("", raw, count=1)).rstrip() for raw in text.splitlines()]
 
 
+@dataclasses.dataclass(frozen=True)
+class Parsed:
+    """What a log says failed. tests: test-level names (`<file> :: <suite > test>`). coarse: files or targets that failed with no `(fail)`
+    line to name a test. hard: reasons the job failed in a way its named tests do not explain (a file stopped at its time limit or killed,
+    a shard cut short, a runner crash, an error between tests, bun counting more failures than the log names): such a job counts."""
+    tests: frozenset = frozenset()
+    coarse: frozenset = frozenset()
+    hard: tuple = ()
+
+
+class _Run:
+    """One file's (or target's) bun run as the log shows it: its `(fail)` names, the failures and errors bun's summary counts."""
+
+    def __init__(self):
+        self.fails, self.reported, self.unhandled = [], 0, False
+
+
+def _runs_parsed(runs, coarse, hard):
+    """(tests, coarse, hard) from the per-file runs: each `(fail)` name, a summary that counts more than the log names, an error between tests."""
+    tests = set()
+    for name, r in runs.items():
+        tests |= {f"{name} :: {f}" if name else f for f in r.fails}
+        if r.reported > len(r.fails):
+            hard.append(f"{name or 'a test file'}: bun's summary counts {r.reported} failures and errors, the log names {len(r.fails)} tests")
+        if r.unhandled:
+            hard.append(f"{name or 'a test file'}: an error between tests")
+    return frozenset(tests), frozenset(coarse), tuple(dict.fromkeys(hard))
+
+
+def _exit_of(runs, coarse, hard, name, code):
+    """A file or target that exited non-zero: coarse when no test is named for it, hard when the code is not bun's failed-tests code."""
+    if int(code) != BUN_FAILED_EXIT:
+        hard.append(f"{name} exited {code}, not bun's {BUN_FAILED_EXIT} for failed tests")
+    if not runs.get(name) or not runs[name].fails:
+        coarse.add(name)
+
+
 def parse_unit_log(text):
-    """The failing tests of a unit-tests job from its log. scripts/verify/test-files.ts runs one `bun test` per file and replays its
-    output under `== bun test --isolate <file>`; bun prints `(fail) <suite > test> [<ms>]` for each failed test. A file that failed
-    with no such line (it did not load, hit its time limit or died by a signal) is named by itself: `test-files: <file> exited N`."""
-    names, failed_in, whole, file = set(), set(), set(), None
+    """The failures of a unit-tests job from its log. scripts/verify/test-files.ts runs one `bun test` per file and replays its output
+    under `== bun test --isolate <file>`; bun prints `(fail) <suite > test> [<ms>]` per failed test and a summary of ` N fail` and
+    ` N error`. Its own lines name a file that did not finish: `test-files: <file> was stopped at <limit>` and
+    `terminated by <signal>` are hard, `exited N` is coarse (no test named) and hard when N is not bun's 1. A job cut by timeout-minutes
+    or a cancel shows GitHub's own line, which is hard too."""
+    runs, coarse, hard, file = {}, set(), [], None
     for line in log_lines(text):
         if m := re.match(r"== bun test --isolate (.+)$", line):
             file = m.group(1)
+            runs.setdefault(file, _Run())
         elif m := _FAIL.match(line):
-            names.add(f"{file} :: {m.group(1)}" if file else m.group(1))
-            failed_in.add(file)
-        elif m := re.match(r"test-files: (.+?) (?:exited \d+|was stopped at .*|terminated by \S+; stopping)$", line):
-            whole.add(m.group(1))
-    return frozenset(names | (whole - failed_in))
+            runs.setdefault(file, _Run()).fails.append(m.group(1))
+        elif m := _SUMMARY.match(line):
+            runs.setdefault(file, _Run()).reported += int(m.group(1))
+        elif _UNHANDLED.match(line):
+            runs.setdefault(file, _Run()).unhandled = True
+        elif m := re.match(r"test-files: (.+?) exited (\d+)$", line):
+            _exit_of(runs, coarse, hard, m.group(1), m.group(2))
+        elif m := re.match(r"test-files: (.+?) was stopped at (.*)$", line):
+            coarse.add(m.group(1))
+            hard.append(f"{m.group(1)} was stopped at {m.group(2)}")
+        elif m := re.match(r"test-files: (.+?) terminated by (\S+); stopping$", line):
+            coarse.add(m.group(1))
+            hard.append(f"{m.group(1)} was terminated by {m.group(2)}")
+        elif _CUT.search(line):
+            hard.append(f"the job was cut short ({line.strip()[:120]})")
+    return Parsed(*_runs_parsed(runs, coarse, hard))
 
 
 def parse_integration_log(text):
-    """The failing tests of an integration shard from its log. testRunner.ts prints each target's output between
-    `[integration] ── target N/M (...): <target>` and `── end target`; a target that failed with no `(fail)` line in it is named by
-    itself, and so is one killed by its watchdog or left unfinished when the shard was cut short (a timeout, a cancel)."""
-    names, failed_in, whole, always, target, listing = set(), set(), set(), set(), None, False
+    """The failures of an integration shard from its log. testRunner.ts prints each target's output between
+    `[integration] ── target N/M (...): <target>` and `── end target`. A target that failed with no `(fail)` line in it is coarse, and hard when
+    its exit code is not bun's 1; one killed by its watchdog, one left unfinished when the shard was cut short, and a crashed runner
+    (`Integration runner crashed`) are hard."""
+    runs, coarse, hard, target, listing = {}, set(), [], None, False
     for line in log_lines(text):
-        if listing and (m := re.match(r" - (.+?)(?: \(exit code \d+\))?$", line)):
-            (always if listing == "cut" else whole).add(m.group(1))
+        if listing and (m := re.match(r" - (.+?)(?: \(exit code (\d+)\))?$", line)):
+            if listing == "cut":
+                coarse.add(m.group(1))
+                hard.append(f"{m.group(1)} did not finish: the shard was cut short")
+            elif m.group(2):
+                _exit_of(runs, coarse, hard, m.group(1), m.group(2))
             continue
         listing = False
         if m := re.match(r"\[integration\] ── target \S+ \(.*\): (.+)$", line):
             target = m.group(1)
+            runs.setdefault(target, _Run())
         elif line.startswith("[integration] ── end target"):
             target = None
         elif m := _FAIL.match(line):
-            names.add(f"{target} :: {m.group(1)}" if target else m.group(1))
-            failed_in.add(target)
-        elif m := re.match(r"\[integration\] Target failed with exit code \d+: (.+)$", line):
-            whole.add(m.group(1))
+            runs.setdefault(target, _Run()).fails.append(m.group(1))
+        elif m := _SUMMARY.match(line):
+            runs.setdefault(target, _Run()).reported += int(m.group(1))
+        elif _UNHANDLED.match(line):
+            runs.setdefault(target, _Run()).unhandled = True
+        elif m := re.match(r"\[integration\] Target failed with exit code (\d+): (.+)$", line):
+            _exit_of(runs, coarse, hard, m.group(2), m.group(1))
         elif m := re.match(r"\[integration\] Target hung past its watchdog and was killed: (.+)$", line):
-            always.add(m.group(1))
+            coarse.add(m.group(1))
+            hard.append(f"{m.group(1)} hung past its watchdog and was killed")
         elif re.match(r"\[integration\] \d+ of \d+ target\(s\) did not finish before \w+:$", line):
             listing = "cut"
         elif re.match(r"\[integration\] \d+ integration target\(s\) failed:$", line):
             listing = "failed"
-    return frozenset(names | always | (whole - failed_in))
+        elif m := re.match(r"\[integration\] Integration runner crashed: (.*)$", line):
+            hard.append(f"the integration runner crashed: {m.group(1)[:120]}")
+        elif _CUT.search(line):
+            hard.append(f"the job was cut short ({line.strip()[:120]})")
+    return Parsed(*_runs_parsed(runs, coarse, hard))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -440,11 +515,18 @@ NAME_SOURCES = {
 
 @dataclasses.dataclass(frozen=True)
 class Read:
-    """The failing tests of one failed job. names empty means none was named: `outside` when the job failed in a step other than the
-    tests' (so it names no test and says which step), else `why` it could not be read."""
-    names: frozenset
+    """The failures of one failed job. names (tests and coarse) empty means none was named: `outside` when the job failed in a step
+    other than the tests' (so it names no test and says which step), else `why` it could not be read. tests, coarse and hard are Parsed's,
+    hard also holding a cancelled step or a failed step other than the tests'."""
+    tests: frozenset = frozenset()
     why: str = ""
     outside: bool = False
+    coarse: frozenset = frozenset()
+    hard: tuple = ()
+
+    @property
+    def names(self):
+        return self.tests | self.coarse
 
 
 @dataclasses.dataclass
@@ -453,7 +535,8 @@ class Tests:
     count. red: test name -> the Blacksmith main runs it failed in. main_runs/main_failed: Blacksmith main runs of the window that ended
     red and the failed jobs read in them. main_unread: (run id, why) of a failed Blacksmith main job whose log could not be read.
     red_jobs: test name -> how many failed Blacksmith main jobs it failed in. b_reads: Blacksmith job id -> Read, for each failed main job
-    read (what the failure rate's exclusion is drawn from)."""
+    read. excused: the tests that excused a superci failure (set by judge_by_tests); the Blacksmith failure rate leaves out a main job
+    only when every test it failed is among them."""
     source: str
     reads: dict
     red: dict
@@ -463,14 +546,27 @@ class Tests:
     logs: int = 0
     red_jobs: dict = dataclasses.field(default_factory=dict)
     b_reads: dict = dataclasses.field(default_factory=dict)
+    excused: frozenset = frozenset()
 
 
 class OverBudget(Exception):
     pass
 
 
+def step_reasons(steps, test_step):
+    """Why a job's steps say it failed in more than a red test: a cancelled step (timeout-minutes or a cancel cut it) or a failed step
+    other than the tests'."""
+    out = []
+    for s in steps:
+        if s.get("conclusion") == "cancelled":
+            out.append(f"step '{s.get('name')}' was cancelled: the job was cut short")
+        elif s.get("conclusion") == "failure" and s.get("name") != test_step:
+            out.append(f"step '{s.get('name')}' failed")
+    return tuple(out)
+
+
 class NameReader:
-    """Failing test names of finished jobs, one log call each, kept in the cache like the run listings (only a finished job is read, so
+    """What a failed job's log says failed, one log call each, kept in the cache like the run listings (only a finished job is read, so
     only a finished job is kept). A job whose steps are known and whose test step succeeded names no test and costs no call."""
 
     def __init__(self, gh, cache, source, limit=MAX_TEST_READS):
@@ -483,30 +579,39 @@ class NameReader:
             bad = next((s.get("name") for s in steps if s.get("conclusion") in ("failure", "cancelled")), None)
             return Read(frozenset(), f"failed outside the '{self.source.step}' step" + (f", in '{bad}'" if bad else ""), outside=True)
         if not job.get("completed_at"):
-            return Read(frozenset(), "the job had not finished")
+            return Read(why="the job had not finished")
 
         def fetch():
             if self.logs >= self.limit:
                 raise OverBudget
             self.logs += 1
-            names = self.source.parse(self.gh.api(f"actions/jobs/{job['id']}/logs", keep=False, raw=True))
-            return {"names": sorted(names), "why": "" if names else f"the log of {job.get('name')} names no failing test"}
+            p = self.source.parse(self.gh.api(f"actions/jobs/{job['id']}/logs", keep=False, raw=True))
+            return {"tests": sorted(p.tests), "coarse": sorted(p.coarse), "hard": list(p.hard),
+                    "why": "" if p.tests or p.coarse or p.hard else f"the log of {job.get('name')} names no failing test"}
 
         try:
             got = self.cache.get(f"tests:v{PARSER_VERSION}:{self.gh.repo}:{job['id']}", fetch)
         except OverBudget:
-            return Read(frozenset(), f"not read: the {self.limit} log reads of --max-test-reads are used up")
+            return Read(why=f"not read: the {self.limit} log reads of --max-test-reads are used up")
+        except UnicodeDecodeError as e:
+            return Read(why=f"log not read (it is not valid UTF-8: {str(e)[:100]})")
         except SystemExit as e:
             if "budget is used up" in str(e) or "rate limit" in str(e).lower():
                 raise SystemExit(f"stopping: {e}")
-            return Read(frozenset(), f"log not read ({str(e)[:160]})")
-        return Read(frozenset(got["names"]), got["why"])
+            return Read(why=f"log not read ({str(e)[:160]})")
+        return Read(frozenset(got["tests"]), got["why"], coarse=frozenset(got["coarse"]), hard=tuple(got["hard"]) + step_reasons(steps, self.source.step))
+
+
+def census_leg(name):
+    """A leg of integration's V3 census (`integration (3, v3)`), which runs every shard under another owner policy: not an ordinary run."""
+    return bool(re.search(r", v3\)$", name))
 
 
 def main_red_runs(listed, job_window):
-    """The Blacksmith main runs of the window that ended red, from the run listing the gate already holds (no call)."""
+    """The Blacksmith main runs of the window that ended red, from the run listing the gate already holds (no call). A run started by
+    hand (workflow_dispatch: a census, a hoist record) is not an ordinary push or schedule, so it is left out."""
     lo, hi = job_window
-    return [r for r in listed if r.get("head_branch") == "main" and lo <= (T.ts(r.get("created_at")) or 0) <= hi
+    return [r for r in listed if r.get("head_branch") == "main" and r.get("event") != "workflow_dispatch" and lo <= (T.ts(r.get("created_at")) or 0) <= hi
             and r.get("conclusion") in ("failure", "timed_out", "cancelled")]
 
 
@@ -514,8 +619,9 @@ def gather_tests(gh, cache, source, name, candidates, s_jobs, events, listed, wi
     """Tests for the failures row. `candidates` are the superci failures the job-level rule would count, `s_jobs` the REST-shaped jobs
     of S by id. Superci's side comes first in the read budget. A record has no GitHub job id, so each failed record is matched to its
     REST job in its run's listing (one call a run, cached, as with_github_created does), which also gives the job's steps.
-    Blacksmith's side is every failed `name` job of the main runs listed in `window` that ended red (not only the sample the rates
-    are drawn from), read once and then cached."""
+    Blacksmith's side is every failed `name` job of the ordinary main runs listed in `window` that ended red (not only the sample the
+    rates are drawn from; no census leg, no manual run), read once and then cached. Only test-level names are red: a file or target
+    named for failing with no test is not."""
     src, reader, reads = NAME_SOURCES[name], NameReader(gh, cache, NAME_SOURCES[name], limit), {}
     listing = jobs_of(gh, [{"id": r} for r in sorted({s_jobs[o.job_id]["run_id"] for o in candidates})], attempts="all") if events and candidates else {}
     for o in candidates:
@@ -523,7 +629,7 @@ def gather_tests(gh, cache, source, name, candidates, s_jobs, events, listed, wi
         if events:
             j = rest_job_of({"name": j.get("name"), "runner": j.get("runner_name"), "finish_time": j.get("completed_at")}, listing.get(j["run_id"], []))
             if j is None:
-                reads[o.job_id] = Read(frozenset(), "no job of its run in GitHub's listing matches the record (name, runner, finish), so its log cannot be found")
+                reads[o.job_id] = Read(why="no job of its run in GitHub's listing matches the record (name, runner, finish), so its log cannot be found")
                 continue
         reads[o.job_id] = reader.read(j)
     runs = main_red_runs(listed, window)
@@ -532,11 +638,12 @@ def gather_tests(gh, cache, source, name, candidates, s_jobs, events, listed, wi
     red, red_jobs = collections.defaultdict(set), collections.Counter()
     for r in runs:
         for j in by_run.get(r["id"], []):
-            if not matches(j.get("name") or "", name) or j.get("conclusion") not in ("failure", "timed_out") or fleet_or_label(j) != "blacksmith":
+            if (not matches(j.get("name") or "", name) or census_leg(j.get("name") or "") or j.get("conclusion") not in ("failure", "timed_out")
+                    or fleet_or_label(j) != "blacksmith"):
                 continue
             t.main_failed += 1
             got = t.b_reads[j["id"]] = reader.read(j)
-            for n in got.names:
+            for n in got.tests:
                 red[n].add(r["id"])
                 red_jobs[n] += 1
             if not got.names and not got.outside:
@@ -546,26 +653,43 @@ def gather_tests(gh, cache, source, name, candidates, s_jobs, events, listed, wi
 
 
 def judge_by_tests(counted, tests, show=20):
-    """(counted, notes, detail): the superci failures the job-level rule counted, less those whose every failing test is red on
-    Blacksmith's main in the window, and the lines that say what was excluded and why each other failure counted. A failure counts when at
-    least one failing test is in no failed Blacksmith main job of the window (a test never seen failing there passed on every main run);
-    one whose tests cannot be read counts, fail closed. Nothing is dropped without a line."""
-    kept, gone, fresh, unread, outside = [], [], {}, collections.defaultdict(list), collections.defaultdict(list)
+    """(counted, notes, detail): the superci failures the job-level rule counted, less those excused, and the lines that say what was
+    excluded and why each other failure counted. A failure is excused only when it is explained by test-level names alone, each red on
+    Blacksmith's main in the window: it counts when a failing test is in no failed Blacksmith main job of the window, when its job timed out,
+    when it has a reason beyond its named tests (a file stopped or killed, a shard cut short, a runner crash, an error between tests, a
+    summary counting more failures than the log names, a cancelled or failed non-test step), when it is named by a file or target alone,
+    and when its tests cannot be read (fail closed). Nothing is dropped without a line. Sets tests.excused."""
+    kept, gone, fresh = [], [], {}
+    unread, outside, beyond, coarse = (collections.defaultdict(list) for _ in range(4))
     for o in counted:
-        r = tests.reads.get(o.job_id) or Read(frozenset(), "no read was made")
+        r = tests.reads.get(o.job_id) or Read(why="no read was made")
+        if o.timed_out:
+            kept.append(o)
+            beyond["the job timed out"].append(o.run_id)
+            continue
+        if r.hard:
+            kept.append(o)
+            for why in r.hard:
+                beyond[why].append(o.run_id)
+            continue
         if not r.names:
             kept.append(o)
             (outside if r.outside else unread)[r.why].append(o.run_id)
             continue
-        new = sorted(n for n in r.names if n not in tests.red)
+        if r.coarse:
+            kept.append(o)
+            coarse[f"named only by its file or target ({', '.join(sorted(r.coarse))[:160]}): no test-level name to compare"].append(o.run_id)
+            continue
+        new = sorted(n for n in r.tests if n not in tests.red)
         if new:
             kept.append(o)
             fresh.setdefault(o.run_id, set()).update(new)
         else:
             gone.append(o)
     detail, notes = [], []
+    tests.excused = frozenset(n for o in gone for n in tests.reads[o.job_id].tests)
     if gone:
-        names = sorted({n for o in gone for n in tests.reads[o.job_id].names})
+        names = sorted(tests.excused)
         runs = sorted({o.run_id for o in gone})
         red_runs = sorted({i for n in names for i in tests.red[n]})
         once = " (1 Blacksmith failure: flaky?)"  # an exclusion that rests on one failure of the test on main
@@ -575,10 +699,10 @@ def judge_by_tests(counted, tests, show=20):
     if fresh:
         names = sorted({n for ns in fresh.values() for n in ns})
         detail.append(f"counted, green on Blacksmith main: {', '.join(names[:show])}" + (f" and {len(names) - show} more" if len(names) > show else "") + f" in {', '.join(map(str, sorted(fresh)))}")
-    for why, runs in sorted(unread.items()):
-        detail.append(f"counted, failing tests unreadable (fail closed): run {', '.join(map(str, sorted(set(runs))))}: {why}")
-    for why, runs in sorted(outside.items()):
-        detail.append(f"counted, no test failed: run {', '.join(map(str, sorted(set(runs))))}: {why}")
+    for label, group in (("failed beyond its named tests (fail closed)", beyond), ("named by file or target only (fail closed)", coarse),
+                         ("failing tests unreadable (fail closed)", unread), ("no test failed", outside)):
+        for why, runs in sorted(group.items()):
+            detail.append(f"counted, {label}: run {', '.join(map(str, sorted(set(runs))))}: {why}")
     if tests.main_unread:
         detail.append(f"Blacksmith main: {len(tests.main_unread)} of {tests.main_failed} failed jobs could not be read ({tests.main_unread[0][1]}); no exclusion is drawn from them")
     return kept, notes, detail

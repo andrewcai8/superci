@@ -112,11 +112,18 @@ output says so: `failing tests: no test-name source for <job>`).
   names no test, or whose job record matches no REST job counts and says why; a failure in a step other than the tests' counts and says
   which. A Blacksmith main failure that cannot be read draws no exclusion and is reported.
   An exclusion that rests on one Blacksmith main failure of that test in the window is tagged `(1 Blacksmith failure: flaky?)`.
-  **The allowance is symmetric.** The same exclusion applies to Blacksmith's failure rate: a failed main job that was read and names a
-  failing test (red on main, by definition: the excluded set is every test red on Blacksmith main in the window) is left out of the
-  numerator, the denominator stays every Blacksmith run. A Blacksmith failure on another branch, one whose log could not be read and one that names no
-  test (failed in setup) still counts, so a failure the gate cannot explain makes the allowance stricter. Both rates are printed under
-  the failures row, before and after the exclusion; the allowance uses the rate after.
+  **A failure the named tests do not explain counts.** A failure is excluded only when its test-level names explain it. It counts, and says
+  why, when its job timed out; when a file was `stopped at` its limit or `terminated by` a signal, a file or target exited with a code other than
+  bun's 1, a shard was cut short (`did not finish before SIGTERM`, a cancelled step, GitHub's own cut-off line), a target hung past its
+  watchdog or the runner crashed; when bun's summary (` N fail`, ` N error`) counts more than the log names, or an error came between tests;
+  when a step other than the tests' failed; and when it is named only by a file or target (no `(fail)` line), since a coarse name
+  compares nothing. A log that is not valid UTF-8 is unreadable and counts.
+  **Which Blacksmith runs make main red.** Ordinary main runs only: a `workflow_dispatch` run (a census, a hoist record) and an integration
+  census leg (`integration (N, v3)`) are left out, as are failed jobs naming no test-level name.
+  **The allowance leaves out only the double-counted cluster.** A failed Blacksmith main job leaves the rate's numerator only when every test
+  it failed is among the tests that excused a superci failure in this window; the denominator stays every Blacksmith run. Scattered
+  Blacksmith failures on other tests, one on another branch, one not read, one naming no test and one with a hard reason still count. Both rates are
+  printed under the failures row, before and after; the allowance uses the rate after.
 
 **Window floors (`WINDOW_FLOORS`).** A job's parity window may not include runs from before its floor: `--since` and Blacksmith's
 baseline start are clamped to it (the output says so), and a Blacksmith window that ends before it is refused. `integration` starts at
