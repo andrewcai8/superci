@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 func renderBoot(t *testing.T, script, mode string) string {
@@ -38,6 +39,12 @@ func TestUserDataFitsInBothModes(t *testing.T) {
 // ones that record what they were asked and answer as the listener does. agent is the status the listener gives /agent.
 func runTail(t *testing.T, mode string, agentStatuses ...string) []string {
 	t.Helper()
+	return runTailWith(t, mode, "", agentStatuses...)
+}
+
+// runTailWith is runTail with shell lines of its own first (the hydration's marker, a sleep that ends it).
+func runTailWith(t *testing.T, mode, pre string, agentStatuses ...string) []string {
+	t.Helper()
 	got := renderBoot(t, bootScript, mode)
 	i := strings.Index(got, "# Dispatch mode (pull/agent.py)")
 	if i < 0 {
@@ -62,6 +69,8 @@ sleep() { echo "sleep $*" >> $log; }
 kill() { :; }
 python3() { echo "python3 $*" >> $log; return 7; }
 poweroff() { echo poweroff >> $log; }
+HR=` + dir + `/hydrated; mkdir -p $HR
+` + pre + `
 ` + got[i:]
 	if out, err := exec.Command("bash", "-c", script).CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
@@ -72,7 +81,7 @@ poweroff() { echo poweroff >> $log; }
 
 func TestDispatchModeSkipsTheRunnerAndRunsTheAgent(t *testing.T) {
 	calls := runTail(t, "dispatch", "200")
-	want := []string{"call agent /run/superci-agent.py", "mark runner.start", "python3 -I /run/superci-agent.py https://203.0.113.1:8443 sha256//pin", "mark runner.exit 7", "mark poweroff", "poweroff"}
+	want := []string{"mark warm.ready", "call agent /run/superci-agent.py", "mark runner.start", "python3 -I /run/superci-agent.py https://203.0.113.1:8443 sha256//pin", "mark runner.exit 7", "mark poweroff", "poweroff"}
 	if strings.Join(calls, "|") != strings.Join(want, "|") {
 		t.Errorf("calls:\n%s\nwant:\n%s", strings.Join(calls, "\n"), strings.Join(want, "\n"))
 	}
@@ -80,7 +89,7 @@ func TestDispatchModeSkipsTheRunnerAndRunsTheAgent(t *testing.T) {
 
 func TestDispatchModeTold410RunsNothingAndPowersOff(t *testing.T) {
 	calls := runTail(t, "dispatch", "410")
-	want := []string{"call agent /run/superci-agent.py", "mark poweroff", "poweroff"}
+	want := []string{"mark warm.ready", "call agent /run/superci-agent.py", "mark poweroff", "poweroff"}
 	if strings.Join(calls, "|") != strings.Join(want, "|") {
 		t.Errorf("calls: %v, want %v", calls, want)
 	}
@@ -107,5 +116,33 @@ func TestScaleSetModeStillAsksForItsRunner(t *testing.T) {
 	joined := strings.Join(calls, "\n")
 	if !strings.Contains(joined, "call jit /run/superci-jit") || strings.Contains(joined, "call agent") || strings.Contains(joined, "python3") {
 		t.Errorf("calls: %v", calls)
+	}
+}
+
+// A machine asks for its job only once its hydration and warm reads are done: a cold machine's job waits on the
+// snapshot's first reads (node's first exec 2.5 s against Blacksmith's 39 ms, Nov 27).
+func TestDispatchModeAsksForWorkOnlyOnceItsWarmIsDone(t *testing.T) {
+	// The hydration ends after the third half-second.
+	calls := runTailWith(t, "dispatch", `: > $HR/.warming; n=0; sleep() { echo "sleep $*" >> $log; n=$((n+1)); [ $n -lt 3 ] || rm -f $HR/.warming; }`, "200")
+	want := []string{"sleep 0.5", "sleep 0.5", "sleep 0.5", "mark warm.ready", "call agent /run/superci-agent.py"}
+	if got := strings.Join(calls[:min(len(calls), len(want))], "|"); got != strings.Join(want, "|") {
+		t.Errorf("calls:\n%s\nwant them to begin:\n%s", strings.Join(calls, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+// A warm that never ends holds the machine 210 s at most, inside the 5 minutes the dispatcher gives it (bootGrace).
+func TestDispatchModeWaitsForAWarmThatNeverEndsAtMost210Seconds(t *testing.T) {
+	calls := runTailWith(t, "dispatch", `: > $HR/.warming`, "200")
+	sleeps, asked := 0, false
+	for _, c := range calls {
+		if c == "sleep 0.5" && !asked {
+			sleeps++
+		}
+		if c == "call agent /run/superci-agent.py" {
+			asked = true
+		}
+	}
+	if !asked || float64(sleeps)*0.5 != 210 || 210*time.Second >= bootGrace {
+		t.Errorf("waited %d half-seconds, then asked for work: %v (bootGrace %s)", sleeps, asked, bootGrace)
 	}
 }
