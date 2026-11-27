@@ -217,7 +217,11 @@ and 0 for 16 and 32; the caps are flat spend guards (120, 200, 130, 40 and 12) a
 for. A floor is a floor under a pool that has jobs to follow: a burst of 0 (no job arrived in the last `window_minutes` and none is held
 or carried from before a restart) means nothing is routed to the set, and its pool is 0 whatever the hour's floor says. On Nov 26 at
 23:57Z the floors held 70, 100 and 9 idle runners of 4, 8 and 2 vCPU, 43.8 USD an hour, with `SUPERCI_JOBS` unset. One arrival
-brings the hour's floor back, and the pool falls to 0 a window (30 minutes) after the last job.
+brings the hour's floor back, and the pool falls to 0 a window plus the hold (35 minutes) after the last job, and its idle machines go a surplus hold (20 s) after that.
+The 15-minute lead before a busy hour warms only a set that has jobs: after a quiet 35 minutes, the first wave of a surge (14:00Z) finds the pool at 0 and
+meets the cold path (its first job's arrival brings the full floor, which registers under the ceiling of 2 a second and 50 at once, about 85 s for 170
+machines). The Nov 26 replay below was measured inside a busy stretch and did not test that start. A rule that warms ahead of a quiet set from the
+same hour's earlier days is the follow-up if it matters.
 Within 15 minutes of the next hour, the larger of the two hours' bounds applies. A split size divides its bounds among
 its sets. No idle runner is trimmed in the first window after a start, while the set has seen too few jobs to size its
 pool.
@@ -561,7 +565,7 @@ others page. `superci-pull-registration-refusals` is the organization's cap, whi
 a job moved from Blacksmith takes one registration on either fleet.
 
 **`superci-pull-pool-at-floor`.** The pool is not following the jobs. Read `curl -s localhost:8080/state | jq '.sets[]'`
-on the listener: a set whose `pool` stays at its floor while jobs wait is reading no arrivals, or has no carried burst.
+on the listener: a set whose `pool` stays at its floor, or at 0, while jobs wait is reading no arrivals, or has no carried burst.
 Look in the listener log for `load pools` and `save pools` errors (the IAM grant for `/superci-pull/pool/*`, or a
 parameter the roll left unreadable), and for the set's JobAssigned and JobAvailable messages. To stop the wait at once,
 pin the pool: `curl -s -X POST 'localhost:8080/override?set=<set>&pool=<n>'` (the next config change clears it).
@@ -606,7 +610,7 @@ function's `CodeSha256` in both regions.
 Before the release that moves the pool parameter to `/superci-pull/pool/<deployment>`: apply `deploy/listener-policy.json`
 (`aws --profile ci-runners iam put-role-policy --role-name superci-pull --policy-name superci-pull --policy-document file://pull/deploy/listener-policy.json`)
 so the new listener may read and write it, and run `deploy/alarms.sh` for the alarms. The first start after the
-release finds no saved burst there and starts from the floor once. The policy still grants the old parameter
+release finds no saved burst there and starts from 0 once. The policy still grants the old parameter
 `/superci-pull/pool`, which the previous binary uses, so a roll back works; drop it with that binary.
 
 **Recycle.** A release that changes what a machine runs at boot (boot.sh, the image, the disk) makes a new launch
