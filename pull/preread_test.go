@@ -80,6 +80,10 @@ func startPrereadOn(t *testing.T, fio, rootBytes, pullcache, catSleep, walkSleep
 			t.Fatal(err)
 		}
 	}
+	// boot.sh makes the warm mark before it starts the hydration; a dispatch machine waits on it.
+	if err := os.WriteFile(filepath.Join(b.hr, ".warming"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(b.spool, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -291,5 +295,14 @@ func TestOnlyAMachineOf12GBOrMoreWarmsTheLibraries(t *testing.T) {
 		if !strings.Contains(list, "/home/runner/externals") {
 			t.Errorf("%s kB: the warm's list %q lacks the runner's externals", memKB, list)
 		}
+	}
+}
+
+// The hydration removes the warm mark when it ends, so a dispatch machine does not wait out its cap for a warm that is done.
+func TestTheHydrationRemovesTheWarmMarkWhenItEnds(t *testing.T) {
+	b := startPreread(t, `true`, "30083776512", `true`)
+	b.wait(t, 20*time.Second)
+	if _, err := os.Stat(filepath.Join(b.hr, ".warming")); !os.IsNotExist(err) {
+		t.Errorf("the warm mark is still there after the hydration ended (%v)", err)
 	}
 }

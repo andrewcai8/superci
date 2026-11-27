@@ -487,6 +487,16 @@
       ],
       "what": "after the walk, the binaries jobs start were read into the page cache: full, or stopped by the job"
     },
+    "warm.ready": {
+      "src": "machine",
+      "fields": [
+        "inst",
+        "set",
+        "offset_ms",
+        "dur_ms"
+      ],
+      "what": "a dispatch machine asked for its job: its warm was done, or its uptime reached the cap (boot.sh)"
+    },
     "cache.restore": {
       "src": "machine",
       "fields": [
