@@ -22,7 +22,6 @@ import json
 import math
 import os
 import re
-import subprocess
 import sys
 import time
 
@@ -570,7 +569,7 @@ def build_trace(jobs, start, hours=1, bucket_s=60, source=None):
 # ---------------------------------------------------------------------------------------------------------------------
 
 def gh_raw(path, ref="main"):
-    p = subprocess.run(["gh", "api", "-H", "Accept: application/vnd.github.raw", f"repos/{REPO}/contents/{path}?ref={ref}"], capture_output=True, text=True)
+    p = T.AUTH.gh(["api", "-H", "Accept: application/vnd.github.raw", f"repos/{REPO}/contents/{path}?ref={ref}"], exception="ci-limits.tsv")
     if p.returncode:
         raise SystemExit(f"gh api contents/{path}@{ref}: {p.stderr.strip()[:300]}")
     return p.stdout
@@ -840,6 +839,7 @@ def build_parser():
     p.add_argument("--repo", default=REPO)
     p.add_argument("--cache", default=os.path.expanduser("~/.cache/superci-timeline"), help="directory of cached GitHub answers")
     p.add_argument("--legacy", action="store_true", help="rebuild launches and registrations from CloudTrail for a window before the listener's tl events")
+    p.add_argument("--personal-token", action="store_true", help="read GitHub on the shared personal token's budget when the superci App's token cannot be had (default: refuse)")
     p.add_argument("--allow-unread", type=int, default=0, help="runs whose jobs GitHub will not list (a persistent 5xx) that the verdict tolerates")
     sub = p.add_subparsers(dest="cmd", required=True)
     j = sub.add_parser("job", help="gate 1: speed parity of one job against Blacksmith")
@@ -877,6 +877,11 @@ def build_parser():
 
 def main(argv=None):
     a = build_parser().parse_args(argv)
+    T.AUTH.personal = a.personal_token
+    # `job` and `replay-trace` always read GitHub, so a missing App token stops them before any other work; `scale` reads it only
+    # for a window the listener's records do not cover, and then refuses at its first call.
+    if a.personal_token or a.cmd != "scale":
+        T.AUTH.require()
     return a.fn(a)
 
 

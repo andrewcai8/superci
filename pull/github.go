@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -62,36 +63,83 @@ func (g *REST) tokenFor(ctx context.Context) (string, error) {
 	if g.token != "" && time.Until(g.expires) > 5*time.Minute {
 		return g.token, nil
 	}
-	key, err := jwt.ParseRSAPrivateKeyFromPEM([]byte(g.app.PEM))
+	token, expires, err := g.mint(ctx, nil)
 	if err != nil {
 		return "", err
+	}
+	g.token, g.expires = token, expires
+	return g.token, nil
+}
+
+// mint asks GitHub for an installation token, signing an App JWT in memory. A non-nil request narrows the token to the
+// repositories and permissions it names (GitHub refuses a permission the App does not hold with 422, and says which).
+func (g *REST) mint(ctx context.Context, narrow any) (string, time.Time, error) {
+	key, err := jwt.ParseRSAPrivateKeyFromPEM([]byte(g.app.PEM))
+	if err != nil {
+		return "", time.Time{}, err
 	}
 	now := time.Now()
 	signed, err := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.RegisteredClaims{Issuer: strconv.FormatInt(g.app.ID, 10),
 		IssuedAt: jwt.NewNumericDate(now.Add(-time.Minute)), ExpiresAt: jwt.NewNumericDate(now.Add(9 * time.Minute))}).SignedString(key)
 	if err != nil {
-		return "", err
+		return "", time.Time{}, err
 	}
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("https://api.github.com/app/installations/%d/access_tokens", g.installation), nil)
+	var body io.Reader
+	if narrow != nil {
+		b, err := json.Marshal(narrow)
+		if err != nil {
+			return "", time.Time{}, err
+		}
+		body = bytes.NewReader(b)
+	}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("https://api.github.com/app/installations/%d/access_tokens", g.installation), body)
 	req.Header.Set("Authorization", "Bearer "+signed)
 	req.Header.Set("Accept", "application/vnd.github+json")
 	resp, err := g.http.Do(req)
 	if err != nil {
-		return "", err
+		return "", time.Time{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusCreated {
-		return "", fmt.Errorf("installation token: %s", resp.Status)
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<10))
+		return "", time.Time{}, &MintError{Status: resp.Status, Code: resp.StatusCode, Message: apiMessage(msg)}
 	}
 	var t struct {
 		Token     string    `json:"token"`
 		ExpiresAt time.Time `json:"expires_at"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&t); err != nil {
-		return "", err
+		return "", time.Time{}, err
 	}
-	g.token, g.expires = t.Token, t.ExpiresAt
-	return g.token, nil
+	if t.Token == "" {
+		return "", time.Time{}, fmt.Errorf("installation token: GitHub answered no token")
+	}
+	return t.Token, t.ExpiresAt, nil
+}
+
+// MintError is GitHub's refusal to make an installation token. Its message is GitHub's own and never holds a token.
+type MintError struct {
+	Status  string
+	Code    int
+	Message string
+}
+
+func (e *MintError) Error() string {
+	if e.Message == "" {
+		return "installation token: " + e.Status
+	}
+	return "installation token: " + e.Status + ": " + e.Message
+}
+
+// apiMessage is the "message" of a GitHub error body, or nothing.
+func apiMessage(body []byte) string {
+	var m struct {
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(body, &m) != nil {
+		return ""
+	}
+	return m.Message
 }
 
 type ListedRunner struct {

@@ -917,6 +917,46 @@ whose message says "burst"); `bench/measure.py BRANCH SINCE UNTIL listener.jsonl
   write` and `actions: write` on megpt-mono, install it on the organization, and put its id and key in
   `/superci-pull/github-app` (and its installation id in `installation`).
 
+### The tools read GitHub on the App's budget
+
+The gate, the timeline and the canary (`tools/gate/gate.py`, `tools/timeline/timeline.py`, `tools/gate/canary.sh`) read GitHub
+on the App's installation budget, not on the operator's personal token, which every session on the operator's host shares
+(it reached 0 on Nov 27 at 18:13Z, writes refused too, and a re-route and the canary's checks waited on it).
+
+- **How.** The listener's admin endpoint (`POST /github/token` on port 8080, `apptoken.go`) answers a read-only installation
+  token: narrowed to the config's repositories and to `actions: read`, held until under ten minutes remain, never logged, and
+  not served on the public port. The tools reach it through `deploy/ssh.sh`, so the App's key never leaves the listener and
+  the tools never read the SSM parameter. `tools/timeline/apptoken.py` keeps the token in the process's memory and gives it to
+  each `gh` call as `GH_TOKEN`; `canary.sh` takes it into a shell variable and sets it for each call. Nothing writes or prints it.
+- **Refusal.** With no App token (ssh or the endpoint down, the permission not granted) `gate.py` and `canary.sh` exit 2 and
+  say why; they never fall back. `gate.py --personal-token` and `SUPERCI_PERSONAL_TOKEN=1 canary.sh` spend the shared personal
+  budget on purpose and print that they do. `gate scale` reads no GitHub for a window the listener's job records cover, and
+  refuses at its first call otherwise.
+- **The floor.** `canary.sh` reads `rate_limit` with the token its checks use, so its 1,500 floor is that token's own budget.
+  A tick that cannot get a token is skipped and logged; the watch does not stop.
+
+What each call needs (GitHub's documented permission names; the first column is what the tools call):
+
+| Call | Permission it needs | Held by the App? |
+| --- | --- | --- |
+| workflow runs, run jobs, job logs, a run's head (`gh api repos/R/actions/...`) | Actions: read | yes (`actions: write` includes it) |
+| `rate_limit` | none | not applicable |
+| `ci-limits.tsv` from main (`gh api repos/R/contents/...`) | Contents: read | not documented: a named exception |
+| `SUPERCI_JOBS` read, set, delete (`repos/R/actions/variables/...`) | Variables: read and write | not documented: a named exception |
+
+Personal-token exceptions (the only calls that use the personal token without `--personal-token`; each prints
+`personal-token exception <name>` when it runs, and the tests hold this list to the code):
+
+| Exception | Where | What the operator changes on the App to end it |
+| --- | --- | --- |
+| `ci-limits.tsv` | `gate.py` `gh_raw` (skipped by `--limits FILE`) | grant repository permission **Contents: read** |
+| `SUPERCI_JOBS` | `canary.sh` (every read, set and delete of the variable) | grant repository permission **Variables: read and write** |
+
+To end an exception, grant the permission (the installation owner must accept it), then delete its row, its key in
+`EXCEPTIONS` (`tools/timeline/apptoken.py`) and its call sites' `exception=`/`personal`, and mint with the permission in
+`apptoken.go`. Until then a rollback's `gh variable set/delete` runs on the personal token, and fails with it (gh's error is in the
+canary's log) when its budget is gone: the operator then removes the job from `SUPERCI_JOBS` by hand.
+
 ## Cost
 
 Spot prices on Nov 25 2026 08:00Z (median of each size's 10 cheapest pools), with its gp3 volume, a machine-hour:

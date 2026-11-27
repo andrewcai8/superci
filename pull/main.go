@@ -271,7 +271,7 @@ func run(ctx context.Context, f flags) error {
 		slots: make(chan struct{}, max(1, cfg.Registration.Concurrency)), maxAge: l.maxAge, dispatch: l.dispatch, dispatchMachine: l.dispatchMachine}
 	go serve(ctx, publicServer(f.listen, srv), &id)
 	ids := NewIdentities(rest, l.budget, cfg)
-	go serve(ctx, &http.Server{Addr: f.admin, Handler: Admin(l.status, l.healthy, l.override, l.budget, ids.Routes)}, nil)
+	go serve(ctx, &http.Server{Addr: f.admin, Handler: Admin(l.status, l.healthy, l.override, l.budget, ids.Routes, NewAppTokens(rest, cfg.Repositories).Routes)}, nil)
 	errs := make(chan error, len(l.sets))
 	var sessions sync.WaitGroup
 	for _, s := range l.sets {
