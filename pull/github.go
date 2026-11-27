@@ -74,13 +74,7 @@ func (g *REST) tokenFor(ctx context.Context) (string, error) {
 // mint asks GitHub for an installation token, signing an App JWT in memory. A non-nil request narrows the token to the
 // repositories and permissions it names (GitHub refuses a permission the App does not hold with 422, and says which).
 func (g *REST) mint(ctx context.Context, narrow any) (string, time.Time, error) {
-	key, err := jwt.ParseRSAPrivateKeyFromPEM([]byte(g.app.PEM))
-	if err != nil {
-		return "", time.Time{}, err
-	}
-	now := time.Now()
-	signed, err := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.RegisteredClaims{Issuer: strconv.FormatInt(g.app.ID, 10),
-		IssuedAt: jwt.NewNumericDate(now.Add(-time.Minute)), ExpiresAt: jwt.NewNumericDate(now.Add(9 * time.Minute))}).SignedString(key)
+	signed, err := g.appJWT()
 	if err != nil {
 		return "", time.Time{}, err
 	}
@@ -115,6 +109,44 @@ func (g *REST) mint(ctx context.Context, narrow any) (string, time.Time, error) 
 		return "", time.Time{}, fmt.Errorf("installation token: GitHub answered no token")
 	}
 	return t.Token, t.ExpiresAt, nil
+}
+
+// appJWT is the App's short-lived JWT, signed in memory with its private key.
+func (g *REST) appJWT() (string, error) {
+	key, err := jwt.ParseRSAPrivateKeyFromPEM([]byte(g.app.PEM))
+	if err != nil {
+		return "", err
+	}
+	now := time.Now()
+	return jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.RegisteredClaims{Issuer: strconv.FormatInt(g.app.ID, 10),
+		IssuedAt: jwt.NewNumericDate(now.Add(-time.Minute)), ExpiresAt: jwt.NewNumericDate(now.Add(9 * time.Minute))}).SignedString(key)
+}
+
+// InstallationPermissions is what the installation was granted, permission name to "read", "write" or "admin", read with the
+// App's JWT (GET /app/installations/<id>), which names a permission the narrowed mint would refuse before it is asked for.
+func (g *REST) InstallationPermissions(ctx context.Context) (map[string]string, error) {
+	signed, err := g.appJWT()
+	if err != nil {
+		return nil, err
+	}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("https://api.github.com/app/installations/%d", g.installation), nil)
+	req.Header.Set("Authorization", "Bearer "+signed)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	resp, err := g.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, &StatusError{Method: http.MethodGet, URL: "app/installation", Status: resp.Status, Code: resp.StatusCode}
+	}
+	var body struct {
+		Permissions map[string]string `json:"permissions"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, err
+	}
+	return body.Permissions, nil
 }
 
 // MintError is GitHub's refusal to make an installation token. Its message is GitHub's own and never holds a token.

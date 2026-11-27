@@ -13,9 +13,10 @@ gate replay-trace --hour T [--hours 1] [--bucket 60] [--out trace.json]         
 ```
 
 GitHub is read on the superci App's installation budget through a token the listener mints
-([how, the refusal and the two personal-token exceptions](../../README.md#the-tools-read-github-on-the-apps-budget)):
+([how, the refusal and the one personal-token exception](../../README.md#the-tools-read-github-on-the-apps-budget)):
 with no App token `gate job` and `gate replay-trace` exit 2 before reading anything, unless `--personal-token` (before the
-subcommand) spends the shared personal budget on purpose. `canary.sh` takes `SUPERCI_PERSONAL_TOKEN=1` for the same.
+subcommand) spends the shared personal budget on purpose. `canary.sh` takes `SUPERCI_PERSONAL_TOKEN=1` for the same. `ci-limits.tsv` is read on the App's
+`contents` token (a refusal says to pass `--limits FILE`).
 
 `--cache DIR` (before the subcommand) keeps GitHub's answers; a finished job never changes, so a rerun costs no calls.
 Exit 0 only when every criterion passes. 1 is FAIL, or INCONCLUSIVE when every miss is a pass inside the noise.
@@ -162,7 +163,9 @@ organization at 5.03-5.30/s) superci's test-go waited 1-2 s and Blacksmith's 4 v
 
 `canary.sh SINCE UNTIL JOB...` runs the check for each job SUPERCI_JOBS still lists, every 15 minutes, until UNTIL, with
 Blacksmith's side the 24 h before SINCE (`--baseline-until`), so a job that left Blacksmith still has a baseline. It
-removes a job that gets ROLL BACK from SUPERCI_JOBS, and leaves the other jobs listed. `WORKFLOW` names the jobs' workflow
+removes a job that gets ROLL BACK from SUPERCI_JOBS, and leaves the other jobs listed. SUPERCI_JOBS is read and written on the App's
+`variables` token, and a rollback that cannot get it prints `ROLLBACK FAILED` (or, with `SUPERCI_PERSONAL_TOKEN=1`, writes on the personal
+token and says so). `canary.sh set '["test-go"]'` and `canary.sh unset` re-route by hand the same way, with no watch. `WORKFLOW` names the jobs' workflow
 file (lint-test-backend.yml by default). A check that crashes exits 1 and rolls nothing back: read its output file.
 
 ## gate 2: `gate scale`

@@ -49,7 +49,7 @@ ec2, machine, network, runner).
 
 ## GitHub access
 
-Every GitHub read goes through `apptoken.py`: a read-only installation token the listener's admin endpoint mints
+Every GitHub read goes through `apptoken.py`: an installation token of one scope (`actions`: read-only, the default; `variables` and `contents` for the canary and the gate) the listener's admin endpoint mints
 (`deploy/ssh.sh`), kept in memory and given to `gh` as `GH_TOKEN`. With none, the command exits 2 and says why;
 `--personal-token` (before the subcommand) spends the shared personal budget instead. See the
 [README](../../README.md#the-tools-read-github-on-the-apps-budget).

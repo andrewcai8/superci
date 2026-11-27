@@ -1008,7 +1008,11 @@ def build_trace(jobs, start, hours=1, bucket_s=60, source=None):
 # ---------------------------------------------------------------------------------------------------------------------
 
 def gh_raw(path, ref="main"):
-    p = T.AUTH.gh(["api", "-H", "Accept: application/vnd.github.raw", f"repos/{REPO}/contents/{path}?ref={ref}"], exception="ci-limits.tsv")
+    """A file of the repository at ref, read on the App's contents token (Contents: read, megpt-mono alone). With none the command refuses and says how to go without."""
+    try:
+        p = T.AUTH.gh(["api", "-H", "Accept: application/vnd.github.raw", f"repos/{REPO}/contents/{path}?ref={ref}"], scope="contents")
+    except T.apptoken.AppTokenRefused as e:
+        raise T.apptoken.AppTokenRefused(f"{e}\nTo make no such call, pass --limits FILE: a copy of {path} from main.") from None
     if p.returncode:
         raise SystemExit(f"gh api contents/{path}@{ref}: {p.stderr.strip()[:300]}")
     return p.stdout

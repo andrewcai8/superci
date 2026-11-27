@@ -877,7 +877,8 @@ aws --profile ci-runners --region us-east-1 autoscaling set-instance-health --he
 ```
 
 To stop taking jobs, send the jobs back to Blacksmith with the fleet switch (megpt-mono's `SUPERCI_JOBS`, which
-since #34100 routes a switched job to `superci-<N>cpu`); to stop launching at once,
+since #34100 routes a switched job to `superci-<N>cpu`; `tools/gate/canary.sh unset` deletes it and `canary.sh set '["test-go"]'`
+re-routes, both on the App's variables token, [below](#the-tools-read-github-on-the-apps-budget)); to stop launching at once,
 `curl -s -X POST 'localhost:8080/override?max=0'` (machines end as their jobs finish).
 
 **Resilience.** systemd restarts a process that crashes (5 s), and the health check (`deploy/health.sh`, every 15 s)
@@ -939,43 +940,64 @@ The gate, the timeline, the logs tool and the canary (`tools/gate/gate.py`, `too
 on the App's installation budget, not on the operator's personal token, which every session on the operator's host shares
 (it reached 0 on Nov 27 at 18:13Z, writes refused too, and a re-route and the canary's checks waited on it).
 
-- **How.** The listener's admin endpoint (`POST /github/token` on port 8080, `apptoken.go`) answers a read-only installation
-  token: narrowed to the config's repositories and to `actions: read`, held until under ten minutes remain, never logged, and
-  not served on the public port. The tools reach it through `deploy/ssh.sh`, so the App's key never leaves the listener and
-  the tools never read the SSM parameter. `tools/timeline/apptoken.py` keeps the token in the process's memory and gives it to
-  each `gh` call as `GH_TOKEN`; `canary.sh` takes it into a shell variable and sets it for each call. Nothing writes or prints it.
+- **How.** The listener's admin endpoint (`POST /github/token?scope=S` on port 8080, `apptoken.go`) answers an installation
+  token of one scope, held until under ten minutes remain (each scope separately), never logged, and not served on the public
+  port. A token has exactly one permission, so what leaves can do that and nothing else:
+
+  | Scope | Permission it is minted with | Repositories | Used for |
+  | --- | --- | --- | --- |
+  | `actions` (the default) | `actions: read` | the config's | runs, jobs, logs |
+  | `variables` | `actions_variables: write` (the App's "Variables" permission) | megpt-mono | `SUPERCI_JOBS`: the canary's checks, its rollback, `canary.sh set/unset` |
+  | `contents` | `contents: read` | megpt-mono | `scripts/verify/ci-limits.tsv` from main (`gate --limits FILE` makes no call) |
+
+  The tools reach it through `deploy/ssh.sh`, so the App's key never leaves the listener and the tools never read the SSM
+  parameter. `tools/timeline/apptoken.py` keeps each token in the process's memory and gives it to each `gh` call as
+  `GH_TOKEN`; `canary.sh` takes it into a shell variable and sets it for each call. Nothing writes or prints it.
+- **A scope the installation lacks.** The listener reads the installation's permissions with the App's JWT
+  (`GET /app/installations/<id>`, held for a minute) before it mints, and answers 422 naming the permission
+  (`"actions_variables: write"`, and what the installation holds) when it is missing or held at a lower level; GitHub's own 422 on the
+  narrowed mint is answered the same way. It never answers a broader token in its place, and an unknown scope is a 400.
 - **Refusal.** With no App token (ssh or the endpoint down, the permission not granted) `gate.py`, `timeline.py`, `logs.py` and
   `canary.sh` exit 2 and say why; they never fall back. A refusal in the middle of a command (a token refresh that fails during
   a long gate) is `apptoken.AppTokenRefused`, not a `SystemExit`, so no per-run "skip this run" catch can swallow it and judge a
-  sample that lost runs; each tool's `main` ends with exit 2. A message about a token never holds one (ssh failing after curl
+  sample that lost runs; each tool's `main` ends with exit 2. A refused contents token ends `gate job` the same way, and the
+  message says to pass `--limits FILE`. A message about a token never holds one (ssh failing after curl
   printed a token says only the exit code and status). `--personal-token` (`gate.py`, `timeline.py`, `logs.py`, before the
   subcommand for the first two) and `SUPERCI_PERSONAL_TOKEN=1 canary.sh` spend the shared personal budget on purpose and print
   that they do. `gate scale` reads no GitHub for a window the listener's job records cover, and refuses at its first call
-  otherwise. `SUPERCI_APP_TOKEN_CMD` (a stub for the ssh call) is honoured only with `SUPERCI_TEST=1`, which the tests set.
+  otherwise. `SUPERCI_APP_TOKEN_CMD` (a stub for the ssh call, which finds the scope in `SUPERCI_TOKEN_SCOPE`) is honoured only
+  with `SUPERCI_TEST=1`, which the tests set.
 - **The floor.** `canary.sh` reads `rate_limit` with the token its checks use, so its 1,500 floor is that token's own budget.
   A tick that cannot get a token is skipped and logged; the watch does not stop.
+- **The rollback never waits on the endpoint.** `canary.sh` keeps the variables token at most 300 s (the listener hands out a held
+  token with over 10 minutes left, so one may expire 10 minutes after the ask) and drops it when GitHub refuses a call made with it,
+  asks once more and tries again. Before its loop it reads `SUPERCI_JOBS` once and refuses to start when it cannot (an old listener
+  answers an actions token for `scope=variables`), so no watch runs that could not roll back. For a rollback it asks 3 times (each ask
+  bounded to 30 s, none repeated when the installation lacks the permission). When the token is refused, or GitHub refuses the write
+  with a fresh one, the rollback prints `ROLLBACK FAILED` with the cause (the listener would not give a token, the token expired, GitHub
+  refused it) on stdout and stderr and leaves SUPERCI_JOBS as it was (the next tick tries again), unless `SUPERCI_PERSONAL_TOKEN=1`:
+  then it asks the App once (10 s) and the write goes out on the personal token and prints
+  `personal-token exception SUPERCI_JOBS write`. A gate that exits 2 is logged `NO CHECK (...)`. `canary.sh set '["test-go"]'` and
+  `canary.sh unset` re-route by hand with the same token and fallback, and need no aws profile and no actions token.
 
-What each call needs (GitHub's documented permission names; the first column is what the tools call):
+What each call needs (GitHub's permission names; the first column is what the tools call):
 
 | Call | Permission it needs | Held by the App? |
 | --- | --- | --- |
 | workflow runs, run jobs, job logs, a run's head (`gh api repos/R/actions/...`) | Actions: read | yes (`actions: write` includes it) |
 | `rate_limit` | none | not applicable |
-| `ci-limits.tsv` from main (`gh api repos/R/contents/...`) | Contents: read | not documented: a named exception |
-| `SUPERCI_JOBS` read, set, delete (`repos/R/actions/variables/...`) | Variables: read and write | not documented: a named exception |
+| `ci-limits.tsv` from main (`gh api repos/R/contents/...`) | Contents: read (`contents`) | yes, since Nov 27 |
+| `SUPERCI_JOBS` read, set, delete (`repos/R/actions/variables/...`) | Variables: read and write (`actions_variables`) | yes, since Nov 27 |
 
-Personal-token exceptions (the only calls that use the personal token without `--personal-token`; each prints
+Personal-token exceptions (the only call that uses the personal token without `--personal-token`; it prints
 `personal-token exception <name>` when it runs, and the tests hold this list to the code):
 
-| Exception | Where | What the operator changes on the App to end it |
+| Exception | Where | When |
 | --- | --- | --- |
-| `ci-limits.tsv` | `gate.py` `gh_raw` (skipped by `--limits FILE`) | grant repository permission **Contents: read** |
-| `SUPERCI_JOBS` | `canary.sh` (every read, set and delete of the variable) | grant repository permission **Variables: read and write** |
+| `SUPERCI_JOBS write` | `canary.sh` (`personal_fallback`: a rollback's, a `set`'s or an `unset`'s write of the variable) | only with `SUPERCI_PERSONAL_TOKEN=1`, and only when the variables token is refused or GitHub refuses the write with it |
 
-To end an exception, grant the permission (the installation owner must accept it), then delete its row, its key in
-`EXCEPTIONS` (`tools/timeline/apptoken.py`) and its call sites' `exception=`/`personal`, and mint with the permission in
-`apptoken.go`. Until then a rollback's `gh variable set/delete` runs on the personal token, and fails with it (gh's error is in the
-canary's log) when its budget is gone: the operator then removes the job from `SUPERCI_JOBS` by hand.
+To end the exception, delete its row, its key in `EXCEPTIONS` (`tools/timeline/apptoken.py`) and its call site
+(`personal_fallback`), and the rollback then fails loudly whenever the variables token is not to be had.
 
 ## Cost
 

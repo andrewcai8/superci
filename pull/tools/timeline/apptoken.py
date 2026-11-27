@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
-"""apptoken: the token the gate, the timeline and the canary read GitHub with.
+"""apptoken: the token the gate, the timeline, the logs tool and the canary read and edit GitHub with.
 
-They read on the superci GitHub App's installation budget (5,000 an hour of its own), never on the personal token every
-session on the operator's host shares. The App's private key stays on the listener: this asks the listener's admin
-endpoint (`POST /github/token` on port 8080, reached through deploy/ssh.sh) for a short-lived read-only installation
-token, and keeps it in this process's memory only: a `gh` call gets it as GH_TOKEN in its own environment, nothing
-writes or prints it.
+They use the superci GitHub App's installation budget (5,000 an hour of its own), never the personal token every session on
+the operator's host shares. The App's private key stays on the listener: this asks the listener's admin endpoint
+(`POST /github/token?scope=S` on port 8080, reached through deploy/ssh.sh) for a short-lived installation token of one scope,
+and keeps it in this process's memory only: a `gh` call gets it as GH_TOKEN in its own environment, nothing writes or prints it.
 
-  apptoken.py            print the token on stdout, for `GH_TOKEN=$(apptoken.py) gh ...` (canary.sh); exit 2 with the reason when there is none
+  actions    actions: read on the configured repositories: runs, jobs, logs (the default)
+  variables  actions_variables: write on megpt-mono: reads and writes the SUPERCI_JOBS variable (canary.sh)
+  contents   contents: read on megpt-mono: scripts/verify/ci-limits.tsv (gate.py)
+
+  apptoken.py [SCOPE]    print the token on stdout, for `GH_TOKEN=$(apptoken.py variables) gh ...` (canary.sh); exit 2 with the reason when
+                         there is none, 3 when the installation lacks the scope's permission (asking again will not help)
 
 A caller that cannot get a token refuses (Auth.require); it never falls back to the personal token unless the operator
-said so (`--personal-token`, SUPERCI_PERSONAL_TOKEN=1), which is announced. The only other personal-token calls are the
-named EXCEPTIONS, each of a permission the App is not documented to hold; pull/README.md lists them and what the operator
-must grant to end each one.
+said so (`--personal-token`, SUPERCI_PERSONAL_TOKEN=1), which is announced. The one other personal-token call is the named
+EXCEPTION: canary.sh's write of SUPERCI_JOBS in a rollback or a re-route when the variables token is refused and the operator
+set SUPERCI_PERSONAL_TOKEN=1; pull/README.md lists it.
 
 SUPERCI_APP_TOKEN_CMD replaces the ssh call, and is honoured only when SUPERCI_TEST=1 is also set (the tests set both): a
-command whose stdout is the listener's answer, then a line with the HTTP status. Without the flag the variable is ignored, so
-an environment that happens to carry it cannot redirect where the tools take their tokens from.
+command whose stdout is the listener's answer, then a line with the HTTP status, and which finds the scope asked for in
+SUPERCI_TOKEN_SCOPE. Without the flag the variable is ignored, so an environment that happens to carry it cannot redirect
+where the tools take their tokens from. SUPERCI_TOKEN_TIMEOUT (seconds, default 90) bounds one ask.
 """
 import datetime as dt
 import json
@@ -28,19 +33,26 @@ import sys
 import threading
 import time
 
-# The calls that stay on the personal token: name -> (permission the App lacks, what the call is).
+# The scopes of the listener's /github/token: name -> (GitHub's permission key, the App permission as its settings page names it).
+SCOPES = {
+    "actions": ("actions: read", "Actions: read"),
+    "variables": ("actions_variables: write", "Variables: read and write"),
+    "contents": ("contents: read", "Contents: read"),
+}
+# The call that stays on the personal token: name -> (why the App's token is not used, what the call is). It is made by canary.sh
+# only with SUPERCI_PERSONAL_TOKEN=1, so a rollback is never stuck on the endpoint.
 EXCEPTIONS = {
-    "ci-limits.tsv": ("Contents: read", "reads scripts/verify/ci-limits.tsv from main (gate --limits FILE makes no call)"),
-    "SUPERCI_JOBS": ("Variables: read and write", "reads, and on a rollback edits or deletes, the repository variable SUPERCI_JOBS"),
+    "SUPERCI_JOBS write": ("the variables token was refused", "writes (sets or deletes) the repository variable SUPERCI_JOBS in a rollback or a re-route"),
 }
 RESERVE_S = 600  # a token must live this much longer to be used: a tool holds it for a whole command
 REFUSED = 2
+PERMANENT = 3  # the CLI's exit when the installation lacks the permission, which asking again will not change
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_ASK = "curl -s -m 20 -X POST -w '\\n%{http_code}' localhost:8080/github/token"
+_ASK = "curl -s -m 20 -X POST -w '\\n%{http_code}' 'localhost:8080/github/token?scope=@SCOPE@'"
 
 
 class NoAppToken(Exception):
-    pass
+    permanent = False  # the installation lacks the permission: asking again will not help
 
 
 class AppTokenRefused(Exception):
@@ -56,19 +68,28 @@ def _clean(text):
     return _TOKEN.sub("<token>", text)
 
 
-def _command():
+def _command(scope="actions"):
     override = os.environ.get("SUPERCI_APP_TOKEN_CMD") if os.environ.get("SUPERCI_TEST") == "1" else None
-    return shlex.split(override) if override else [os.path.join(_HERE, "..", "..", "deploy", "ssh.sh"), _ASK]
+    return shlex.split(override) if override else [os.path.join(_HERE, "..", "..", "deploy", "ssh.sh"), _ASK.replace("@SCOPE@", scope)]
+
+
+def _timeout():
+    try:
+        return max(1.0, float(os.environ.get("SUPERCI_TOKEN_TIMEOUT") or 90))
+    except ValueError:
+        return 90.0
 
 
 def _expiry(text):
     return dt.datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc).timestamp()
 
 
-def mint():
-    """(token, expires as epoch seconds) from the listener, or NoAppToken with why. The message never holds a token."""
+def mint(scope="actions"):
+    """(token, expires as epoch seconds) of a scope from the listener, or NoAppToken with why. The message never holds a token."""
+    if scope not in SCOPES:
+        raise ValueError(f"{scope} is not a token scope: {', '.join(SCOPES)}")
     try:
-        p = subprocess.run(_command(), capture_output=True, text=True, timeout=90)
+        p = subprocess.run(_command(scope), capture_output=True, text=True, timeout=_timeout(), env={**os.environ, "SUPERCI_TOKEN_SCOPE": scope})
     except (OSError, subprocess.SubprocessError) as e:
         raise NoAppToken(_clean(f"could not reach the listener: {e}")) from None
     body, _, status = p.stdout.rstrip("\n").rpartition("\n")
@@ -82,7 +103,9 @@ def mint():
         # What the listener said is quoted only for a refusal that holds no token: an answer that was a token (ssh failing after curl
         # printed it, say) is never repeated, and neither is any body that came with a 200.
         said = "" if token or status == "200" else _clean((body.strip() or p.stderr.strip())[:300])
-        raise NoAppToken(f"the listener's /github/token did not answer 200 (exit {p.returncode}, status {status[:20] or 'none'})" + (f": {said}" if said else ""))
+        err = NoAppToken(f"the listener's /github/token did not answer 200 (exit {p.returncode}, status {status[:20] or 'none'})" + (f": {said}" if said else ""))
+        err.permanent = status == "422" and not p.returncode
+        raise err
     if token is None:
         raise NoAppToken("the listener's /github/token answered something that is not a token")
     if not token:
@@ -90,10 +113,11 @@ def mint():
     return token, expires
 
 
-def refusal(why):
-    return _clean(f"refusing: no GitHub App token ({why}).\n"
+def refusal(why, scope="actions"):
+    named = "" if scope == "actions" else f" for {scope} ({SCOPES[scope][1]})"
+    return _clean(f"refusing: no GitHub App token{named} ({why}).\n"
             "The gate reads GitHub on the superci App's budget, not on the personal token every session on this host shares.\n"
-            "Make the listener's admin endpoint answer (deploy/ssh.sh, `curl -X POST localhost:8080/github/token`), or pass --personal-token "
+            f"Make the listener's admin endpoint answer (deploy/ssh.sh, `curl -X POST 'localhost:8080/github/token?scope={scope}'`), or pass --personal-token "
             "(SUPERCI_PERSONAL_TOKEN=1 for canary.sh) to spend the shared personal budget knowingly.")
 
 
@@ -101,13 +125,14 @@ class Auth:
     """Where a `gh` call gets its credential. App by default; personal only when asked, or for a named exception."""
 
     def __init__(self):
-        self.personal, self._token, self._expires, self._lock = False, None, 0.0, threading.Lock()
+        self.personal, self._tokens, self._lock = False, {}, threading.Lock()
 
-    def token(self):
+    def token(self, scope="actions"):
         with self._lock:
-            if self._token is None or self._expires - time.time() < RESERVE_S:
-                self._token, self._expires = mint()
-            return self._token
+            held = self._tokens.get(scope)
+            if held is None or held[1] - time.time() < RESERVE_S:
+                held = self._tokens[scope] = mint(scope)
+            return held[0]
 
     def require(self):
         """Settles the credential before any call: the App's token, or the announced override. Raises AppTokenRefused without either."""
@@ -119,23 +144,23 @@ class Auth:
         except NoAppToken as e:
             raise AppTokenRefused(refusal(e)) from None
 
-    def env(self, exception=None):
+    def env(self, exception=None, scope="actions"):
         """The environment of a `gh` call, or None to leave the caller's (the personal credential)."""
         if exception is not None:
             if exception not in EXCEPTIONS:
                 raise ValueError(f"{exception} is not a named personal-token exception")
-            permission, what = EXCEPTIONS[exception]
-            print(f"personal-token exception {exception}: the App lacks {permission}; this call {what} on the shared personal budget", file=sys.stderr)
+            why, what = EXCEPTIONS[exception]
+            print(f"personal-token exception {exception}: {why}; this call {what} on the shared personal budget", file=sys.stderr)
             return None
         if self.personal:
             return None
         try:
-            return {**os.environ, "GH_TOKEN": self.token()}
+            return {**os.environ, "GH_TOKEN": self.token(scope)}
         except NoAppToken as e:
-            raise AppTokenRefused(refusal(e)) from None
+            raise AppTokenRefused(refusal(e, scope)) from None
 
-    def gh(self, args, exception=None):
-        env = self.env(exception)
+    def gh(self, args, exception=None, scope="actions"):
+        env = self.env(exception, scope)
         return subprocess.run(["gh", *args], capture_output=True, text=True, **({"env": env} if env is not None else {}))
 
 
@@ -154,11 +179,15 @@ AUTH = Auth()
 
 
 if __name__ == "__main__":
+    scope = sys.argv[1] if len(sys.argv) > 1 else "actions"
+    if len(sys.argv) > 2 or scope not in SCOPES:
+        print(f"usage: apptoken.py [{'|'.join(SCOPES)}]", file=sys.stderr)
+        sys.exit(REFUSED)
     if sys.stdout.isatty():
         print("refusing: the token would print on the terminal; capture it: GH_TOKEN=$(apptoken.py) gh ...", file=sys.stderr)
         sys.exit(REFUSED)
     try:
-        sys.stdout.write(mint()[0])
+        sys.stdout.write(mint(scope)[0])
     except NoAppToken as e:
-        print(refusal(e), file=sys.stderr)
-        sys.exit(REFUSED)
+        print(refusal(e, scope), file=sys.stderr)
+        sys.exit(PERMANENT if e.permanent else REFUSED)
