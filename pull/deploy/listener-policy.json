@@ -55,11 +55,11 @@
       "Condition": { "StringEquals": { "aws:ResourceTag/purpose": "superci-pull" } }
     },
     {
-      "Sid": "NeverTheListenersOwnTemplate",
+      "Sid": "NeverTheListenersOrTheIdentityHostsTemplate",
       "Effect": "Deny",
       "Action": ["ec2:CreateFleet", "ec2:RunInstances", "ec2:CreateLaunchTemplateVersion", "ec2:ModifyLaunchTemplate", "ec2:DeleteLaunchTemplate"],
       "Resource": "arn:aws:ec2:*:243891825325:launch-template/*",
-      "Condition": { "StringEquals": { "aws:ResourceTag/superci-pull-role": "listener" } }
+      "Condition": { "StringEquals": { "aws:ResourceTag/superci-pull-role": ["listener", "identity"] } }
     },
     {
       "Sid": "TagOnlyWhileCreating",

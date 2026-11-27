@@ -1,7 +1,8 @@
 #!/bin/bash
 echo "systemctl $*" >> "$FAKE/systemctl.log"
 case $1 in
-  enable|start) for a in "$@"; do case $a in superci-id@*) echo "${a#superci-id@}" >> "$FAKE_UNITS" ;; esac; done ;;
-  list-units) [ -e "$FAKE_UNITS" ] && sed 's/.*/superci-id@& running/' "$FAKE_UNITS" ;;
+  enable|start) [ -e "$FAKE/units-wont-start" ] || for a in "$@"; do case $a in superci-id@*) echo "${a#superci-id@}" >> "$FAKE_UNITS" ;; esac; done ;;
+  stop) for a in "$@"; do case $a in "superci-id@*") : > "$FAKE_UNITS" ;; esac; done ;; # (every listener stops; Restart=always does not undo a stop)
+  list-units) [ -e "$FAKE_UNITS" ] && sort -u "$FAKE_UNITS" | sed 's/.*/superci-id@& running/' ;;
 esac
 exit 0

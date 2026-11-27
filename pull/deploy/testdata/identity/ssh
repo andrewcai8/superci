@@ -14,7 +14,7 @@ for f in sorted(os.listdir(sys.argv[1])):
 cmd=$(sed -e 's|sudo ||g' -e "s|/usr/local/bin/|$H/bin/|g" -e "s|/run/|$H/run/|g" <<< "$*")
 [ -e "$H/conf" ] || printf 'BUCKET=superci-pull-identities-243891825325\nDEPLOYMENT=superci-pull\nRELEASE=superci-pull-243891825325\nKMS_KEY=arn:aws:kms:us-east-1:243891825325:key/1234abcd-12ab-34cd-56ef-1234567890ab\n' > "$H/conf"
 export PATH=$H/bin:$PATH ID_ROOT=$H/opt/id RUNNER_SRC=$FAKE_RUNNER SHIM_BIN=$H/shim SHIM_ENV=$H/shim.env ID_CONF=$H/conf UNIT_DIR=$H/units \
-  ID_LOG=$H/log ID_AZ=$az PROC_ROOT=$H/proc FS_ROOT=$H ID_LOCK=$H/run/superci-id.lock READY_FILE=$H/run/superci-id-ready FAKE_UNITS=$H/enabled
+  ID_LOG=$H/log ID_AZ=$az PROC_ROOT=$H/proc FS_ROOT=$H ID_LOCK=$H/run/superci-id.lock READY_FILE=$H/run/superci-id-ready BOOTING_FILE=$H/run/superci-id-booting FAKE_UNITS=$H/enabled
 # a host that hangs on a registration (its ssh never answers) while $FAKE/ssh-hang exists
 if [ -e "$FAKE/ssh-hang" ] && grep -q 'superci-id register' <<< "$cmd"; then exec python3 -I -c 'import time; time.sleep(30)'; fi
 [ -e "$H/shim" ] || printf '#!/bin/sh\n' > "$H/shim"; chmod 755 "$H/shim"
