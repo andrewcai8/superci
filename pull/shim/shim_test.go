@@ -13,12 +13,14 @@ import (
 	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"io"
 	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -150,6 +152,9 @@ func newFake(t *testing.T, handle func(c *fconn)) *fakeDispatcher {
 				f.reqs = append(f.reqs, c)
 				f.mu.Unlock()
 				f.handle(c)
+				// Closing with the shim's PINGs unread makes TCP reset the connection, which discards the frames the shim has yet to read.
+				raw.SetReadDeadline(time.Now().Add(2 * time.Second))
+				io.Copy(io.Discard, br)
 			}()
 		}
 	}()
@@ -458,9 +463,14 @@ func TestAWrongPinConnectsToNothing(t *testing.T) {
 
 func TestAFrameOutsideItsBoundEndsTheConnectionUnread(t *testing.T) {
 	bad := map[string]func(c *fconn){
-		"stdout over 1 MiB":    func(c *fconn) { c.header(typeStdout, maxOutFrame+1) },
-		"stderr over 1 MiB":    func(c *fconn) { c.header(typeStderr, 1<<31) },
-		"info over 4 KiB":      func(c *fconn) { c.header(typeInfo, maxInfoFrame+1) },
+		"stdout over 1 MiB": func(c *fconn) { c.header(typeStdout, maxOutFrame+1) },
+		"stderr over 1 MiB": func(c *fconn) { c.header(typeStderr, 1<<31) },
+		"info over 4 KiB":   func(c *fconn) { c.header(typeInfo, maxInfoFrame+1) },
+		"a 65th info frame": func(c *fconn) {
+			for i := 0; i <= maxInfoFrames; i++ {
+				c.send(typeInfo, []byte(`{}`))
+			}
+		},
 		"exit of 3 bytes":      func(c *fconn) { c.send(typeExit, []byte{1, 0, 0}) },
 		"exit of 5 bytes":      func(c *fconn) { c.send(typeExit, []byte{1, 0, 0, 0, 0}) },
 		"unknown type":         func(c *fconn) { c.header(99, 0) },
@@ -518,7 +528,7 @@ func TestOutputPastItsBudgetIsDroppedAndTheRestStillArrives(t *testing.T) {
 func TestInfoFramesAtTheirBoundAreTaken(t *testing.T) {
 	g := newRig(t, "", func(c *fconn) {
 		c.up()
-		for i := 0; i < maxInfoFrames+10; i++ {
+		for i := 0; i < maxInfoFrames; i++ {
 			c.send(typeInfo, bytes.Repeat([]byte("i"), maxInfoFrame))
 		}
 		c.send(typeExit, exitFrame(7))
@@ -637,5 +647,63 @@ func TestTheRunnerFileIsBesideBinAndLosesItsByteOrderMark(t *testing.T) {
 	got, err := readRunner(p)
 	if err != nil || string(got) != `{"agentId":1}` {
 		t.Errorf("%q %v", got, err)
+	}
+}
+
+func TestWhatAMachineHasTakenIsNoLongerHeldSoALargeJobMessageFlows(t *testing.T) {
+	const total = 1 << 20
+	g := newRig(t, "", func(c *fconn) {
+		c.up()
+		c.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		c.pipeUntil(t, "first")
+		c.send(typePaired, paired("i-1", "t"))
+		c.pipeUntil(t, "last")
+		c.send(typeExit, exitFrame(100))
+	})
+	g.s.ob = newOutbox(256 << 10)
+	go func() {
+		g.pipe.WriteString("first")
+		g.pipe.Write(bytes.Repeat([]byte("p"), total))
+		g.pipe.WriteString("last")
+	}()
+	if code := g.run(t); code != 100 {
+		t.Fatalf("exit %d", code)
+	}
+	g.s.ob.mu.Lock()
+	defer g.s.ob.mu.Unlock()
+	if len(g.s.ob.hist) != 0 {
+		t.Errorf("%d chunks of what a machine took are still held", len(g.s.ob.hist))
+	}
+}
+
+func TestTheIdentityDocumentIsFetchedWithoutAProxy(t *testing.T) {
+	d, err := newDialer(config{Listener: "https://127.0.0.1:1", Pin: "sha256//" + base64.StdEncoding.EncodeToString(make([]byte, 32))}, nil, "http://169.254.169.254")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr, ok := d.http.Transport.(*http.Transport)
+	if !ok || tr.Proxy != nil {
+		t.Errorf("the IMDS client's transport %#v can use a proxy from the environment", d.http.Transport)
+	}
+}
+
+func TestMainSurvivesAClosedStderr(t *testing.T) {
+	if os.Getenv("SHIM_MAIN_HELPER") == "1" {
+		os.Args = []string{"Runner.Worker"}
+		main()
+		return
+	}
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Close()
+	defer w.Close()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestMainSurvivesAClosedStderr$")
+	cmd.Env = append(os.Environ(), "SHIM_MAIN_HELPER=1")
+	cmd.Stderr = w
+	var ee *exec.ExitError
+	if err := cmd.Run(); !errors.As(err, &ee) || ee.ExitCode() != 1 {
+		t.Fatalf("the shim with a closed stderr ended with %v, want its own exit 1 and not SIGPIPE", err)
 	}
 }

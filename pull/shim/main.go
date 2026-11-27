@@ -22,10 +22,12 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -141,7 +143,7 @@ func newDialer(c config, runner []byte, imds string) (*dialer, error) {
 		return nil, err
 	}
 	return &dialer{host: host, pins: pins, label: c.Label, runner: runner, imds: imds, timeout: 15 * time.Second,
-		http: &http.Client{Timeout: 5 * time.Second}}, nil
+		http: &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{Proxy: nil}}}, nil
 }
 
 // identityDocument is the instance identity document EC2 signed for this host, from IMDSv2.
@@ -533,6 +535,10 @@ func (s *shim) serve(ctx context.Context, conn net.Conn, br *bufio.Reader) (code
 				s.logf("refused a %d-byte INFO frame", n)
 				return 0, false, progressed
 			}
+			if s.info >= maxInfoFrames {
+				s.logf("refused an INFO frame past the %d a job may send", maxInfoFrames)
+				return 0, false, progressed
+			}
 			if _, err := io.CopyN(io.Discard, br, int64(n)); err != nil {
 				return 0, false, progressed
 			}
@@ -602,6 +608,9 @@ func readRunner(path string) ([]byte, error) {
 }
 
 func main() {
+	// A write to a closed stdout or stderr kills a Go program with SIGPIPE; the listener closing its end of the Worker's
+	// output must not end the job (lenient drops the error).
+	signal.Ignore(syscall.SIGPIPE)
 	if len(os.Args) != 4 || !strings.EqualFold(os.Args[1], "spawnclient") {
 		fmt.Fprintln(os.Stderr, "superci-shim: usage: Runner.Worker spawnclient <inHandle> <outHandle>")
 		os.Exit(1)

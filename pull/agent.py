@@ -51,6 +51,8 @@ class Config:
     renew_every: float = 60
     exit_settle: float = 10  # an EXIT sent and not answered by a reset or a close in this long is taken as delivered
     hydrate_timeout: float = 10
+    first_message_wait: float = 60  # how long after JOB the listener's job message may take to arrive whole
+    renew_context: ssl.SSLContext | None = None  # the TLS settings of the renewal; None is the system's trust (tests)
 
     @property
     def runner_file(self):
@@ -114,6 +116,11 @@ def http_get(opener, url, headers=None, method="GET", timeout=5):
 NO_PROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None  # the job's token goes to the run service it names and nowhere else
+
+
 def imds(cfg, path):
     token = http_get(NO_PROXY, cfg.imds + "/latest/api/token", {"X-aws-ec2-metadata-token-ttl-seconds": "600"}, "PUT")
     return http_get(NO_PROXY, cfg.imds + path, {"X-aws-ec2-metadata-token": token})
@@ -127,10 +134,9 @@ def upgrade(cfg, doc, path, resume=None):
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE  # the listener's certificate is self-issued: its key is what is pinned
+    raw = socket.create_connection((u.hostname, u.port or 443), timeout=10)
     # A close without the TLS close_notify (a crashed dispatcher, a reset) must not read as the clean close that tells the
     # agent its EXIT was relayed.
-    ctx.options &= ~ssl.OP_IGNORE_UNEXPECTED_EOF
-    raw = socket.create_connection((u.hostname, u.port or 443), timeout=10)
     s = ctx.wrap_socket(raw, suppress_ragged_eofs=False)
     try:
         if not pin_matches(s.getpeercert(binary_form=True), cfg.pin):
@@ -222,10 +228,13 @@ class Agent:
         self.pipe_lock = threading.Lock()
         self.first = FirstMessage()
         self.out_sent = 0
+        self.out_lock = threading.Lock()  # the stdout and stderr pumps share the budget
         self.last_mark = time.monotonic()
         self.exit_code = None
         self.exit_sent_on = None
         self.exit_sent_at = 0.0
+        self.exit_lock = threading.Lock()
+        self.no_message = False
         self.worker_done = threading.Event()
         self.finished = threading.Event()  # nothing more to ask of the dispatcher
         self.delivered = False
@@ -329,7 +338,7 @@ class Agent:
                                          stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, **self.as_runner())
         except OSError as e:
             log(f"the Worker did not start: {type(e).__name__}")
-            for fd in (r_in, w_in, r_out, w_out):
+            for fd in (w_in, r_out):  # the finally below closes the other two
                 os.close(fd)
             self.exit_code = 1
             self.job_taken.set()
@@ -345,16 +354,18 @@ class Agent:
         self.threads = [threading.Thread(target=self.pump_out, args=(self.proc.stdout, STDOUT), daemon=True),
                         threading.Thread(target=self.pump_out, args=(self.proc.stderr, STDERR), daemon=True),
                         threading.Thread(target=self.drain, args=(r_out,), daemon=True),
-                        threading.Thread(target=self.renew_loop, daemon=True)]
+                        threading.Thread(target=self.renew_loop, daemon=True),
+                        threading.Thread(target=self.first_message_watch, daemon=True)]
         for t in self.threads:
             t.start()
         self.job_taken.set()
 
     def pump_out(self, src, typ):
         for chunk in iter(lambda: src.read1(OUT_CHUNK), b""):
-            if self.out_sent + len(chunk) > OUT_BUDGET:
-                continue  # the dispatcher drops it past the budget; the Worker must still never block on its pipe
-            self.out_sent += len(chunk)
+            with self.out_lock:
+                if self.out_sent + len(chunk) > OUT_BUDGET:
+                    continue  # the dispatcher drops it past the budget; the Worker must still never block on its pipe
+                self.out_sent += len(chunk)
             self.send(typ, chunk)
 
     @staticmethod
@@ -387,12 +398,17 @@ class Agent:
                 log("no renewal: the job message names no run service")
             return
         url, token, plan, job = self.first.renewal
+        if urllib.parse.urlsplit(url).scheme != "https":
+            log("no renewal: the job message names a run service that is not https")
+            return
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=self.cfg.renew_context),
+                                             NoRedirect)
         body = json.dumps({"planId": plan, "jobId": job}).encode()
         while True:
             req = urllib.request.Request(url, data=body, method="POST", headers={
                 "Content-Type": "application/json", "Accept": "application/json", "Authorization": "Bearer " + token})
             try:
-                NO_PROXY.open(req, timeout=30).close()
+                opener.open(req, timeout=30).close()
             except urllib.error.HTTPError as e:
                 if e.code == 404:
                     log("the job is no longer valid: no more renewals")
@@ -401,6 +417,21 @@ class Agent:
             except (OSError, ValueError) as e:
                 log(f"renew: {type(e).__name__}")
             if self.worker_done.wait(self.cfg.renew_every):
+                return
+
+    def first_message_watch(self):
+        """A job message lost between the dispatcher's pairing and its forwarding leaves the Worker reading an empty pipe
+        while the identity's listener keeps renewing the job. Ends the Worker, and with it the job, if the message does not
+        arrive whole in time."""
+        deadline = time.monotonic() + self.cfg.first_message_wait
+        while not self.first.done:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                log("no job message arrived: ending the job")
+                self.no_message = True
+                self.proc.kill()
+                return
+            if self.worker_done.wait(min(left, 0.05)):
                 return
 
     def ping_loop(self):
@@ -441,11 +472,12 @@ class Agent:
     def send_exit(self, s):
         """Sends the EXIT on s, once. Half-closing a TLS socket would end its reads, so the connection stays open: the
         dispatcher closes it after relaying."""
-        if self.sock is not s or self.exit_sent_on is s:
-            return
-        if self.send(EXIT, struct.pack("<i", self.exit_code)):
-            self.exit_sent_on = s
-            self.exit_sent_at = time.monotonic()
+        with self.exit_lock:
+            if self.sock is not s or self.exit_sent_on is s:
+                return
+            if self.send(EXIT, struct.pack("<i", self.exit_code)):
+                self.exit_sent_on = s
+                self.exit_sent_at = time.monotonic()
 
     def connect_loop(self):
         outage = time.monotonic()
@@ -507,7 +539,7 @@ class Agent:
                 os.close(self.w_in)
                 self.w_in = None
             self.mark("worker.exit", code)
-            self.exit_code = code if code >= 0 else 128 - code
+            self.exit_code = 1 if self.no_message else code if code >= 0 else 128 - code
         self.worker_done.set()
         self.deliver_exit()
         self.finished.set()

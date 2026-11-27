@@ -5,6 +5,8 @@ import http.server
 import importlib.util
 import json
 import os
+import types
+import unittest.mock
 import shutil
 import socket
 import ssl
@@ -209,6 +211,7 @@ class Imds(http.server.BaseHTTPRequestHandler):
 class RunService(http.server.BaseHTTPRequestHandler):
     calls = []
     status = 200
+    redirect = None
 
     def log_message(self, *a):
         pass
@@ -216,10 +219,26 @@ class RunService(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get("Content-Length", "0"))
         type(self).calls.append((self.path, self.headers.get("Authorization"), json.loads(self.rfile.read(n))))
+        if type(self).redirect:
+            self.send_response(302)
+            self.send_header("Location", type(self).redirect)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         self.send_response(type(self).status)
         self.send_header("Content-Length", "2")
         self.end_headers()
         self.wfile.write(b"{}")
+
+    def do_GET(self):
+        type(self).calls.append((self.path, self.headers.get("Authorization"), None))
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+
+class PlainService(RunService):
+    calls = []
 
 
 WORKER = """#!/bin/bash
@@ -254,9 +273,20 @@ class AgentCase(unittest.TestCase):
         self.addCleanup(self.imds.shutdown)
         RunService.calls = []
         RunService.status = 200
+        RunService.redirect = None
+        PlainService.calls = []
         self.runsvc = http.server.ThreadingHTTPServer(("127.0.0.1", 0), RunService)
+        tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls.load_cert_chain(os.path.join(CERT_DIR, "cert.pem"), os.path.join(CERT_DIR, "key.pem"))
+        self.runsvc.socket = tls.wrap_socket(self.runsvc.socket, server_side=True)
         threading.Thread(target=self.runsvc.serve_forever, daemon=True).start()
         self.addCleanup(self.runsvc.shutdown)
+        self.plainsvc = http.server.ThreadingHTTPServer(("127.0.0.1", 0), PlainService)
+        threading.Thread(target=self.plainsvc.serve_forever, daemon=True).start()
+        self.addCleanup(self.plainsvc.shutdown)
+        self.trust = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        self.trust.check_hostname = False
+        self.trust.verify_mode = ssl.CERT_NONE  # the run service's certificate is the test's own
         self.disp = None
         self.agent = None
         self.result = {}
@@ -278,10 +308,10 @@ class AgentCase(unittest.TestCase):
         return self.disp
 
     def config(self, **kw):
-        cfg = dict(listener=f"https://127.0.0.1:{self.disp.port}", pin=PIN, imds=f"http://127.0.0.1:{self.imds.server_port}",
+        cfg = dict(listener=f"https://127.0.0.1:{self.disp.port if self.disp else 1}", pin=PIN, imds=f"http://127.0.0.1:{self.imds.server_port}",
                    home=self.home, user=None, spool=self.spool, environment=os.path.join(self.tmp, "environment"),
                    ping_every=0.05, silence=5, window=1.0, wait_window=1.0, retry=0.02, renew_every=0.05, exit_settle=0.3,
-                   hydrate_timeout=5)
+                   hydrate_timeout=5, renew_context=self.trust)
         cfg.update(kw)
         return agent.Config(**cfg)
 
@@ -522,7 +552,7 @@ class TestRenewal(AgentCase):
         return struct.pack("<ii", 1, len(raw)) + raw
 
     def test_the_job_is_renewed_with_its_own_token(self):
-        msg = self.message(f"http://127.0.0.1:{self.runsvc.server_port}/abc/")
+        msg = self.message(f"https://127.0.0.1:{self.runsvc.server_port}/abc/")
 
         def handler(c):
             c.up()
@@ -541,7 +571,7 @@ class TestRenewal(AgentCase):
 
     def test_a_job_the_service_no_longer_knows_is_not_renewed_again(self):
         RunService.status = 404
-        msg = self.message(f"http://127.0.0.1:{self.runsvc.server_port}/abc/")
+        msg = self.message(f"https://127.0.0.1:{self.runsvc.server_port}/abc/")
 
         def handler(c):
             c.up()
@@ -574,6 +604,250 @@ class TestRenewal(AgentCase):
         for url, want in [("https://x/y/", "https://x/y/renewjob"), ("https://x/y", "https://x/renewjob")]:
             self.assertEqual(agent.FirstMessage.extract({"Plan": {"PlanId": "p"}, "JobId": "j", "Resources": {"Endpoints": [
                 {"Name": "systemvssconnection", "Url": url, "Authorization": {"Parameters": {"accesstoken": "t"}}}]}})[0], want)
+
+
+class TestRenewalLimits(AgentCase):
+    message = TestRenewal.message
+
+    def held_job(self, url, **start):
+        msg = self.message(url)
+
+        def handler(c):
+            c.up()
+            c.job()
+            c.send(agent.PIPE, msg)
+            c.until_exit()
+        self.dispatcher(handler)
+        self.dotenv(WANT=str(len(msg)), HOLD=self.hold)
+        self.start(**start)
+        wait_for(lambda: self.agent is not None and hasattr(self.agent, "threads"), "the job to start")
+
+    def test_renewal_stops_once_the_worker_has_exited(self):
+        self.held_job(f"https://127.0.0.1:{self.runsvc.server_port}/abc/")
+        wait_for(lambda: len(RunService.calls) >= 2, "two renewals")
+        open(self.hold, "w").close()
+        self.finish()
+        wait_for(lambda: not self.agent.threads[3].is_alive(), "the renewals to stop", timeout=3)
+
+    def test_a_job_token_never_goes_over_plain_http(self):
+        self.held_job(f"http://127.0.0.1:{self.plainsvc.server_port}/abc/")
+        wait_for(lambda: not self.agent.threads[3].is_alive(), "the renewal thread to give up", timeout=3)
+        open(self.hold, "w").close()
+        self.finish()
+        self.assertEqual(PlainService.calls, [])
+
+    def test_a_redirect_from_the_run_service_is_not_followed(self):
+        RunService.redirect = f"https://127.0.0.1:{self.runsvc.server_port}/stolen"
+        self.held_job(f"https://127.0.0.1:{self.runsvc.server_port}/abc/")
+        wait_for(lambda: len(RunService.calls) >= 3, "three renewals")
+        open(self.hold, "w").close()
+        self.finish()
+        self.assertEqual({path for path, _, _ in RunService.calls}, {"/abc/renewjob"}, "the token followed a redirect")
+
+    def test_a_message_over_its_bound_is_dropped_unread(self):
+        m = agent.FirstMessage()
+        m.feed(struct.pack("<ii", 1, agent.MAX_MESSAGE + 1) + b"x" * 100)
+        self.assertTrue(m.done)
+        self.assertIsNone(m.renewal)
+        m.feed(b"y" * 1000)
+        self.assertEqual(len(m.buf), 0)
+        at_bound = agent.FirstMessage()
+        at_bound.feed(struct.pack("<ii", 1, agent.MAX_MESSAGE))
+        self.assertFalse(at_bound.done, "a message at its bound is still read")
+
+
+class TestFirstMessage(AgentCase):
+    def test_a_job_whose_message_never_arrives_is_ended_with_one(self):
+        got = {}
+
+        def handler(c):
+            c.up()
+            c.job()
+            got["code"] = c.until_exit()
+        self.dispatcher(handler)
+        self.put_exec(os.path.join(self.home, "bin", "Runner.Worker"), '#!/bin/bash\nexec head -c 1 <&"$2"\n')
+        self.start(first_message_wait=0.3)
+        self.assertEqual(self.finish(timeout=8), 0, "the exit was delivered")
+        self.assertEqual(got["code"], 1)
+
+    def test_a_message_that_arrived_whole_is_not_timed_out(self):
+        msg = TestRenewal.message(self, f"https://127.0.0.1:{self.runsvc.server_port}/abc/")
+        got = {}
+
+        def handler(c):
+            c.up()
+            c.job()
+            c.send(agent.PIPE, msg)
+            got["code"] = c.until_exit()
+        self.dispatcher(handler)
+        self.dotenv(WANT=str(len(msg)), HOLD=self.hold)
+        self.start(first_message_wait=0.2)
+        wait_for(lambda: len(RunService.calls) >= 1, "a renewal")
+        threading.Event().wait(0.6)
+        self.assertIsNone(self.agent.proc.poll(), "the Worker was ended after its message arrived")
+        open(self.hold, "w").close()
+        self.finish()
+        self.assertEqual(got["code"], 100)
+
+
+class TestDelivery(AgentCase):
+    def test_a_clean_close_before_the_exit_is_a_break_to_resume_not_a_delivery(self):
+        got = {}
+
+        def handler(c):
+            c.up()
+            if c.n == 0:
+                c.job(token="tok-3")
+                c.send(agent.PIPE, b"x")
+                wait_for(lambda: "worker" in self.lines(self.log), "worker")
+                return
+            got["resume"] = c.headers.get("x-superci-resume")
+            got["code"] = c.until_exit()
+        self.dispatcher(handler)
+        self.dotenv(WANT="1", HOLD=self.hold)
+        self.start()
+        wait_for(lambda: len(self.disp.conns) >= 2, "a resumed connection", timeout=5)
+        open(self.hold, "w").close()
+        self.assertEqual(self.finish(), 0)
+        self.assertEqual(got, {"resume": f"{INSTANCE}.tok-3", "code": 100})
+
+    def test_an_exit_the_dispatcher_leaves_open_counts_as_delivered_after_the_settle(self):
+        open_ = threading.Event()
+        self.addCleanup(open_.set)
+
+        def handler(c):
+            c.up()
+            c.job()
+            c.send(agent.PIPE, b"x")
+            c.until_exit()
+            open_.wait(10)
+        self.dispatcher(handler)
+        self.dotenv(WANT="1")
+        self.start(window=5, exit_settle=0.3)
+        started = time.monotonic()
+        self.assertEqual(self.finish(), 0)
+        self.assertLess(time.monotonic() - started, 4, "waited out the resume window")
+
+    def test_an_exit_no_connection_took_makes_the_agent_fail(self):
+        def handler(c):
+            if c.n > 0:
+                c.status(410)
+                return
+            c.up()
+            c.job()
+            c.send(agent.PIPE, b"x")
+            wait_for(lambda: "worker" in self.lines(self.log), "worker")
+            c.drop()
+        self.dispatcher(handler)
+        self.dotenv(WANT="1", HOLD=self.hold)
+        self.start()
+        wait_for(lambda: self.agent.finished.is_set(), "the dispatcher to refuse the resume", timeout=5)
+        open(self.hold, "w").close()
+        self.assertEqual(self.finish(), 1)
+
+    def test_the_exit_is_sent_once_per_connection_whoever_asks(self):
+        a = agent.Agent(self.config())
+        a.exit_code = 1
+        a.sock = s = object()
+        sent = []
+
+        def slow_send(typ, payload=b""):
+            sent.append(typ)
+            time.sleep(0.1)
+            return True
+        a.send = slow_send
+        threads = [threading.Thread(target=a.send_exit, args=(s,)) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(sent, [agent.EXIT])
+
+    def test_the_output_budget_holds_when_stdout_and_stderr_race(self):
+        class Racy(agent.Agent):
+            _sent = 0
+
+            @property
+            def out_sent(self):
+                v = self._sent
+                time.sleep(0.0002)
+                return v
+
+            @out_sent.setter
+            def out_sent(self, v):
+                self._sent = v
+
+        a = Racy(self.config())
+        sent = []
+        a.send = lambda typ, payload=b"": sent.append(len(payload)) or True
+
+        class Src:
+            def __init__(self):
+                self.left = 6 << 20
+
+            def read1(self, n):
+                n = min(n, self.left)
+                self.left -= n
+                return b"x" * n
+
+        threads = [threading.Thread(target=a.pump_out, args=(Src(), typ)) for typ in (agent.STDOUT, agent.STDERR)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertLessEqual(sum(sent), agent.OUT_BUDGET)
+
+
+class TestWorkerStart(AgentCase):
+    RUNNER = types.SimpleNamespace(pw_uid=41001, pw_gid=41002)
+
+    def start_as_runner(self, popen):
+        a = agent.Agent(self.config(user="runner"))
+        ran = []
+
+        def run(*args, **kw):
+            ran.append(kw)
+            raise OSError("not run")
+        job = json.dumps({"runner": "{}", "token": "t"})
+        with unittest.mock.patch.object(agent.pwd, "getpwnam", return_value=self.RUNNER), \
+                unittest.mock.patch.object(os, "getgrouplist", return_value=[41002, 41003]), \
+                unittest.mock.patch.object(os, "chown"), \
+                unittest.mock.patch.object(agent.subprocess, "run", run), \
+                unittest.mock.patch.object(agent.subprocess, "Popen", popen):
+            a.start_job(job)
+        return a, ran
+
+    def test_the_hydration_stop_and_the_worker_run_as_the_runner_user_not_root(self):
+        popped = []
+
+        def popen(*args, **kw):
+            popped.append(kw)
+            raise OSError("not started")
+        a, ran = self.start_as_runner(popen)
+        want = dict(user=41001, group=41002, extra_groups=[41002, 41003])
+        for kw in ran + popped:
+            self.assertEqual({k: kw.get(k) for k in want}, want)
+        self.assertEqual((len(ran), len(popped)), (1, 1))
+        self.assertEqual(agent.Agent(self.config()).as_runner(), {}, "a test config runs as the agent's own user")
+
+    def test_a_worker_that_does_not_start_closes_each_of_its_pipes_once(self):
+        def popen(*args, **kw):
+            raise OSError("not started")
+        closed, made = [], []
+        real_close, real_pipe = os.close, os.pipe
+
+        def pipe():
+            made.extend(real_pipe())
+            return made[-2:]
+
+        def close(fd):
+            if made:
+                closed.append(fd)
+            real_close(fd)
+        with unittest.mock.patch.object(os, "close", close), unittest.mock.patch.object(os, "pipe", pipe):
+            a, _ = self.start_as_runner(popen)
+        self.assertEqual(sorted(closed), sorted(made), "a pipe end was left open or closed twice")
+        self.assertEqual(a.exit_code, 1)
 
 
 if __name__ == "__main__":
