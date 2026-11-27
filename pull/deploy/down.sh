@@ -1,8 +1,8 @@
 #!/bin/bash
 # Removes everything superci-pull made: the scale sets at GitHub (deleted by the listener with its own credentials),
-# the listener's group, then every resource tagged purpose=superci-pull in us-east-1 and us-east-2 (machines, launch
-# templates, security groups, the key pair, the address, the parameters, the bucket, alarms and topic) and the
-# listener's role. Touches nothing else.
+# the listener's group and the identity hosts' groups, then every resource tagged purpose=superci-pull in us-east-1 and
+# us-east-2 (machines, launch templates, security groups, the key pair, the address, the parameters, the bucket, alarms
+# and topic) and the listener's role. Touches nothing else.
 #
 #   pull/deploy/down.sh [ssh command for the listener, pull/deploy/ssh.sh by default]
 set -uo pipefail
@@ -14,6 +14,10 @@ ACCOUNT=$($A sts get-caller-identity --query Account --output text)
 
 $SSH 'sudo systemctl disable --now superci-pull superci-pull-health.timer; sudo /usr/local/bin/superci-pull -delete-scale-sets'
 $A autoscaling delete-auto-scaling-group --region us-east-1 --auto-scaling-group-name $NAME-listener --force-delete && echo "deleted group $NAME-listener"
+# The identity hosts' groups (identity.sh) would launch their hosts again as they are terminated below.
+for g in $($A autoscaling describe-auto-scaling-groups --region us-east-1 --query "AutoScalingGroups[?starts_with(AutoScalingGroupName, '$NAME-identity-')].AutoScalingGroupName" --output text); do
+  $A autoscaling delete-auto-scaling-group --region us-east-1 --auto-scaling-group-name "$g" --force-delete && echo "deleted group $g"
+done
 sleep 30
 for r in us-east-1 us-east-2; do
   ids=$($A ec2 describe-instances --region $r --filters Name=tag:purpose,Values=superci-pull Name=instance-state-name,Values=pending,running,stopping,stopped --query 'Reservations[].Instances[].InstanceId' --output text)

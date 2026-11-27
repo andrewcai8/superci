@@ -665,6 +665,30 @@ each job to a fresh machine. Its listener runs on an **identity host**, and no j
   the same version. IMDSv2 only, hop limit 1. Tags: `superci-pull-role=identity`, `superci-pull-deployment`,
   `purpose=superci-pull`, `Name=superci-pull-identity-<az>`. The shim's `/shim` endpoint serves only an instance with
   the first two.
+- **Self-healing.** Each AZ's host is the one instance (min = max = desired = 1) of an Auto Scaling group
+  `superci-pull-identity-<az>`, from a launch template of the same name that carries the host's whole configuration and
+  its user data (the gzip'd `identity-host.sh`, the pin, the key). EC2 replaces a host that is terminated or fails its
+  status checks, and the group is set to terminate before it launches (`MinHealthyPercentage=0,MaxHealthyPercentage=100`),
+  so the old host is ending before the new one starts. The replacement boots from the template exactly as `up`'s host did:
+  it restores its AZ's share from S3 and registers nothing. Measured Nov 27 for a planned rebuild of a 295-identity host:
+  terminate 34 s, launch +16 s, restore 213 s, GitHub online within 20 s after it, 284 s in all, the other AZ's host
+  carrying the peak meanwhile (the 2x sizing above). Nothing is rolled by hand and nothing alerts by ruling.
+- **A host that runs but whose listeners do not.** `superci-id-health.timer` runs `superci-id health` every 30 s, in the
+  manner of the listener's `health.sh`, and judges nothing before the host is 15 minutes old (a restore takes minutes).
+  **Healthy** is: boot finished (`/run/superci-id-ready`), every identity of the AZ's share stored in S3 restored on the
+  host, and every listener running but one in fifty (rounded down, so none under 50 identities: an identity GitHub removed
+  stops at its start limit). A host that is not healthy for 60 s is **revived** once per episode: boot is run again as a
+  process of its own (so its errexit applies; it removes the ready file first and touches it only once every stored identity is
+  restored and started, so a boot that fails leaves the host not ready), or, when all are restored and too few run, every unit
+  is started. If it is still unhealthy 120 s after the revive ends (and the host is 20 minutes old) it **stops every
+  listener**, so the host that goes holds no session at GitHub while its replacement boots (the group does not wait for the
+  old instance's shutdown), then marks its own instance Unhealthy (`autoscaling:SetInstanceHealth` on
+  `superci-pull-identity-*`, the role's one non-S3, non-KMS statement; `--no-should-respect-grace-period`), once, and its
+  group replaces it. The health unit may run 2,700 s: its revive reruns boot, which restores 1,550 identities (a host alone
+  after the other AZ's is lost) in about 1,120 s (213 s for 295, extrapolated), twice that. A boot or register
+  that holds the host's lock is busy, not sick, until a **boot** has held it for 40 minutes (boot writes its start to `/run/superci-id-booting`; a boot an operator runs on a host that has been up for days is not mistaken for one that never ends). Listeners are stopped, and the instance marked, only when it is in this AZ's group (the role may read its own group, `autoscaling:DescribeAutoScalingInstances`); a plain host's health check says so and stops nothing. Boot and `check` refuse a host that cannot read its AZ (`us-east-1[a-f]`), and `check` fails when the share cannot be listed in S3, so `up` adopts nothing it cannot verify. A host whose
+  boot always fails (a shim the release does not name, say) is replaced again and again, no oftener than every 20 minutes: read its
+  boot log, `/var/log/superci-id-boot.log`.
 - **Hardened at boot.** The image leaves much of `/usr/share`, `/usr/local` and `/opt` writable by others (mode 777)
   and its runner tree the runner user's, so boot runs `superci-id harden` first. Instance Connect's key command and
   every directory above it become root's, writable by neither group nor others (sshd refuses it otherwise, so no
@@ -673,14 +697,42 @@ each job to a fresh machine. Its listener runs on an **identity host**, and no j
   by others or the chain is not root's alone. A path writable by its group alone is left.
 
 ```bash
-pull/deploy/identity.sh up us-east-1a                         # bucket, role, group, host (r7i.4xlarge; --type T for another); waits until it has restored its share
+pull/deploy/identity.sh up us-east-1a                         # bucket, role, launch template, group of one, host (r7i.4xlarge; --type T for another); waits until it has restored its share
 pull/deploy/identity.sh register 4cpu 100                     # superci-id-4cpu-0001 .. 0100, label superci-park
 pull/deploy/identity.sh register --rate 0.25 4cpu 100 101     # the next hundred (the default rate; 1 a second at most)
 pull/deploy/identity.sh relabel 4cpu superci-park superci-4cpu   # cutover of a size (after deleting its scale set)
 pull/deploy/identity.sh relabel 4cpu superci-4cpu superci-park   # rollback (then recreate the scale set)
-pull/deploy/identity.sh status                                # hosts, identities per host, listeners, memory against 64 MiB, labels at GitHub
-pull/deploy/identity.sh down us-east-1a                       # terminates the host by its name; identities stay, `up` restores them
+pull/deploy/identity.sh status                                # groups, hosts, identities per host, listeners, memory against 64 MiB, labels at GitHub
+pull/deploy/identity.sh down us-east-1a                       # group to 0 and deleted, host terminated (not healed back); identities stay, `up` restores them
+pull/deploy/identity.sh up --replace us-east-1a               # a plain host from before the groups: end it, then let the group launch (see below)
 ```
+
+**`up` and the template.** `up <az>` makes or updates, each time and without change when nothing changed, the role,
+key, bucket, the launch template `superci-pull-identity-<az>` (tagged `superci-pull-role=identity`, which the listener's
+role may neither launch from nor change, as for its own template) and the group. The template's data is hashed into its
+version description: the same data adds no version, changed data (the host script, the pin, the image, `--type`) adds one
+and makes it the group's default. A running host is not touched by it: the next host the group launches takes it
+(`down <az>` then `up <az>`, or terminating the host, takes it now). Pass `--type` again each time, or the next version
+is the default type. `down <az>` sets the group to 0, ends the host and deletes the group, so nothing launches it again
+(`deploy/down.sh` deletes the identity groups before it terminates every instance, too); the template stays.
+
+**Adopting a host from before the groups.** Two Runner.Listeners on one identity conflict at GitHub (a session for the runner
+exists already), so an AZ's old host and a new one must never restore one share at once. `up <az>` on an AZ
+whose host is a plain instance (the `Name` tag, no group) therefore does not launch another: it makes the group empty
+(min 0, desired 0, so nothing launches), **attaches the running host to it** (`attach-instances`), then sets min 1. The host
+is the group's instance from then on, no identity goes offline and nothing is restored. Before that `up` runs `superci-id check` on it (the same rule as the health check) and **refuses** to adopt a host that is not healthy: the health timer it is given would revive, then replace, a live host. Make it healthy (`sudo superci-id boot` on it restores and starts what is missing) and run `up` again, or use `--replace`; `up` pushes it this checkout's
+`superci-id` and installs its health timer (`superci-id install-health`). Run it one AZ at a time, `status` between. If the
+attach is refused the host still runs alone and the group holds nothing: run `up` again, or `up --replace <az>`, which
+terminates the plain host, waits for it to be gone, and only then lets the group launch its own (the identities of that AZ
+are offline for the rebuild, 284 s as measured, the other AZ carrying the peak). The order **launch the group's host, then
+terminate the plain one** is never used, however short: the new host restores and starts the share 213 s before the old
+one is gone. `up` refuses outright while a group's host and a plain host of one AZ both exist (run `down <az>`, which ends
+both, then `up <az>`). `up` has no way left to make a plain host: a group is how it launches one.
+
+**What this does not cover.** A host that is impaired but still running when EC2 replaces it may keep its listeners
+for the seconds before it is gone (terminate before launch holds for the group, not for a hung kernel); its replacement
+then meets GitHub's session conflict on those identities until the old session ends. The health check cannot see a listener that runs and is offline at
+GitHub (that is the `identity-none` and `identity-starved` alarms' to catch).
 
 **Registering.** Every registration spends the organization's cap, so `register` is bounded four ways:
 

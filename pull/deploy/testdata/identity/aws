@@ -1,7 +1,10 @@
 #!/usr/bin/env -S python3 -I
-"""The aws CLI as identity_test.sh needs it: S3 objects, IAM, EC2 instances and SSM kept under $FAKE, every call logged
-to $FAKE/calls.log. Answers each call in the shape the script's own --query and --output ask for."""
-import json, os, shutil, sys
+"""The aws CLI as identity_test.sh needs it: S3 objects, IAM, EC2 instances and launch templates, Auto Scaling groups and
+SSM kept under $FAKE, every call logged to $FAKE/calls.log. A group is reconciled as EC2 does whenever it is described or
+changed: an instance that is gone or marked unhealthy is dropped (terminated first) and the group launches from its
+template's default version until it holds its desired number. state/two-live is written the moment two live instances
+carry one Name, which for an identity host is two hosts on one share. Answers each call in the shape the script's own --query and --output ask for."""
+import base64, json, os, shutil, sys
 
 root = os.environ["FAKE"]
 args = sys.argv[1:]
@@ -9,7 +12,7 @@ with open(os.path.join(root, "calls.log"), "a") as log:
     log.write(" ".join(args) + "\n")
 
 KEY_ARN = "arn:aws:kms:us-east-1:243891825325:key/1234abcd-12ab-34cd-56ef-1234567890ab"
-BOOL = {"--quiet", "--only-show-errors", "--with-decryption", "--recursive", "--associate-public-ip-address"}
+BOOL = {"--quiet", "--only-show-errors", "--with-decryption", "--recursive", "--associate-public-ip-address", "--force-delete", "--no-should-respect-grace-period"}
 
 
 def opt(name, default=None):
@@ -81,6 +84,91 @@ def filters():
     return out
 
 
+def lt_files():
+    d = os.path.join(state, "lt")
+    return [os.path.join(d, f) for f in sorted(os.listdir(d))] if os.path.isdir(d) else []
+
+
+def lt_load(ref):
+    for f in lt_files():
+        t = json.load(open(f))
+        if ref in (t["id"], t["name"]):
+            return t
+    return None
+
+
+def lt_save(t):
+    os.makedirs(os.path.join(state, "lt"), exist_ok=True)
+    json.dump(t, open(os.path.join(state, "lt", t["name"]), "w"))
+
+
+def asg_load(name):
+    p = os.path.join(state, "asg", name)
+    return json.load(open(p)) if os.path.exists(p) else None
+
+
+def asg_save(g):
+    os.makedirs(os.path.join(state, "asg"), exist_ok=True)
+    json.dump(g, open(os.path.join(state, "asg", g["name"]), "w"))
+
+
+def asg_names():
+    d = os.path.join(state, "asg")
+    return sorted(os.listdir(d)) if os.path.isdir(d) else []
+
+
+def terminate(iid):
+    for i in instances():
+        if i["id"] == iid and i["state"] != "terminated":
+            i["state"] = "terminated"
+            save(i)
+
+
+def launch_from(g):
+    t = lt_load(g["lt"])
+    data = json.loads(next(v for v in t["versions"] if v["n"] == (t["default"] if g["version"] == "$Default" else int(g["version"])))["data"])
+    n = len(instances()) + 1
+    az = "us-east-1" + g["subnet"][-1]
+    tags = {}
+    for spec in data["TagSpecifications"]:
+        if spec["ResourceType"] == "instance":
+            tags = {kv["Key"]: kv["Value"] for kv in spec["Tags"]}
+    tags["aws:autoscaling:groupName"] = g["name"]
+    live = [i["id"] for i in instances() if i["state"] in ("running", "pending") and i["tags"].get("Name") == tags.get("Name")]
+    if live:
+        open(os.path.join(state, "two-live"), "a").write("%s launched while %s runs\n" % (tags.get("Name"), " ".join(live)))
+    ip = "192.0.2.%d" % (10 + n)
+    save({"id": "i-%04d" % n, "az": az, "ip": ip, "state": "running", "tags": tags, "type": data["InstanceType"], "ami": data["ImageId"],
+          "metadata": data["MetadataOptions"], "profile": data["IamInstanceProfile"], "template": data})
+    open(os.path.join(state, "userdata-%04d" % n), "w").write(base64.b64decode(data["UserData"]).decode())
+    os.makedirs(os.path.join(root, "hosts", ip, "run"), exist_ok=True)
+    open(os.path.join(root, "hosts", ip, "run", "superci-id-ready"), "w").write("")
+    g["instances"].append("i-%04d" % n)
+
+
+def reconcile(g):
+    for iid in g["unhealthy"]:
+        terminate(iid)
+    g["unhealthy"] = []
+    running = {i["id"] for i in instances() if i["state"] == "running"}
+    g["instances"] = [x for x in g["instances"] if x in running]
+    while len(g["instances"]) > g["desired"]:
+        terminate(g["instances"].pop())
+    while len(g["instances"]) < g["desired"]:
+        launch_from(g)
+    asg_save(g)
+
+
+def reconcile_all():
+    for n in asg_names():
+        reconcile(asg_load(n))
+
+
+def fail(msg):
+    sys.stderr.write("An error occurred (ValidationError): %s\n" % msg)
+    sys.exit(254)
+
+
 if svc == "sts":
     if opt("--query") == "Arn":
         print("arn:aws:sts::243891825325:assumed-role/ops/me")
@@ -109,6 +197,9 @@ elif svc == "s3" and cmd == "cp":
     else:
         os.makedirs(os.path.dirname(s3path(dst)), exist_ok=True)
         shutil.copyfile(src, s3path(dst))
+elif svc == "s3" and cmd == "sync" and os.path.exists(os.path.join(root, "s3-sync-fail")):
+    sys.stderr.write("fatal error: the sync failed\n")
+    sys.exit(1)
 elif svc == "s3" and cmd == "sync":
     src, dst = pos[2], pos[3]
     bucket, _, prefix = src[len("s3://"):].partition("/")
@@ -124,6 +215,9 @@ elif svc == "s3api" and cmd == "put-bucket-encryption":
     open(os.path.join(state, "bucket-encryption.json"), "w").write(opt("--server-side-encryption-configuration"))
 elif svc == "s3api" and cmd == "put-bucket-policy":
     open(os.path.join(state, "bucket-policy.json"), "w").write(opt("--policy"))
+elif svc == "s3api" and cmd == "list-objects-v2" and os.path.exists(os.path.join(root, "s3-list-fail")):
+    sys.stderr.write("An error occurred (AccessDenied) when calling the ListObjectsV2 operation\n")
+    sys.exit(254)
 elif svc == "s3api" and cmd == "list-objects-v2":
     ks = keys(opt("--bucket"), opt("--prefix", ""))
     print("\t".join(ks) if ks else "None")
@@ -199,6 +293,113 @@ elif svc == "ec2" and cmd == "run-instances":
     os.makedirs(os.path.join(root, "hosts", "192.0.2.%d" % (10 + n), "run"), exist_ok=True)
     open(os.path.join(root, "hosts", "192.0.2.%d" % (10 + n), "run", "superci-id-ready"), "w").write("")
     print("i-%04d" % n)
+elif svc == "ec2" and cmd == "describe-launch-templates":
+    t = lt_load(filters()["launch-template-name"][0])
+    print(t["id"] if t else "None")
+elif svc == "ec2" and cmd == "create-launch-template":
+    name = opt("--launch-template-name")
+    if lt_load(name):
+        fail("launch template %s already exists" % name)
+    json.loads(opt("--launch-template-data"))
+    t = {"id": "lt-%04d" % (len(lt_files()) + 1), "name": name, "versions": [{"n": 1, "data": opt("--launch-template-data"), "desc": opt("--version-description")}],
+         "default": 1, "tags": opts("--tag-specifications")}
+    lt_save(t)
+    print(t["id"])
+elif svc == "ec2" and cmd == "create-launch-template-version":
+    t = lt_load(opt("--launch-template-id"))
+    json.loads(opt("--launch-template-data"))
+    v = {"n": len(t["versions"]) + 1, "data": opt("--launch-template-data"), "desc": opt("--version-description")}
+    t["versions"].append(v)
+    lt_save(t)
+    print(v["n"])
+elif svc == "ec2" and cmd == "modify-launch-template":
+    t = lt_load(opt("--launch-template-id"))
+    t["default"] = int(opt("--default-version"))
+    lt_save(t)
+elif svc == "ec2" and cmd == "describe-launch-template-versions":
+    t = lt_load(opt("--launch-template-id"))
+    assert opt("--versions") == "$Default", opt("--versions")
+    print(next(v for v in t["versions"] if v["n"] == t["default"])["desc"])
+elif svc == "autoscaling" and cmd == "describe-auto-scaling-groups":
+    reconcile_all()
+    want = multi("--auto-scaling-group-names")
+    out = []
+    for n in asg_names():
+        g = asg_load(n)
+        if want and n not in want:
+            continue
+        out.append({"AutoScalingGroupName": n, "MinSize": g["min"], "MaxSize": g["max"], "DesiredCapacity": g["desired"],
+                    "Instances": [{"InstanceId": i, "LifecycleState": "InService", "HealthStatus": "Healthy"} for i in g["instances"]]})
+    print(json.dumps({"AutoScalingGroups": out}))
+elif svc == "autoscaling" and cmd == "create-auto-scaling-group":
+    name = opt("--auto-scaling-group-name")
+    if asg_load(name):
+        fail("AlreadyExists: %s" % name)
+    lt = dict(kv.split("=", 1) for kv in opt("--launch-template").split(","))
+    g = {"name": name, "lt": lt["LaunchTemplateId"], "version": lt["Version"], "min": int(opt("--min-size")), "max": int(opt("--max-size")),
+         "desired": int(opt("--desired-capacity")), "subnet": opt("--vpc-zone-identifier"), "health": opt("--health-check-type"),
+         "grace": opt("--health-check-grace-period"), "maintenance": opt("--instance-maintenance-policy"), "tags": multi("--tags"),
+         "instances": [], "unhealthy": []}
+    if not g["min"] <= g["desired"] <= g["max"]:
+        fail("desired capacity is outside min and max")
+    reconcile(g)
+elif svc == "autoscaling" and cmd == "update-auto-scaling-group":
+    g = asg_load(opt("--auto-scaling-group-name"))
+    if g is None:
+        fail("no such group")
+    for k, flag in (("min", "--min-size"), ("max", "--max-size"), ("desired", "--desired-capacity")):
+        if opt(flag) is not None:
+            g[k] = int(opt(flag))
+    if opt("--launch-template"):
+        lt = dict(kv.split("=", 1) for kv in opt("--launch-template").split(","))
+        g["lt"], g["version"] = lt["LaunchTemplateId"], lt["Version"]
+    if not g["min"] <= g["desired"] <= g["max"]:
+        fail("desired capacity is outside min and max")
+    reconcile(g)
+elif svc == "autoscaling" and cmd == "attach-instances":
+    if os.path.exists(os.path.join(root, "attach-fail")):
+        fail("the instance cannot be attached")
+    g = asg_load(opt("--auto-scaling-group-name"))
+    for iid in multi("--instance-ids"):
+        inst = next((i for i in instances() if i["id"] == iid), None)
+        if inst is None or inst["state"] != "running":
+            fail("instance %s is not running" % iid)
+        if inst["az"][-1] != g["subnet"][-1]:
+            fail("instance %s is in another AZ than the group" % iid)
+        if any(iid in (asg_load(n) or {"instances": []})["instances"] for n in asg_names()):
+            fail("instance %s is in a group" % iid)
+        if g["desired"] + 1 > g["max"]:
+            fail("attaching would exceed the group's maximum")
+        g["instances"].append(iid)
+        g["desired"] += 1
+        inst["tags"]["aws:autoscaling:groupName"] = g["name"]
+        save(inst)
+    reconcile(g)
+elif svc == "autoscaling" and cmd == "delete-auto-scaling-group":
+    g = asg_load(opt("--auto-scaling-group-name"))
+    if g is None:
+        fail("no such group")
+    if g["instances"] and "--force-delete" not in args:
+        fail("ResourceInUse: the group has instances")
+    for iid in g["instances"]:
+        terminate(iid)
+    os.remove(os.path.join(state, "asg", g["name"]))
+elif svc == "autoscaling" and cmd == "describe-auto-scaling-instances":
+    iid = opt("--instance-ids")
+    g = next((asg_load(n) for n in asg_names() if iid in asg_load(n)["instances"]), None)
+    print(g["name"] if g else "None")
+elif svc == "autoscaling" and cmd == "set-instance-health":
+    iid = opt("--instance-id")
+    assert opt("--health-status") == "Unhealthy" and "--no-should-respect-grace-period" in args
+    g = next((asg_load(n) for n in asg_names() if iid in asg_load(n)["instances"]), None)
+    if g is None:
+        fail("Instance %s is not part of an Auto Scaling group" % iid)
+    # a host that is marked while a listener of it still runs holds its sessions at GitHub while its replacement boots
+    units = os.environ.get("FAKE_UNITS")
+    if units and os.path.exists(units) and open(units).read().strip():
+        open(os.path.join(state, "mark-with-listeners"), "a").write("%s marked with listeners running\n" % iid)
+    g["unhealthy"].append(iid)
+    reconcile(g)
 elif svc == "ec2" and cmd == "describe-instances":
     f, ids = filters(), (opt("--instance-ids") or "").split()
     sel = [i for i in instances() if (not ids or i["id"] in ids)
@@ -215,7 +416,7 @@ elif svc == "ec2" and cmd == "describe-instances":
         print("\t".join(i["id"] for i in sel))
 elif svc == "ec2" and cmd == "terminate-instances":
     for i in instances():
-        if i["id"] in opt("--instance-ids").split():
+        if i["id"] in multi("--instance-ids"):
             i["state"] = "terminated"
             save(i)
 elif opt("--query") is not None:

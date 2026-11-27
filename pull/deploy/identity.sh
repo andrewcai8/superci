@@ -4,8 +4,15 @@
 # account is ci-runners first. Every resource is tagged purpose=superci-pull and named superci-pull-identity[-<az>], so
 # it is deleted by exact name (deploy/down.sh takes the instances by their tag). Each command can be run again.
 #
-#   up [--type T] <az>             launches the host of that AZ (us-east-1; T is r7i.4xlarge by default) and waits until
-#                                  it has restored its share
+#   up [--type T] [--replace] <az>
+#                                  makes the host of that AZ (us-east-1; T is r7i.4xlarge by default) a one-instance Auto
+#                                  Scaling group (superci-pull-identity-<az>, min = max = desired = 1) from a launch
+#                                  template of the same name, and waits until the host has restored its share. EC2 replaces a
+#                                  host that is lost or impaired, and the host marks itself unhealthy when its listeners do
+#                                  not run (superci-id health); the replacement restores the share at boot, as up does. Run
+#                                  again it changes nothing, except that changed user data is a new template version
+#                                  (the group's default, taken by the next replacement). A plain host from before the
+#                                  groups is adopted, never joined by a second one: see "adopting a plain host" below
 #   register [--rate R] [--peak-ok] <size> <n> [first]
 #                                  registers identities superci-id-<size>-<first> .. <first+n-1> (n at most 100) under the
 #                                  park label, identity i on the host of IDENTITY_AZS[i mod their number] (us-east-1a
@@ -17,8 +24,17 @@
 #                                  every ask for a while: wait, do not run it again at once
 #   relabel <size> <from> <to>     moves every superci-id-<size>-* from one label to the other (no registration), at most
 #                                  60 a minute, stopped at the first 403 or 429 and held until its Retry-After has passed
-#   down <az>                      terminates that host; its identities stay registered, and `up <az>` restores them
-#   status                         hosts, identities per host, listeners running, private memory per listener
+#   down <az>                      sets that AZ's group to 0 and deletes it (so nothing heals the host back), terminates the
+#                                  host; its identities stay registered, and `up <az>` restores them
+#   status                         groups, hosts, identities per host, listeners running, private memory per listener
+#
+# Adopting a plain host. Two Runner.Listeners on one identity conflict at GitHub, so a host and its replacement must never
+# restore one share at once. A host that `up` finds with the AZ's name and no group is therefore ATTACHED to a new group
+# (attach-instances): it is the group's instance from then on, nothing restores anything, no identity goes offline. Were
+# that refused, `up --replace <az>` terminates the plain host and waits for it to be gone before the group launches its
+# own (the identities are offline for the rebuild, 284 s measured Nov 27, the other AZ carrying the peak). Launching the
+# group's host first and terminating the plain one after is never done: the new host would restore and start the share
+# (213 s of the 284) while the old one still ran it. `up` refuses outright while a group's host and a plain one both exist.
 #
 # up, register, relabel and down run one at a time (flock on IDENTITY_LOCK): two registers at once would race for the same
 # identities, and the host takes the same care for its own files.
@@ -46,7 +62,7 @@ IMAGE_PIN=20261102081424
 
 die() { echo "$*" >&2; exit 1; }
 cmd=${1:-}
-[ -n "$cmd" ] || die "usage: identity.sh up [--type T] <az> | register <size> <n> [first] | relabel <size> <from> <to> | down <az> | status"
+[ -n "$cmd" ] || die "usage: identity.sh up [--type T] [--replace] <az> | register <size> <n> [first] | relabel <size> <from> <to> | down <az> | status"
 shift
 ACCOUNT=$($A sts get-caller-identity --query Account --output text)
 [ "$ACCOUNT" = 243891825325 ] || { echo "refusing: account $ACCOUNT is not ci-runners" >&2; exit 1; }
@@ -187,7 +203,7 @@ ensure_role() {
   fi
   ensure_key # (its policy names the role, so the role comes first, and the role's policy names the key)
   $A iam put-role-policy --role-name $NAME --policy-name $NAME --policy-document \
-    "$(render "$here/identity-policy.json" BUCKET="$BUCKET" DEPLOYMENT="$DEPLOYMENT" KEY_ARN="$KEY_ARN" RELEASE="$LISTENER_BUCKET")"
+    "$(render "$here/identity-policy.json" ACCOUNT="$ACCOUNT" BUCKET="$BUCKET" DEPLOYMENT="$DEPLOYMENT" KEY_ARN="$KEY_ARN" RELEASE="$LISTENER_BUCKET")"
   if ! $A iam get-instance-profile --instance-profile-name $NAME > /dev/null 2>&1; then
     $A iam create-instance-profile --instance-profile-name $NAME --tags $TAGS > /dev/null
     $A iam add-role-to-instance-profile --instance-profile-name $NAME --role-name $NAME
@@ -245,11 +261,112 @@ chmod 755 /usr/local/bin/superci-id
 EOF
 }
 
+# group_name <az>: the Auto Scaling group (and launch template) of an AZ's host.
+group_name() { echo "$NAME-$1"; }
+
+# group_info <az>: "none", or "<min> <max> <desired> <instance>=<lifecycle>/<health>..." of the AZ's group.
+group_info() {
+  $A autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$(group_name "$1")" --output json | python3 -I -c 'import json,sys
+gs = json.load(sys.stdin)["AutoScalingGroups"]
+if not gs:
+    print("none")
+else:
+    g = gs[0]
+    print(g["MinSize"], g["MaxSize"], g["DesiredCapacity"], *("%s=%s/%s" % (i["InstanceId"], i["LifecycleState"], i["HealthStatus"]) for i in g["Instances"]))'
+}
+
+# template_data <type> <ami> <root device> <security group> <user data>: the launch template's data. Every launch of the
+# group (the first, and each replacement) is this instance: what up launched on its own before the groups.
+template_data() {
+  python3 -I -c 'import base64, json, sys
+typ, ami, rootdev, sg, ud, name, deployment = sys.argv[1:8]
+tags = [{"Key": "purpose", "Value": "superci-pull"}]
+print(json.dumps({
+    "ImageId": ami, "InstanceType": typ, "IamInstanceProfile": {"Name": sys.argv[8]},
+    "NetworkInterfaces": [{"DeviceIndex": 0, "AssociatePublicIpAddress": True, "DeleteOnTermination": True, "Groups": [sg]}],
+    "BlockDeviceMappings": [{"DeviceName": rootdev, "Ebs": {"Encrypted": True, "DeleteOnTermination": True}}],
+    "MetadataOptions": {"HttpTokens": "required", "HttpPutResponseHopLimit": 1, "HttpEndpoint": "enabled"},
+    "UserData": base64.b64encode(ud.encode()).decode(),
+    "TagSpecifications": [
+        {"ResourceType": "instance", "Tags": tags + [{"Key": "superci-pull-role", "Value": "identity"}, {"Key": "superci-pull-deployment", "Value": deployment}, {"Key": "Name", "Value": name}]},
+        {"ResourceType": "volume", "Tags": tags + [{"Key": "Name", "Value": name}]}],
+}, sort_keys=True, separators=(",", ":")))' "$@" "$NAME"
+}
+
+# ensure_template <az> <template data>: sets TEMPLATE_ID. The data's sha256 is the version's description, so a run again
+# with the same data adds no version, and a changed one (user data, image, type) adds one and makes it the group's default.
+ensure_template() {
+  local az=$1 data=$2 lt=$NAME-$1 sum have v try
+  sum=sha256:$(printf '%s' "$data" | sha256sum | cut -d' ' -f1)
+  TEMPLATE_ID=$($A ec2 describe-launch-templates --filters Name=launch-template-name,Values="$lt" --query 'LaunchTemplates[0].LaunchTemplateId' --output text)
+  if [ "$TEMPLATE_ID" = None ] || [ -z "$TEMPLATE_ID" ]; then
+    for try in 1 2 3 4 5 6; do # (a new instance profile takes a few seconds to be usable)
+      TEMPLATE_ID=$($A ec2 create-launch-template --launch-template-name "$lt" --launch-template-data "$data" --version-description "$sum" \
+        --tag-specifications "ResourceType=launch-template,Tags=[{$TAGS},{Key=superci-pull-role,Value=identity}]" --query LaunchTemplate.LaunchTemplateId --output text) && break
+      [ "$try" != 6 ] || die "create-launch-template failed"
+      sleep "${RUN_RETRY_SLEEP:-10}"
+    done
+    echo "launch template: $TEMPLATE_ID ($lt, version 1)"
+    return 0
+  fi
+  have=$($A ec2 describe-launch-template-versions --launch-template-id "$TEMPLATE_ID" --versions '$Default' --query 'LaunchTemplateVersions[0].VersionDescription' --output text)
+  if [ "$have" = "$sum" ]; then echo "launch template: $TEMPLATE_ID ($lt, unchanged)"; return 0; fi
+  v=$($A ec2 create-launch-template-version --launch-template-id "$TEMPLATE_ID" --launch-template-data "$data" --version-description "$sum" --query LaunchTemplateVersion.VersionNumber --output text)
+  $A ec2 modify-launch-template --launch-template-id "$TEMPLATE_ID" --default-version "$v" > /dev/null
+  echo "launch template: $TEMPLATE_ID ($lt, new version $v is the default; a host takes it when it is next replaced)"
+}
+
+# plain_hosts <az>: the live instances of the AZ's name that are in no group, which restored the share before the groups.
+plain_hosts() {
+  local az=$1 all in_group id
+  all=$($A ec2 describe-instances --filters Name=tag:Name,Values=$NAME-"$az" Name=tag:superci-pull-role,Values=identity Name=tag:superci-pull-deployment,Values="$DEPLOYMENT" \
+    Name=instance-state-name,Values=pending,running --query 'Reservations[].Instances[].InstanceId' --output text)
+  [ "$all" != None ] || all=""
+  in_group=$(group_info "$az")
+  for id in $all; do
+    case " $in_group " in *" $id="*) ;; *) echo "$id" ;; esac
+  done
+}
+
+# wait_group_host <az>: sets HOST_ID and HOST_IP, the group's instance once it is InService.
+wait_group_host() {
+  local az=$1 info try
+  for try in $(seq 1 "${GROUP_TRIES:-30}"); do
+    info=$(group_info "$az")
+    HOST_ID=$(tr ' ' '\n' <<< "$info" | sed -n 's|^\(i-[0-9a-f]*\)=InService/.*|\1|p' | head -1)
+    [ -z "$HOST_ID" ] || break
+    sleep "${READY_SLEEP:-10}"
+  done
+  [ -n "$HOST_ID" ] || die "the group $(group_name "$az") has no InService instance yet ($info); run up $az again once it has"
+  $A ec2 wait instance-running --instance-ids "$HOST_ID"
+  HOST_IP=$($A ec2 describe-instances --instance-ids "$HOST_ID" --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+}
+
+# wait_ready <az> <id> <ip>: until the host has restored its share.
+wait_ready() {
+  local az=$1 id=$2 ip=$3
+  for _ in $(seq 1 "${READY_TRIES:-60}"); do
+    if hssh "$id" "$az" "$ip" 'test -f /run/superci-id-ready' < /dev/null 2> /dev/null; then
+      echo "ready: $NAME-$az restored its share"
+      return 0
+    fi
+    sleep "${READY_SLEEP:-10}"
+  done
+  die "$id is not ready (its boot log is /var/log/superci-id-boot.log on the host); run up $az again once it is"
+}
+
+# install_health <az> <id> <ip>: the current host script, and its health timer, on a host that was not booted with them.
+install_health() {
+  hpush "$1 $2 $3"
+  hssh "$2" "$1" "$3" 'sudo superci-id install-health' < /dev/null
+}
+
 up() {
-  local type=r7i.4xlarge az existing eip pin ami subnet sg ud shim id ip rootdev
+  local type=r7i.4xlarge az eip pin ami subnet sg ud shim rootdev data replace=0 gname info min max desired plain have fresh=0 pip verdict
   while [ $# -gt 0 ]; do
     case $1 in
       --type) type=${2:-}; shift; shift || true ;;
+      --replace) replace=1; shift ;;
       --*) die "unknown flag $1" ;;
       *) break ;;
     esac
@@ -257,9 +374,7 @@ up() {
   az=${1:-}
   [[ $type =~ ^[a-z0-9]+\.[a-z0-9]+$ ]] || die "--type is an instance type like r7i.4xlarge"
   check_az "$az"
-  existing=$($A ec2 describe-instances --filters Name=tag:Name,Values=$NAME-"$az" Name=instance-state-name,Values=pending,running \
-    --query 'Reservations[].Instances[].InstanceId' --output text)
-  if [ -n "$existing" ] && [ "$existing" != None ]; then echo "already up: $existing ($NAME-$az)"; return 0; fi
+  gname=$(group_name "$az")
   ensure_role; ensure_bucket
   sg=$(ensure_sg); echo "security group: $sg"
   shim=$(mktemp); released_object "$LISTENER_BUCKET" $R bin/superci-shim "$shim" || die "refusing: no released shim for the host to run"
@@ -274,26 +389,67 @@ up() {
   [[ $rootdev =~ ^/dev/[a-z0-9]+$ ]] || die "refusing: $ami names no root device ($rootdev)"
   ud=$(userdata "https://$eip:8443" "$pin")
   [ ${#ud} -le 16000 ] || die "refusing: user data is ${#ud} bytes, over EC2's 16 KB"
-  for _ in 1 2 3 4 5 6; do # (a new instance profile takes a few seconds to be usable)
-    id=$($A ec2 run-instances --image-id "$ami" --instance-type "$type" --subnet-id "$subnet" --security-group-ids "$sg" --associate-public-ip-address \
-      --iam-instance-profile Name=$NAME --block-device-mappings "DeviceName=$rootdev,Ebs={Encrypted=true,DeleteOnTermination=true}" --metadata-options HttpTokens=required,HttpPutResponseHopLimit=1,HttpEndpoint=enabled \
-      --user-data "$ud" \
-      --tag-specifications "ResourceType=instance,Tags=[{$TAGS},{Key=superci-pull-role,Value=identity},{Key=superci-pull-deployment,Value=$DEPLOYMENT},{Key=Name,Value=$NAME-$az}]" \
-      "ResourceType=volume,Tags=[{$TAGS},{Key=Name,Value=$NAME-$az}]" --query 'Instances[0].InstanceId' --output text) && break
-    sleep "${RUN_RETRY_SLEEP:-10}"
-  done
-  [ -n "${id:-}" ] || die "run-instances failed"
-  echo "launched $id ($NAME-$az, $type, $ami)"
-  $A ec2 wait instance-running --instance-ids "$id"
-  ip=$($A ec2 describe-instances --instance-ids "$id" --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
-  for _ in $(seq 1 "${READY_TRIES:-60}"); do
-    if hssh "$id" "$az" "$ip" 'test -f /run/superci-id-ready' < /dev/null 2> /dev/null; then
-      echo "ready: $NAME-$az restored its share"
-      return 0
+  data=$(template_data "$type" "$ami" "$rootdev" "$sg" "$ud" "$NAME-$az" "$DEPLOYMENT")
+  ensure_template "$az" "$data"
+
+  info=$(group_info "$az"); plain=$(plain_hosts "$az")
+  have=$(tr ' ' '\n' <<< "$info" | sed -n 's|^\(i-[0-9a-f]*\)=.*|\1|p')
+  # A group's host and a plain one of the same name are two hosts on one share: nothing here picks between them.
+  if [ -n "$have" ] && [ -n "$plain" ]; then
+    die "refusing: $gname has a host ($(echo $have)) and so has a plain one ($(echo $plain)): both would run the share of $az. Run down $az (it ends both, the identities stay), then up $az"
+  fi
+  if [ -n "$plain" ] && [ "$replace" = 1 ]; then
+    # Gone first, then the group's own host: never both on the share.
+    echo "replacing the plain host $(echo $plain): terminating it, and waiting for it to be gone, before the group launches one"
+    # shellcheck disable=SC2086
+    $A ec2 terminate-instances --instance-ids $plain > /dev/null
+    # shellcheck disable=SC2086
+    $A ec2 wait instance-terminated --instance-ids $plain
+    plain=""
+  fi
+  if [ -n "$have" ]; then
+    read -r min max desired _ <<< "$info"
+    if [ "$min $max $desired" = "1 1 1" ]; then
+      echo "already up: $gname (one instance; replaced when lost or unhealthy)"
+    else
+      $A autoscaling update-auto-scaling-group --auto-scaling-group-name "$gname" --min-size 1 --max-size 1 --desired-capacity 1
+      echo "$gname was at $min/$max/$desired: set to one instance"
     fi
-    sleep "${READY_SLEEP:-10}"
-  done
-  die "$id is not ready (its boot log is /var/log/superci-id-boot.log on the host); run up $az again once it is"
+  elif [ -n "$plain" ]; then
+    [ "$(wc -w <<< "$plain")" = 1 ] || die "refusing: $(wc -w <<< "$plain") plain hosts are named $NAME-$az ($(echo $plain)); run down $az first"
+    # Adopt it: an empty group takes the running host as its instance. Nothing is launched and nothing restores the share.
+    $A ec2 wait instance-running --instance-ids "$plain"
+    # The health timer it is given judges the host at once: one that is not healthy now would be revived, then replaced.
+    pip=$($A ec2 describe-instances --instance-ids "$plain" --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+    hpush "$az $plain $pip"
+    verdict=$(hssh "$plain" "$az" "$pip" 'sudo superci-id check' < /dev/null 2>&1) ||
+      die "refusing to adopt the plain host $plain: $verdict. This host now has this checkout's superci-id (pushed to read it); the group, the template and the instance are unchanged. Make it healthy (sudo superci-id boot on it restores and starts what is missing) and run up $az again, or run up --replace $az to rebuild it"
+    if [ "$info" = none ]; then create_group "$gname" "$subnet" 0 0
+    else $A autoscaling update-auto-scaling-group --auto-scaling-group-name "$gname" --min-size 0 --max-size 1 --desired-capacity 0; fi
+    $A autoscaling attach-instances --auto-scaling-group-name "$gname" --instance-ids "$plain" ||
+      die "the plain host $plain was not attached: it still runs alone and $gname holds nothing (desired 0), so no second host exists. Run up $az again, or up --replace $az to rebuild it"
+    $A autoscaling update-auto-scaling-group --auto-scaling-group-name "$gname" --min-size 1
+    echo "adopted the plain host $plain into $gname: no second host, no identity restored or moved"
+  else
+    if [ "$info" = none ]; then create_group "$gname" "$subnet" 1 1
+    else $A autoscaling update-auto-scaling-group --auto-scaling-group-name "$gname" --min-size 1 --max-size 1 --desired-capacity 1; fi
+    fresh=1
+    echo "group $gname: its instance restores the share of $az at boot"
+  fi
+  wait_group_host "$az"
+  echo "host $HOST_ID ($NAME-$az, $type, $ami) in $gname"
+  wait_ready "$az" "$HOST_ID" "$HOST_IP"
+  # A host that was not booted from this checkout's user data (adopted, or already up) gets its script and health timer.
+  [ "$fresh" = 1 ] || install_health "$az" "$HOST_ID" "$HOST_IP"
+}
+
+# create_group <name> <subnet> <min> <desired>: the AZ's group, max 1, EC2 health, terminate before launch.
+create_group() {
+  $A autoscaling create-auto-scaling-group --auto-scaling-group-name "$1" --launch-template "LaunchTemplateId=$TEMPLATE_ID,Version=\$Default" \
+    --min-size "$3" --max-size 1 --desired-capacity "$4" --vpc-zone-identifier "$2" --health-check-type EC2 --health-check-grace-period 300 \
+    --instance-maintenance-policy MinHealthyPercentage=0,MaxHealthyPercentage=100 \
+    --tags "ResourceId=$1,ResourceType=auto-scaling-group,Key=purpose,Value=superci-pull,PropagateAtLaunch=false" \
+    "ResourceId=$1,ResourceType=auto-scaling-group,Key=superci-pull-role,Value=identity,PropagateAtLaunch=false"
 }
 
 # ---- register ----
@@ -510,27 +666,46 @@ for r in json.load(sys.stdin)["runners"]:
 # ---- down ----
 
 down() {
-  local az=${1:-} ids
+  local az=${1:-} ids gname info
   check_az "$az"
+  gname=$(group_name "$az")
   ids=$($A ec2 describe-instances --filters Name=tag:Name,Values=$NAME-"$az" Name=tag:superci-pull-role,Values=identity \
     Name=tag:superci-pull-deployment,Values="$DEPLOYMENT" Name=instance-state-name,Values=pending,running,stopping,stopped \
     --query 'Reservations[].Instances[].InstanceId' --output text)
-  if [ -z "$ids" ] || [ "$ids" = None ]; then echo "no host named $NAME-$az"; return 0; fi
-  # shellcheck disable=SC2086
-  $A ec2 terminate-instances --instance-ids $ids > /dev/null
-  # shellcheck disable=SC2086
-  $A ec2 wait instance-terminated --instance-ids $ids
-  echo "terminated $ids ($NAME-$az); its identities stay registered at GitHub (offline) and in s3://$BUCKET, and up $az restores them"
+  [ "$ids" != None ] || ids=""
+  info=$(group_info "$az")
+  if [ -z "$ids" ] && [ "$info" = none ]; then echo "no host named $NAME-$az"; return 0; fi
+  # The group goes to 0 first, so nothing heals the host back; then the host is ended by name (a plain host, or a straggler).
+  if [ "$info" != none ]; then
+    $A autoscaling update-auto-scaling-group --auto-scaling-group-name "$gname" --min-size 0 --max-size 0 --desired-capacity 0
+  fi
+  if [ -n "$ids" ]; then
+    # shellcheck disable=SC2086
+    $A ec2 terminate-instances --instance-ids $ids > /dev/null
+    # shellcheck disable=SC2086
+    $A ec2 wait instance-terminated --instance-ids $ids
+  fi
+  [ "$info" = none ] || $A autoscaling delete-auto-scaling-group --auto-scaling-group-name "$gname" --force-delete
+  echo "terminated ${ids:-nothing} ($NAME-$az)$([ "$info" = none ] || echo "; deleted group $gname, so nothing heals it back (its launch template stays)"); its identities stay registered at GitHub (offline) and in s3://$BUCKET, and up $az restores them"
 }
 
 # ---- status ----
 
 status() {
   mapfile -t HOSTS < <(hosts)
+  echo "identity groups:"
+  $A autoscaling describe-auto-scaling-groups --output json | python3 -I -c 'import json,sys
+rows = [g for g in json.load(sys.stdin)["AutoScalingGroups"] if g["AutoScalingGroupName"].startswith(sys.argv[1] + "-")]
+for g in sorted(rows, key=lambda g: g["AutoScalingGroupName"]):
+    hosts = ", ".join("%s %s %s" % (i["InstanceId"], i["LifecycleState"], i["HealthStatus"]) for i in g["Instances"]) or "no instance"
+    print("  %s: min %d max %d desired %d: %s" % (g["AutoScalingGroupName"], g["MinSize"], g["MaxSize"], g["DesiredCapacity"], hosts))
+if not rows:
+    print("  none: every host is plain, and nothing replaces one that is lost (up <az> adopts it into a group)")' "$NAME"
   echo "identity hosts: ${#HOSTS[@]}"
   local line az id ip
   for line in "${HOSTS[@]}"; do
     read -r az id ip <<< "$line"
+    case " $(group_info "$az") " in *" $id="*) ;; *) echo "$id is in no group: nothing replaces it if it is lost; up $az adopts it" ;; esac
     hpush "$line"
     echo "$id $(hssh "$id" "$az" "$ip" 'sudo superci-id status' < /dev/null || echo 'status failed')"
   done
@@ -553,5 +728,5 @@ case "$cmd" in
   relabel) relabel "$@" ;;
   down) down "$@" ;;
   status) status "$@" ;;
-  *) die "usage: identity.sh up [--type T] <az> | register <size> <n> [first] | relabel <size> <from> <to> | down <az> | status" ;;
+  *) die "usage: identity.sh up [--type T] [--replace] <az> | register <size> <n> [first] | relabel <size> <from> <to> | down <az> | status" ;;
 esac

@@ -11,6 +11,10 @@
 #   superci-id adopt <name>...                           uploads and starts identities already registered here; no token
 #   superci-id status                                    identities, listeners running, private memory per listener against its 64 MiB
 #   superci-id harden                                    no path is left writable by others (boot runs it first)
+#   superci-id health                                    run by superci-id-health.timer every 30 s: revives listeners that do not
+#                                                        run, then marks this instance Unhealthy so its Auto Scaling group replaces it
+#   superci-id install-health                            the timer, on a host that was not booted with it
+#   superci-id check                                     read-only: exit 0 if the host is ready and runs every listener of its share
 set -euo pipefail
 umask 077
 ROOT=${ID_ROOT:-/opt/id}
@@ -21,6 +25,10 @@ CONF=${ID_CONF:-/etc/superci-id.conf}
 LOCK=${ID_LOCK:-/run/superci-id.lock}
 UNIT_DIR=${UNIT_DIR:-/etc/systemd/system}
 LOG=${ID_LOG:-/var/log/superci-id}
+HEALTH_DIR=${HEALTH_DIR:-/run/superci-id-health}
+HEALTH_UPTIME=${HEALTH_UPTIME:-/proc/uptime}
+READY_FILE=${READY_FILE:-/run/superci-id-ready}
+BOOTING_FILE=${BOOTING_FILE:-$(dirname "$READY_FILE")/superci-id-booting} # the uptime second a boot started at, while it runs
 PROC=${PROC_ROOT:-/proc}
 FSROOT=${FS_ROOT:-/}   # the filesystem harden walks: / on a host, a fake one in identity_test.sh
 FILES=".runner .credentials .credentials_rsaparams"
@@ -32,10 +40,14 @@ mkdir -p "$LOG" "$ROOT"
 
 az() {
   if [ -n "${ID_AZ:-}" ]; then echo "$ID_AZ"; return; fi
-  local t; t=$(curl -s -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token)
-  curl -s -H "X-aws-ec2-metadata-token: $t" http://169.254.169.254/latest/meta-data/placement/availability-zone
+  local t; t=$(curl -s -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token || true)
+  curl -s -H "X-aws-ec2-metadata-token: $t" http://169.254.169.254/latest/meta-data/placement/availability-zone || true
 }
-PREFIX="s3://$BUCKET/$DEPLOYMENT/hosts/$(az)"
+AZ=$(az)
+# valid_az: the share is this AZ's prefix in S3, and an empty or odd AZ names no share (or all of them): nothing runs on it.
+valid_az() { [[ $AZ =~ ^us-east-1[a-f]$ ]]; }
+no_az() { echo "no valid availability zone (got '$AZ')"; }
+PREFIX="s3://$BUCKET/$DEPLOYMENT/hosts/$AZ"
 
 # make_dir: a fresh identity tree. Its bin and externals are hard links to the image's, so the listeners share their
 # pages; only the shim, which must know its own directory, is a file of its own.
@@ -56,6 +68,7 @@ locked() {
 
 upload() {
   local name=$1 f t
+  valid_az || { echo "superci-id: $(no_az): $name not uploaded" >&2; return 1; } # $PREFIX would name no share, or all of them
   for f in $FILES; do [ -s "$ROOT/$name/$f" ] || { echo "superci-id: $name has no $f" >&2; return 1; }; done
   t=$(mktemp -d)
   mkdir "$t/$name"
@@ -172,8 +185,166 @@ harden() {
   echo "hardened: nothing outside /proc, /sys, /dev, /run and sticky directories is writable by others"
 }
 
+# install_health: the timer that runs `superci-id health` every 30 s (its first 2 minutes after boot; the check itself
+# judges nothing before the host is 15 minutes old). Written to $UNIT_DIR, enabled now.
+install_health() {
+  cat > "$UNIT_DIR/superci-id-health.service" <<'UNIT'
+[Unit]
+Description=superci identity host: revive listeners that do not run, then ask the Auto Scaling group to replace this host
+
+[Service]
+Type=oneshot
+# A revive runs boot again inside this start: the restore of the largest share a host may hold (1,550 identities, when the
+# other AZ's host is lost) is about 1,120 s (213 s for 295, extrapolated), so this is 2,700 s: twice that, and past the
+# 40 minutes after which a host that never became ready is replaced.
+TimeoutStartSec=2700
+ExecStart=/usr/local/bin/superci-id health
+UNIT
+  cat > "$UNIT_DIR/superci-id-health.timer" <<'UNIT'
+[Unit]
+Description=superci identity host: health check every 30 seconds
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=30s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable --now superci-id-health.timer > /dev/null 2>&1 || systemctl start superci-id-health.timer
+}
+
+# running_listeners / held_identities: the units systemd runs, and the identities whose files are here.
+running_listeners() { systemctl list-units --no-legend --state=running 'superci-id@*' 2> /dev/null | wc -l; }
+held_identities() { find "$ROOT" -maxdepth 2 -name .runner 2> /dev/null | wc -l; }
+count_lines() { grep -c . || true; }
+
+# stored_names: the identities of this AZ whose three files are in S3, one a line. It fails when S3 cannot be listed.
+stored_names() {
+  local keys
+  keys=$(aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "$DEPLOYMENT/hosts/$AZ/" --query 'Contents[].Key' --output text) || return 1
+  tr '\t' '\n' <<< "$keys" | awk -F/ 'NF == 5 && ($5 == ".runner" || $5 == ".credentials" || $5 == ".credentials_rsaparams") {c[$4]++} END {for (n in c) if (c[n] == 3) print n}' | sort
+}
+
+# judge: sets WHY and REVIVE, and fails, unless this host is healthy. The rule: the host is ready (boot finished), every
+# identity of its share stored in S3 is restored here (its .runner is under $ROOT), and every listener runs, but for
+# one in fifty of them (rounded down: none under 50 identities), which may be an identity GitHub removed and the unit
+# stopped at its start limit. When S3 cannot be listed the identities held here stand for the share (for the timer; `check` fails).
+#   REVIVE=boot   the host is not ready, or an identity is not restored: run boot again (it restores what is missing)
+#   REVIVE=start  all are restored and too few run: start every unit
+judge() {
+  local stored total n missing=0 running
+  WHY=""; REVIVE=""
+  if ! valid_az; then WHY=$(no_az); REVIVE=boot; return 1; fi
+  if [ ! -e "$READY_FILE" ]; then WHY="boot did not finish ($READY_FILE is missing)"; REVIVE=boot; return 1; fi
+  if ! stored=$(stored_names); then
+    # `check` (JUDGE_STRICT) cannot verify what it cannot list and fails; the timer does not revive a host over a listing it could not read.
+    if [ "${JUDGE_STRICT:-0}" = 1 ]; then WHY="the identities stored in S3 for $AZ cannot be listed, so the host cannot be verified"; REVIVE=none; return 1; fi
+    stored=$(find "$ROOT" -maxdepth 2 -name .runner 2> /dev/null | awk -F/ '{print $(NF-1)}')
+  fi
+  total=$(count_lines <<< "$stored")
+  for n in $stored; do [ -e "$ROOT/$n/.runner" ] || missing=$((missing + 1)); done
+  if [ "$missing" -gt 0 ]; then WHY="$missing of $total stored identities are not restored on this host"; REVIVE=boot; return 1; fi
+  running=$(running_listeners)
+  if [ $((running + total / 50)) -lt "$total" ]; then WHY="$running of $total listeners are running"; REVIVE=start; return 1; fi
+  return 0
+}
+
+# stop_listeners: every listener stopped (a stop is not undone by Restart=always), so the host that goes holds no session
+# at GitHub while its replacement boots: the group does not wait for the old instance's shutdown.
+stop_listeners() {
+  local try
+  for try in 1 2; do
+    systemctl stop 'superci-id@*' > /dev/null 2>&1 || true
+    [ "$(running_listeners)" = 0 ] && return 0
+  done
+  echo "could not stop every listener ($(running_listeners) still run)"
+}
+
+# health: a host whose listeners do not run takes no jobs, and nothing else notices (systemd restarts each unit, but
+# a host that is not ready, or whose units all stopped, stays so). Judged every 30 s from the host's uptime, from 15
+# minutes on (the restore of a share takes minutes) by `judge`:
+#   unhealthy for 60 s             -> revive, once per episode: boot again as a process of its own (so its errexit applies, and a
+#                                     boot that fails leaves the host not ready), or start every unit
+#   still so 120 s after the revive -> stop every listener, then mark this instance Unhealthy (once), which its group
+#                                      replaces; the new host restores the share at boot, as up does. Never before the host
+#                                      is 20 minutes old.
+# A boot, register or adopt in progress holds the lock: that is a busy host, not a sick one, unless it is the boot of a
+# boot that has run more than 40 minutes, which cannot be revived and is replaced after the same 120 s.
+health() {
+  local D=$HEALTH_DIR now first since="" why="" id t stuck=0 d booting group
+  mkdir -p "$D"
+  now=$(cut -d. -f1 "$HEALTH_UPTIME")
+  [ "$now" -ge "${HEALTH_GRACE:-900}" ] || exit 0
+  exec 9> "$LOCK"
+  if ! flock -n 9; then
+    # Stuck is a boot that has held the lock past the limit (its start time is in $BOOTING_FILE), not a host that has been up
+    # that long: an operator's boot on a host up for days is busy, not sick. A register or adopt holding the lock is busy.
+    booting=$(cat "$BOOTING_FILE" 2> /dev/null || true)
+    { [[ $booting =~ ^[0-9]+$ ]] && [ $((now - booting)) -ge "${HEALTH_STUCK:-2400}" ]; } || exit 0
+    stuck=1; why="boot has held the lock for $((now - booting)) s"
+  else
+    judge || why=$WHY
+  fi
+  if [ -z "$why" ]; then rm -f "$D/first" "$D/restarted" "$D/not-in-group"; exit 0; fi
+  [ -f "$D/first" ] || echo "$now" > "$D/first"
+  first=$(cat "$D/first")
+  echo "health check failing for $((now - first)) s: $why"
+  if [ -f "$D/restarted" ]; then since=$(cat "$D/restarted"); elif [ "$stuck" = 1 ]; then since=$first; fi
+  if [ -n "$since" ]; then
+    [ $((now - since)) -ge "${HEALTH_REPLACE_AFTER:-120}" ] || exit 0
+    [ ! -f "$D/marked" ] || exit 0
+    [ "$now" -ge "${HEALTH_YOUNG:-1200}" ] || { echo "this host is $now s old: not asking to be replaced yet"; exit 0; }
+    id=${ID_INSTANCE:-}
+    if [ -z "$id" ]; then
+      t=$(curl -s -m 2 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token)
+      id=$(curl -s -m 2 -H "X-aws-ec2-metadata-token: $t" http://169.254.169.254/latest/meta-data/instance-id)
+    fi
+    # Listeners are stopped only when a mark can follow: the instance is in this AZ's group (the role reads and marks its own
+    # groups together). A plain host is not replaced by anything: stopping its listeners would only take its jobs.
+    group=$(aws autoscaling describe-auto-scaling-instances --region us-east-1 --instance-ids "$id" --query 'AutoScalingInstances[0].AutoScalingGroupName' --output text 2> /dev/null) || group=""
+    if [ "$group" != "superci-pull-identity-$AZ" ]; then
+      [ -e "$D/not-in-group" ] || echo "this host is in no group of $AZ (${group:-none}): nothing would replace it, so its listeners are not stopped and it is not marked"
+      touch "$D/not-in-group"; exit 0
+    fi
+    stop_listeners
+    echo "asking the Auto Scaling group to replace $id"
+    aws autoscaling set-instance-health --region us-east-1 --instance-id "$id" --health-status Unhealthy --no-should-respect-grace-period && touch "$D/marked"
+    exit 0
+  fi
+  [ $((now - first)) -ge "${HEALTH_RESTART_AFTER:-60}" ] || exit 0
+  echo "reviving: $why"
+  echo "$now" > "$D/restarted"
+  if [ "$stuck" = 0 ] && [ "$REVIVE" = start ]; then
+    for d in "$ROOT"/*/; do [ ! -e "$d/.runner" ] || start "$(basename "$d")"; done
+  else
+    # Its own process, with the lock let go: in an `||` context bash ignores errexit, and a boot that failed halfway
+    # would go on, touch the ready file with nothing restored, and read as healthy.
+    exec 9>&-
+    "$0" boot || echo "boot failed again"
+  fi
+  # The 120 s run from the end of the revive, which may have taken minutes.
+  cut -d. -f1 "$HEALTH_UPTIME" > "$D/restarted"
+  exit 0
+}
+
+# check: judge once, for `identity.sh up` to read before it adopts a running host (a host that is not healthy would be
+# revived, then replaced, by the timer it installs).
+check() {
+  JUDGE_STRICT=1
+  if judge; then echo "healthy: ready, every identity of the share restored and running"; else echo "not healthy: $WHY"; exit 1; fi
+}
+
 boot() {
-  local stage release want got
+  local stage release want got stored expected
+  valid_az || { echo "superci-id: $(no_az): refusing" >&2; exit 1; }
+  # While boot runs the host is not ready and the health check sees its lock: the marker says since when, so a long-lived host
+  # whose operator runs boot is not taken for one whose boot never ends.
+  trap 'rm -f "$BOOTING_FILE"' EXIT
+  cut -d. -f1 "$HEALTH_UPTIME" > "$BOOTING_FILE"
+  rm -f "$READY_FILE" # (a boot run again that fails leaves the host not ready)
   for _ in $(seq 1 60); do [ -x "$SRC/bin/Runner.Listener" ] && break; sleep 5; done
   harden
   command -v aws > /dev/null || { echo "superci-id: no aws cli on this image" >&2; exit 1; }
@@ -210,7 +381,10 @@ RestartSec=5
 WantedBy=multi-user.target
 UNIT
   systemctl daemon-reload
+  install_health
   stage=$(mktemp -d)
+  stored=$(stored_names)
+  expected=$(count_lines <<< "$stored")
   aws s3 sync --only-show-errors "$PREFIX/" "$stage/"
   local name n=0
   for d in "$stage"/*/; do
@@ -227,7 +401,9 @@ UNIT
   done
   rm -rf "$stage"
   echo "restored $n identities"
-  touch "${READY_FILE:-/run/superci-id-ready}"
+  # Ready is every identity stored for this AZ restored and started, not that the restore ended.
+  [ "$n" -ge "$expected" ] || { echo "superci-id: restored $n of the $expected identities stored for $AZ; not ready" >&2; exit 1; }
+  touch "$READY_FILE"
 }
 
 status() {
@@ -247,9 +423,14 @@ status() {
 
 case "${1:-}" in
   boot) locked; boot ;;
-  register) shift; [ $# -ge 4 ] || { echo "register <label> <url> <group|-> <name>..." >&2; exit 2; }; locked; register "$@" ;;
-  adopt) shift; locked; adopt "$@" ;;
+  register) shift; [ $# -ge 4 ] || { echo "register <label> <url> <group|-> <name>..." >&2; exit 2; }
+    valid_az || { echo "superci-id: $(no_az): refusing" >&2; exit 1; } # before any registration: an identity stored under no share is lost
+    locked; register "$@" ;;
+  adopt) shift; valid_az || { echo "superci-id: $(no_az): refusing" >&2; exit 1; }; locked; adopt "$@" ;;
   status) status ;;
   harden) locked; harden ;;
-  *) echo "usage: superci-id boot|register|adopt|status|harden" >&2; exit 2 ;;
+  health) health ;;
+  check) check ;;
+  install-health) locked; install_health ;;
+  *) echo "usage: superci-id boot|register|adopt|status|harden|health|install-health|check" >&2; exit 2 ;;
 esac

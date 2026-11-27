@@ -45,7 +45,7 @@ done
 # ---- the key ----
 refuses "a key whose alias cannot be made is scheduled for deletion, not left to be made again" "the new key is scheduled for deletion" env FAKE_ALIAS_FAIL=1 "$ID" up us-east-1a
 grep -q 'kms schedule-key-deletion' "$FAKE/calls.log" && [ ! -e "$FAKE/state/key" ]; check $? "and no key is left"
-[ "$(count 'run-instances' "$FAKE/calls.log")" = 0 ]; check $? "and no host is launched"
+[ "$(count 'run-instances\|auto-scaling-group' "$FAKE/calls.log")" = 0 ]; check $? "and no host is launched and no group made"
 flog
 # A role up just made is not a principal KMS knows for some seconds (measured Nov 27: create-key refused 3 s after
 # create-role). That answer is asked again; any other refusal is not. Each in a world of its own, which holds no shim,
@@ -56,21 +56,41 @@ refuses "up waits out a role KMS does not know yet (and then refuses for want of
 check $? "and makes the key on the third ask, under one alias"
 K2=$T/fake-key-denied; mkdir -p "$K2/state"
 refuses "a create-key refused for any other reason is not asked again" "refusing: create-key failed" env FAKE=$K2 FAKE_KEY_DENIED=1 "$ID" up us-east-1a
-[ "$(count 'kms create-key' "$K2/calls.log")" = 1 ] && [ ! -e "$K2/state/key" ] && [ "$(count 'run-instances' "$K2/calls.log")" = 0 ]
+[ "$(count 'kms create-key' "$K2/calls.log")" = 1 ] && [ ! -e "$K2/state/key" ] && [ "$(count 'run-instances\|auto-scaling-group' "$K2/calls.log")" = 0 ]
 check $? "and is asked once, makes no key and launches nothing"
 
 # ---- up ----
 refuses "up refuses while the release holds no shim" "refusing" "$ID" up us-east-1a
-[ "$(count run-instances "$FAKE/calls.log")" = 0 ]; check $? "and launches nothing"
+[ "$(count 'run-instances\|auto-scaling-group\|create-launch-template' "$FAKE/calls.log")" = 0 ]; check $? "and launches nothing, and makes no group or template"
 release one
-ok "up launches the host of an AZ" "$ID" up us-east-1a
+ok "up makes the host of an AZ a group of one, from a launch template" "$ID" up us-east-1a
 c=$FAKE/calls.log
-for want in "--instance-type r7i.4xlarge" "--image-id ami-1" "HttpTokens=required,HttpPutResponseHopLimit=1" "Key=superci-pull-role,Value=identity" \
-  "Key=superci-pull-deployment,Value=superci-pull" "Key=Name,Value=superci-pull-identity-us-east-1a" "Key=purpose,Value=superci-pull" "--iam-instance-profile Name=superci-pull-identity" "--subnet-id subnet-a"; do
-  has "$want" "$c" "run-instances carries $want"
-done
-has "ResourceType=volume,Tags=[{Key=purpose,Value=superci-pull}" "$c" "and tags the volume"
-has "--block-device-mappings DeviceName=/dev/sda1,Ebs={Encrypted=true,DeleteOnTermination=true}" "$c" "and encrypts the root volume, on the image's own root device"
+[ "$(count 'run-instances' "$c")" = 0 ]; check $? "no instance is launched by hand: the group's template launches it"
+python3 -I - "$FAKE/state" << 'PY'
+import json, os, sys
+st = sys.argv[1]
+t = json.load(open(os.path.join(st, "lt", "superci-pull-identity-us-east-1a")))
+d = json.loads(t["versions"][0]["data"])
+assert len(t["versions"]) == 1 and t["versions"][0]["desc"].startswith("sha256:"), t["versions"]
+assert d["InstanceType"] == "r7i.4xlarge" and d["ImageId"] == "ami-1", d
+assert d["MetadataOptions"] == {"HttpTokens": "required", "HttpPutResponseHopLimit": 1, "HttpEndpoint": "enabled"}, d["MetadataOptions"]
+assert d["IamInstanceProfile"] == {"Name": "superci-pull-identity"}, d["IamInstanceProfile"]
+ni = d["NetworkInterfaces"]
+assert ni == [{"DeviceIndex": 0, "AssociatePublicIpAddress": True, "DeleteOnTermination": True, "Groups": ["sg-identity"]}], ni
+assert d["BlockDeviceMappings"] == [{"DeviceName": "/dev/sda1", "Ebs": {"Encrypted": True, "DeleteOnTermination": True}}], d["BlockDeviceMappings"]
+specs = {s["ResourceType"]: {kv["Key"]: kv["Value"] for kv in s["Tags"]} for s in d["TagSpecifications"]}
+assert specs["instance"] == {"purpose": "superci-pull", "superci-pull-role": "identity", "superci-pull-deployment": "superci-pull", "Name": "superci-pull-identity-us-east-1a"}, specs["instance"]
+assert specs["volume"] == {"purpose": "superci-pull", "Name": "superci-pull-identity-us-east-1a"}, specs["volume"]
+g = json.load(open(os.path.join(st, "asg", "superci-pull-identity-us-east-1a")))
+assert (g["min"], g["max"], g["desired"]) == (1, 1, 1), g
+assert g["subnet"] == "subnet-a" and g["health"] == "EC2" and g["version"] == "$Default" and g["lt"] == t["id"], g
+assert g["maintenance"] == "MinHealthyPercentage=0,MaxHealthyPercentage=100", g["maintenance"]
+assert len(g["instances"]) == 1
+PY
+check $? "the template carries today's host (type, image, IMDSv2, profile, public address, encrypted root on the image's device, tags and volume tags) and the group is one instance, EC2 health, in the AZ's subnet, terminating before it launches"
+[ "$(count 'create-launch-template ' "$c")" = 1 ] && [ "$(count 'create-auto-scaling-group' "$c")" = 1 ] && [ "$(count 'wait instance-running' "$c")" -ge 1 ]; check $? "one template and one group are made, and the host is waited for"
+grep -q "ready: superci-pull-identity-us-east-1a restored its share" <<< "$out"; check $? "up waits until the host has restored its share"
+[ ! -e "$FAKE/state/two-live" ]; check $? "and no second host was ever live on a name"
 [ "$(count 'kms create-key' "$c")" = 1 ] && [ "$(count 'kms create-alias --alias-name alias/superci-pull-identities' "$c")" = 1 ]; check $? "the key is made once, under its alias"
 U=$FAKE/state/userdata-0001
 has "$PIN" "$U" "user data pins the listener's public key"
@@ -81,20 +101,29 @@ has "https://203.0.113.9:8443" "$U" "and names the listener's address"
 python3 -I -c 'import re,sys,base64,gzip; sys.stdout.buffer.write(gzip.decompress(base64.b64decode(re.search(r"echo .([A-Za-z0-9+/=]+). \| base64 -d \| gunzip", open(sys.argv[1]).read()).group(1))))' "$U" | cmp -s - "$here/identity-host.sh"
 check $? "and carries the host script of this checkout"
 grep -q 'superci-id boot' "$U"; check $? "and runs its boot"
+n0=$(wc -l < "$c")
 ok "up again changes nothing" "$ID" up us-east-1a
-[ "$(count 'run-instances' "$c")" = 1 ]; check $? "and launches no second host"
+tail -n +$((n0 + 1)) "$c" > "$T/up-again.calls"
+[ "$(count 'create-launch-template\|create-auto-scaling-group\|update-auto-scaling-group\|attach-instances\|terminate-instances' "$T/up-again.calls")" = 0 ]; check $? "no template version, no group change, no instance ended or attached"
+[ "$(ls "$FAKE/state/instances" | wc -l)" = 1 ]; check $? "and no second host"
 grep -q "already up" <<< "$out"; check $? "and says so"
+python3 -I -c 'import json,sys; t = json.load(open(sys.argv[1])); assert [v["n"] for v in t["versions"]] == [1] and t["default"] == 1, t' "$FAKE/state/lt/superci-pull-identity-us-east-1a"
+check $? "the template is still its one version"
 ok "up of a second AZ" "$ID" up us-east-1b
 python3 -I - "$FAKE/state/role-policy.json" "$FAKE/state/bucket-policy.json" << 'EOF'
 import json, sys
 role, bucket = json.load(open(sys.argv[1])), json.load(open(sys.argv[2]))
 allowed = {"arn:aws:s3:::superci-pull-identities-243891825325/superci-pull/*", "arn:aws:s3:::superci-pull-identities-243891825325",
-           "arn:aws:s3:::superci-pull-243891825325/bin/superci-shim", "arn:aws:s3:::superci-pull-243891825325/bin/RELEASE.json", "arn:aws:kms:us-east-1:243891825325:key/1234abcd-12ab-34cd-56ef-1234567890ab"}
+           "arn:aws:s3:::superci-pull-243891825325/bin/superci-shim", "arn:aws:s3:::superci-pull-243891825325/bin/RELEASE.json", "arn:aws:kms:us-east-1:243891825325:key/1234abcd-12ab-34cd-56ef-1234567890ab",
+           "arn:aws:autoscaling:us-east-1:243891825325:autoScalingGroup:*:autoScalingGroupName/superci-pull-identity-*"}
 res = set()
 for st in role["Statement"]:
     assert st["Effect"] == "Allow"
+    if st["Sid"] == "ReadItsOwnGroup":  # a Describe call takes no resource: it is the one statement on "*"
+        assert st["Action"] == "autoscaling:DescribeAutoScalingInstances" and st["Resource"] == "*", st
+        continue
     acts = st["Action"] if isinstance(st["Action"], list) else [st["Action"]]
-    assert all(a.startswith(("s3:Get", "s3:Put", "s3:List", "kms:")) and "*" not in a for a in acts), acts
+    assert all(a.startswith(("s3:Get", "s3:Put", "s3:List", "kms:")) and "*" not in a or a == "autoscaling:SetInstanceHealth" for a in acts), acts
     res |= set(st["Resource"] if isinstance(st["Resource"], list) else [st["Resource"]])
 assert res <= allowed, res - allowed
 sids = {s["Sid"]: s for s in bucket["Statement"]}
@@ -103,7 +132,7 @@ for need in ["TlsOnly", "NoPutWithoutKms", "NoPutWithoutAnEncryptionHeader", "On
 assert sids["OnlyTheOperatorDeletes"]["Condition"]["ArnNotLike"]["aws:PrincipalArn"] == ["arn:aws:iam::243891825325:role/ops", "arn:aws:iam::243891825325:role/*/ops"]
 assert sids["OnlyTheIdentityHostsRead"]["Condition"]["ArnNotEquals"]["aws:PrincipalArn"] == "arn:aws:iam::243891825325:role/superci-pull-identity"
 EOF
-check $? "the role may only use its prefix, the shim and the one key; the bucket denies unencrypted puts and others' reads, writes and deletes"
+check $? "the role may only use its prefix, the shim, the one key and mark an identity host's own group unhealthy; the bucket denies unencrypted puts and others' reads, writes and deletes"
 python3 -I - "$FAKE/state/role-policy.json" "$FAKE/state/bucket-policy.json" "$FAKE/state/key-policy.json" "$FAKE/state/bucket-encryption.json" << 'PY'
 import json, sys
 role, bucket, key, enc = (json.load(open(f)) for f in sys.argv[1:5])
@@ -213,7 +242,8 @@ refuses "n is at least 1" "n is 1 to 100" "$ID" register --rate 1 4cpu 0
 # ---- three hosts: identity i on host i mod 3 ----
 refuses "up refuses a type that is not one" "--type is an instance type" "$ID" up --type 'r7i;x' us-east-1c
 ok "up of a third AZ, on the smaller type" "$ID" up --type r7i.2xlarge us-east-1c
-[ "$(count '--instance-type r7i.2xlarge' "$FAKE/calls.log")" = 1 ] && [ "$(count '--instance-type r7i.4xlarge' "$FAKE/calls.log")" = 0 ]; check $? "the flag sets the instance type"
+python3 -I -c 'import json,sys; d = json.loads(json.load(open(sys.argv[1]))["versions"][0]["data"]); assert d["InstanceType"] == "r7i.2xlarge", d' "$FAKE/state/lt/superci-pull-identity-us-east-1c"
+check $? "the flag sets the template's instance type"
 flog
 ok "register across three hosts" env IDENTITY_AZS="us-east-1a us-east-1b us-east-1c" "$ID" register --rate 1 16cpu 6 1
 for p in "1 b" "2 c" "3 a" "4 b" "5 c" "6 a"; do set -- $p
@@ -366,6 +396,8 @@ H=$FAKE/hosts/$ip_a; mkdir -p "$H/proc/101" "$H/proc/102"; printf '101\n102\n' >
 ln -sf "$H/opt/id/superci-id-4cpu-0002" "$H/proc/101/cwd"; printf 'Rss: 9 kB\nPrivate_Dirty:     36864 kB\n' > "$H/proc/101/smaps_rollup"
 ln -sf "$H/opt/id/superci-id-4cpu-0004" "$H/proc/102/cwd"; printf 'Rss: 9 kB\nPrivate_Dirty:     70000 kB\n' > "$H/proc/102/smaps_rollup"
 ok "status" "$ID" status
+grep -q "identity groups:" <<< "$out" && grep -q "superci-pull-identity-us-east-1a: min 1 max 1 desired 1: i-0001 InService Healthy" <<< "$out" && grep -q "superci-pull-identity-us-east-1b: min 1 max 1 desired 1: i-0002 InService Healthy" <<< "$out"; check $? "status shows each group, its size and its host's state"
+! grep -q "is in no group" <<< "$out"; check $? "and no host outside a group"
 grep -q "identity hosts: 3" <<< "$out" && grep -q "az us-east-1a identities [0-9]* listeners_running [0-9]* private_dirty_kib_avg 53432 max 70000 over_64mib 1" <<< "$out"; check $? "counts hosts, measures each listener's private memory and counts those over 64 MiB"
 grep -q "at GitHub:" <<< "$out" && grep -q "memory they need on 3 hosts" <<< "$out" && grep -q "64 MiB private (its unit restarts it at MemoryMax 192M) + 60 MiB shared a host; 1,550 identities are about 97 GiB" <<< "$out"; check $? "and shows what GitHub holds and the memory budget"
 
@@ -398,6 +430,11 @@ check $? "every identity's unit sets exactly the measured GC environment"
 for want in MemoryMax=192M Restart=always RestartSec=5 StartLimitIntervalSec=600 StartLimitBurst=10 RUNNER_ALLOW_RUNASROOT=1; do
   has "$want" "$U" "every identity's unit has $want"
 done
+has "ExecStart=/usr/local/bin/superci-id health" "$N/units/superci-id-health.service" "every host runs its health check from a service"
+has "OnUnitActiveSec=30s" "$N/units/superci-id-health.timer" "every 30 seconds"
+tmo=$(sed -n 's/^TimeoutStartSec=//p' "$N/units/superci-id-health.service")
+[ -n "$tmo" ] && [ "$tmo" -ge $((1550 * 213 / 295 * 2)) ]; check $? "a health run may last twice the restore of 1,550 identities at the measured 213 s for 295 (its revive reruns boot inside it; it is ${tmo:-unset} s)"
+grep -q 'systemctl enable --now superci-id-health.timer' "$FAKE/systemctl.log"; check $? "and the timer is enabled at boot"
 ! grep -q '^KillMode=' "$U"; check $? "and keeps systemd's default KillMode, so a stop takes the listener and its shim down together"
 printf 'tampered\n' >> "$REL/bin/superci-shim"; rm -rf "$N/id" "$N/enabled" "$N/ready" "$N/shim"
 refuses "a replacement host refuses a shim that is not the release's" "refusing s3://superci-pull-$ACCOUNT/bin/superci-shim" newhost boot
@@ -474,6 +511,300 @@ refuses "a run that cannot get the lock in time says so and changes nothing" "bu
 unset LOCK_WAIT
 exec 7>&-
 [ ! -e "$C/id/superci-id-4cpu-0098" ]; check $? "and registers nothing"
+
+# ---- the groups: each in a world of its own (its own AWS, hosts and release; the stubs keep $FAKE) ----
+# A group is reconciled by the stub as EC2 does it (testdata/identity/aws), and state/two-live is written the moment two
+# live instances carry one Name: for an identity host, two hosts on one share, two listeners on one identity.
+release again
+world() { # <dir>: a fresh AWS with the release and the listener's key
+  mkdir -p "$1/state" "$1/s3"; cp -r "$REL" "$1/s3/"; cp "$FAKE/tls.json" "$1/"
+  : > "$1/calls.log"; : > "$1/ssh.log"; : > "$1/curl.log"; : > "$1/config.log"; : > "$1/sleep.log"
+}
+wlog() { for f in calls ssh curl config sleep; do : > "$1/$f.log"; done; }
+share() { # <world> <az> <name>...: identities stored in the world's bucket
+  local w=$1 az=$2 n f; shift 2
+  for n in "$@"; do mkdir -p "$w/s3/superci-pull-identities-$ACCOUNT/superci-pull/hosts/$az/$n"
+    for f in .runner .credentials .credentials_rsaparams; do echo "$n $f" > "$w/s3/superci-pull-identities-$ACCOUNT/superci-pull/hosts/$az/$n/$f"; done; done
+}
+plainhost() { # <world> <az>: a host as identity.sh launched it before the groups, by hand, in no group; prints its id
+  env FAKE=$1 aws ec2 run-instances --image-id ami-1 --instance-type r7i.4xlarge --subnet-id "subnet-${2: -1}" --security-group-ids sg-identity --associate-public-ip-address \
+    --iam-instance-profile Name=superci-pull-identity --metadata-options HttpTokens=required --user-data plain \
+    --tag-specifications "ResourceType=instance,Tags=[{Key=purpose,Value=superci-pull},{Key=superci-pull-role,Value=identity},{Key=superci-pull-deployment,Value=superci-pull},{Key=Name,Value=superci-pull-identity-$2}]" --query 'Instances[0].InstanceId' --output text
+}
+seedhost() { # <world> <ip> <name>...: the identities a healthy plain host holds and runs
+  local w=$1 ip=$2 n; shift 2
+  mkdir -p "$w/hosts/$ip/opt/id"; : > "$w/hosts/$ip/enabled"
+  for n in "$@"; do mkdir -p "$w/hosts/$ip/opt/id/$n"; : > "$w/hosts/$ip/opt/id/$n/.runner"; echo "$n" >> "$w/hosts/$ip/enabled"; done
+}
+gjson() { python3 -I -c 'import json,sys; g = json.load(open(sys.argv[1] + "/state/asg/" + sys.argv[2])); print(g["min"], g["max"], g["desired"], *g["instances"])' "$1" "$2"; } # "<min> <max> <desired> <ids>"
+istate() { python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1] + "/state/instances/" + sys.argv[2]))["state"])' "$1" "$2"; }
+ninst() { ls "$1/state/instances" 2> /dev/null | wc -l; }
+line() { grep -n -- "$2" "$1" | head -1 | cut -d: -f1; } # the first line of a log with it
+GA=superci-pull-identity-us-east-1a
+
+# ---- adopting a plain host: it is attached, and a second host never exists ----
+M=$T/fake-adopt; world "$M"; share "$M" us-east-1a superci-id-4cpu-0002 superci-id-4cpu-0004 superci-id-4cpu-0006
+[ "$(plainhost "$M" us-east-1a)" = i-0001 ]; check $? "(a plain host of us-east-1a, as before the groups)"
+seedhost "$M" 192.0.2.11 superci-id-4cpu-0002 superci-id-4cpu-0004 superci-id-4cpu-0006
+wlog "$M"
+ok "status names a host that is in no group" env FAKE=$M "$ID" status
+grep -q "i-0001 is in no group: nothing replaces it if it is lost; up us-east-1a adopts it" <<< "$out" && grep -q "none: every host is plain" <<< "$out"; check $? "and says nothing replaces it"
+wlog "$M"
+ok "up adopts the plain host into a new group" env FAKE=$M "$ID" up us-east-1a
+grep -q "adopted the plain host i-0001 into $GA: no second host" <<< "$out"; check $? "and says so"
+mc=$M/calls.log
+[ "$(count 'run-instances\|terminate-instances' "$mc")" = 0 ] && [ "$(ninst "$M")" = 1 ] && [ "$(istate "$M" i-0001)" = running ]; check $? "no instance is launched or ended: the plain host is the group's instance, still running"
+[ ! -e "$M/state/two-live" ]; check $? "and never are two hosts live on one name"
+[ "$(gjson "$M" $GA)" = "1 1 1 i-0001" ]; check $? "the group holds exactly that host (min 1, max 1, desired 1)"
+c1=$(line "$mc" 'create-auto-scaling-group'); c2=$(line "$mc" 'attach-instances'); c3=$(line "$mc" 'update-auto-scaling-group.*--min-size 1')
+sed -n "${c1}p" "$mc" | grep -q -- '--min-size 0 --max-size 1 --desired-capacity 0' && [ "$c1" -lt "$c2" ] && [ "$c2" -lt "$c3" ]
+check $? "in that order: an empty group (nothing launches), the host attached, then min 1"
+grep -q 'superci-id install-health' "$M/ssh.log" && [ -s "$M/hosts/192.0.2.11/units/superci-id-health.timer" ]; check $? "the host gets this checkout's script and its health timer"
+python3 -I -c 'import json,sys; t = json.load(open(sys.argv[1])); assert [v["n"] for v in t["versions"]] == [1], t' "$M/state/lt/$GA"; check $? "and the group has its template, for the host's next replacement"
+# the stub's detector is no tautology: a second group on the same template launches a second host on the name
+env FAKE=$M aws autoscaling create-auto-scaling-group --auto-scaling-group-name rogue --launch-template 'LaunchTemplateId=lt-0001,Version=$Default' --min-size 1 --max-size 1 --desired-capacity 1 --vpc-zone-identifier subnet-a
+grep -q "launched while i-0001 runs" "$M/state/two-live" 2> /dev/null; check $? "(the stub sees a second live host on the name when one is launched beside the first)"
+env FAKE=$M aws autoscaling delete-auto-scaling-group --auto-scaling-group-name rogue --force-delete; rm -f "$M/state/two-live"
+[ "$(plainhost "$M" us-east-1a)" = i-0003 ]; wlog "$M"
+refuses "up refuses while a group's host and a plain one both exist" "both would run the share of us-east-1a" env FAKE=$M "$ID" up us-east-1a
+[ "$(count 'terminate-instances\|attach-instances\|update-auto-scaling-group\|create-auto-scaling-group' "$mc")" = 0 ]; check $? "and changes nothing"
+ok "down ends the group's host and the plain one, and deletes the group" env FAKE=$M "$ID" down us-east-1a
+[ ! -e "$M/state/asg/$GA" ] && [ "$(istate "$M" i-0001)" = terminated ] && [ "$(istate "$M" i-0003)" = terminated ]; check $? "so none is left"
+
+# an adoption that is refused: the plain host runs alone and the group holds nothing
+M2=$T/fake-adopt-refused; world "$M2"; share "$M2" us-east-1a superci-id-4cpu-0002
+plainhost "$M2" us-east-1a > /dev/null; seedhost "$M2" 192.0.2.11 superci-id-4cpu-0002; touch "$M2/attach-fail"; wlog "$M2"
+refuses "an attach that is refused says what stands" "was not attached: it still runs alone and $GA holds nothing" env FAKE=$M2 "$ID" up us-east-1a
+[ "$(gjson "$M2" $GA)" = "0 1 0" ] && [ "$(ninst "$M2")" = 1 ] && [ "$(istate "$M2" i-0001)" = running ] && [ ! -e "$M2/state/two-live" ]; check $? "the group is empty (desired 0), the plain host runs and no second one was launched"
+rm -f "$M2/attach-fail"
+ok "up again resumes the adoption" env FAKE=$M2 "$ID" up us-east-1a
+[ "$(gjson "$M2" $GA)" = "1 1 1 i-0001" ] && [ "$(ninst "$M2")" = 1 ] && [ ! -e "$M2/state/two-live" ]; check $? "the host is attached, and still no second host"
+
+# a plain host that is not healthy is not adopted: the health timer it would be given would revive, then replace, a live host
+MU=$T/fake-adopt-sick; world "$MU"; share "$MU" us-east-1a superci-id-4cpu-0002 superci-id-4cpu-0004 superci-id-4cpu-0006
+plainhost "$MU" us-east-1a > /dev/null; seedhost "$MU" 192.0.2.11 superci-id-4cpu-0002 superci-id-4cpu-0004 superci-id-4cpu-0006; sed -i '$d' "$MU/hosts/192.0.2.11/enabled"; wlog "$MU"
+refuses "up refuses to adopt a plain host that runs 2 of the 3 listeners of its share" "refusing to adopt the plain host i-0001: not healthy: 2 of 3 listeners are running" env FAKE=$MU "$ID" up us-east-1a
+[ "$(count 'create-auto-scaling-group\|attach-instances\|update-auto-scaling-group\|terminate-instances' "$MU/calls.log")" = 0 ] && [ ! -e "$MU/state/asg/$GA" ] && [ "$(ninst "$MU")" = 1 ] && [ "$(istate "$MU" i-0001)" = running ]; check $? "and changes nothing: no group, no attach, the host runs on"
+rm -rf "$MU/hosts/192.0.2.11/opt/id/superci-id-4cpu-0006"; seedhost "$MU" 192.0.2.11 superci-id-4cpu-0002 superci-id-4cpu-0004
+refuses "nor one that has not restored an identity of its share" "not healthy: 1 of 3 stored identities are not restored on this host" env FAKE=$MU "$ID" up us-east-1a
+seedhost "$MU" 192.0.2.11 superci-id-4cpu-0002 superci-id-4cpu-0004 superci-id-4cpu-0006
+ok "up adopts it once every listener of its share runs" env FAKE=$MU "$ID" up us-east-1a
+[ "$(gjson "$MU" $GA)" = "1 1 1 i-0001" ] && [ "$(ninst "$MU")" = 1 ]; check $? "(the one host, attached)"
+
+# --replace: the plain host is gone before the group launches its own
+M3=$T/fake-replace; world "$M3"; share "$M3" us-east-1a superci-id-4cpu-0002
+plainhost "$M3" us-east-1a > /dev/null; wlog "$M3"
+ok "up --replace ends the plain host, then the group launches its own" env FAKE=$M3 "$ID" up --replace us-east-1a
+mc=$M3/calls.log
+t1=$(line "$mc" 'terminate-instances'); t2=$(line "$mc" 'wait instance-terminated'); t3=$(line "$mc" 'create-auto-scaling-group')
+[ -n "$t1" ] && [ "$t1" -lt "$t2" ] && [ "$t2" -lt "$t3" ]; check $? "terminated and waited for before the group is made"
+[ ! -e "$M3/state/two-live" ] && [ "$(istate "$M3" i-0001)" = terminated ] && [ "$(gjson "$M3" $GA)" = "1 1 1 i-0002" ]; check $? "so the group's host never ran beside the old one"
+
+# ---- a host that is lost is replaced, and restores its share ----
+HW=$T/fake-heal; world "$HW"; share "$HW" us-east-1a superci-id-4cpu-0002 superci-id-4cpu-0004 superci-id-4cpu-0006 superci-id-4cpu-0008; share "$HW" us-east-1b superci-id-4cpu-0001 superci-id-4cpu-0003
+wlog "$HW"
+ok "up on an empty AZ makes the group, whose host is ready" env FAKE=$HW "$ID" up us-east-1a
+[ "$(gjson "$HW" $GA)" = "1 1 1 i-0001" ] && [ "$(count 'run-instances' "$HW/calls.log")" = 0 ]; check $? "the group launched it"
+env FAKE=$HW aws ec2 terminate-instances --instance-ids i-0001 # EC2 lost it, with no person involved
+env FAKE=$HW aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names $GA --output json | grep -q '"InstanceId": "i-0002"'; check $? "the group, asked after the loss, holds a new host"
+[ "$(gjson "$HW" $GA)" = "1 1 1 i-0002" ] && [ "$(istate "$HW" i-0001)" = terminated ] && [ "$(istate "$HW" i-0002)" = running ] && [ ! -e "$HW/state/two-live" ]; check $? "(one host, the lost one gone, never two on the name)"
+cmp -s "$HW/state/userdata-0001" "$HW/state/userdata-0002"; check $? "launched from the same template: the same user data"
+python3 -I -c 'import json,sys; a, b = (json.load(open(sys.argv[1] + "/state/instances/" + i)) for i in ("i-0001", "i-0002")); assert a["tags"] == b["tags"] and b["tags"]["Name"] == "superci-pull-identity-us-east-1a" and b["tags"]["superci-pull-role"] == "identity", (a, b)' "$HW"
+check $? "with the same tags, which the dispatcher and identity.sh find a host by"
+# the replacement boots from that user data (never run as written: its script and conf, in a root of this test's own)
+X=$T/healed; mkdir -p "$X/units"
+python3 -I -c 'import re,sys,base64,gzip; t = open(sys.argv[1]).read(); open(sys.argv[2], "wb").write(gzip.decompress(base64.b64decode(re.search(r"echo .([A-Za-z0-9+/=]+). \| base64 -d \| gunzip", t).group(1)))); open(sys.argv[3], "w").write(re.search(r"<< .CONF.\n(.*?)\nCONF\n", t, re.S).group(1) + "\n")' "$HW/state/userdata-0002" "$X/superci-id" "$X/conf"
+cmp -s "$X/superci-id" "$here/identity-host.sh"; check $? "the user data carries this checkout's host script"
+env FAKE=$HW ID_ROOT=$X/id RUNNER_SRC=$FAKE_RUNNER SHIM_BIN=$X/shim SHIM_ENV=$X/shim.env ID_CONF=$X/conf UNIT_DIR=$X/units ID_LOG=$X/log ID_AZ=us-east-1a ID_LOCK=$X/lock READY_FILE=$X/ready FAKE_UNITS=$X/enabled \
+  bash "$X/superci-id" boot > "$X/boot.out" 2>&1; check $? "the replacement boots"
+[ "$(ls "$X/id" | tr '\n' ' ')" = "superci-id-4cpu-0002 superci-id-4cpu-0004 superci-id-4cpu-0006 superci-id-4cpu-0008 " ] && [ "$(sort "$X/enabled" | tr '\n' ' ')" = "$(ls "$X/id" | tr '\n' ' ')" ] && [ -e "$X/ready" ]
+check $? "and restores exactly its AZ's share, starts it and is ready, with no hand to run anything"
+[ ! -s "$HW/config.log" ] && [ "$(count '^token' "$HW/curl.log")" = 0 ]; check $? "registering nothing"
+ok "up after the heal finds the group whole" env FAKE=$HW "$ID" up us-east-1a
+grep -q "already up" <<< "$out" && [ "$(count 'create-launch-template' "$HW/calls.log")" = 1 ]; check $? "and adds no template version"
+
+# ---- the host's own health: listeners that do not run, a boot that did not finish ----
+hip=192.0.2.12; HD=$HW/hosts/$hip; hid=i-0002
+mkdir -p "$HD/opt/id"; for n in 0002 0004 0006 0008; do mkdir -p "$HD/opt/id/superci-id-4cpu-$n"; : > "$HD/opt/id/superci-id-4cpu-$n/.runner"; done
+all4() { printf 'superci-id-4cpu-%s\n' 0002 0004 0006 0008 > "$HD/enabled"; }
+hh() { # <uptime seconds> [state dir]: one health tick on the host $hid ($hip), as its timer runs it, over the ssh stub
+  printf '%s.00 0.00\n' "$1" > "$T/uptime"
+  env FAKE=$HW HEALTH_UPTIME=$T/uptime HEALTH_DIR=${2:-$T/hd} ID_INSTANCE=$hid "$F/ssh" -q -i k -o x "ubuntu@$hip" 'sudo superci-id health' 2>&1
+}
+marks() { count 'autoscaling set-instance-health' "$HW/calls.log"; }
+starts() { count 'enable --now --no-block superci-id@' "$HW/systemctl.log"; }
+: > "$HW/systemctl.log"; rm -f "$T/hd"
+: > "$HD/enabled"; hh 500 > /dev/null
+[ "$(marks)" = 0 ] && [ "$(starts)" = 0 ] && [ ! -e "$T/hd/first" ]; check $? "a host under 15 minutes old is not judged, whatever runs"
+all4; hh 2000 > /dev/null; hh 2030 > /dev/null
+[ "$(marks)" = 0 ] && [ "$(starts)" = 0 ] && [ ! -e "$T/hd/first" ]; check $? "a host whose listeners all run is not touched"
+printf 'superci-id-4cpu-0002\n' > "$HD/enabled"
+hh 2000 > /dev/null; hh 2030 > /dev/null
+[ "$(starts)" = 0 ] && [ -e "$T/hd/first" ]; check $? "under half of them running for under 60 s: noted, nothing done"
+out=$(hh 2060)
+[ "$(starts)" = 4 ] && [ "$(sort -u "$HD/enabled" | wc -l)" = 4 ] && [ "$(marks)" = 0 ] && grep -q "reviving: 1 of 4 listeners are running" <<< "$out"; check $? "for 60 s: every listener is started again first (not the instance replaced)"
+hh 2090 > /dev/null
+[ ! -e "$T/hd/first" ] && [ ! -e "$T/hd/restarted" ] && [ "$(marks)" = 0 ]; check $? "and a host that is cured is not marked, and its episode ends"
+touch "$HW/units-wont-start"; rm -rf "$T/hd"; printf 'superci-id-4cpu-0002\n' > "$HD/enabled"
+for t in 2000 2060 2120; do hh $t > /dev/null; done
+[ "$(marks)" = 0 ] && [ "$(starts)" = 8 ]; check $? "listeners that stay down 60 s after the revive are not yet cause to replace the host (it waits 120 s)"
+[ "$(ninst "$HW")" = 2 ]; check $? "(nothing was launched meanwhile)"
+out=$(hh 2180)
+[ "$(marks)" = 1 ] && grep -q "asking the Auto Scaling group to replace i-0002" <<< "$out" && grep -q -- '--health-status Unhealthy --no-should-respect-grace-period' "$HW/calls.log"; check $? "120 s after the revive the host asks its group to replace it (Unhealthy, grace period not respected)"
+[ "$(istate "$HW" i-0002)" = terminated ] && [ "$(gjson "$HW" $GA)" = "1 1 1 i-0003" ] && [ ! -e "$HW/state/two-live" ]; check $? "the group ends it before it launches the next, and the next is the group's one host"
+[ ! -e "$HW/state/mark-with-listeners" ] && grep -qF "systemctl stop superci-id@*" "$HW/systemctl.log" && [ ! -s "$HD/enabled" ]; check $? "every listener was stopped before the mark: the host that goes holds no session while its replacement boots"
+hh 2240 > /dev/null; [ "$(marks)" = 1 ]; check $? "and the host asks once"
+# a host not yet 20 minutes old asks later: a dud image would be replaced in a loop otherwise
+hip=192.0.2.13; hid=i-0003; HD=$HW/hosts/$hip; mkdir -p "$HD/opt/id" "$HD/bin"; cp "$here/identity-host.sh" "$HD/bin/superci-id"; for n in 0002 0004 0006 0008; do mkdir -p "$HD/opt/id/superci-id-4cpu-$n"; : > "$HD/opt/id/superci-id-4cpu-$n/.runner"; done
+: > "$HD/enabled"; rm -rf "$T/hd2"
+for t in 900 960 1100; do out=$(hh $t "$T/hd2"); done
+[ "$(marks)" = 1 ] && grep -q "not asking to be replaced yet" <<< "$out"; check $? "a host younger than 20 minutes is not replaced, and says so"
+out=$(hh 1200 "$T/hd2")
+[ "$(marks)" = 2 ] && [ "$(gjson "$HW" $GA)" = "1 1 1 i-0004" ] && [ ! -e "$HW/state/two-live" ]; check $? "at 20 minutes it is, and again no second host on the name"
+# boot did not finish: it is run again, and a host that does not finish is replaced
+rm -f "$HW/units-wont-start"
+hip=192.0.2.14; hid=i-0004; HD=$HW/hosts/$hip; mkdir -p "$HD/bin"; cp "$here/identity-host.sh" "$HD/bin/superci-id"; rm -f "$HD/run/superci-id-ready"; rm -rf "$T/hd3" "$HD/opt/id"
+hh 2000 "$T/hd3" > /dev/null
+out=$(hh 2060 "$T/hd3")
+grep -q "reviving: boot did not finish" <<< "$out" && [ -e "$HD/run/superci-id-ready" ] && [ "$(ls "$HD/opt/id" | wc -l)" = 4 ]; check $? "a host that is not ready runs its boot again, and restores its share"
+[ "$(marks)" = 2 ]; check $? "(without replacing the host)"
+rm -f "$HD/run/superci-id-ready"; rm -rf "$T/hd4"
+echo 0 > "$HD/run/superci-id-booting" # (the boot began at uptime 0: it is the boot's age that makes it stuck)
+exec 7> "$HD/run/superci-id.lock"; flock 7
+hh 2000 "$T/hd4" > /dev/null; [ ! -e "$T/hd4/first" ] && [ "$(marks)" = 2 ]; check $? "a boot that holds the host's lock is busy, not sick (for 40 minutes)"
+hh 2400 "$T/hd4" > /dev/null; hh 2460 "$T/hd4" > /dev/null
+[ "$(marks)" = 2 ]; check $? "past it, 120 s must pass before the host asks"
+out=$(hh 2520 "$T/hd4")
+[ "$(marks)" = 3 ] && grep -q "boot has held the lock for 2520 s" <<< "$out" && [ "$(gjson "$HW" $GA)" = "1 1 1 i-0005" ]; check $? "a boot that never ends is replaced"
+[ ! -e "$HW/state/mark-with-listeners" ] && [ ! -s "$HD/enabled" ]; check $? "(its listeners stopped first)"
+exec 7>&-
+# a boot run again whose S3 sync fails: not ready, never healthy, then replaced
+hip=192.0.2.15; hid=i-0005; HD=$HW/hosts/$hip; mkdir -p "$HD/bin"; cp "$here/identity-host.sh" "$HD/bin/superci-id"; rm -f "$HD/run/superci-id-ready"; rm -rf "$T/hd5"
+touch "$HW/s3-sync-fail"
+hh 2000 "$T/hd5" > /dev/null
+out=$(hh 2060 "$T/hd5")
+grep -q "reviving: boot did not finish" <<< "$out" && grep -q "boot failed again" <<< "$out" && [ ! -e "$HD/run/superci-id-ready" ]; check $? "a revive whose S3 sync fails again leaves the host not ready (a boot in an || context kept going, restored 0 and touched ready)"
+[ "$(marks)" = 3 ]; check $? "(not replaced yet)"
+hh 2120 "$T/hd5" > /dev/null; [ "$(marks)" = 3 ] && [ ! -e "$HD/run/superci-id-ready" ]; check $? "(nor 60 s on: the 120 s run from the end of the revive)"
+out=$(hh 2180 "$T/hd5")
+[ "$(marks)" = 4 ] && grep -q "asking the Auto Scaling group to replace i-0005" <<< "$out" && [ "$(gjson "$HW" $GA)" = "1 1 1 i-0006" ] && [ ! -e "$HW/state/two-live" ]; check $? "and the host that cannot restore its share is marked Unhealthy and replaced"
+# a partial restore is not healthy: 3 of the 4 identities of the share restored and running is a failing host
+rm -f "$HW/s3-sync-fail"
+hip=192.0.2.16; hid=i-0006; HD=$HW/hosts/$hip; mkdir -p "$HD/bin"; cp "$here/identity-host.sh" "$HD/bin/superci-id"; rm -rf "$T/hd6"
+seedhost "$HW" $hip superci-id-4cpu-0002 superci-id-4cpu-0004 superci-id-4cpu-0006
+hh 2000 "$T/hd6" > /dev/null; hh 2030 "$T/hd6" > /dev/null
+[ -e "$T/hd6/first" ] && [ "$(marks)" = 4 ]; check $? "3 of the 4 identities of the share restored and running is not healthy (at least half was enough before)"
+out=$(hh 2060 "$T/hd6")
+grep -q "reviving: 1 of 4 stored identities are not restored on this host" <<< "$out" && [ -s "$HD/opt/id/superci-id-4cpu-0008/.runner" ] && [ "$(sort -u "$HD/enabled" | wc -l)" = 4 ] && [ "$(marks)" = 4 ]; check $? "the revive runs boot, which restores the missing identity and starts it"
+hh 2090 "$T/hd6" > /dev/null; [ ! -e "$T/hd6/first" ] && [ "$(marks)" = 4 ]; check $? "and the host is healthy then, not replaced"
+# a boot an operator runs on a host that has been up for days (what up's refusal tells them to do) is busy, not stuck
+hh 2000 "$T/hd6" > /dev/null # (the host i-0006, healthy)
+seedhost "$HW" $hip superci-id-4cpu-0002 superci-id-4cpu-0004 superci-id-4cpu-0006 superci-id-4cpu-0008
+rm -f "$HD/run/superci-id-ready"; echo 4700 > "$HD/run/superci-id-booting"; rm -rf "$T/hd7"
+exec 7> "$HD/run/superci-id.lock"; flock 7
+m0=$(marks); s0=$(count 'systemctl stop' "$HW/systemctl.log")
+for t in 5000 5060 5120 5180 5240; do hh $t "$T/hd7" > /dev/null; done
+[ "$(marks)" = "$m0" ] && [ "$(count 'systemctl stop' "$HW/systemctl.log")" = "$s0" ] && [ "$(sort -u "$HD/enabled" | wc -l)" = 4 ] && [ ! -e "$T/hd7/first" ]; check $? "a boot that has run 300 s on a host up for 5,000 s is not stuck: its listeners are not stopped and the host is not marked, however long the host has been up"
+echo 2000 > "$HD/run/superci-id-booting"; rm -rf "$T/hd8"
+hh 5000 "$T/hd8" > /dev/null; hh 5060 "$T/hd8" > /dev/null
+[ "$(marks)" = "$m0" ]; check $? "a boot that has held the lock past the limit (3,000 s) is stuck, and waits its 120 s"
+out=$(hh 5120 "$T/hd8")
+[ "$(marks)" = $((m0 + 1)) ] && grep -q "boot has held the lock for 3120 s" <<< "$out" && [ ! -e "$HW/state/mark-with-listeners" ] && [ ! -s "$HD/enabled" ] && [ "$(gjson "$HW" $GA)" = "1 1 1 i-0007" ]; check $? "then its listeners stop and the group's host is marked and replaced"
+exec 7>&-
+
+# a plain host (in no group) is never stopped by its health check: nothing would replace it
+MP=$T/fake-plain-health; world "$MP"; share "$MP" us-east-1a superci-id-4cpu-0002 superci-id-4cpu-0004 superci-id-4cpu-0006 superci-id-4cpu-0008
+plainhost "$MP" us-east-1a > /dev/null; seedhost "$MP" 192.0.2.11 superci-id-4cpu-0002 superci-id-4cpu-0004 superci-id-4cpu-0006 superci-id-4cpu-0008
+printf 'superci-id-4cpu-0002\n' > "$MP/hosts/192.0.2.11/enabled"; mkdir -p "$MP/hosts/192.0.2.11/bin"; cp "$here/identity-host.sh" "$MP/hosts/192.0.2.11/bin/superci-id"
+touch "$MP/units-wont-start"; : > "$MP/systemctl.log"
+hp() { printf '%s.00 0.00\n' "$1" > "$T/uptime"; env FAKE=$MP HEALTH_UPTIME=$T/uptime HEALTH_DIR=$T/hdp ID_INSTANCE=i-0001 "$F/ssh" -q -i k -o x ubuntu@192.0.2.11 'sudo superci-id health' 2>&1; }
+for t in 2000 2060 2120; do hp $t > /dev/null; done
+out=$(hp 2180); hp 2240 > /dev/null
+grep -q "in no group of us-east-1a (None): nothing would replace it" <<< "$out" && [ "$(count 'stop superci-id@' "$MP/systemctl.log")" = 0 ] && [ "$(sort -u "$MP/hosts/192.0.2.11/enabled" | wc -l)" = 1 ] && [ "$(count 'set-instance-health' "$MP/calls.log")" = 0 ] && [ "$(istate "$MP" i-0001)" = running ]; check $? "a plain host that stays unhealthy keeps its listeners, is not marked, and the health check says why"
+! grep -q "in no group" <<< "$(hp 2300)"; check $? "(and says it once an episode)"
+
+# an AZ the host cannot read is no share: boot and check refuse it, and nothing starts
+AZH=$T/azhost; mkdir -p "$AZH/units"; cp "$N/conf" "$AZH/conf"
+azenv=(ID_ROOT=$AZH/id RUNNER_SRC=$FAKE_RUNNER SHIM_BIN=$AZH/shim SHIM_ENV=$AZH/shim.env ID_CONF=$AZH/conf UNIT_DIR=$AZH/units ID_LOG=$AZH/log ID_LOCK=$AZH/lock READY_FILE=$AZH/ready FAKE_UNITS=$AZH/enabled)
+refuses "boot refuses a host whose AZ it cannot read (no instance metadata)" "no valid availability zone (got ''): refusing" env -u ID_AZ "${azenv[@]}" bash "$HS" boot
+refuses "boot refuses a region's name for an AZ" "no valid availability zone (got 'us-east-1'): refusing" env ID_AZ=us-east-1 "${azenv[@]}" bash "$HS" boot
+refuses "check refuses it too, rather than reading an empty share as healthy" "not healthy: no valid availability zone" env -u ID_AZ "${azenv[@]}" bash "$HS" check
+refuses "and an AZ of another region" "no valid availability zone (got 'eu-west-1a')" env ID_AZ=eu-west-1a "${azenv[@]}" bash "$HS" boot
+[ ! -e "$AZH/ready" ] && [ ! -e "$AZH/enabled" ] && [ ! -e "$AZH/id" -o -z "$(ls "$AZH/id" 2> /dev/null)" ]; check $? "and nothing was restored, started or marked ready"
+# register and adopt refuse it before any registration or upload: an identity stored under hosts//<name> is restored by no host
+# a held identity adopt would upload (all its files, non-empty), so "nothing uploaded" means the refusal, not a missing file
+mkdir -p "$AZH/id/superci-id-4cpu-0002"; for f in .runner .credentials .credentials_rsaparams; do echo x > "$AZH/id/superci-id-4cpu-0002/$f"; done
+cp_before=$(count "s3 cp" "$FAKE/calls.log")
+refuses "register refuses a host whose AZ it cannot read, before reading a token or registering" "no valid availability zone (got ''): refusing" env -u ID_AZ "${azenv[@]}" bash "$HS" register superci-park https://github.com/o - superci-id-4cpu-0009 <<< "a-token"
+refuses "adopt refuses it too, so no identity is stored under no share" "no valid availability zone (got ''): refusing" env -u ID_AZ "${azenv[@]}" bash "$HS" adopt superci-id-4cpu-0002
+[ "$(count "s3 cp" "$FAKE/calls.log")" = "$cp_before" ] && [ ! -e "$AZH/id/superci-id-4cpu-0009" ]; check $? "and nothing was registered or uploaded to S3"
+rm -rf "$AZH/id/superci-id-4cpu-0002"
+
+# check fails closed: a host whose share cannot be listed is not adopted
+MS=$T/fake-adopt-unlistable; world "$MS"; share "$MS" us-east-1a superci-id-4cpu-0002 superci-id-4cpu-0004
+plainhost "$MS" us-east-1a > /dev/null; seedhost "$MS" 192.0.2.11 superci-id-4cpu-0002 superci-id-4cpu-0004; touch "$MS/s3-list-fail"; wlog "$MS"
+refuses "up refuses to adopt a plain host whose share it cannot list in S3" "not healthy: the identities stored in S3 for us-east-1a cannot be listed, so the host cannot be verified" env FAKE=$MS "$ID" up us-east-1a
+! grep -q "Nothing was changed" <<< "$out" && grep -q "now has this checkout's superci-id (pushed to read it); the group, the template and the instance are unchanged" <<< "$out"; check $? "and says what changed: the pushed script, nothing else"
+[ "$(count 'create-auto-scaling-group\|attach-instances\|terminate-instances' "$MS/calls.log")" = 0 ] && [ ! -e "$MS/state/asg/$GA" ]; check $? "no group, no attach"
+rm -f "$MS/s3-list-fail"
+ok "up adopts it once S3 can be listed" env FAKE=$MS "$ID" up us-east-1a
+[ "$(gjson "$MS" $GA)" = "1 1 1 i-0001" ]; check $? "(the one host, attached)"
+grep -q 'autoscaling:SetInstanceHealth' "$FAKE/state/role-policy.json"; check $? "(the role may do it, on the identity groups)"
+
+# ---- down: the group goes to 0 and is deleted, so nothing heals the host back ----
+DW=$T/fake-down; world "$DW"; share "$DW" us-east-1a superci-id-4cpu-0002; share "$DW" us-east-1b superci-id-4cpu-0001
+ok "up of two AZs" env FAKE=$DW "$ID" up us-east-1a; ok "up of the other" env FAKE=$DW "$ID" up us-east-1b
+wlog "$DW"
+ok "down of one AZ" env FAKE=$DW "$ID" down us-east-1a
+dc=$DW/calls.log
+d1=$(line "$dc" 'update-auto-scaling-group.*--desired-capacity 0'); d2=$(line "$dc" 'terminate-instances'); d3=$(line "$dc" 'delete-auto-scaling-group')
+sed -n "${d1}p" "$dc" | grep -q -- '--min-size 0 --max-size 0 --desired-capacity 0' && [ "$d1" -lt "$d2" ] && [ "$d2" -lt "$d3" ]; check $? "the group is set to 0 first, then the host ended, then the group deleted"
+[ ! -e "$DW/state/asg/$GA" ] && [ "$(istate "$DW" i-0001)" = terminated ]; check $? "the group is gone and so is its host"
+env FAKE=$DW aws autoscaling describe-auto-scaling-groups --output json > /dev/null
+[ "$(ninst "$DW")" = 2 ] && [ "$(istate "$DW" i-0002)" = running ] && [ "$(gjson "$DW" superci-pull-identity-us-east-1b)" = "1 1 1 i-0002" ]; check $? "and, with time passing, it is not healed back; the other AZ's host is as it was"
+grep -q "deleted group $GA, so nothing heals it back" <<< "$out"; check $? "and says so"
+[ -e "$DW/state/lt/$GA" ]; check $? "the template stays for the next up"
+[ -s "$DW/s3/superci-pull-identities-$ACCOUNT/superci-pull/hosts/us-east-1a/superci-id-4cpu-0002/.runner" ]; check $? "and the identities stay in S3"
+ok "down again" env FAKE=$DW "$ID" down us-east-1a
+grep -q "no host named superci-pull-identity-us-east-1a" <<< "$out"; check $? "finds nothing to do"
+wlog "$DW"
+ok "up again restores the AZ with a new group from the same template" env FAKE=$DW "$ID" up us-east-1a
+[ "$(gjson "$DW" $GA)" = "1 1 1 i-0003" ] && [ "$(count 'create-launch-template' "$dc")" = 0 ] && [ ! -e "$DW/state/two-live" ]; check $? "one host, and the template unchanged (no new version)"
+# a group left at 0 (a down that stopped halfway) is set back to one by up
+env FAKE=$DW aws autoscaling update-auto-scaling-group --auto-scaling-group-name $GA --min-size 0 --max-size 0 --desired-capacity 0
+ok "up on a group left at 0" env FAKE=$DW "$ID" up us-east-1a
+[ "$(gjson "$DW" $GA)" = "1 1 1 i-0004" ] && [ ! -e "$DW/state/two-live" ]; check $? "sets it to one and launches a host"
+
+# ---- changed user data is a new template version; an unchanged one is not ----
+VW=$T/fake-version; world "$VW"; share "$VW" us-east-1a superci-id-4cpu-0002
+ok "up" env FAKE=$VW "$ID" up us-east-1a
+D2=$T/deploy2; mkdir -p "$D2"; cp "$here"/identity.sh "$here"/identity-host.sh "$here"/release-lib.sh "$here"/ssh.sh "$here"/identity-*.json "$D2/"
+printf '# a change of the host script, and so of the user data\n' >> "$D2/identity-host.sh"
+wlog "$VW"
+ok "up with changed user data" env FAKE=$VW timeout 120 "$D2/identity.sh" up us-east-1a
+vc=$VW/calls.log
+python3 -I -c 'import json,sys; t = json.load(open(sys.argv[1])); v = t["versions"]; assert [x["n"] for x in v] == [1, 2] and t["default"] == 2 and v[0]["desc"] != v[1]["desc"], t' "$VW/state/lt/$GA"
+check $? "makes a second template version and its default"
+[ "$(count 'create-launch-template-version' "$vc")" = 1 ] && [ "$(count 'modify-launch-template.*--default-version 2' "$vc")" = 1 ]; check $? "(one version, then the default set)"
+[ "$(gjson "$VW" $GA)" = "1 1 1 i-0001" ] && [ "$(count 'terminate-instances\|run-instances' "$vc")" = 0 ] && grep -qF '"version": "$Default"' "$VW/state/asg/$GA"; check $? "the group follows the default, and the running host is left as it is"
+wlog "$VW"
+ok "up again with the same user data" env FAKE=$VW timeout 120 "$D2/identity.sh" up us-east-1a
+[ "$(count 'create-launch-template-version\|modify-launch-template' "$vc")" = 0 ]; check $? "adds no version"
+env FAKE=$VW aws ec2 terminate-instances --instance-ids i-0001; env FAKE=$VW aws autoscaling describe-auto-scaling-groups --output json > /dev/null
+grep -q 'a change of the host script' "$VW/state/userdata-0002" || python3 -I -c 'import re,sys,base64,gzip; t = open(sys.argv[1]).read(); sys.exit(0 if b"a change of the host script" in gzip.decompress(base64.b64decode(re.search(r"echo .([A-Za-z0-9+/=]+). \| base64 -d \| gunzip", t).group(1))) else 1)' "$VW/state/userdata-0002"
+check $? "and the next host the group launches takes the new user data"
+
+# ---- the policies and down.sh ----
+python3 -I - "$here/listener-policy.json" << 'PY'
+import json, sys
+st = {s["Sid"]: s for s in json.load(open(sys.argv[1]))["Statement"]}
+deny = next(s for s in st.values() if s["Effect"] == "Deny" and "ec2:ModifyLaunchTemplate" in s["Action"])
+assert set(deny["Condition"]["StringEquals"]["aws:ResourceTag/superci-pull-role"]) == {"listener", "identity"}, deny
+PY
+check $? "the listener's role may not launch from, change or delete an identity host's template (tagged superci-pull-role=identity), as its own"
+python3 -I -c 'import json,sys; json.load(open(sys.argv[1]))' "$here/identity-policy.json"; check $? "(identity-policy.json is JSON)"
+dg=$(grep -n 'delete-auto-scaling-group.*"\$g"' "$here/down.sh" | head -1 | cut -d: -f1); dt=$(grep -n 'terminate-instances' "$here/down.sh" | head -1 | cut -d: -f1)
+[ -n "$dg" ] && [ "$dg" -lt "$dt" ]; check $? "deploy/down.sh deletes the identity groups before it terminates every instance, or they would be launched again"
 
 # ---- the image is the one fleet.go runs ----
 grep -qF "Owner: \"$(sed -n 's/^IMAGE_OWNER=//p' "$here/identity.sh")\", Name: \"$(sed -n "s/^IMAGE_NAME='\(.*\)'/\1/p" "$here/identity.sh")\", Pin: \"$(sed -n 's/^IMAGE_PIN=//p' "$here/identity.sh")\"" "$here/../main.go"
