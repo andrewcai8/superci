@@ -1060,13 +1060,17 @@ func (d *Dispatcher) hand(st *DispatchSet, s *session, m *dmachine, mw *wire) {
 		st.abandon(s, m)
 		return
 	}
-	if st.handed(s, time.Now()) {
-		st.loseReclaimed(s)
-	} else {
+	// The job goes live before a reclaim found at the handed point loses it, so the shim has its live frame before the
+	// loss ends its wire (the other order raced the loss's closeAll against goLive's send).
+	reclaimed := st.handed(s, time.Now())
+	if !reclaimed {
 		s.attachMachine(mw)
 	}
 	if s.goLive() {
 		st.finish(s, exitRelayed)
+	}
+	if reclaimed {
+		st.loseReclaimed(s)
 	}
 	slog.Info("dispatch handed", "set", st.spec.Name, "job", s.id, "machine", m.ID, "agent", s.agent, "run", s.head.Run, "name", s.head.Name)
 }
