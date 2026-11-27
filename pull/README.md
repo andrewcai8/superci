@@ -576,6 +576,14 @@ of that time unpacking main's caches, so the job's setup takes them with a renam
   machine: $0.065 to $0.097 each, about $9,300 a month at 4,800 machines a day. It also did not speed first reads before it finished. Fast snapshot restore
   on a copy of the snapshot is $0.75 per AZ-hour (9 AZs: $4,860 a month) and its credit bucket for a 30 GiB snapshot
   refills 10 volumes an hour per AZ.
+- **Read set, instead of the pre-read.** A size with a read set (`readsets/<label>.list`, released as `bin/warm/<label>.list`
+  in the cache tree) reads only the image files its jobs were recorded reading, 64 at a time through the page cache, before
+  the hydration starts. It skips the pre-read, the walk and the one-file-at-a-time warm, then starts dockerd. A unit-tests
+  shard read 1.2 GB of the snapshot's 25.0 GiB of blocks. On 15 fresh m8azn.3xlarge and m8a.2xlarge machines its list took
+  1.0 to 6.8 s (p50 2.2 s), against 270 s for the pre-read on the same volume and 172 s p50 in production (Nov 27). The
+  machine posts `readset.start` and `readset.done` (`full` or `stopped`). A path the image lacks costs one failed open; a
+  file outside the list reads cold, as it would with no pre-read. A size without a list pre-reads as before.
+  [tools/readset](tools/readset/README.md) records a list and proves that it holds only the image's files.
 - **Burst.** An entry is read in ranges of 64 MiB, three ahead, and each machine waits a random 0 to 3 s before its first
   read: a thousand machines make about 16 requests per GB each to one prefix, not 64.
 - **Where.** `/home/runner/hydrated/<version>/<key>/`, in which that directory stands for `/`: an archive's files are
