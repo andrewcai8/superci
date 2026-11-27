@@ -33,7 +33,9 @@ type fakeREST struct {
 	// labelsCode and labelsRetry make the label writes answer that status, with a Retry-After header when it is set.
 	labelsCode  int
 	labelsRetry string
-	srv         *httptest.Server
+	// readCode makes a read of one runner answer that status, with labelsRetry as its Retry-After.
+	readCode int
+	srv      *httptest.Server
 }
 
 var runnerOne = regexp.MustCompile(`^/(?:orgs|repos)/o/(?:r\d/)?actions/runners/(\d+)$`)
@@ -72,6 +74,11 @@ func (f *fakeREST) serve(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `{}`)
 	case r.Method == http.MethodPut && strings.HasSuffix(path, "/repositories"):
 		w.WriteHeader(http.StatusNoContent)
+	case r.Method == http.MethodGet && runnerOne.MatchString(path) && f.readCode != 0:
+		if f.labelsRetry != "" {
+			w.Header().Set("Retry-After", f.labelsRetry)
+		}
+		w.WriteHeader(f.readCode)
 	case r.Method == http.MethodGet && runnerOne.MatchString(path):
 		id := runnerOne.FindStringSubmatch(path)[1]
 		for _, rr := range f.runners {
@@ -427,5 +434,18 @@ func TestTheConfigsScopeIsOrgOrRepository(t *testing.T) {
 	}
 	if err := load("enterprise"); err == nil || !strings.Contains(err.Error(), "scope") {
 		t.Errorf("scope enterprise: %v", err)
+	}
+}
+
+// The read of the runner before a relabel is limited by GitHub as its write is: a 403 or 429 there is answered 429 with
+// its Retry-After too, so relabel stops and waits instead of going on at its pace.
+func TestARelabelWhoseRunnerReadGitHubLimitsIsAnswered429AndWritesNothing(t *testing.T) {
+	for _, code := range []int{http.StatusTooManyRequests, http.StatusForbidden} {
+		f := newFakeREST(t)
+		f.readCode, f.labelsRetry = code, "45"
+		w := do(idsAdmin(f, spare(), ""), http.MethodPost, "/identities/labels?id=9&labels=a")
+		if w.Code != http.StatusTooManyRequests || w.Header().Get("Retry-After") != "45" || f.called("PUT") != 0 {
+			t.Errorf("GitHub %d on the read: %d, Retry-After %q, calls %v", code, w.Code, w.Header().Get("Retry-After"), f.calls)
+		}
 	}
 }

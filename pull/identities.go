@@ -238,7 +238,9 @@ func (ids *Identities) labels(w http.ResponseWriter, r *http.Request) {
 	name, err := ids.rest.Runner(r.Context(), ids.repo, id)
 	if err != nil {
 		slog.Error("identities labels", "id", id, "err", err.Error())
-		http.Error(w, "GitHub could not say which runner that is", http.StatusBadGateway)
+		if !limited(w, err) {
+			http.Error(w, "GitHub could not say which runner that is", http.StatusBadGateway)
+		}
 		return
 	}
 	if !strings.HasPrefix(name, identityPrefix) {
@@ -248,16 +250,9 @@ func (ids *Identities) labels(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := ids.rest.SetRunnerLabels(r.Context(), ids.repo, id, labels); err != nil {
 		slog.Error("identities labels", "id", id, "err", err.Error())
-		// GitHub's write limits answer 403 or 429, with a Retry-After: the caller stops and waits that long.
-		var se *StatusError
-		if errors.As(err, &se) && (se.Code == http.StatusForbidden || se.Code == http.StatusTooManyRequests) {
-			if secs, err := strconv.Atoi(se.RetryAfter); err == nil && secs > 0 {
-				w.Header().Set("Retry-After", strconv.Itoa(secs))
-			}
-			http.Error(w, "GitHub is limiting writes", http.StatusTooManyRequests)
-			return
+		if !limited(w, err) {
+			http.Error(w, "GitHub refused the labels", http.StatusBadGateway)
 		}
-		http.Error(w, "GitHub refused the labels", http.StatusBadGateway)
 		return
 	}
 	slog.Info("identities labels", "id", id, "labels", strings.Join(labels, ","))
@@ -286,4 +281,18 @@ func (ids *Identities) list(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, map[string]any{"group": group, "runners": runners})
+}
+
+// limited answers 429, with GitHub's Retry-After, when GitHub's answer was a limit (403 or 429), and says whether it
+// did: the caller stops and waits that long, on the read before a relabel as on its write.
+func limited(w http.ResponseWriter, err error) bool {
+	var se *StatusError
+	if !errors.As(err, &se) || (se.Code != http.StatusForbidden && se.Code != http.StatusTooManyRequests) {
+		return false
+	}
+	if secs, err := strconv.Atoi(se.RetryAfter); err == nil && secs > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(secs))
+	}
+	http.Error(w, "GitHub is limiting requests", http.StatusTooManyRequests)
+	return true
 }

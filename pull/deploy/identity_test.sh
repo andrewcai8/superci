@@ -108,12 +108,15 @@ for st in key["Statement"]:
     assert st["Effect"] == "Allow" and list(st["Principal"]) == ["AWS"], st
     principals[st["Sid"]] = (st["Principal"]["AWS"], set(st["Action"]))
 admin, use = principals["TheOperatorAdministersTheKey"], principals["TheIdentityRoleEncryptsAndDecryptsThroughS3"]
+root = principals["TheAccountCanStillAdministerTheKey"]
 assert admin[0] == "arn:aws:iam::243891825325:role/ops", admin[0]
+assert root[0] == "arn:aws:iam::243891825325:root" and root[1] == admin[1], root
+assert not any(a.startswith(("kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey", "kms:ReEncrypt", "kms:CreateGrant", "kms:*")) for a in root[1]), "the account root administers and never uses the key"
 assert use[0] == "arn:aws:iam::243891825325:role/superci-pull-identity" and use[1] == {"kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey"}, use
-assert len(principals) == 2, principals
+assert len(principals) == 3, principals
 assert not any(a.startswith(("kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey", "kms:ReEncrypt", "kms:CreateGrant", "kms:*")) for a in admin[1]), "the operator administers and never uses the key"
 PY
-check $? "the key's policy names only the identity role (encrypt, decrypt) and the operator (administer, never use); the bucket's default is that key and it refuses another"
+check $? "the key's policy names only the identity role (encrypt, decrypt), the operator and the account root (administer, never use: a deleted operator role cannot lock the key); the bucket's default is that key and it refuses another"
 grep -q 'put-public-access-block' "$c" && grep -q 'put-bucket-encryption' "$c"; check $? "the bucket blocks public access and encrypts by default"
 A=$FAKE/state/instances; ip_a=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]+"/i-0001"))["ip"])' "$A"); ip_b=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]+"/i-0002"))["ip"])' "$A")
 
