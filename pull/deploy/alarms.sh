@@ -15,7 +15,7 @@ alarm() { # name description metric statistic comparison threshold period evalua
   [[ $4 == p* ]] && stat=(--extended-statistic "$4")
   [ -n "${11:-}" ] && dim=(--dimensions "Name=Set,Value=${11}")
   $A cloudwatch put-metric-alarm --alarm-name "superci-pull-$1" --alarm-description "$2" --namespace superci-pull --metric-name "$3" \
-    "${stat[@]}" "${dim[@]}" --comparison-operator "$5" --threshold "$6" --period "$7" --evaluation-periods "$8" --datapoints-to-alarm "$9" \
+    "${stat[@]}" ${dim[@]+"${dim[@]}"} --comparison-operator "$5" --threshold "$6" --period "$7" --evaluation-periods "$8" --datapoints-to-alarm "$9" \
     --treat-missing-data "${10}" --alarm-actions "$TOPIC" --ok-actions "$TOPIC" --tags Key=purpose,Value=superci-pull
   echo "alarm superci-pull-$1"
 }

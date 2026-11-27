@@ -269,6 +269,29 @@ class CanaryPerSet(unittest.TestCase):
         alarms = {**self.QUIET, "superci-pull-oldest-job-wait-8cpu": "ALARM", "superci-pull-jobs-stalled-16cpu": "ALARM"}
         self.assertEqual(G.canary_verdict(self.rows(), alarms, ["superci-4cpu", "superci-8cpu"]), ["superci-pull-oldest-job-wait-8cpu in ALARM"])
 
+    def test_a_set_whose_own_alarm_does_not_exist_is_judged_on_the_listener_wide_one(self):
+        wide = {**self.QUIET, "superci-pull-oldest-job-wait": "ALARM"}
+        for why, sets in (("alarms.sh not yet run, no per-set alarm in the answer", ["superci-4cpu"]), ("a split set alarms.sh makes none for", ["superci-4cpu-2"]),
+                          ("no set known", [])):
+            self.assertEqual(G.canary_verdict(self.rows(), wide, sets), ["superci-pull-oldest-job-wait in ALARM"], why)
+        stalled = {**self.QUIET, "superci-pull-jobs-stalled": "ALARM"}
+        self.assertEqual(G.canary_verdict(self.rows(), stalled, ["superci-4cpu"]), ["superci-pull-jobs-stalled in ALARM"])
+
+    def test_a_split_set_beside_a_sized_one_is_judged_on_each_ones_own_alarm_and_the_reason_is_not_repeated(self):
+        alarms = {**self.QUIET, "superci-pull-oldest-job-wait": "ALARM", "superci-pull-oldest-job-wait-4cpu": "OK", "superci-pull-jobs-stalled-4cpu": "OK"}
+        self.assertEqual(G.canary_verdict(self.rows(), alarms, ["superci-4cpu", "superci-4cpu-2", "superci-4cpu-3"]), ["superci-pull-oldest-job-wait in ALARM"])
+
+    def test_a_set_whose_own_alarm_exists_and_is_ok_ignores_the_listener_wide_one(self):
+        alarms = {**self.QUIET, "superci-pull-oldest-job-wait": "ALARM", "superci-pull-oldest-job-wait-4cpu": "OK", "superci-pull-jobs-stalled-4cpu": "OK"}
+        self.assertEqual(G.canary_verdict(self.rows(), alarms, ["superci-4cpu"]), [])
+
+    def test_the_line_says_which_alarm_each_set_was_judged_on(self):
+        alarms = {"superci-pull-oldest-job-wait-4cpu": "OK", "superci-pull-jobs-stalled-4cpu": "OK"}
+        self.assertEqual(G.judged_on(alarms, ["superci-4cpu", "superci-4cpu-2"]),
+                         "superci-4cpu by superci-pull-oldest-job-wait-4cpu, superci-pull-jobs-stalled-4cpu; "
+                         "superci-4cpu-2 by superci-pull-oldest-job-wait (no per-set alarm), superci-pull-jobs-stalled (no per-set alarm)")
+        self.assertEqual(G.judged_on({}, []), "no set known by superci-pull-oldest-job-wait (no per-set alarm), superci-pull-jobs-stalled (no per-set alarm)")
+
     def test_listener_down_and_spend_capped_roll_back_whatever_the_set(self):
         for name in ("superci-pull-listener-down", "superci-pull-spend-capped"):
             for sets in ([], ["superci-4cpu"], ["superci-32cpu"]):
@@ -897,15 +920,17 @@ class GateJobFromRecords(unittest.TestCase):
         code, out, _, _ = self.run_gate(recs, self.blacksmith(8), extra=("--superci-group", "other-group"))
         self.assertRegex(out, r"n \(superci runs\)\s+5")
 
-    def canary(self, records, alarms, **kw):
-        """`gate job --canary` over `records`, with the alarms in `alarms` in ALARM and every other OK: (exit code, the canary line)."""
+    def canary(self, records, alarms, exist=("4cpu", "8cpu"), blacksmith=8, **kw):
+        """`gate job --canary` over `records`, with the alarms in `alarms` in ALARM and every other OK: (exit code, the output's judged-on and canary lines).
+        alarm_states answers the two listener-wide alarms and the per-set ones of the sizes in `exist`, as CloudWatch does for alarms that were made."""
         saved = G.alarm_states
-        G.alarm_states = lambda *a, **k: {n: "ALARM" if n in alarms else "OK" for n in (*G.ROLLBACK_ALARMS, *alarms, "superci-pull-oldest-job-wait-4cpu", "superci-pull-oldest-job-wait-8cpu")}
+        made = [*G.ROLLBACK_ALARMS, *G.SET_ROLLBACK_ALARMS, *(f"{a}-{z}" for a in G.SET_ROLLBACK_ALARMS for z in exist)]
+        G.alarm_states = lambda *a, **k: {n: "ALARM" if n in alarms else "OK" for n in (*made, *alarms)}
         try:
-            code, out, _, _ = self.run_gate(records, self.blacksmith(8), extra=("--canary",), **kw)
+            code, out, _, _ = self.run_gate(records, self.blacksmith(blacksmith), extra=("--canary",), **kw)
         finally:
             G.alarm_states = saved
-        return code, next(l for l in out.splitlines() if l.startswith("canary "))
+        return code, "\n".join(l for l in out.splitlines() if l.startswith(("judged on:", "canary ")))
 
     def on(self, superci_set, n=5):
         return [dict(record(f"{superci_set}-{i}", 1, 81, run=100 + i), set=superci_set, labels=[superci_set]) for i in range(n)]
@@ -913,7 +938,7 @@ class GateJobFromRecords(unittest.TestCase):
     def test_a_canary_that_ran_on_4cpu_is_kept_while_8cpu_waits_for_a_cold_machine(self):
         """17:43:50Z Nov 27: every test-go row passed, and superci-pull-oldest-job-wait (listener-wide) was in ALARM for 8cpu's net-tools."""
         code, line = self.canary(self.on("superci-4cpu"), {"superci-pull-oldest-job-wait", "superci-pull-oldest-job-wait-8cpu"})
-        self.assertEqual((code, line.split(":", 1)[1].split("[")[0].strip()), (0, "KEEP"), line)
+        self.assertEqual((code, line.splitlines()[-1].split(":", 1)[1].split("[")[0].strip()), (0, "KEEP"), line)
         self.assertIn("superci-pull-oldest-job-wait-8cpu", line, "it still pages")
 
     def test_a_canary_that_ran_on_4cpu_is_rolled_back_by_4cpus_own_wait_naming_the_set(self):
@@ -927,6 +952,27 @@ class GateJobFromRecords(unittest.TestCase):
                 code, line = self.canary(self.on(sets), {name})
                 self.assertEqual(code, 3, line)
                 self.assertIn(f"ROLL BACK ({name} in ALARM)", line)
+
+    def test_a_per_set_alarm_that_does_not_exist_falls_back_to_the_listener_wide_one(self):
+        wide = {"superci-pull-oldest-job-wait"}
+        # (a) the rollout window: alarms.sh has not made the per-set alarms yet
+        code, line = self.canary(self.on("superci-4cpu"), wide, exist=())
+        self.assertEqual(code, 3, line)
+        self.assertIn("ROLL BACK (superci-pull-oldest-job-wait in ALARM)", line)
+        self.assertIn("superci-4cpu by superci-pull-oldest-job-wait (no per-set alarm), superci-pull-jobs-stalled (no per-set alarm)", line)
+        # (b) a split set, which alarms.sh makes no alarm for
+        code, line = self.canary(self.on("superci-4cpu-2"), wide)
+        self.assertEqual(code, 3, line)
+        self.assertIn("judged on: superci-4cpu-2 by superci-pull-oldest-job-wait (no per-set alarm)", line)
+        # (c) no set known: no superci record and no Blacksmith run in the baseline
+        code, line = self.canary([], wide, blacksmith=0)
+        self.assertEqual(code, 3, line)
+        self.assertIn("judged on: no set known by superci-pull-oldest-job-wait (no per-set alarm)", line)
+
+    def test_a_per_set_alarm_that_exists_is_what_the_set_is_judged_on_and_the_line_says_so(self):
+        code, line = self.canary(self.on("superci-4cpu"), {"superci-pull-oldest-job-wait", "superci-pull-oldest-job-wait-8cpu"})
+        self.assertEqual(code, 0, line)
+        self.assertIn("judged on: superci-4cpu by superci-pull-oldest-job-wait-4cpu, superci-pull-jobs-stalled-4cpu\n", line)
 
     def test_with_no_record_yet_the_canary_is_judged_on_the_set_of_its_label(self):
         """No superci record: the label the job ran under on Blacksmith (blacksmith-4vcpu-ubuntu-2404) names superci-4cpu."""

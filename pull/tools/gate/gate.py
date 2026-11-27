@@ -252,24 +252,43 @@ def set_alarm(alarm, superci_set):
     return f"{alarm}-{superci_set.removeprefix('superci-')}"
 
 
-def rollback_alarms(sets):
-    """The alarms a canary that ran on `sets` rolls back on: the global ROLLBACK_ALARMS and each set's own SET_ROLLBACK_ALARMS."""
-    return list(ROLLBACK_ALARMS) + [set_alarm(a, s) for s in sorted(set(sets)) for a in SET_ROLLBACK_ALARMS]
+def watched(alarms, sets):
+    """[(set, alarm, per_set)] the canary watches for `sets`, one entry per set and wait or stall alarm. A set's own alarm is
+    watched when `alarms` (alarm_states' answer) has it; one it does not have (alarms.sh not yet run, StalledSets not yet published,
+    a split set such as superci-4cpu-2 that alarms.sh makes none for) falls back to the listener-wide alarm, and so does a job with
+    no set known (set None): the gate is never blind, only less partitioned where it cannot be."""
+    return [(s, own if s and own in alarms else base, bool(s and own in alarms))
+            for s in sorted(set(sets)) or [None] for base in SET_ROLLBACK_ALARMS for own in [set_alarm(base, s) if s else base]]
+
+
+def rollback_alarms(alarms, sets):
+    """The alarms a canary that ran on `sets` rolls back on: the global ROLLBACK_ALARMS and each set's watched alarms."""
+    return list(dict.fromkeys(list(ROLLBACK_ALARMS) + [a for _, a, _ in watched(alarms, sets)]))
+
+
+def judged_on(alarms, sets):
+    """One line saying which alarm each set is judged on, e.g.
+    `superci-4cpu by superci-pull-oldest-job-wait-4cpu, superci-pull-jobs-stalled-4cpu; superci-4cpu-2 by superci-pull-oldest-job-wait (no per-set alarm), ...`."""
+    by = {}
+    for s, a, own in watched(alarms, sets):
+        by.setdefault(s or "no set known", []).append(a if own else f"{a} (no per-set alarm)")
+    return "; ".join(f"{s} by {', '.join(a)}" for s, a in by.items())
 
 
 def canary_verdict(rows, alarms, sets=()):
     """The reasons a live canary must go back to Blacksmith, from gate 1's rows, the alarm states and `sets`, the superci sets the
     job ran on (job_sets); empty keeps it. A p50 row counts once n passes and a p90 row once there are CANARY_P90_RUNS runs, each
     only as FAIL (NOISE asks for runs, not a rollback), and never when Blacksmith had no runs to compare with; the failures row
-    counts from the first run. Of the alarms only rollback_alarms(sets) count: each is a superci job not served, and the job's
-    sets alone are the ones that serve it, bar the two that stop every set."""
+    counts from the first run. Of the alarms only rollback_alarms(alarms, sets) count: each is a superci job not served, and the
+    job's sets alone are the ones that serve it, bar the two that stop every set. A set with no alarm of its own in `alarms`, and
+    a job with no set, are judged on the listener-wide wait and stall alarms (watched)."""
     by = {r.name: r for r in rows}
     n = by.get("n (superci runs)")
     runs = int(n.value) if n and n.value.isdigit() else 0
     need = {"wall p50": MIN_RUNS, "queue wait p50": MIN_RUNS, "wall p90": CANARY_P90_RUNS, "queue wait p90": CANARY_P90_RUNS, "failures (superci)": 0}
     harmed = [r for r in (by.get(k) for k in ROLLBACK_ROWS) if r and r.status == FAIL and runs >= need[r.name] and not r.note.startswith("no Blacksmith runs")]
     return ([f"{r.name}: {r.value} vs {r.threshold}" for r in harmed]
-            + [f"{a} in ALARM" for a in rollback_alarms(sets) if alarms.get(a) == "ALARM"])
+            + [f"{a} in ALARM" for a in rollback_alarms(alarms, sets) if alarms.get(a) == "ALARM"])
 
 
 def job_sets(S_jobs, B_jobs):
@@ -741,8 +760,9 @@ def cmd_job(a):
     alarms = alarm_states(a.profile, now, now)
     sets = job_sets(S_jobs, B_jobs)
     reasons = canary_verdict(rows, alarms, sets)
-    paging = sorted(n for n, st in alarms.items() if st == "ALARM" and n not in rollback_alarms(sets))
-    print(f"\ncanary {a.job}: " + (f"ROLL BACK ({'; '.join(reasons)})" if reasons else "KEEP") + (f"   [paging, no rollback: {paging}]" if paging else ""))
+    paging = sorted(n for n, st in alarms.items() if st == "ALARM" and n not in rollback_alarms(alarms, sets))
+    print(f"\njudged on: {judged_on(alarms, sets)}")
+    print(f"canary {a.job}: " + (f"ROLL BACK ({'; '.join(reasons)})" if reasons else "KEEP") + (f"   [paging, no rollback: {paging}]" if paging else ""))
     return ROLLBACK if reasons else KEEP
 
 

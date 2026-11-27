@@ -94,7 +94,10 @@ back on harm to superci's own jobs, judged against Blacksmith over the same wind
   stall is one set's, so a canary reads the alarms of its own sets alone. The sets are the `set` of the job's superci records in
   the window (the superci-`<n>`cpu label of a job read from GitHub); with no superci record yet, the set of the label the job
   ran under on Blacksmith (`blacksmith-4vcpu-ubuntu-2404` is `superci-4cpu`), read from Blacksmith's listing with no further call;
-  with neither, only the two above. Another set's alarm never sends the job back, so a new or unrelated size, or a cold machine
+  with neither, only the two above. A set with no alarm of its own (alarms.sh not yet run, `StalledSets` not yet published, a split
+  set such as `superci-4cpu-2`), and a job with no set known, are judged on the listener-wide `superci-pull-oldest-job-wait` and
+  `-jobs-stalled`, so the gate is never blind, only less partitioned where it cannot be; the line `judged on:` before the canary
+  line says which alarm each set was judged on. Another set's alarm never sends the job back, so a new or unrelated size, or a cold machine
   of superci-8cpu, cannot make a superci-4cpu canary fragile (Nov 27 17:43Z: test-go's canary was rolled back on the
   listener-wide `oldest-job-wait`, which 8cpu's `net-tools` had tripped, with every test-go row passing). The reason names the
   alarm and so the set (`superci-pull-oldest-job-wait-4cpu in ALARM`). The listener-wide `oldest-job-wait` and `jobs-stalled`
