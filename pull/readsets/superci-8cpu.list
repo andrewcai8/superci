@@ -78,7 +78,6 @@
 /etc/gitconfig
 /etc/gnutls/config
 /etc/host.conf
-/etc/hosts
 /etc/hosts.allow
 /etc/hosts.deny
 /etc/init.d/hibagent
@@ -123,7 +122,6 @@
 /etc/lsb-release
 /etc/lvm/lvm.conf
 /etc/lvm/lvmlocal.conf
-/etc/machine-id
 /etc/mime.types
 /etc/modprobe.d/amd64-microcode-blacklist.conf
 /etc/modprobe.d/blacklist-ath_pci.conf
@@ -2924,8 +2922,6 @@
 /var/cache/debconf/config.dat
 /var/cache/debconf/passwords.dat
 /var/cache/swcatalog/cache/C-os-catalog.xb
-/var/lib/dhcpcd/duid
-/var/lib/dhcpcd/enp39s0.lease
 /var/lib/dpkg/alternatives/arptables
 /var/lib/dpkg/alternatives/automake
 /var/lib/dpkg/alternatives/awk

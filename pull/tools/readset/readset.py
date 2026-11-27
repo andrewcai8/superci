@@ -19,6 +19,9 @@ import sys
 
 PAGE = os.sysconf("SC_PAGE_SIZE")
 SKIP_TOP = {"proc", "sys", "dev", "run", "tmp"}
+# Every boot writes these afresh, so the image's copy is never the one a job reads (readsets_test.go holds the same).
+BOOT_WRITTEN = ("/etc/hosts", "/etc/hostname", "/etc/machine-id")
+BOOT_WRITTEN_UNDER = ("/var/lib/dhcp", "/etc/ssh/ssh_host_")
 
 
 def resident_bytes(libc, path, size):
@@ -37,6 +40,13 @@ def resident_bytes(libc, path, size):
     return 0 if rc else min(size, sum(b & 1 for b in bytes(vec)) * PAGE)
 
 
+def same_device(path, dev):
+    try:
+        return os.lstat(path).st_dev == dev
+    except OSError:
+        return False
+
+
 def resident(out):
     libc = ctypes.CDLL("libc.so.6", use_errno=True)
     libc.mmap.restype = ctypes.c_void_p
@@ -47,12 +57,14 @@ def resident(out):
     n = total = 0
     with open(out, "w") as w:
         for root, dirs, files in os.walk("/"):
-            dirs[:] = [d for d in dirs if not (root == "/" and d in SKIP_TOP) and os.lstat(os.path.join(root, d)).st_dev == dev]
+            dirs[:] = [d for d in dirs if not (root == "/" and d in SKIP_TOP) and same_device(os.path.join(root, d), dev)]
             for f in files:
                 p = os.path.join(root, f)
+                if not p.isprintable():
+                    continue
                 try:
                     st = os.lstat(p)
-                    if not stat.S_ISREG(st.st_mode) or st.st_size == 0 or "\n" in p:
+                    if not stat.S_ISREG(st.st_mode) or st.st_size == 0:
                         continue
                     b = resident_bytes(libc, p, st.st_size)
                 except OSError:
@@ -64,8 +76,15 @@ def resident(out):
 
 
 def image_file(image, path, size=None):
+    """The path is a regular file of the image mounted at image, reached without leaving it: no .. and no directory link out."""
+    if not path.startswith("/") or os.path.normpath(path) != path:
+        return False
+    full = os.path.join(image, path.lstrip("/"))
+    root = os.path.realpath(image)
+    if os.path.commonpath([root, os.path.realpath(os.path.dirname(full))]) != root:
+        return False
     try:
-        st = os.lstat(os.path.join(image, path.lstrip("/")))
+        st = os.lstat(full)
     except OSError:
         return False
     return stat.S_ISREG(st.st_mode) and (size is None or st.st_size == size)
@@ -80,7 +99,7 @@ def build(image, out, residents):
             if len(fields) != 3 or not fields[2].startswith("/") or fields[2] in seen:
                 continue
             seen.add(fields[2])
-            if image_file(image, fields[2], int(fields[1])):
+            if fields[2] not in BOOT_WRITTEN and not fields[2].startswith(BOOT_WRITTEN_UNDER) and image_file(image, fields[2], int(fields[1])):
                 kept.append(fields[2])
             else:
                 dropped += 1

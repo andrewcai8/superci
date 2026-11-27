@@ -336,7 +336,7 @@ func TestASizeWithAReadSetReadsOnlyItsFilesAndNotTheWholeRoot(t *testing.T) {
 	if walked := b.read("find.log"); walked != "" {
 		t.Errorf("a size with a read set walked trees: find %q", walked)
 	}
-	if got, want := strings.Join(b.marks(), " "), "hydrate.start= readset.start= readset.done=full hydrate.done="; got != want {
+	if got, want := strings.Join(b.marks(), " "), "hydrate.start= readset.start= readset.done=full:missing hydrate.done="; got != want {
 		t.Errorf("marks %q, want %q", got, want)
 	}
 	if got := b.read("systemctl.log"); got != "start docker.service" {
@@ -364,5 +364,21 @@ func TestAJobThatStartsDuringTheReadSetEndsItAndNothingReadsAfter(t *testing.T) 
 	}
 	if b.read("fio.ran") != "" || b.read("systemctl.log") != "" || b.read("find.log") != "" {
 		t.Error("the pre-read, the daemon or a walk started after the job")
+	}
+}
+
+func TestAnEmptyReadSetPrereadsAsBeforeAndAWholeOneMarksFull(t *testing.T) {
+	b := startPrereadWith(t, `echo ran > "$BOX/fio.ran"`, "30083776512", `true`, "0", "0", "16000000", []string{""})
+	b.wait(t, 20*time.Second)
+	if b.read("fio.ran") == "" {
+		t.Error("an empty read set switched the pre-read off")
+	}
+	if strings.Contains(strings.Join(b.marks(), " "), "readset.") {
+		t.Errorf("an empty read set posted read set marks: %q", b.marks())
+	}
+	b = startPrereadWith(t, `echo ran > "$BOX/fio.ran"`, "30083776512", `true`, "0", "0", "16000000", []string{"{BOX}/hot/bin0", "{BOX}/hot/bin1"})
+	b.wait(t, 20*time.Second)
+	if got, want := strings.Join(b.marks(), " "), "hydrate.start= readset.start= readset.done=full hydrate.done="; got != want {
+		t.Errorf("marks %q, want %q", got, want)
 	}
 }

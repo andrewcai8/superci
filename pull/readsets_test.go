@@ -11,7 +11,10 @@ import (
 // writtenOnMachines are trees a job or the machine's own boot writes: a read set recorded on a lab machine (tools/readset)
 // holds only paths of the image, checked against a volume of its snapshot, so none of these can be in it.
 var writtenOnMachines = []string{"/home/runner/_work/", "/home/runner/hydrated/", "/home/runner/.", "/tmp/", "/run/", "/proc/",
-	"/sys/", "/dev/", "/root/", "/var/lib/cloud/", "/var/log/"}
+	"/sys/", "/dev/", "/root/", "/var/lib/cloud/", "/var/log/", "/var/lib/dhcp", "/etc/ssh/ssh_host_"}
+
+// bootWritten are files every boot writes afresh, so the image's copy is never what a job reads.
+var bootWritten = []string{"/etc/hosts", "/etc/hostname", "/etc/machine-id"}
 
 func TestEachReadSetIsSortedAbsoluteImagePathsAndNamesASize(t *testing.T) {
 	cfg, err := LoadConfig("")
@@ -38,6 +41,9 @@ func TestEachReadSetIsSortedAbsoluteImagePathsAndNamesASize(t *testing.T) {
 		for _, p := range paths {
 			if !filepath.IsAbs(p) || filepath.Clean(p) != p {
 				t.Errorf("%s: %q is not a clean absolute path", f, p)
+			}
+			if slices.Contains(bootWritten, p) {
+				t.Errorf("%s: %q is written by every boot, not read from the image", f, p)
 			}
 			for _, w := range writtenOnMachines {
 				if strings.HasPrefix(p, w) {

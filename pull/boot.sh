@@ -110,10 +110,17 @@ hydrate() {
   # hydration, and the job-started hook ends it as it ends the rest. A path the image lacks costs nothing.
   readset() {
     local list=/run/superci-readset.list
-    aws s3 cp --only-show-errors --region "$CR" "s3://$PB/bin/warm/@LABEL@.list" "$list" 2> /dev/null || return 1
-    readall() { tr '\n' '\0' < "$list" | xargs -0 -r -P 64 -n 8 cat -- > /dev/null 2>&1; return 0; }
+    # An empty list reads nothing, so that machine pre-reads as before. Paths the image lacks (xargs' 123) mark the read
+    # full:missing, the sign of a list recorded on another image.
+    aws s3 cp --only-show-errors --region "$CR" "s3://$PB/bin/warm/@LABEL@.list" "$list" 2> /dev/null && grep -q . "$list" || return 1
+    readall() {
+      tr '\n' '\0' < "$list" | xargs -0 -r -P 64 -n 8 cat -- > /dev/null 2>&1
+      case $? in 0) ;; 123) : > "$list.missing" ;; *) return 1 ;; esac
+    }
     mark_hydrate "$(us)" readset.start
-    mark_hydrate "$(us)" readset.done "$(until_job readall)"
+    val=$(until_job readall)
+    [ "$val" = full ] && [ -e "$list.missing" ] && val=full:missing
+    mark_hydrate "$(us)" readset.done "$val"
     [ -e "$HR/.pid" ] && systemctl start docker.service > /dev/null 2>&1
     return 0
   }

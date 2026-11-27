@@ -33,11 +33,20 @@ host. Terminate every instance at the end.
 A machine reads every listed file and discards it, so a path is all a list carries from the machines it was recorded on.
 A recording machine also holds files its boot and its job wrote: ssh host keys, cloud-init's instance data, the job's
 checkout. On Nov 27 the union of ten recordings held 151 such paths and 11 files rewritten to another size. `build` keeps
-a path only when the snapshot's volume has it as a regular file of the recorded size, which left 3,045 of 3,207. `check`
-on the result found 0 that were not image files, and a planted `/etc/ssh/ssh_host_ed25519_key` made it exit 1.
+a path only when the snapshot's volume has it as a regular file of the recorded size, reached without leaving the
+volume (no `..`, no directory link out of it), and drops the few files every boot rewrites (`/etc/hosts`,
+`/etc/machine-id`, dhcpcd's leases). That left 3,041 of 3,207. `check` on the list found 0 that were not image files, and
+a planted `/etc/ssh/ssh_host_ed25519_key` made it exit 1.
 
 ## When the image or the jobs change
 
 A path the new image lacks costs one failed open. A file a job newly reads is read cold until the list is recorded again.
-That is as slow as a machine with no pre-read, never wrong. Record again when a size's `readset.done` times or its jobs'
-first-exec times (`gate/spawn.py`) drift from Blacksmith.
+That is as slow as a machine with no pre-read, never wrong. `readset.done=full:missing` says the list names paths the
+image lacks: record it again then, or when a size's jobs' first-exec times (`gate/spawn.py`) drift from Blacksmith. An
+empty list reads nothing, and that machine pre-reads as before.
+
+## Turning a list off
+
+Delete `readsets/<label>.list` and, in each region's cache bucket, `bin/warm/<label>.list`. A release only uploads, so the
+bucket keeps a deleted list (and `verify-release.sh` then fails on it) until it is deleted there. Machines launched
+afterwards pre-read as before.
