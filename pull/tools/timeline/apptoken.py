@@ -121,6 +121,11 @@ def refusal(why, scope="actions"):
             "(SUPERCI_PERSONAL_TOKEN=1 for canary.sh) to spend the shared personal budget knowingly.")
 
 
+# A host's `gh` wrapper may route reads through another GitHub App and replace the caller's GH_TOKEN unless this is set to 1.
+# Every call that runs on superci's own App token sets it, so the call spends the budget it was meant to; a personal-token call never does.
+KEEP_TOKEN = "GH_SHIM_KEEP_TOKEN"
+
+
 class Auth:
     """Where a `gh` call gets its credential. App by default; personal only when asked, or for a named exception."""
 
@@ -155,7 +160,7 @@ class Auth:
         if self.personal:
             return None
         try:
-            return {**os.environ, "GH_TOKEN": self.token(scope)}
+            return {**os.environ, "GH_TOKEN": self.token(scope), KEEP_TOKEN: "1"}
         except NoAppToken as e:
             raise AppTokenRefused(refusal(e, scope)) from None
 
