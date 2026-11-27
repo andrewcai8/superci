@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Undoes each fix of round 2, of the fence round (audit E), of the wait round (F1 to F4), of the visible wait (U2), of the priority classes (U4), of the hygiene round (U7), of admission on GitHub's answer (the refusal shapes, the hold, the 2 and 50 start, the ceiling against the cap) and of the identity plane and its fix round (D-) in a copy of pull/ and runs the test written for it, which must fail. A fix whose
+"""Undoes each fix of round 2, of the fence round (audit E), of the wait round (F1 to F4), of the visible wait (U2), of the priority classes (U4), of the hygiene round (U7), of admission on GitHub's answer (the refusal shapes, the hold, the 2 and 50 start, the ceiling against the cap) and of the identity plane, its fix round and F5's strandings (D-) in a copy of pull/ and runs the test written for it, which must fail. A fix whose
 test still passes without it is reported as NOT RED. A path under cache/ runs its test in the cache module. Run it in pull/ where Go is installed:
 
   python3 tools/redfirst.py [name fragment ...]   # only the mutants whose name holds one of them
@@ -229,7 +229,7 @@ MUTANTS = [
     ("warm starts after a job that started during the walk", "boot.sh", "    [ -e \"$HR/.pid\" ] || return 0\n    # The walk reads inodes", "    # The walk reads inodes", "TestAJobThatStartsDuringTheWalkStartsNoDaemonAndNoWarm"),
     ("warm reads the libraries on any machine", "boot.sh", "-ge 12000000 ] 2> /dev/null && libs=", "-ge 0 ] 2> /dev/null && libs=", "TestOnlyAMachineOf12GBOrMoreWarmsTheLibraries"),
     # The identity plane (dispatch.go, dset.go): each mutant undoes one guard of the dispatcher or of a dispatch set.
-    ("D-1 a job's own claim is not taken", "dispatch.go", "\tswitch err := d.take(fctx, jobFence(s.id), claim.String(), 0); {", "\tswitch err := d.take(fctx, jobFence(s.id)+newToken(), claim.String(), 0); {",
+    ("D-1 a job's own claim is not taken", "dispatch.go", "\theld, err := claim, d.take(fctx, jobFence(s.id), claim.String(), 0)", "\theld, err := claim, d.take(fctx, jobFence(s.id)+newToken(), claim.String(), 0)",
      "TestNoInterleavingOfPairingFailureAndRestartWritesAJobToTwoMachines"),
     ("D-1 a replay of a handed job is not sent to its pair", "dispatch.go", "\t\tif key != \"\" {\n\t\t\tslog.Warn(\"dispatch job already handed\"", "\t\tif key == \"-\" {\n\t\t\tslog.Warn(\"dispatch job already handed\"",
      "TestNoInterleavingOfPairingFailureAndRestartWritesAJobToTwoMachines"),
@@ -299,7 +299,7 @@ MUTANTS = [
      "TestShimCallersCostBoundedReadsOfTheirTags"),
     ("D-fix-4 reads of tags at once are unbounded", "dispatch.go", "lookups: make(chan struct{}, tagLookups)", "lookups: make(chan struct{}, 1000)",
      "TestShimCallersCostBoundedReadsOfTheirTags"),
-    ("D-fix-5 a machine's unknown claim is asked once", "dispatch.go", "d.take(ctx, m.ID, token, claimTries)", "d.take(ctx, m.ID, token, 1)",
+    ("D-fix-5 a machine's unknown claim is asked once", "dispatch.go", "d.take(ctx, m.ID, claim.String(), claimTries)", "d.take(ctx, m.ID, claim.String(), 1)",
      "TestALastingS3FaultDoesNotChurnMachines"),
     ("D-fix-5 a job spends machines on unknown claims without bound", "dset.go", "if s.unknown++; s.unknown >= claimSpend {", "if s.unknown++; false {",
      "TestALastingS3FaultDoesNotChurnMachines"),
@@ -334,6 +334,16 @@ MUTANTS = [
      "TestAMachineThatLeavesAsItsJobIsHandedIsLost"),
     ("D-away a machine that left during its held bytes is attached", "dispatch.go", "\tif mw.gone() {\n\t\tif s.away[0].IsZero() {", "\tif false {\n\t\tif s.away[0].IsZero() {",
      "TestAMachineThatLeavesAsItsJobIsHandedIsLost"),
+    # F5: a job PAIRED and never handed (a process killed before the job's claim, or the claim unanswered past the shim's
+    # window) is stranded, written to no machine, and re-run once.
+    ("D-F5 a resume of a job with no claim strands nothing", "dispatch.go", "\tif err == nil && claim == (jobClaim{}) {", "\tif false && err == nil && claim == (jobClaim{}) {", "TestAJobPairedByAProcessKilledBeforeItsClaimIsReRunOnceAndWrittenToNoMachine"),
+    ("D-F5 a machine's claim holds no names", "dispatch.go", "d.take(ctx, m.ID, claim.String(), claimTries)", "d.take(ctx, m.ID, claim.pair, claimTries)", "TestAJobPairedByAProcessKilledBeforeItsClaimIsReRunOnceAndWrittenToNoMachine"),
+    ("D-F5 a resume with any token strands the job", "dispatch.go", "\tif c.pair != key {\n\t\treturn jobClaim{}, nil\n\t}", "\tif false {\n\t\treturn jobClaim{}, nil\n\t}", "TestAJobPairedByAProcessKilledBeforeItsClaimIsReRunOnceAndWrittenToNoMachine"),
+    ("D-F5 a stranding fences nothing", "dispatch.go", "d.take(ctx, jobFence(job), lost.String(), 0)", "d.take(ctx, jobFence(job)+\".lost\", lost.String(), 0)", "TestAJobPairedByAProcessKilledBeforeItsClaimIsReRunOnceAndWrittenToNoMachine"),
+    ("D-F5 a stranded job is reported for no re-run", "dset.go", "\tlost, st.stranded = st.stranded, nil\n", "", "TestAJobPairedByAProcessKilledBeforeItsClaimIsReRunOnceAndWrittenToNoMachine"),
+    ("D-F5 a stranded job is re-run only on a reclaim's proof", "rerun.go", "\tproven = proven || j.Unrun\n", "", "TestAJobPairedByAProcessKilledBeforeItsClaimIsReRunOnceAndWrittenToNoMachine"),
+    ("D-F5 a claim unanswered past the window drops its job", "dispatch.go", "\tcase err != nil:\n\t\theld, err = d.strand(d.life, st, claim, s.id)\n", "", "TestAJobClaimUnansweredPastTheShimsWindowIsStrandedOrHandedByWhatLanded"),
+    ("D-F5 a stranding ignores the pair's claim that landed first", "dispatch.go", "\tcase errors.Is(err, ErrClaimed):\n\t\treturn d.jobClaimOf(ctx, job)\n", "\tcase errors.Is(err, ErrClaimed):\n\t\treturn jobClaim{}, nil\n", "TestAJobClaimUnansweredPastTheShimsWindowIsStrandedOrHandedByWhatLanded"),
     ("D-pool a dispatch set's pool is not saved", "carry.go", "\tfor _, d := range dsets {\n\t\tsaved.Sets[d.spec.Name] = d.Carry(now, rule)\n\t}", "",
      "TestADispatchSetsBurstSurvivesARestartThroughTheSavedParameter"),
     ("D-pool a dispatch set's pool is not resumed", "carry.go", "\t\t\td.Resume(c)\n", "\t\t\t_ = c\n",

@@ -478,11 +478,13 @@ size is one set (`split` 1), since an identity names its size, not a set of it.
   The dispatcher reads the job's id and names from the listener's first message (`NewJobRequest`, at most 32 MiB) and
   keeps no secret field of it. A shim whose connection broke before PAIRED replays its job on a new connection: the
   replay takes the queued job's place, so a job is one job however often it arrives. To pair, the dispatcher takes the
-  machine's claim (`issued/<instance>`, made once) with a fresh token, sends JOB to the machine and PAIRED to the
-  shim, takes the job's own claim (`issued/job-<job id>`, holding `<instance>.<token>` and, on a second line, the
+  machine's claim (`issued/<instance>`, made once, holding the pair and the job's names) with a fresh token, sends JOB
+  to the machine and PAIRED to the shim, takes the job's own claim (`issued/job-<job id>`, holding `<instance>.<token>` and, on a second line, the
   job's run, name, repository and identity, so a job lost after a restart can be re-run), and writes the first PIPE
   byte. A claim whose answer S3 lost is asked again with the same token, which finds it taken by that token if it
-  landed: a machine's claim 3 times before the machine is spent, the job's claim for up to 3 minutes. A job that has
+  landed: a machine's claim 3 times before the machine is spent, the job's claim for up to 3 minutes. Past those 3
+  minutes the shim may have given up, so the job is stranded instead (Resume), once S3 answers: the first of the two
+  claims to land decides whether the job was handed. A job that has
   spent 3 machines on claims S3 never answered waits 30 s before each next one, so a lasting S3 fault does not churn
   the set's machines. **The job's claim is the handed point.** Before it, any failure spends the machine (it is ended
   and never offered again) and puts the job back at the head of its queue. After it, the job goes to no other machine,
@@ -493,7 +495,11 @@ size is one set (`split` 1), since an identity names its size, not a set of it.
   each failure in a row (the shim and the agent both; the agent also waits at least a 503's `Retry-After`), so a
   restarted listener is not met by every side at once, and none starts a retry after the 3 minutes end. The token carries the job's id, so a new dispatcher reads the job's claim:
   it must name the pair (it was taken only once the machine's claim held that token), or the answer is 410. A pair
-  never handed is also 410: the shim drops its job's bytes once PAIRED comes, so it cannot start the job again. Bytes
+  never handed is also 410: the shim drops its job's bytes once PAIRED comes, so it cannot start the job again. A job
+  with no claim at all is **stranded** on its first resume, by a side whose pair the machine's claim names: the job's
+  claim is taken with no pair (naming the stranded pair on its second line), so no pair can be handed the job after,
+  and the job is reported among the set's lost jobs, marked unrun. Every strand of one pair writes the same claim, so a
+  lost answer or a strand from each side finds it its own. Bytes
   in flight at the break may be lost; the shim sends what it read while away, and the machine sends its EXIT again
   until a clean close follows it. A PIPE frame whose send failed is sent on the machine's next connection: a failed
   send puts no whole frame on the wire, and the agent acts only on whole frames, so no byte reaches the Worker twice.
@@ -506,7 +512,8 @@ size is one set (`split` 1), since an identity names its size, not a set of it.
   the job. A shim that is away loses nothing: the machine renews its job itself, so the job runs on to its EXIT
   however long the shim stays away. An EXIT that comes while the shim is away ends the machine and is held for the
   shim until 3 minutes after the shim left. A spot reclaim's lost job is re-run as a scale set's is, known by its
-  machine and found in its run by its name (an identity takes many jobs).
+  machine and found in its run by its name (an identity takes many jobs). A stranded job is re-run the same way with no
+  reclaim to prove: no machine ever got its bytes, so its failure is superci's own.
 - **Machines.** A dispatch machine carries `superci-pull-mode=dispatch`, so a scale set and a dispatch set of one size
   never take each other's machines. Its demand is the jobs waiting plus the jobs running, and its pool follows the
   jobs that arrive at the dispatcher, by the same rule as a scale set's (Pools). It ends when its EXIT has been
@@ -975,8 +982,11 @@ baseline) and were not measured. A changed template makes new machines: the list
   and its end waits for GitHub's word on its runner.
 - **A dispatcher that crashes in a hand-off fails that job once, and never runs it twice.** The shim drops the job's
   bytes once PAIRED comes, so from then until the machine has them the job message is only in the dispatcher's memory.
-  A crash between PAIRED and the job's claim (one S3 round trip) leaves a claim that names no pair: both sides are
-  answered 410 when they rejoin, and the shim fails the job. A crash after the job's claim and before its bytes reach
+  A crash between PAIRED and the job's claim (one S3 round trip) leaves no job claim: the next dispatcher strands the
+  job when either side rejoins, both are answered 410, the shim fails the job, and it is re-run once its run has
+  completed. A job is stranded only by a resume, or by the process that paired it: one whose sides both gave up before
+  any dispatcher answered (a listener down past 3 minutes), or whose pairing process ended with S3 still unanswered,
+  stays failed. A crash after the job's claim and before its bytes reach
   the machine leaves a machine with its JOB and no job message: its agent sends EXIT 1 when no complete first message
   comes within 60 s of JOB, the next dispatcher relays it through the job it adopts, and the job fails. In both cases
   the job's claim names at most one pair, so no other machine gets the job.

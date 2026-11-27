@@ -1648,3 +1648,182 @@ func TestALostJobsExitCodeIsHeldForAShimNotYetAttached(t *testing.T) {
 		t.Fatalf("held for the shim %+v, want the one exit code 1", s.toShim)
 	}
 }
+
+// named is a lost job's names, what the re-run finds it by in GitHub.
+func named(j JobRef) JobRef {
+	return JobRef{Owner: j.Owner, Repo: j.Repo, RunID: j.RunID, Name: j.Name, Runner: j.Runner, Instance: j.Instance}
+}
+
+// reRuns gives lost jobs to a re-runner as the listener does, with no spot reclaim to prove, passes it twice and returns
+// the jobs it re-ran: GitHub has the run completed and the job failed, as the identity's listener fails it.
+func reRuns(t *testing.T, lost []JobRef) []string {
+	t.Helper()
+	gh := &identityJobs{jobs: `{"jobs":[{"id":11,"name":"unit","runner_name":"superci-id-4cpu-17","conclusion":"failure"}]}`}
+	rest := &REST{org: "o", http: &http.Client{Transport: gh}, token: "t", expires: time.Now().Add(time.Hour)}
+	r := NewRerunner(rest, func(context.Context, []string) (map[string]bool, error) { return map[string]bool{}, nil })
+	for _, j := range lost {
+		r.Add(j, time.Now(), false)
+	}
+	r.pass(context.Background())
+	r.pass(context.Background())
+	return gh.reruns
+}
+
+// F5: a process killed between PAIRED and the job's claim leaves a job whose shim has dropped its bytes. The next
+// dispatcher strands it on a side's resume: the job's claim is taken with no pair, so no pair is handed it after, not
+// even by the dead process's write landing late, and the job is reported once for its re-run.
+func TestAJobPairedByAProcessKilledBeforeItsClaimIsReRunOnceAndWrittenToNoMachine(t *testing.T) {
+	store := &fakeS3{objects: map[string]string{}}
+	hooked := &hookedClaims{Claims: &Claims{store: store, bucket: "claims"}}
+	p := startDispatcher(t, store, identityTags(), dispatchSet("i-0m1"))
+	p.d.claims = hooked
+	pending, dead := make(chan struct{}), make(chan struct{})
+	var release sync.Once
+	t.Cleanup(func() { release.Do(func() { close(dead) }) })
+	hooked.before = func(name string) {
+		if name == jobFence(jobA) {
+			close(pending)
+			<-dead
+		}
+	}
+	m := p.machine(t, "i-0m1")
+	waitUntil(t, "the machine waits", func() bool { return phaseOf(p.st, "i-0m1") == mWaiting })
+	s := p.shim(t)
+	s.sendJob(jobMessage(jobA, 7, "unit"))
+	token := m.job().Token
+	s.paired()
+	<-pending
+	p.d.mu.Lock()
+	for w := range p.d.wires {
+		go w.close()
+	}
+	p.d.mu.Unlock()
+
+	next := startDispatcher(t, store, identityTags(), dispatchSet("i-0m1", "i-0m2"))
+	m2 := next.machine(t, "i-0m2")
+	waitUntil(t, "the second machine waits", func() bool { return phaseOf(next.st, "i-0m2") == mWaiting })
+	if forged := next.shim(t, resumeHeader, "i-0m1.0123."+jobA); forged.code != http.StatusGone {
+		t.Fatalf("a resume with a token the machine's claim does not hold: %d, want 410", forged.code)
+	}
+	if _, lost := next.st.Reconcile(time.Now(), bounds); len(lost) != 0 || store.claims() != 1 {
+		t.Fatalf("a resume with another token stranded the job (lost %+v)", lost)
+	}
+	pair := "i-0m1." + token
+	if s = next.shim(t, resumeHeader, pair); s.code != http.StatusGone {
+		t.Fatalf("the shim's resume: %d, want 410 (it dropped the job's bytes)", s.code)
+	}
+	if m = next.machine(t, "i-0m1", resumeHeader, pair); m.code != http.StatusGone {
+		t.Fatalf("the machine's resume: %d, want 410", m.code)
+	}
+	_, lost := next.st.Reconcile(time.Now(), bounds)
+	want := JobRef{Owner: "acme", Repo: "mono", RunID: 7, Name: "unit", Runner: "superci-id-4cpu-17", Instance: "i-0m1"}
+	if len(lost) != 1 || named(lost[0]) != want {
+		t.Fatalf("lost %+v, want the stranded job %+v once", lost, want)
+	}
+	if _, again := next.st.Reconcile(time.Now(), bounds); len(again) != 0 {
+		t.Fatalf("the stranded job was reported again: %+v", again)
+	}
+	if runs := reRuns(t, lost); len(runs) != 1 || !strings.HasSuffix(runs[0], "/jobs/11/rerun") {
+		t.Fatalf("re-ran %v, want the stranded job once", runs)
+	}
+
+	release.Do(func() { close(dead) })
+	settled := make(chan struct{})
+	go func() { p.d.handing.Wait(); close(settled) }()
+	waitUntil(t, "the dead process's hand-off settles", func() bool {
+		select {
+		case <-settled:
+			return true
+		default:
+			return false
+		}
+	})
+	store.mu.Lock()
+	holder := store.objects["issued/"+jobFence(jobA)]
+	store.mu.Unlock()
+	if c := parseJobClaim(holder); c.pair != "" || !strings.Contains(holder, pair) {
+		t.Fatalf("the job's claim %q, want it stranded from %s with no pair", holder, pair)
+	}
+	if err := m2.quiet(300 * time.Millisecond); err != nil {
+		t.Fatalf("the waiting machine: %v", err)
+	}
+}
+
+// unanswered answers each take of a job's claim with a pair with an error, as S3 does through an outage: with land the
+// claim is made first, so every answer is lost, and otherwise it is not made. A claim with no pair gets S3's answer.
+type unanswered struct {
+	*Claims
+	land bool
+}
+
+func (u *unanswered) Take(ctx context.Context, name, token string) error {
+	if name != jobFence(jobA) || strings.HasPrefix(token, "\n") {
+		return u.Claims.Take(ctx, name, token)
+	}
+	if u.land {
+		_ = u.Claims.Take(ctx, name, token)
+	}
+	return errors.New("SlowDown: please reduce your request rate")
+}
+
+// F5: a job's claim S3 does not answer for as long as the shim waits to rejoin is stranded instead, once S3 answers.
+// Whichever claim landed decides: none, and the job is written to no machine and re-run once; the pair's, and the job
+// was handed, so it runs on its machine and is never re-run.
+func TestAJobClaimUnansweredPastTheShimsWindowIsStrandedOrHandedByWhatLanded(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		land bool
+	}{
+		{"not made", false},
+		{"made, with every answer lost", true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			store := &fakeS3{objects: map[string]string{}}
+			p := startDispatcher(t, store, identityTags(), dispatchSet("i-0m1"))
+			p.d.claims = &unanswered{Claims: &Claims{store: store, bucket: "claims"}, land: c.land}
+			p.d.window = 200 * time.Millisecond
+			m := p.machine(t, "i-0m1")
+			waitUntil(t, "the machine waits", func() bool { return phaseOf(p.st, "i-0m1") == mWaiting })
+			s := p.shim(t)
+			msg := jobMessage(jobA, 7, "unit")
+			s.sendJob(msg)
+			token := m.job().Token
+			s.paired()
+			if c.land {
+				if got := m.pipeBytes(len(msg)); !bytes.Equal(got, msg) {
+					t.Fatal("the machine its claim names did not get the job")
+				}
+				m.send(frameExit, i32(100))
+				if code := exitCode(s.expect(frameExit)); code != 100 {
+					t.Fatalf("exit %d, want the Worker's 100", code)
+				}
+				if _, lost := p.st.Reconcile(time.Now(), bounds); len(lost) != 0 {
+					t.Fatalf("a handed job was reported for a re-run: %+v", lost)
+				}
+				return
+			}
+			for {
+				typ, _, err := m.next(5 * time.Second)
+				if err != nil {
+					break
+				}
+				if typ == framePipe {
+					t.Fatal("the stranded job's machine got PIPE bytes")
+				}
+			}
+			if !s.ended(5 * time.Second) {
+				t.Fatal("the stranded job's shim was kept")
+			}
+			if again := p.shim(t, resumeHeader, "i-0m1."+token); again.code != http.StatusGone {
+				t.Fatalf("the shim's resume: %d, want 410", again.code)
+			}
+			_, lost := p.st.Reconcile(time.Now(), bounds)
+			if len(lost) != 1 || named(lost[0]) != (JobRef{Owner: "acme", Repo: "mono", RunID: 7, Name: "unit", Runner: "superci-id-4cpu-17", Instance: "i-0m1"}) {
+				t.Fatalf("lost %+v, want the stranded job once", lost)
+			}
+			if runs := reRuns(t, lost); len(runs) != 1 {
+				t.Fatalf("re-ran %v, want the stranded job once", runs)
+			}
+		})
+	}
+}
