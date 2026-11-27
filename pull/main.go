@@ -218,7 +218,9 @@ func run(ctx context.Context, f flags) error {
 			if err != nil {
 				return err
 			}
-			l.dsets = append(l.dsets, NewDispatchSet(spec, sf, regions, now))
+			ds := NewDispatchSet(spec, sf, regions, now)
+			ds.SetNoDemand(cfg.NoDemand)
+			l.dsets = append(l.dsets, ds)
 			continue
 		}
 		scaled = append(scaled, spec)
@@ -370,6 +372,7 @@ func deniedSince(before, now map[string]int) map[string]int {
 func setState(spec SetSpec, cfg Config, regions []string, now time.Time) *State {
 	s := NewState(spec.Name, 0, spec.Max, regions, now)
 	s.SetBatch(cfg.Batch)
+	s.SetNoDemand(cfg.NoDemand)
 	return s
 }
 
@@ -1216,11 +1219,13 @@ func (l *Listener) watchConfig() {
 	}
 	for _, s := range l.sets {
 		s.state.SetBatch(cfg.Batch)
+		s.state.SetNoDemand(cfg.NoDemand)
 		if n, ok := maxes[s.spec.Name]; ok {
 			s.state.SetMax(n)
 		}
 	}
 	for _, d := range l.dsets {
+		d.SetNoDemand(cfg.NoDemand)
 		if n, ok := maxes[d.spec.Name]; ok {
 			d.SetMax(n)
 		}
