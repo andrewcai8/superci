@@ -386,7 +386,7 @@ func bootData(c Config, listener, pin, label string) string {
 // bootDataMode is bootData for a mode: "scaleset" asks for a just-in-time runner as always, "dispatch" runs the agent
 // (agent.py) that takes the one job the dispatcher pairs the machine with.
 func bootDataMode(c Config, listener, pin, label, mode string) string {
-	return strings.NewReplacer("@MODE@", mode, "@LISTENER@", listener, "@PIN@", pin, "@LIFE_SECONDS@", strconv.Itoa(int(c.life().Seconds())), "@LABEL@", label, "@HYDRATE_STOP@", strings.TrimSpace(hydrateStop)).Replace(bootScript)
+	return strings.NewReplacer("@MODE@", mode, "@LISTENER@", listener, "@PIN@", pin, "@LIFE_SECONDS@", strconv.Itoa(int(c.life().Seconds())), "@LABEL@", label, "@WARM_CAP_SECONDS@", strconv.Itoa(int(warmCap.Seconds())), "@HYDRATE_STOP@", strings.TrimSpace(hydrateStop)).Replace(bootScript)
 }
 
 // ensureScaleSet finds or makes the set at GitHub, in the deployment's runner group, with its labels: its name, and

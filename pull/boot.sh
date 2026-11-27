@@ -77,6 +77,7 @@ mark cache.up
 # It drops to the runner user with setpriv, which execs in place (runuser forks and may start a session of its own, out of the hook's reach).
 export HR=/home/runner/hydrated HM=/run/superci-hydrate.json PB CR
 install -d -o runner -g runner "$HR"
+: > "$HR/.warming" # until hydrate() is done; a dispatch machine waits on it (below)
 cat > /home/runner/superci-hydrate-stop.sh << 'HOOK'
 @HYDRATE_STOP@
 HOOK
@@ -147,7 +148,7 @@ hydrate() {
     mark_hydrate "$(us)" hydrate.done "$val"
   fi
   preread
-  rm -f "$HR/.pid"
+  rm -f "$HR/.pid" "$HR/.warming"
 }
 setsid bash -c "$(declare -f hydrate); hydrate" &
 DOC=$(curl -s -m 2 -H "X-aws-ec2-metadata-token: $T" http://169.254.169.254/latest/dynamic/instance-identity/rsa2048)
@@ -159,10 +160,14 @@ call() { curl -s -k --pinnedpubkey "$PIN" -m 60 --data-binary "$DOC" -o "$2" -w 
     [ "$(curl -s -m 2 -o /dev/null -w '%{http_code}' -H "X-aws-ec2-metadata-token: $T" http://169.254.169.254/latest/meta-data/spot/instance-action)" = 200 ] || continue
     call notice /dev/null; break
   done ) &
+uptime_s() { cut -d. -f1 /proc/uptime; }
 # Dispatch mode (pull/agent.py): no runner is registered. The machine fetches its agent with the identity document and
 # the pin, which proves itself to the dispatcher and runs the one job it is paired with, and powers off as below.
 if [ '@MODE@' = dispatch ]; then
   umask 077
+  # Ask for a job once the warm is done (a cold machine's node took 2.5 s, Blacksmith's 39 ms), or at @WARM_CAP_SECONDS@ s of uptime.
+  while [ -e "$HR/.warming" ] && [ "$(uptime_s)" -lt @WARM_CAP_SECONDS@ ]; do sleep 0.5; done
+  mark warm.ready
   fails=0
   while :; do
     code=$(call agent /run/superci-agent.py)

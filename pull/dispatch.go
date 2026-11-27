@@ -70,7 +70,8 @@ const (
 	pipeHeld      = jobMessageMax + 1<<20 // PIPE bytes held while the job has no machine to write them to
 	shimHeld      = 8 << 20               // what the machine sent that is held while the shim is away, frames at heldCost
 	heldCost      = 64                    // a held frame's memory beyond its payload, so a flood of empty frames is bounded
-	bootGrace     = 5 * time.Minute       // a launched machine that has not come to /work by then is stuck
+	bootGrace     = 8 * time.Minute       // a launched machine that has not come to /work by then is stuck: warmCap, after a slow launch
+	warmCap       = 300 * time.Second     // the uptime up to which a dispatch machine waits for its warm before it asks for a job (boot.sh)
 	resumeWindow  = 3 * time.Minute       // how long a handed job waits for a side to rejoin after its connection broke
 	drainFor      = 5 * time.Second       // how long an ended connection reads what its peer still sends
 	hostTrust     = 5 * time.Minute       // how long an identity host's tags are trusted
