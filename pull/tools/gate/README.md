@@ -116,7 +116,9 @@ output says so: `failing tests: no test-name source for <job>`).
   why, when its job timed out; when a file was `stopped at` its limit or `terminated by` a signal, a file or target exited with a code other than
   bun's 1, a shard was cut short (`did not finish before SIGTERM`, a cancelled step, GitHub's own cut-off line), a target hung past its
   watchdog or the runner crashed; when bun's summary (` N fail`, ` N error`) counts more than the log names, or an error came between tests;
-  when a step other than the tests' failed; and when it is named only by a file or target (no `(fail)` line), since a coarse name
+  when a file or target has failures, exited non-zero and printed no `Ran N tests across` line (the run died after its first failures, e.g. `process.exit(1)`);
+  when a step's process ended with an exit code other than 1 (`Process completed with exit code 137`, the OOM killer), the runner lost communication with the server, or a step
+  of a finished job has no conclusion; when a step other than the tests' failed; and when it is named only by a file or target (no `(fail)` line), since a coarse name
   compares nothing. A log that is not valid UTF-8 is unreadable and counts.
   **Which Blacksmith runs make main red.** Ordinary main runs only: a `workflow_dispatch` run (a census, a hoist record) and an integration
   census leg (`integration (N, v3)`) are left out, as are failed jobs naming no test-level name.

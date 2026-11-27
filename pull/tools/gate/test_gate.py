@@ -1620,7 +1620,7 @@ class NoTokenInAMessage(Sandbox):
 STAMP = "2026-11-27T10:00:00.0000000Z "
 
 
-def unit_log(*fails, file="src/a.test.ts", exit_line=True, exit_code=1, reported=None, errors=0, stopped=None, unhandled=False):
+def unit_log(*fails, file="src/a.test.ts", exit_line=True, exit_code=1, reported=None, errors=0, stopped=None, unhandled=False, summary=True):
     """What a unit-tests job's log holds for one test file: scripts/verify/test-files.ts's header, bun's lines and summary (` N fail`, ` N error`),
     its verdict on the file (`exited N`, or `was stopped at <limit>`)."""
     lines = [f"== bun test --isolate {file}", "bun test v1.3.0", "(pass) suite > fine [0.10ms]"]
@@ -1628,7 +1628,7 @@ def unit_log(*fails, file="src/a.test.ts", exit_line=True, exit_code=1, reported
         lines += ["# Unhandled error between tests", "-------------------------------", "error: boom", "-------------------------------"]
     lines += [f"(fail) {f} [12.50ms]" for f in fails]
     n = len(fails) if reported is None else reported
-    if n or errors:
+    if (n or errors) and summary:
         lines += [" 1 pass"] + ([f" {n} fail"] if n else []) + ([f" {errors} error{'s' if errors != 1 else ''}"] if errors else []) + [" 3 expect() calls", f"Ran {n + 1} tests across 1 file. [50.00ms]"]
     if stopped:
         lines.append(f"test-files: {file} was stopped at {stopped}")
@@ -1637,12 +1637,12 @@ def unit_log(*fails, file="src/a.test.ts", exit_line=True, exit_code=1, reported
     return "\n".join(STAMP + l for l in lines) + "\n"
 
 
-def integration_log(target, *fails, exit_code=1, watchdog=False, crash=None, reported=None):
+def integration_log(target, *fails, exit_code=1, watchdog=False, crash=None, reported=None, summary=True):
     """What an integration shard's log holds for one failed target (testRunner.ts, INTEGRATION_QUIET_PASSING=1; targetReports.ts's list)."""
     n = len(fails) if reported is None else reported
     lines = ["[integration] Target 1/2 finished in 3.0s (exit 0): src/integration/ok.integration.ts",
              f"[integration] ── target 2/2 (worker 1, 9.0s, exit {exit_code}): {target}", "bun test v1.3.0", *(f"(fail) {f} [5001.00ms]" for f in fails),
-             *([" 1 pass", f" {n} fail", f"Ran {n + 1} tests across 1 file. [50.00ms]"] if n else []), "[integration] ── end target 2/2"]
+             *([" 1 pass", f" {n} fail", f"Ran {n + 1} tests across 1 file. [50.00ms]"] if n and summary else []), "[integration] ── end target 2/2"]
     if watchdog:
         lines.insert(3, f"[integration] Target hung past its watchdog and was killed: {target}")
     lines += [f"[integration] Target failed with exit code {exit_code}: {target}", "[integration] 1 integration target(s) failed:", f" - {target} (exit code {exit_code})"]
@@ -1946,6 +1946,29 @@ class FailingTests(FailingHarness, unittest.TestCase):
         self.assertRegex(out, r"failures \(superci\)\s+1 of 6")
         self.assertIn("counted, failing tests unreadable (fail closed): run 9000: log not read (it is not valid UTF-8", out)
 
+    def test_a_file_that_died_with_exit_1_and_no_bun_summary_counts_though_a_red_test_is_in_its_log(self):
+        """bun 1.4.3: a second test calling process.exit(1) after a red one prints `(fail) red`, then nothing, and the runner logs `exited 1`."""
+        red = unit_log("suite > stampDoubles")
+        self.beyond(red, unit_log("suite > stampDoubles", summary=False), "src/a.test.ts exited 1 with no bun summary: the run died after its failures")
+
+    def test_a_step_killed_with_exit_137_counts_though_a_red_test_is_in_its_log(self):
+        red = unit_log("suite > stampDoubles")
+        self.beyond(red, red + STAMP + "##[error]Process completed with exit code 137.\n", "the step's process exited 137")
+
+    def test_a_runner_that_lost_communication_with_the_server_counts(self):
+        red = unit_log("suite > stampDoubles")
+        self.beyond(red, red + STAMP + "##[error]The runner has lost communication with the server.\n", "the job was cut short (##[error]The runner has lost communication with the server.)")
+
+    def test_a_step_with_no_conclusion_on_a_finished_job_counts(self):
+        red = unit_log("suite > stampDoubles")
+        steps = [{"name": "Run tests", "conclusion": "failure"}, {"name": "Upload unit test observations", "conclusion": None}]
+        self.beyond(red, red, "step 'Upload unit test observations' has no conclusion on a finished job: the runner was lost", steps=steps)
+
+    def test_an_unreadable_blacksmith_main_failure_names_its_hard_reason_not_an_empty_one(self):
+        killed = STAMP + "##[error]Process completed with exit code 137.\n"
+        code, out = self.run_gate(self.baseline(red=[killed]) + self.superci(failed=[unit_log("suite > stampDoubles")]))
+        self.assertIn("1 of 1 failed jobs could not be read (the step's process exited 137); no exclusion is drawn from them", out)
+
     def test_a_job_with_no_test_name_source_keeps_the_job_level_rule_and_says_so(self):
         self.job = "verify-tools"
         try:
@@ -1990,6 +2013,11 @@ class IntegrationFailingTests(FailingHarness, unittest.TestCase):
         red = integration_log("src/integration/stampDoubles.integration.ts", "stamp > doubles")
         cut = red + "\n".join(STAMP + l for l in ["[integration] 1 of 40 target(s) did not finish before SIGTERM:", " - src/integration/slow.integration.ts"]) + "\n"
         self.beyond(red, cut, "src/integration/slow.integration.ts did not finish: the shard was cut short")
+
+    def test_a_target_that_died_with_exit_1_and_no_bun_summary_counts_though_a_red_test_is_in_its_log(self):
+        t = "src/integration/stampDoubles.integration.ts"
+        red = integration_log(t, "stamp > doubles")
+        self.beyond(red, integration_log(t, "stamp > doubles", summary=False), f"{t} exited 1 with no bun summary: the run died after its failures")
 
     def test_a_census_leg_and_a_manual_run_are_not_main_s_ordinary_runs(self):
         a, b = integration_log("src/integration/a.integration.ts", "a > one"), integration_log("src/integration/b.integration.ts", "b > one")
@@ -2045,6 +2073,17 @@ class LogParsers(unittest.TestCase):
         self.assertEqual(G.parse_unit_log(unit_log("a > b", unhandled=True, errors=1)).hard,
                          ("src/a.test.ts: bun's summary counts 2 failures and errors, the log names 1 tests", "src/a.test.ts: an error between tests"))
         self.assertIn("counts 3 failures and errors, the log names 1 tests", G.parse_unit_log(unit_log("a > b", reported=3)).hard[0])
+
+    def test_a_run_with_failures_a_non_zero_exit_and_no_ran_line_is_hard_and_one_that_ran_to_its_end_is_not(self):
+        self.assertEqual(G.parse_unit_log(unit_log("a > b", summary=False)).hard, ("src/a.test.ts exited 1 with no bun summary: the run died after its failures",))
+        self.assertEqual(G.parse_unit_log(unit_log("a > b")).hard, ())
+        self.assertEqual(G.parse_integration_log(integration_log("t.ts", "s > one", summary=False)).hard, ("t.ts exited 1 with no bun summary: the run died after its failures",))
+        self.assertEqual(G.parse_unit_log(unit_log("a > b", exit_line=False, summary=False)).hard, (), "no exit line: nothing says the run died")
+
+    def test_a_step_process_exit_other_than_1_is_hard_and_1_is_not(self):
+        self.assertEqual(G.parse_unit_log(STAMP + "##[error]Process completed with exit code 137.\n").hard, ("the step's process exited 137",))
+        self.assertEqual(G.parse_integration_log(STAMP + "##[error]Process completed with exit code 143.\n").hard, ("the step's process exited 143",))
+        self.assertEqual(G.parse_unit_log(STAMP + "##[error]Process completed with exit code 1.\n").hard, ())
 
     def test_a_job_cut_by_its_timeout_is_hard(self):
         text = unit_log("a > b") + STAMP + "##[error]The operation was canceled.\n"

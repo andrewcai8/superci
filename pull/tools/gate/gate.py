@@ -378,7 +378,9 @@ _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _FAIL = re.compile(r"^\s*\(fail\) (.*?)(?: \[[\d.]+ ?m?s\])?$")
 _SUMMARY = re.compile(r"^\s*(\d+) (?:fail|errors?)$")  # bun's ` 1 fail` and ` 2 errors` lines, one of each at the end of a file's run
 _UNHANDLED = re.compile(r"^# Unhandled error between tests")
-_CUT = re.compile(r"(The operation was canceled|has exceeded the maximum execution time|received a shutdown signal)")
+_CUT = re.compile(r"(The operation was canceled|has exceeded the maximum execution time|received a shutdown signal|lost communication with the server)")
+_RAN = re.compile(r"^Ran \d+ tests? across ")  # bun's last line of a run that finished
+_PROCESS_EXIT = re.compile(r"Process completed with exit code (\d+)")  # GitHub's line when a step's command ends non-zero
 BUN_FAILED_EXIT = 1  # bun test's exit code when tests failed; any other code of a file or target is a crash, a kill or a harness failure
 
 
@@ -401,7 +403,7 @@ class _Run:
     """One file's (or target's) bun run as the log shows it: its `(fail)` names, the failures and errors bun's summary counts."""
 
     def __init__(self):
-        self.fails, self.reported, self.unhandled = [], 0, False
+        self.fails, self.reported, self.unhandled, self.ran, self.exit = [], 0, False, False, None
 
 
 def _runs_parsed(runs, coarse, hard):
@@ -413,15 +415,27 @@ def _runs_parsed(runs, coarse, hard):
             hard.append(f"{name or 'a test file'}: bun's summary counts {r.reported} failures and errors, the log names {len(r.fails)} tests")
         if r.unhandled:
             hard.append(f"{name or 'a test file'}: an error between tests")
+        if r.fails and r.exit not in (None, 0) and not r.ran:
+            hard.append(f"{name or 'a test file'} exited {r.exit} with no bun summary: the run died after its failures")
     return frozenset(tests), frozenset(coarse), tuple(dict.fromkeys(hard))
 
 
 def _exit_of(runs, coarse, hard, name, code):
     """A file or target that exited non-zero: coarse when no test is named for it, hard when the code is not bun's failed-tests code."""
+    runs.setdefault(name, _Run()).exit = int(code)
     if int(code) != BUN_FAILED_EXIT:
         hard.append(f"{name} exited {code}, not bun's {BUN_FAILED_EXIT} for failed tests")
-    if not runs.get(name) or not runs[name].fails:
+    if not runs[name].fails:
         coarse.add(name)
+
+
+def _runner_line(line, hard):
+    """GitHub's `Process completed with exit code N` for a step: any N other than bun's 1 is a kill or a crash (137 is the OOM killer). Whether it
+    was one is decided here; True when the line was one."""
+    m = _PROCESS_EXIT.search(line)
+    if m and int(m.group(1)) != BUN_FAILED_EXIT:
+        hard.append(f"the step's process exited {m.group(1)}")
+    return bool(m)
 
 
 def parse_unit_log(text):
@@ -439,6 +453,8 @@ def parse_unit_log(text):
             runs.setdefault(file, _Run()).fails.append(m.group(1))
         elif m := _SUMMARY.match(line):
             runs.setdefault(file, _Run()).reported += int(m.group(1))
+        elif _RAN.match(line):
+            runs.setdefault(file, _Run()).ran = True
         elif _UNHANDLED.match(line):
             runs.setdefault(file, _Run()).unhandled = True
         elif m := re.match(r"test-files: (.+?) exited (\d+)$", line):
@@ -449,6 +465,8 @@ def parse_unit_log(text):
         elif m := re.match(r"test-files: (.+?) terminated by (\S+); stopping$", line):
             coarse.add(m.group(1))
             hard.append(f"{m.group(1)} was terminated by {m.group(2)}")
+        elif _runner_line(line, hard):
+            pass
         elif _CUT.search(line):
             hard.append(f"the job was cut short ({line.strip()[:120]})")
     return Parsed(*_runs_parsed(runs, coarse, hard))
@@ -478,6 +496,8 @@ def parse_integration_log(text):
             runs.setdefault(target, _Run()).fails.append(m.group(1))
         elif m := _SUMMARY.match(line):
             runs.setdefault(target, _Run()).reported += int(m.group(1))
+        elif _RAN.match(line):
+            runs.setdefault(target, _Run()).ran = True
         elif _UNHANDLED.match(line):
             runs.setdefault(target, _Run()).unhandled = True
         elif m := re.match(r"\[integration\] Target failed with exit code (\d+): (.+)$", line):
@@ -491,6 +511,8 @@ def parse_integration_log(text):
             listing = "failed"
         elif m := re.match(r"\[integration\] Integration runner crashed: (.*)$", line):
             hard.append(f"the integration runner crashed: {m.group(1)[:120]}")
+        elif _runner_line(line, hard):
+            pass
         elif _CUT.search(line):
             hard.append(f"the job was cut short ({line.strip()[:120]})")
     return Parsed(*_runs_parsed(runs, coarse, hard))
@@ -554,11 +576,13 @@ class OverBudget(Exception):
 
 
 def step_reasons(steps, test_step):
-    """Why a job's steps say it failed in more than a red test: a cancelled step (timeout-minutes or a cancel cut it) or a failed step
-    other than the tests'."""
+    """Why a job's steps say it failed in more than a red test: a cancelled step (timeout-minutes or a cancel cut it), a step with no
+    conclusion on a finished job (its runner was lost) or a failed step other than the tests'."""
     out = []
     for s in steps:
-        if s.get("conclusion") == "cancelled":
+        if s.get("conclusion") is None:
+            out.append(f"step '{s.get('name')}' has no conclusion on a finished job: the runner was lost")
+        elif s.get("conclusion") == "cancelled":
             out.append(f"step '{s.get('name')}' was cancelled: the job was cut short")
         elif s.get("conclusion") == "failure" and s.get("name") != test_step:
             out.append(f"step '{s.get('name')}' failed")
@@ -647,7 +671,7 @@ def gather_tests(gh, cache, source, name, candidates, s_jobs, events, listed, wi
                 red[n].add(r["id"])
                 red_jobs[n] += 1
             if not got.names and not got.outside:
-                t.main_unread.append((r["id"], got.why))
+                t.main_unread.append((r["id"], got.why or "; ".join(got.hard) or "no reason given"))
     t.red, t.red_jobs, t.logs = {n: sorted(ids) for n, ids in red.items()}, dict(red_jobs), reader.logs
     return t
 
