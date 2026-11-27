@@ -209,7 +209,7 @@ func newRig(t *testing.T, label string, handle func(c *fconn)) *rig {
 	t.Cleanup(func() { r.Close(); w.Close() })
 	g := &rig{fake: f, pipe: w, stdout: &syncBuf{}, stderr: &syncBuf{}}
 	g.s = &shim{dial: d.dial, ob: newOutbox(maxBuffered), stdout: g.stdout, stderr: g.stderr,
-		pingEvery: 40 * time.Millisecond, silence: 5 * time.Second, window: 800 * time.Millisecond, retry: 10 * time.Millisecond}
+		pingEvery: 40 * time.Millisecond, silence: 5 * time.Second, window: 800 * time.Millisecond, retry: 10 * time.Millisecond, retryMax: 40 * time.Millisecond}
 	g.readEnd = r
 	return g
 }

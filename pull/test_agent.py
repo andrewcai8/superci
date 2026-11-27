@@ -310,7 +310,7 @@ class AgentCase(unittest.TestCase):
     def config(self, **kw):
         cfg = dict(listener=f"https://127.0.0.1:{self.disp.port if self.disp else 1}", pin=PIN, imds=f"http://127.0.0.1:{self.imds.server_port}",
                    home=self.home, user=None, spool=self.spool, environment=os.path.join(self.tmp, "environment"),
-                   ping_every=0.05, silence=5, window=1.0, wait_window=1.0, retry=0.02, renew_every=0.05, exit_settle=0.3,
+                   ping_every=0.05, silence=5, window=1.0, wait_window=1.0, retry=0.02, retry_max=0.1, renew_every=0.05, exit_settle=0.3,
                    hydrate_timeout=5, renew_context=self.trust)
         cfg.update(kw)
         return agent.Config(**cfg)
@@ -447,6 +447,7 @@ class TestFrames(AgentCase):
                 self.dispatcher(handler)
                 self.start()
                 self.finish()
+                wait_for(lambda: closed, "the dispatcher to see the connection end")
                 self.assertEqual(closed, [True], "the agent kept the connection")
                 self.assertEqual(self.lines(self.log), [], "a worker started")
 
@@ -467,8 +468,126 @@ class TestFrames(AgentCase):
         self.dotenv(WANT="1")
         self.start()
         self.finish()
+        wait_for(lambda: closed, "the dispatcher to see the connection end")
         self.assertEqual(closed, [True])
         self.assertEqual(self.disp.conns[1].headers["x-superci-resume"], f"{INSTANCE}.claim-token")
+
+
+class FakeClock:
+    """The reconnect loop's clock and wait: a sleep only moves the time forward, so these tests wait on nothing."""
+
+    def __init__(self):
+        self.t = 1000.0
+        self.start = self.t
+        self.sleeps = []
+        self.dials = []
+
+    def now(self):
+        return self.t
+
+    def sleep(self, d):
+        self.sleeps.append(d)
+        self.t += d
+
+
+class TestReconnectBackoff(AgentCase):
+    def looping(self, clock, upgrade, draw=lambda: 1.0, token="t", **cfg):
+        a = agent.Agent(self.config(**{"retry": 1, "retry_max": 15, "window": 180, "wait_window": 180, **cfg}))
+        a.doc, a.instance, a.token = DOC, INSTANCE, token
+        a.clock, a.sleep, a.jitter = clock.now, clock.sleep, draw
+
+        def dial(*args, **kw):
+            clock.dials.append(clock.t)
+            return upgrade(*args, **kw)
+        with unittest.mock.patch.object(agent, "upgrade", dial):
+            a.connect_loop()
+        return a
+
+    @staticmethod
+    def refused(*args, **kw):
+        raise OSError("connection refused")
+
+    def test_the_backoff_ceiling_doubles_from_one_second_to_fifteen_and_the_draw_is_uniform_below_it(self):
+        for attempt, draw, want in [(0, 1, 1), (1, 1, 2), (2, 1, 4), (3, 1, 8), (4, 1, 15), (5, 1, 15), (40, 1, 15), (3, 0.5, 4), (3, 0, 0), (0, 0.25, 0.25)]:
+            self.assertEqual(agent.backoff(attempt, 1, 15, draw), want, f"attempt {attempt}, draw {draw}")
+
+    def test_a_herd_of_agents_at_the_same_attempt_returns_spread_over_the_whole_ceiling(self):
+        herd = 1400
+        buckets = {}
+        for i in range(herd):
+            b = int(agent.backoff(4, 1, 15, i / herd))
+            buckets[b] = buckets.get(b, 0) + 1
+        self.assertEqual(len(buckets), 15)
+        self.assertLessEqual(max(buckets.values()), herd // 15 + 2)
+
+    def test_failed_reconnects_wait_longer_each_time_up_to_fifteen_seconds(self):
+        clock = FakeClock()
+        self.looping(clock, self.refused)
+        self.assertEqual(clock.sleeps[:7], [1, 2, 4, 8, 15, 15, 15])
+        self.assertLessEqual(max(clock.sleeps), 15)
+
+    def test_no_reconnect_starts_after_the_resume_window_ends(self):
+        for window in (20, 180, 181):
+            with self.subTest(window=window):
+                clock = FakeClock()
+                self.looping(clock, self.refused, window=window)
+                end = clock.start + window
+                self.assertEqual([d for d in clock.dials if d > end], [], "a dial started after the window")
+                self.assertEqual(clock.dials[-1], end, "the window was not used to its end")
+
+    def test_a_machine_without_a_job_asks_no_longer_than_its_wait_window(self):
+        clock = FakeClock()
+        self.looping(clock, self.refused, token=None, wait_window=50)
+        self.assertEqual([d for d in clock.dials if d > clock.start + 50], [])
+        self.assertEqual(clock.dials[-1], clock.start + 50)
+
+    def test_a_connection_that_sent_a_frame_starts_the_ladder_over(self):
+        clock = FakeClock()
+        calls = []
+
+        def upgrade(*args, **kw):
+            calls.append(1)
+            if len(calls) != 4:
+                raise OSError("connection refused")
+            return types.SimpleNamespace(close=lambda: None), None
+        a = agent.Agent(self.config(retry=1, retry_max=15, window=40))
+        a.doc, a.instance, a.token = DOC, INSTANCE, "t"
+        a.clock, a.sleep, a.jitter = clock.now, clock.sleep, lambda: 1.0
+        a.serve = lambda s, rf: True
+        with unittest.mock.patch.object(agent, "upgrade", upgrade):
+            a.connect_loop()
+        self.assertEqual(clock.sleeps[:7], [1, 2, 4, 1, 2, 4, 8])
+
+    def refusing(self, header):
+        def handler(c):
+            c.sock.sendall(f"HTTP/1.1 503 X\r\n{header}Content-Length: 0\r\n\r\n".encode())
+        self.dispatcher(handler)
+
+    def test_the_agent_waits_at_least_the_retry_after_the_dispatcher_sends_and_adds_jitter(self):
+        self.refusing("Retry-After: 3\r\n")
+        clock = FakeClock()
+        self.looping(clock, agent.upgrade, draw=lambda: 0.5, token=None, wait_window=60)
+        self.assertEqual(clock.sleeps[:4], [3.5, 4, 5, 7])
+        self.assertGreaterEqual(min(clock.sleeps[:-1]), 3)
+
+    def test_a_retry_after_cannot_carry_a_reconnect_past_the_window(self):
+        self.refusing("Retry-After: 100000\r\n")
+        clock = FakeClock()
+        self.looping(clock, agent.upgrade, token=None, wait_window=60)
+        self.assertEqual(clock.sleeps, [60])
+        self.assertEqual(clock.dials, [clock.start, clock.start + 60])
+
+    def test_a_refusal_with_no_usable_retry_after_waits_only_the_backoff(self):
+        for header in ("", "Retry-After: soon\r\n", "Retry-After: -4\r\n", "Retry-After: Wed, 21 Oct 2026 07:28:00 GMT\r\n"):
+            with self.subTest(header=header):
+                self.refusing(header)
+                clock = FakeClock()
+                self.looping(clock, agent.upgrade, draw=lambda: 1.0, token=None, wait_window=30)
+                self.assertEqual(clock.sleeps[:4], [1, 2, 4, 8])
+
+    def test_retry_after_is_read_as_whole_seconds(self):
+        for value, want in [("3", 3), (" 7 ", 7), ("0", 0), ("", None), ("-1", None), ("2.5", None), ("soon", None), ("٣", None)]:
+            self.assertEqual(agent.retry_after_seconds(value), want, repr(value))
 
 
 class TestPairing(AgentCase):
