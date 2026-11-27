@@ -1,6 +1,7 @@
 [Unit]
-Description=superci-pull: mark this instance unhealthy (the Auto Scaling group replaces it) after 5 failed health checks
+Description=superci-pull: restart a hung listener, and mark the instance unhealthy (the Auto Scaling group replaces it) when a restart does not cure it
 
 [Service]
 Type=oneshot
+TimeoutStartSec=90
 ExecStart=/usr/local/bin/superci-pull-health

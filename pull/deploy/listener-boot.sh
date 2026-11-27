@@ -9,7 +9,8 @@ T=$(curl -s -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 300' http://169.254
 ID=$(curl -s -H "X-aws-ec2-metadata-token: $T" http://169.254.169.254/latest/meta-data/instance-id)
 unset T
 set -x
-# Machines reach the listener at the Elastic IP only: an instance that cannot take it asks to be replaced.
+# Machines reach the listener at the Elastic IP only: an instance that cannot take it asks to be replaced. The call
+# must ignore the group's 300 s health check grace period, or the group drops it.
 eip=""
 for i in $(seq 1 30); do
   aws ec2 associate-address --region us-east-1 --allocation-id @EIP_ALLOC@ --instance-id "$ID" --allow-reassociation && { eip=@EIP@; break; }
@@ -17,7 +18,7 @@ for i in $(seq 1 30); do
 done
 if [ -z "$eip" ]; then
   echo "superci-pull: the Elastic IP could not be taken; asking the Auto Scaling group to replace this instance"
-  aws autoscaling set-instance-health --region us-east-1 --instance-id "$ID" --health-status Unhealthy
+  aws autoscaling set-instance-health --region us-east-1 --instance-id "$ID" --health-status Unhealthy --no-should-respect-grace-period
   exit 1
 fi
 mkdir -p /etc/superci-pull
