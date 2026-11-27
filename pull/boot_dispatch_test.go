@@ -25,10 +25,18 @@ func renderBoot(t *testing.T, script, mode string) string {
 
 func TestUserDataFitsInBothModes(t *testing.T) {
 	for _, mode := range []string{"scaleset", "dispatch"} {
-		got := renderBoot(t, bootScript, mode)
-		t.Logf("%s: %d bytes of user data", mode, len(got))
-		if len(got) > 16*1024 {
-			t.Errorf("%s: user data is %d bytes; EC2 takes 16 KiB", mode, len(got))
+		cfg, err := LoadConfig("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := bootDataMode(cfg, realListener, realPin, "superci-4cpu", mode)
+		zipped := launchUserData(t, got)
+		t.Logf("%s: %d bytes of script, %d zipped", mode, len(got), len(zipped))
+		if len(zipped) > userDataBudget {
+			t.Errorf("%s: user data is %d bytes zipped; at most %d of EC2's 16 KiB", mode, len(zipped), userDataBudget)
+		}
+		if len(got) > 64*1024 {
+			t.Errorf("%s: the script is %d bytes, which no boot script needs", mode, len(got))
 		}
 		if left := regexp.MustCompile(`@[A-Z_]+@`).FindString(got); left != "" {
 			t.Errorf("%s: a placeholder is left: %s", mode, left)

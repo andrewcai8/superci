@@ -92,9 +92,9 @@ func TestAMachineRegistersAtOnceAndHydratesInTheBackgroundUnderAHookThatStopsIt(
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := bootData(cfg, "https://203.0.113.1:8443", "sha256//pin", "superci-4cpu")
-	if len(got) > 16*1024 {
-		t.Fatalf("user data is %d bytes; EC2 takes 16 KiB", len(got))
+	got := bootData(cfg, realListener, realPin, "superci-4cpu")
+	if zipped := launchUserData(t, got); len(zipped) > userDataBudget {
+		t.Fatalf("user data is %d bytes zipped; at most %d of EC2's 16 KiB", len(zipped), userDataBudget)
 	}
 	for _, want := range []string{
 		"ACTIONS_RUNNER_HOOK_JOB_STARTED=",

@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"slices"
 	"sort"
@@ -159,10 +162,11 @@ func rootDevice(name string, diskGB int, spec SetSpec) []ec2types.LaunchTemplate
 		VolumeSize: aws.Int32(int32(diskGB)), VolumeType: ec2types.VolumeTypeGp3, Iops: aws.Int32(int32(iops)), Throughput: aws.Int32(int32(mbps)), DeleteOnTermination: aws.Bool(true)}}}
 }
 
-func (sr *setRegion) ensureTemplate(ctx context.Context, r *Region, name, userData, group string, diskGB int, spec SetSpec, tags []ec2types.Tag) error {
-	data := &ec2types.RequestLaunchTemplateData{
+// templateData is what a set's launch template holds in a region.
+func templateData(r *Region, userData, group string, diskGB int, spec SetSpec, tags []ec2types.Tag) *ec2types.RequestLaunchTemplateData {
+	return &ec2types.RequestLaunchTemplateData{
 		ImageId:                           aws.String(r.image),
-		UserData:                          aws.String(base64.StdEncoding.EncodeToString([]byte(userData))),
+		UserData:                          aws.String(encodeUserData(userData)),
 		SecurityGroupIds:                  []string{group},
 		IamInstanceProfile:                &ec2types.LaunchTemplateIamInstanceProfileSpecificationRequest{Name: aws.String("superci-pull-cache-machine")},
 		InstanceInitiatedShutdownBehavior: ec2types.ShutdownBehaviorTerminate,
@@ -171,6 +175,51 @@ func (sr *setRegion) ensureTemplate(ctx context.Context, r *Region, name, userDa
 		BlockDeviceMappings: rootDevice(r.root, diskGB, spec),
 		TagSpecifications:   []ec2types.LaunchTemplateTagSpecificationRequest{{ResourceType: ec2types.ResourceTypeInstance, Tags: tags}, {ResourceType: ec2types.ResourceTypeVolume, Tags: tags}},
 	}
+}
+
+// encodeUserData is the script as a launch template takes it: gzip, then base64. EC2 takes 16 KiB of user data before
+// the base64 and a boot script is near that as plain text; cloud-init unzips user data that starts with gzip's magic
+// bytes and then reads the script as it always has. The gzip has no name and no time and the best level, so one script
+// is always the same bytes.
+func encodeUserData(script string) string {
+	var buf bytes.Buffer
+	zw, err := gzip.NewWriterLevel(&buf, gzip.BestCompression)
+	if err == nil {
+		zw.ModTime = time.Time{}
+		_, err = zw.Write([]byte(script))
+	}
+	if err == nil {
+		err = zw.Close()
+	}
+	if err != nil { // a write to memory does not fail
+		panic(err)
+	}
+	return base64.StdEncoding.EncodeToString(buf.Bytes())
+}
+
+// userDataScript is the script a template's user data holds: the gzip's content, or the user data itself for a version
+// made before the data was zipped.
+func userDataScript(encoded string) (string, bool) {
+	raw, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", false
+	}
+	if len(raw) < 2 || raw[0] != 0x1f || raw[1] != 0x8b {
+		return string(raw), true
+	}
+	zr, err := gzip.NewReader(bytes.NewReader(raw))
+	if err != nil {
+		return "", false
+	}
+	out, err := io.ReadAll(zr)
+	if err != nil {
+		return "", false
+	}
+	return string(out), true
+}
+
+func (sr *setRegion) ensureTemplate(ctx context.Context, r *Region, name, userData, group string, diskGB int, spec SetSpec, tags []ec2types.Tag) error {
+	data := templateData(r, userData, group, diskGB, spec, tags)
 	got, err := r.ec2.DescribeLaunchTemplates(ctx, &ec2.DescribeLaunchTemplatesInput{LaunchTemplateNames: []string{name}})
 	if err == nil && len(got.LaunchTemplates) == 1 {
 		sr.template = aws.ToString(got.LaunchTemplates[0].LaunchTemplateId)
@@ -198,13 +247,18 @@ func (sr *setRegion) ensureTemplate(ctx context.Context, r *Region, name, userDa
 }
 
 // sameData says whether a template version holds what a new version would: image, user data, security group, the
-// cache's instance profile, disk and metadata options.
+// cache's instance profile, disk and metadata options. User data is compared as the script it holds, so a version made
+// before the data was zipped, or by another gzip, is the same when the script is.
 func sameData(have *ec2types.ResponseLaunchTemplateData, want *ec2types.RequestLaunchTemplateData) bool {
 	if have == nil || have.MetadataOptions == nil || len(have.BlockDeviceMappings) != 1 || have.BlockDeviceMappings[0].Ebs == nil {
 		return false
 	}
 	h, w := have.BlockDeviceMappings[0], want.BlockDeviceMappings[0]
-	return aws.ToString(have.ImageId) == aws.ToString(want.ImageId) && aws.ToString(have.UserData) == aws.ToString(want.UserData) &&
+	haveScript, ok := userDataScript(aws.ToString(have.UserData))
+	if wantScript, wok := userDataScript(aws.ToString(want.UserData)); !ok || !wok || haveScript != wantScript {
+		return false
+	}
+	return aws.ToString(have.ImageId) == aws.ToString(want.ImageId) &&
 		slices.Equal(have.SecurityGroupIds, want.SecurityGroupIds) &&
 		have.IamInstanceProfile != nil && strings.HasSuffix(aws.ToString(have.IamInstanceProfile.Arn), "/superci-pull-cache-machine") &&
 		aws.ToString(h.DeviceName) == aws.ToString(w.DeviceName) &&

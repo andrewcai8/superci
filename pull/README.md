@@ -896,7 +896,8 @@ whose message says "burst"); `bench/measure.py BRANCH SINCE UNTIL listener.jsonl
 - **Who may use the runners.** The runner group `superci-pull` admits megpt-mono only (`repositories` in the config),
   never a public repository. The listener makes and keeps the group with the App's
   `organization_self_hosted_runners: write`, and acts only on its own group's sets.
-- **What a job can do.** A job is root on its machine, can read its identity document and its user data, and can
+- **What a job can do.** A job is root on its machine, can read its identity document and its user data (boot.sh as gzip: the template holds it zipped
+  because the script as text was 16,293 of EC2's 16,384 bytes with a real pin), and can
   stop its power-off. It cannot get a second runner, from this listener or the next (the machine's claim), and its
   machine ends when its job completes. The machine's role reads the cache bucket and invokes the cache broker; it
   cannot write EC2 tags. Measured below (Round 2, live proof).
