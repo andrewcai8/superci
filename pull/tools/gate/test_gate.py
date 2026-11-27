@@ -1613,5 +1613,541 @@ class NoTokenInAMessage(Sandbox):
         self.assertEqual(os.listdir(self.tmpdir), [], "a killed watch left its temp file")
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Failing tests: a superci failure whose tests are red on Blacksmith's main too is not superci's regression.
+# ---------------------------------------------------------------------------------------------------------------------
+
+STAMP = "2026-11-27T10:00:00.0000000Z "
+
+
+def unit_log(*fails, file="src/a.test.ts", exit_line=True, exit_code=1, reported=None, errors=0, stopped=None, unhandled=False, summary=True):
+    """What a unit-tests job's log holds for one test file: scripts/verify/test-files.ts's header, bun's lines and summary (` N fail`, ` N error`),
+    its verdict on the file (`exited N`, or `was stopped at <limit>`)."""
+    lines = [f"== bun test --isolate {file}", "bun test v1.3.0", "(pass) suite > fine [0.10ms]"]
+    if unhandled:
+        lines += ["# Unhandled error between tests", "-------------------------------", "error: boom", "-------------------------------"]
+    lines += [f"(fail) {f} [12.50ms]" for f in fails]
+    n = len(fails) if reported is None else reported
+    if (n or errors) and summary:
+        lines += [" 1 pass"] + ([f" {n} fail"] if n else []) + ([f" {errors} error{'s' if errors != 1 else ''}"] if errors else []) + [" 3 expect() calls", f"Ran {n + 1} tests across 1 file. [50.00ms]"]
+    if stopped:
+        lines.append(f"test-files: {file} was stopped at {stopped}")
+    elif exit_line:
+        lines.append(f"test-files: {file} exited {exit_code}")
+    return "\n".join(STAMP + l for l in lines) + "\n"
+
+
+def integration_log(target, *fails, exit_code=1, watchdog=False, crash=None, reported=None, summary=True):
+    """What an integration shard's log holds for one failed target (testRunner.ts, INTEGRATION_QUIET_PASSING=1; targetReports.ts's list)."""
+    n = len(fails) if reported is None else reported
+    lines = ["[integration] Target 1/2 finished in 3.0s (exit 0): src/integration/ok.integration.ts",
+             f"[integration] ── target 2/2 (worker 1, 9.0s, exit {exit_code}): {target}", "bun test v1.3.0", *(f"(fail) {f} [5001.00ms]" for f in fails),
+             *([" 1 pass", f" {n} fail", f"Ran {n + 1} tests across 1 file. [50.00ms]"] if n and summary else []), "[integration] ── end target 2/2"]
+    if watchdog:
+        lines.insert(3, f"[integration] Target hung past its watchdog and was killed: {target}")
+    lines += [f"[integration] Target failed with exit code {exit_code}: {target}", "[integration] 1 integration target(s) failed:", f" - {target} (exit code {exit_code})"]
+    if crash:
+        lines.append(f"[integration] Integration runner crashed: {crash}")
+    return "\n".join(STAMP + l for l in lines) + "\n"
+
+
+class LogGitHub:
+    """GitHub for cmd_job with logs: the jobs of each run, the log of each job, and every log read."""
+    jobs, logs, reads, extra_calls = {}, {}, [], []
+
+    def __init__(self, repo, cache):
+        self.repo, self.calls, self.cache = repo, 0, cache
+
+    def run_jobs(self, run_id, attempts="latest", fresh=False):
+        self.calls += 1
+        return list(LogGitHub.jobs[run_id])
+
+    def api(self, path, keep=True, raw=False):
+        self.calls += 1
+        if m := re.fullmatch(r"actions/jobs/(\d+)/logs", path):
+            LogGitHub.reads.append(int(m.group(1)))
+            if int(m.group(1)) not in LogGitHub.logs:
+                raise SystemExit(f"gh api {path}: HTTP 404: Not Found (logs expired)")
+            return LogGitHub.logs[int(m.group(1))]
+        LogGitHub.extra_calls.append(path)
+        return {"head_sha": "abc"}
+
+
+NOW = T.ts("2026-12-01T12:00:00Z")
+
+
+def tj(jid, run, conclusion, fleet, name, log=None, steps=None, when=None):
+    """A REST job of a test run; `when` is how long before NOW it was created. Its log (None: GitHub has none) is registered."""
+    at = NOW - (when if when is not None else (1800 if fleet == "superci" else 10 * 3600))
+    j = gh_job(jid, run, 1, conclusion, at, at + 2, at + 90, fleet=fleet, name=name, sha=f"sha{jid}", branch="ci/load-1" if fleet == "superci" else "main")
+    j["steps"] = steps or []
+    if log is not None:
+        LogGitHub.logs[jid] = log
+    return j
+
+
+class FailingHarness:
+    """cmd_job over a canned GitHub whose jobs have logs, for the test classes below."""
+    job = "unit-tests"
+    workflow = "lint-test-backend.yml"
+
+    def setUp(self):
+        LogGitHub.logs, LogGitHub.reads = {}, []
+
+    def run_gate(self, runs, extra=(), records=None, now=NOW, cache=None):
+        """runs: [(run id, branch, run conclusion, [REST jobs][, event])]. Returns (code, output)."""
+        LogGitHub.jobs, LogGitHub.extra_calls = {}, []
+        listing = []
+        for rid, branch, conclusion, jobs, *event in runs:
+            for j in jobs:
+                j["run_id"] = rid
+            LogGitHub.jobs[rid] = jobs
+            listing.append({"id": rid, "created_at": jobs[0]["created_at"], "head_branch": branch, "conclusion": conclusion, "event": event[0] if event else "push"})
+        saved = (G.T.GitHub, G.runs_of, G.T.gather, G.T.build, G.T.listener_events, G.time.time)
+        G.T.GitHub, G.runs_of, G.time.time = LogGitHub, lambda gh, wf, lo, hi: listing, lambda: now
+        G.T.gather = lambda *a, **k: {}
+        G.T.build = lambda j, ev: type("TL", (), {"wall": 1.0, "unexplained": 0.5})()
+        G.T.listener_events = lambda profile, lo, hi, where=None: records or []
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                limits = os.path.join(d, "limits.tsv")
+                with open(limits, "w") as fh:
+                    fh.write(f"{self.workflow}\t{self.job}\t200\tx\n")
+                since = [] if "--since" in extra else ["--since", T.iso(now - 7200)]
+                a = G.build_parser().parse_args(["--cache", cache or d, "job", self.job, "--workflow", self.workflow, "--branch-glob", "ci/*", "--limits", limits,
+                                                 "--superci-source", "events" if records is not None else "github", *since, *extra])
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    code = a.fn(a)
+                return code, buf.getvalue()
+        finally:
+            G.T.GitHub, G.runs_of, G.T.gather, G.T.build, G.T.listener_events, G.time.time = saved
+
+    def baseline(self, red=(), n=8):
+        """Blacksmith's side: n green main runs and, for each log in `red`, a failed main run. [(run, branch, conclusion, jobs)]."""
+        out = [(5000 + i, "main", "success", [tj(5000 + i, 0, "success", "blacksmith", f"{self.job} (1)")]) for i in range(n)]
+        for i, log in enumerate(red):
+            out.append((6000 + i, "main", "failure", [tj(6000 + i, 0, "failure", "blacksmith", f"{self.job} (2)", log)]))
+        return out
+
+    def superci(self, n=5, failed=()):
+        """n green superci runs and, for each (log, steps) of `failed`, a failed one: runs 9000+."""
+        out = [(8000 + i, "ci/load-1", "success", [tj(8000 + i, 0, "success", "superci", f"{self.job} (1)")]) for i in range(n)]
+        for i, f in enumerate(failed):
+            log, steps = f if isinstance(f, tuple) else (f, None)
+            out.append((9000 + i, "ci/load-1", "failure", [tj(9000 + i, 0, "failure", "superci", f"{self.job} (1)", log, steps)]))
+        return out
+
+
+    def beyond(self, red_log, sup_log, why, steps=None, conclusion="failure", base_red=None):
+        """A superci failure whose log names a test red on main too, but that failed in a way those tests do not explain: it counts, and says why."""
+        runs = self.baseline(red=[base_red or red_log])
+        runs += [(8000 + i, "ci/load-1", "success", [tj(8000 + i, 0, "success", "superci", f"{self.job} (1)")]) for i in range(5)]
+        runs += [(9000, "ci/load-1", conclusion, [tj(9000, 0, conclusion, "superci", f"{self.job} (1)", sup_log, steps)])]
+        code, out = self.run_gate(runs)
+        self.assertRegex(out, r"failures \(superci\)\s+1 of 6")
+        self.assertIn(f"counted, failed beyond its named tests (fail closed): run 9000: {why}", out)
+        self.assertNotIn("excluded (red on Blacksmith main too)", out)
+
+
+class FailingTests(FailingHarness, unittest.TestCase):
+    """The failures row of a job with a test-name source (unit-tests): what it counts, excludes and prints."""
+
+    def test_a_superci_failure_whose_test_is_red_on_blacksmith_main_in_the_window_is_excluded_and_printed(self):
+        code, out = self.run_gate(self.baseline(red=[unit_log("suite > stampDoubles")]) + self.superci(failed=[unit_log("suite > stampDoubles")]))
+        self.assertRegex(out, r"failures \(superci\)\s+0 of 6")
+        self.assertIn("excluded (red on Blacksmith main too): src/a.test.ts :: suite > stampDoubles (1 Blacksmith failure: flaky?) in 9000", out)
+        self.assertIn("red on Blacksmith main in runs 6000", out)
+        self.assertRegex(out, r"1 more failed only on tests red on Blacksmith main too")
+
+    def test_a_superci_failure_whose_test_is_green_on_blacksmith_main_counts(self):
+        code, out = self.run_gate(self.baseline(red=[unit_log("suite > stampDoubles")]) + self.superci(failed=[unit_log("suite > newlyBroken")]))
+        self.assertRegex(out, r"failures \(superci\)\s+1 of 6")
+        self.assertIn("counted, green on Blacksmith main: src/a.test.ts :: suite > newlyBroken in 9000", out)
+        self.assertNotIn("excluded (red on Blacksmith main too)", out)
+
+    def test_a_failure_with_one_red_and_one_green_test_counts(self):
+        code, out = self.run_gate(self.baseline(red=[unit_log("suite > stampDoubles")]) + self.superci(failed=[unit_log("suite > stampDoubles", "suite > newlyBroken")]))
+        self.assertRegex(out, r"failures \(superci\)\s+1 of 6")
+        self.assertIn("counted, green on Blacksmith main: src/a.test.ts :: suite > newlyBroken in 9000", out)
+
+    def test_a_failure_whose_tests_cannot_be_read_counts_and_says_why(self):
+        code, out = self.run_gate(self.baseline(red=[unit_log("suite > stampDoubles")]) + self.superci(failed=[None]))
+        self.assertRegex(out, r"failures \(superci\)\s+1 of 6")
+        self.assertIn("counted, failing tests unreadable (fail closed): run 9000: log not read", out)
+        self.assertIn("HTTP 404", out)
+
+    def test_a_log_that_names_no_test_counts_and_says_so(self):
+        code, out = self.run_gate(self.baseline(red=[unit_log("suite > stampDoubles")]) + self.superci(failed=["2026-11-27T10:00:00.0000000Z the runner lost its machine\n"]))
+        self.assertRegex(out, r"failures \(superci\)\s+1 of 6")
+        self.assertIn("names no failing test", out)
+
+    def test_a_job_that_failed_before_its_tests_counts_with_no_log_read(self):
+        steps = [{"name": "Run tests", "conclusion": "success"}, {"name": "Record this shard's coverage", "conclusion": "failure"}]
+        code, out = self.run_gate(self.baseline(red=[unit_log("suite > stampDoubles")]) + self.superci(failed=[(unit_log("suite > stampDoubles"), steps)]))
+        self.assertRegex(out, r"failures \(superci\)\s+1 of 6")
+        self.assertIn("counted, no test failed: run 9000: failed outside the 'Run tests' step, in 'Record this shard's coverage'", out)
+        self.assertNotIn(9000, LogGitHub.reads)
+
+    def test_with_no_blacksmith_main_failure_in_the_window_every_failure_counts(self):
+        code, out = self.run_gate(self.baseline() + self.superci(failed=[unit_log("suite > stampDoubles")]))
+        self.assertRegex(out, r"failures \(superci\)\s+1 of 6")
+        self.assertIn("0 main runs ended red", out)
+
+    def test_a_blacksmith_main_failure_before_the_window_or_on_another_branch_excludes_nothing(self):
+        base = self.baseline()
+        old = tj(6100, 0, "failure", "blacksmith", f"{self.job} (2)", unit_log("suite > stampDoubles"), when=40 * 3600)
+        other = tj(6101, 0, "failure", "blacksmith", f"{self.job} (2)", unit_log("suite > stampDoubles"), when=3600)
+        base += [(6100, "main", "failure", [old]), (6101, "ci/feature", "failure", [other])]
+        code, out = self.run_gate(base + self.superci(failed=[unit_log("suite > stampDoubles")]))
+        self.assertRegex(out, r"failures \(superci\)\s+1 of 6")
+
+    def test_a_second_check_reads_no_log_again(self):
+        with tempfile.TemporaryDirectory() as cache:
+            runs = lambda: self.baseline(red=[unit_log("suite > stampDoubles")]) + self.superci(failed=[unit_log("suite > stampDoubles")])
+            self.run_gate(runs(), cache=cache)
+            first = sorted(LogGitHub.reads)
+            LogGitHub.reads.clear()
+            code, out = self.run_gate(runs(), cache=cache)
+        self.assertEqual(first, [6000, 9000])
+        self.assertEqual(LogGitHub.reads, [], "a finished job's names are kept")
+        self.assertIn("excluded (red on Blacksmith main too)", out)
+
+    def test_a_check_reads_no_more_logs_than_its_budget_and_what_is_not_read_counts(self):
+        code, out = self.run_gate(self.baseline(red=[unit_log("suite > stampDoubles")]) + self.superci(failed=[unit_log("suite > stampDoubles")]), extra=["--max-test-reads", "0"])
+        self.assertEqual(LogGitHub.reads, [], "no log was read past the budget of 0")
+        self.assertRegex(out, r"failures \(superci\)\s+1 of 6")
+        self.assertIn("--max-test-reads", out)
+
+    def test_a_record_is_matched_to_its_rest_job_and_its_log_read(self):
+        rec = record("gF", 1, 30, "failure", run=9000, name=f"{self.job} (1)", workflow=self.workflow, branch="ci/load-1")
+        rec["runner"] = "superci-i-1"
+        recs = [record(f"g{i}", 1, 81, run=8000 + i, name=f"{self.job} (1)", workflow=self.workflow, branch="ci/load-1") for i in range(5)] + [rec]
+        rest = tj(9000, 9000, "failure", "superci", f"{self.job} (1)", unit_log("suite > stampDoubles"))
+        shift = NOW - 1800 - 1_000_000.0
+        rec_t = lambda e: dict(e, t=NOW, **{k: T.iso(T.ts(e[k]) + shift) for k in ("queue_time", "start_time", "finish_time") if e.get(k)})
+        done = T.ts(rec_t(rec)["finish_time"])
+        rest.update(created_at=T.iso(done - 33), started_at=T.iso(done - 30), completed_at=T.iso(done))
+        runs = self.baseline(red=[unit_log("suite > stampDoubles")]) + [(9000, "ci/load-1", "failure", [rest])]
+        LogGitHub.logs[9000] = unit_log("suite > stampDoubles")
+        code, out = self.run_gate(runs, records=[rec_t(e) for e in recs])
+        self.assertRegex(out, r"failures \(superci\)\s+0 of 6")
+        self.assertIn("excluded (red on Blacksmith main too): src/a.test.ts :: suite > stampDoubles (1 Blacksmith failure: flaky?) in 9000", out)
+
+
+    def test_a_red_cluster_that_excused_superci_failures_leaves_blacksmith_s_rate_so_the_allowance_does_not_grow(self):
+        red = unit_log("suite > stampDoubles")
+        failed = [red, red, unit_log("suite > newlyBroken"), unit_log("suite > alsoBroken")]
+        code, out = self.run_gate(self.baseline(red=[red, red, red]) + self.superci(failed=failed))
+        self.assertRegex(out, r"FAIL\s+failures \(superci\)\s+2 of 9\s+<= B rate 0\.0% x 9 \+ 1 = 1\.0")
+        self.assertIn("Blacksmith failure rate: 27.3% (3 of 11) before, 0.0% (0 of 11) after excluding 3 failed main jobs whose every failing test excused a superci failure", out)
+
+    def test_scattered_blacksmith_flakes_on_other_tests_still_count_toward_the_allowance(self):
+        """Main 6 of 20 failing on six different flaky tests, superci 3 of 10 on three others: 30% x 10 + 1 = 4, so 3 pass."""
+        main = [unit_log(f"suite > mainFlake{i}") for i in range(6)]
+        sup = [unit_log(f"suite > superciFlake{i}") for i in range(3)]
+        code, out = self.run_gate(self.baseline(red=main, n=14) + self.superci(n=7, failed=sup))
+        self.assertRegex(out, r"PASS\s+failures \(superci\)\s+3 of 10\s+<= B rate 30\.0% x 10 \+ 1 = 4\.0")
+        self.assertIn("30.0% (6 of 20) before, 30.0% (6 of 20) after excluding 0 failed main jobs", out)
+
+    def test_a_blacksmith_main_failure_that_cannot_be_read_still_counts_toward_the_rate(self):
+        red = unit_log("suite > stampDoubles")
+        code, out = self.run_gate(self.baseline(red=[red, None]) + self.superci(failed=[red]))
+        self.assertIn("20.0% (2 of 10) before, 10.0% (1 of 10) after excluding 1 failed main job", out)
+        self.assertIn("B rate 10.0% x 6 + 1 = 1.6", out)
+
+    def test_a_blacksmith_failure_off_main_or_with_no_test_named_still_counts_toward_the_rate(self):
+        red = unit_log("suite > stampDoubles")
+        feature = tj(6200, 0, "failure", "blacksmith", f"{self.job} (2)", red)
+        feature["head_branch"] = "ci/feature"
+        setup = tj(6300, 0, "failure", "blacksmith", f"{self.job} (2)", steps=[{"name": "Run tests", "conclusion": "success"}, {"name": "Install", "conclusion": "failure"}])
+        code, out = self.run_gate(self.baseline(red=[red]) + [(6200, "ci/feature", "failure", [feature]), (6300, "main", "failure", [setup])] + self.superci(failed=[red]))
+        self.assertIn("27.3% (3 of 11) before, 18.2% (2 of 11) after excluding 1 failed main job", out)
+
+    def test_a_blacksmith_failure_with_a_hard_reason_or_a_second_test_outside_the_excused_ones_counts_toward_the_rate(self):
+        red = unit_log("suite > stampDoubles")
+        both = unit_log("suite > stampDoubles", "suite > other")
+        stopped = unit_log("suite > stampDoubles", stopped="the 180 s a test file may run")
+        code, out = self.run_gate(self.baseline(red=[red, both, stopped]) + self.superci(failed=[red]))
+        self.assertIn("27.3% (3 of 11) before, 18.2% (2 of 11) after excluding 1 failed main job", out)
+
+    def test_an_exclusion_resting_on_one_blacksmith_failure_is_tagged_and_one_resting_on_two_is_not(self):
+        once, twice = unit_log("suite > once"), unit_log("suite > twice")
+        base = self.baseline(red=[once + twice, twice])
+        code, out = self.run_gate(base + self.superci(failed=[unit_log("suite > once", "suite > twice")]))
+        self.assertIn("excluded (red on Blacksmith main too): src/a.test.ts :: suite > once (1 Blacksmith failure: flaky?), src/a.test.ts :: suite > twice in 9000", out)
+
+    def test_an_exclusion_resting_on_two_blacksmith_failures_carries_no_tag(self):
+        red = unit_log("suite > stampDoubles")
+        code, out = self.run_gate(self.baseline(red=[red, red]) + self.superci(failed=[red]))
+        self.assertIn("excluded (red on Blacksmith main too): src/a.test.ts :: suite > stampDoubles in 9000", out)
+        self.assertNotIn("flaky?", out)
+
+    def test_a_file_stopped_at_its_time_limit_counts_though_a_red_test_is_in_its_log(self):
+        red = unit_log("suite > stampDoubles")
+        self.beyond(red, unit_log("suite > stampDoubles", stopped="the 180 s a test file may run"), "src/a.test.ts was stopped at the 180 s a test file may run", base_red=red)
+
+    def test_a_file_terminated_by_a_signal_counts_though_a_red_test_is_in_its_log(self):
+        red = unit_log("suite > stampDoubles")
+        self.beyond(red, red + STAMP + "test-files: src/a.test.ts terminated by SIGSEGV; stopping\n", "src/a.test.ts was terminated by SIGSEGV")
+
+    def test_an_error_between_tests_counts_though_a_red_test_is_in_its_log(self):
+        red = unit_log("suite > stampDoubles")
+        self.beyond(red, unit_log("suite > stampDoubles", unhandled=True, errors=1), "src/a.test.ts: an error between tests")
+
+    def test_a_summary_counting_more_failures_than_the_log_names_counts(self):
+        red = unit_log("suite > stampDoubles")
+        self.beyond(red, unit_log("suite > stampDoubles", reported=2), "src/a.test.ts: bun's summary counts 2 failures and errors, the log names 1 tests")
+
+    def test_a_job_cut_by_its_timeout_counts_whether_the_conclusion_the_step_or_the_log_says_so(self):
+        red = unit_log("suite > stampDoubles")
+        self.beyond(red, red, "the job timed out", conclusion="timed_out")
+        self.beyond(red, red, "step 'Run tests' was cancelled: the job was cut short", steps=[{"name": "Run tests", "conclusion": "cancelled"}])
+        self.beyond(red, red + STAMP + "##[error]The operation was canceled.\n", "the job was cut short (##[error]The operation was canceled.)")
+
+    def test_a_failed_step_other_than_the_tests_counts_though_a_red_test_is_in_its_log(self):
+        red = unit_log("suite > stampDoubles")
+        steps = [{"name": "Run tests", "conclusion": "failure"}, {"name": "Record this shard's coverage", "conclusion": "failure"}]
+        self.beyond(red, red, "step 'Record this shard's coverage' failed", steps=steps)
+
+    def test_a_failure_named_only_by_its_file_counts_and_says_why(self):
+        """Both fleets log the file with no test named: the names match, but a coarse name excuses nothing."""
+        coarse = unit_log()
+        code, out = self.run_gate(self.baseline(red=[coarse]) + self.superci(failed=[coarse]))
+        self.assertRegex(out, r"failures \(superci\)\s+1 of 6")
+        self.assertIn("counted, named by file or target only (fail closed): run 9000: named only by its file or target (src/a.test.ts)", out)
+        self.assertNotIn("excluded (red on Blacksmith main too)", out)
+
+    def test_a_blacksmith_run_started_by_hand_is_not_a_main_run_of_the_window(self):
+        red = unit_log("suite > stampDoubles")
+        by_hand = (6100, "main", "failure", [tj(6100, 0, "failure", "blacksmith", f"{self.job} (2)", red)], "workflow_dispatch")
+        code, out = self.run_gate(self.baseline() + [by_hand] + self.superci(failed=[red]))
+        self.assertRegex(out, r"failures \(superci\)\s+1 of 6")
+        self.assertIn("counted, green on Blacksmith main: src/a.test.ts :: suite > stampDoubles in 9000", out)
+        self.assertIn("0 main runs ended red", out)
+
+    def test_a_log_that_is_not_valid_utf8_is_unreadable_and_counts_instead_of_stopping_the_check(self):
+        LogGitHub.logs[9000] = None
+        orig = LogGitHub.api
+
+        def api(self, path, keep=True, raw=False):
+            if path == "actions/jobs/9000/logs":
+                raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+            return orig(self, path, keep, raw)
+
+        LogGitHub.api = api
+        try:
+            try:
+                code, out = self.run_gate(self.baseline(red=[unit_log("suite > stampDoubles")]) + self.superci(failed=[unit_log("suite > stampDoubles")]))
+            except UnicodeDecodeError as e:
+                self.fail(f"the check stopped on an undecodable log: {e}")
+        finally:
+            LogGitHub.api = orig
+        self.assertRegex(out, r"failures \(superci\)\s+1 of 6")
+        self.assertIn("counted, failing tests unreadable (fail closed): run 9000: log not read (it is not valid UTF-8", out)
+
+    def test_a_file_that_died_with_exit_1_and_no_bun_summary_counts_though_a_red_test_is_in_its_log(self):
+        """bun 1.4.3: a second test calling process.exit(1) after a red one prints `(fail) red`, then nothing, and the runner logs `exited 1`."""
+        red = unit_log("suite > stampDoubles")
+        self.beyond(red, unit_log("suite > stampDoubles", summary=False), "src/a.test.ts exited 1 with no bun summary: the run died after its failures")
+
+    def test_a_step_killed_with_exit_137_counts_though_a_red_test_is_in_its_log(self):
+        red = unit_log("suite > stampDoubles")
+        self.beyond(red, red + STAMP + "##[error]Process completed with exit code 137.\n", "the step's process exited 137")
+
+    def test_a_runner_that_lost_communication_with_the_server_counts(self):
+        red = unit_log("suite > stampDoubles")
+        self.beyond(red, red + STAMP + "##[error]The runner has lost communication with the server.\n", "the job was cut short (##[error]The runner has lost communication with the server.)")
+
+    def test_a_step_with_no_conclusion_on_a_finished_job_counts(self):
+        red = unit_log("suite > stampDoubles")
+        steps = [{"name": "Run tests", "conclusion": "failure"}, {"name": "Upload unit test observations", "conclusion": None}]
+        self.beyond(red, red, "step 'Upload unit test observations' has no conclusion on a finished job: the runner was lost", steps=steps)
+
+    def test_an_unreadable_blacksmith_main_failure_names_its_hard_reason_not_an_empty_one(self):
+        killed = STAMP + "##[error]Process completed with exit code 137.\n"
+        code, out = self.run_gate(self.baseline(red=[killed]) + self.superci(failed=[unit_log("suite > stampDoubles")]))
+        self.assertIn("1 of 1 failed jobs could not be read (the step's process exited 137); no exclusion is drawn from them", out)
+
+    def test_a_cached_read_from_an_older_parser_is_not_served_and_the_job_is_read_again(self):
+        """9152daa cached `hard=[]` for a job that died after a red test; the parser has since learned to mark it, so its entry must not be served."""
+        red = unit_log("suite > stampDoubles")
+        with tempfile.TemporaryDirectory() as cache:
+            old = T.Cache(cache)
+            old.get(f"tests:v2:{G.REPO}:9000", lambda: {"tests": ["src/a.test.ts :: suite > stampDoubles"], "coarse": [], "hard": [], "why": ""})
+            code, out = self.run_gate(self.baseline(red=[red]) + self.superci(failed=[unit_log("suite > stampDoubles", summary=False)]), cache=cache)
+        self.assertRegex(out, r"failures \(superci\)\s+1 of 6")
+        self.assertIn(9000, LogGitHub.reads, "the job's log was read again")
+        self.assertIn("exited 1 with no bun summary", out)
+
+    def test_a_test_s_own_output_saying_the_runner_s_exit_text_does_not_make_a_red_on_main_failure_count(self):
+        red = unit_log("suite > stampDoubles")
+        code, out = self.run_gate(self.baseline(red=[red]) + self.superci(failed=[red + STAMP + "Process completed with exit code 137\n"]))
+        self.assertRegex(out, r"failures \(superci\)\s+0 of 6")
+        self.assertIn("excluded (red on Blacksmith main too)", out)
+
+    def test_a_job_with_no_test_name_source_keeps_the_job_level_rule_and_says_so(self):
+        self.job = "verify-tools"
+        try:
+            code, out = self.run_gate(self.baseline(red=[unit_log("suite > stampDoubles")]) + self.superci(failed=[unit_log("suite > stampDoubles")]))
+        finally:
+            self.job = "unit-tests"
+        self.assertRegex(out, r"failures \(superci\)\s+1 of 6")
+        self.assertIn("no test-name source for verify-tools", out)
+        self.assertEqual(LogGitHub.reads, [])
+
+
+class IntegrationFailingTests(FailingHarness, unittest.TestCase):
+    """The same rules for integration, whose log names failing targets as well as tests."""
+    job = "integration"
+    workflow = "integration-tests.yml"
+
+    def test_a_target_red_on_main_is_excluded_and_a_new_one_counts(self):
+        red = integration_log("src/integration/stampDoubles.integration.ts", "stamp > doubles")
+        code, out = self.run_gate(self.baseline(red=[red]) + self.superci(failed=[red, integration_log("src/integration/other.integration.ts", "other > breaks")]))
+        self.assertRegex(out, r"failures \(superci\)\s+1 of 7")
+        self.assertIn("excluded (red on Blacksmith main too): src/integration/stampDoubles.integration.ts :: stamp > doubles (1 Blacksmith failure: flaky?) in 9000", out)
+        self.assertIn("counted, green on Blacksmith main: src/integration/other.integration.ts :: other > breaks in 9001", out)
+
+    def test_a_target_killed_by_its_watchdog_counts_even_when_main_has_it_too(self):
+        red = integration_log("src/integration/stagedHistoryBare.integration.ts", watchdog=True)
+        code, out = self.run_gate(self.baseline(red=[red]) + self.superci(failed=[red]))
+        self.assertRegex(out, r"failures \(superci\)\s+1 of 6")
+        self.assertIn("counted, failed beyond its named tests (fail closed): run 9000: src/integration/stagedHistoryBare.integration.ts hung past its watchdog and was killed", out)
+        self.assertNotIn("excluded (red on Blacksmith main too)", out)
+
+    def test_a_runner_crash_counts_though_a_red_target_is_in_its_log(self):
+        red = integration_log("src/integration/stampDoubles.integration.ts", "stamp > doubles")
+        crashed = integration_log("src/integration/stampDoubles.integration.ts", "stamp > doubles", crash="Gel went away")
+        self.beyond(red, crashed, "the integration runner crashed: Gel went away")
+
+    def test_a_target_that_exited_with_a_crash_code_counts_though_its_tests_are_red_on_main(self):
+        red = integration_log("src/integration/stampDoubles.integration.ts", "stamp > doubles")
+        self.beyond(red, integration_log("src/integration/stampDoubles.integration.ts", "stamp > doubles", exit_code=139),
+                    "src/integration/stampDoubles.integration.ts exited 139, not bun's 1 for failed tests")
+
+    def test_a_shard_cut_short_counts_though_a_red_target_is_in_its_log(self):
+        red = integration_log("src/integration/stampDoubles.integration.ts", "stamp > doubles")
+        cut = red + "\n".join(STAMP + l for l in ["[integration] 1 of 40 target(s) did not finish before SIGTERM:", " - src/integration/slow.integration.ts"]) + "\n"
+        self.beyond(red, cut, "src/integration/slow.integration.ts did not finish: the shard was cut short")
+
+    def test_a_target_that_died_with_exit_1_and_no_bun_summary_counts_though_a_red_test_is_in_its_log(self):
+        t = "src/integration/stampDoubles.integration.ts"
+        red = integration_log(t, "stamp > doubles")
+        self.beyond(red, integration_log(t, "stamp > doubles", summary=False), f"{t} exited 1 with no bun summary: the run died after its failures")
+
+    def test_a_census_leg_and_a_manual_run_are_not_main_s_ordinary_runs(self):
+        a, b = integration_log("src/integration/a.integration.ts", "a > one"), integration_log("src/integration/b.integration.ts", "b > one")
+        interim = (6100, "main", "failure", [tj(6100, 0, "failure", "blacksmith", "integration (2, interim)", a)], "schedule")
+        census = (6101, "main", "failure", [tj(6101, 0, "failure", "blacksmith", "integration (2, v3)", b)], "schedule")
+        runs = self.baseline() + [interim, census] + self.superci(failed=[a, b])
+        code, out = self.run_gate(runs)
+        self.assertRegex(out, r"failures \(superci\)\s+1 of 7")
+        self.assertIn("excluded (red on Blacksmith main too): src/integration/a.integration.ts :: a > one (1 Blacksmith failure: flaky?) in 9000", out)
+        self.assertIn("counted, green on Blacksmith main: src/integration/b.integration.ts :: b > one in 9001", out)
+        self.assertIn("1 failed job read", out)
+
+    def test_the_floor_is_reported_and_the_window_starts_after_it_here(self):
+        code, out = self.run_gate(self.baseline() + self.superci())
+        self.assertIn("window floor (integration): 4e75d94 at 2026-11-27T20:33:52Z", out)
+        self.assertIn("nothing clamped", out)
+
+    def test_a_window_that_starts_before_the_floor_is_clamped_and_says_so(self):
+        now = T.ts("2026-11-28T00:00:00Z")
+        floor = "2026-11-27T20:33:52Z"
+        code, out = self.run_gate(self.baseline() + self.superci(), now=now, extra=["--since", "2026-11-27T12:00:00Z"])
+        self.assertIn(f"--since 2026-11-27T12:00:00Z clamped to {floor}", out)
+        self.assertIn(f"Blacksmith baseline start 2026-11-27T00:00:00Z clamped to {floor}", out)
+        self.assertIn(f"blacksmith: created {floor} to 2026-11-28T00:00:00Z", out)
+        self.assertIn(f"created {floor} to 2026-11-28T00:00:00Z", out.split("superci:")[1])
+
+    def test_a_blacksmith_window_that_ends_before_the_floor_is_refused(self):
+        with self.assertRaises(SystemExit) as e:
+            self.run_gate(self.baseline() + self.superci(), extra=["--baseline-until", "2026-11-27T18:00:00Z", "--since", "2026-11-27T18:00:00Z"])
+        self.assertIn("before window floor (integration)", str(e.exception))
+
+
+class LogParsers(unittest.TestCase):
+    def test_unit_names_are_file_and_test_with_the_timing_removed(self):
+        p = G.parse_unit_log(unit_log("a > b", "c > d [with brackets]"))
+        self.assertEqual((p.tests, p.coarse, p.hard), ({"src/a.test.ts :: a > b", "src/a.test.ts :: c > d [with brackets]"}, frozenset(), ()))
+
+    def test_a_unit_file_that_failed_with_no_fail_line_is_coarse(self):
+        p = G.parse_unit_log(unit_log(file="src/x.test.ts"))
+        self.assertEqual((p.tests, p.coarse, p.hard), (frozenset(), {"src/x.test.ts"}, ()))
+
+    def test_a_unit_file_stopped_at_its_limit_or_killed_is_hard_even_with_a_fail_line(self):
+        p = G.parse_unit_log(unit_log("a > b", stopped="the 180 s a test file may run"))
+        self.assertEqual(p.tests, {"src/a.test.ts :: a > b"})
+        self.assertEqual(p.hard, ("src/a.test.ts was stopped at the 180 s a test file may run",))
+        k = G.parse_unit_log(unit_log("a > b") + STAMP + "test-files: src/a.test.ts terminated by SIGSEGV; stopping\n")
+        self.assertEqual(k.hard, ("src/a.test.ts was terminated by SIGSEGV",))
+
+    def test_a_file_that_exited_with_a_code_other_than_bun_s_is_hard(self):
+        self.assertEqual(G.parse_unit_log(unit_log("a > b", exit_code=137)).hard, ("src/a.test.ts exited 137, not bun's 1 for failed tests",))
+
+    def test_an_error_between_tests_and_a_summary_counting_more_than_the_log_names_are_hard(self):
+        self.assertEqual(G.parse_unit_log(unit_log("a > b", unhandled=True, errors=1)).hard,
+                         ("src/a.test.ts: bun's summary counts 2 failures and errors, the log names 1 tests", "src/a.test.ts: an error between tests"))
+        self.assertIn("counts 3 failures and errors, the log names 1 tests", G.parse_unit_log(unit_log("a > b", reported=3)).hard[0])
+
+    def test_a_run_with_failures_a_non_zero_exit_and_no_ran_line_is_hard_and_one_that_ran_to_its_end_is_not(self):
+        self.assertEqual(G.parse_unit_log(unit_log("a > b", summary=False)).hard, ("src/a.test.ts exited 1 with no bun summary: the run died after its failures",))
+        self.assertEqual(G.parse_unit_log(unit_log("a > b")).hard, ())
+        self.assertEqual(G.parse_integration_log(integration_log("t.ts", "s > one", summary=False)).hard, ("t.ts exited 1 with no bun summary: the run died after its failures",))
+        self.assertEqual(G.parse_unit_log(unit_log("a > b", exit_line=False, summary=False)).hard, (), "no exit line: nothing says the run died")
+
+    def test_a_step_process_exit_other_than_1_is_hard_and_1_is_not(self):
+        self.assertEqual(G.parse_unit_log(STAMP + "##[error]Process completed with exit code 137.\n").hard, ("the step's process exited 137",))
+        self.assertEqual(G.parse_integration_log(STAMP + "##[error]Process completed with exit code 143.\n").hard, ("the step's process exited 143",))
+        self.assertEqual(G.parse_unit_log(STAMP + "##[error]Process completed with exit code 1.\n").hard, ())
+
+    def test_a_file_that_runs_twice_is_judged_per_run_so_a_later_run_cannot_finish_an_earlier_one(self):
+        passing = STAMP + "== bun test --isolate src/a.test.ts\n" + STAMP + " 1 pass\n" + STAMP + "Ran 1 test across 1 file. [5.00ms]\n"
+        died = "src/a.test.ts exited 1 with no bun summary: the run died after its failures"
+        self.assertEqual(G.parse_unit_log(unit_log("a > b", summary=False) + passing).hard, (died,), "a died run, then a finished one")
+        self.assertEqual(G.parse_unit_log(unit_log("a > b") + unit_log("a > b", summary=False)).hard, (died,), "a finished red run, then a died one")
+        self.assertEqual(G.parse_unit_log(unit_log("a > b") + passing).hard, (), "a finished red run and a passing one are not hard")
+
+    def test_a_target_that_runs_twice_is_judged_per_run(self):
+        t = "t.ts"
+        passing = "\n".join(STAMP + l for l in ["[integration] ── target 1/2 (worker 1, 3.0s, exit 0): t.ts", " 1 pass", "Ran 1 test across 1 file. [5.00ms]", "[integration] ── end target 1/2"]) + "\n"
+        died = "t.ts exited 1 with no bun summary: the run died after its failures"
+        self.assertEqual(G.parse_integration_log(integration_log(t, "s > one", summary=False) + passing).hard, (died,), "a died target, then a finished one")
+        self.assertEqual(G.parse_integration_log(integration_log(t, "s > one") + integration_log(t, "s > one", summary=False)).hard, (died,), "a finished red target, then a died one")
+        self.assertEqual(G.parse_integration_log(integration_log(t, "s > one") + passing).hard, ())
+
+    def test_the_text_of_the_runner_s_exit_line_inside_a_test_s_output_is_not_the_runner_s_line(self):
+        self.assertEqual(G.parse_unit_log(unit_log("a > b") + STAMP + "Process completed with exit code 137\n").hard, ())
+        self.assertEqual(G.parse_unit_log(unit_log("a > b") + STAMP + "  error: Process completed with exit code 137 was expected\n").hard, ())
+        self.assertEqual(G.parse_unit_log(unit_log("a > b") + STAMP + "##[error]Process completed with exit code 137.\n").hard, ("the step's process exited 137",))
+        self.assertEqual(G.parse_integration_log(integration_log("t.ts", "s > one") + STAMP + "Process completed with exit code 137\n").hard, ())
+
+    def test_a_job_cut_by_its_timeout_is_hard(self):
+        text = unit_log("a > b") + STAMP + "##[error]The operation was canceled.\n"
+        self.assertEqual(G.parse_unit_log(text).hard, ("the job was cut short (##[error]The operation was canceled.)",))
+
+    def test_a_clean_unit_log_and_ansi_colours_are_handled(self):
+        self.assertEqual(G.parse_unit_log(STAMP + "== bun test --isolate f.ts\n" + STAMP + "\x1b[31m(fail)\x1b[0m x\n").tests, {"f.ts :: x"})
+        self.assertEqual(G.parse_unit_log(STAMP + "test-files: all 3 files passed\n"), G.Parsed())
+
+    def test_integration_targets_cut_short_are_coarse_and_hard(self):
+        text = "\n".join(STAMP + l for l in ["[integration] 2 of 40 target(s) did not finish before SIGTERM:", " - src/integration/a.integration.ts", " - src/integration/b.integration.ts", "other line"]) + "\n"
+        p = G.parse_integration_log(text)
+        self.assertEqual((p.tests, p.coarse), (frozenset(), {"src/integration/a.integration.ts", "src/integration/b.integration.ts"}))
+        self.assertEqual(len(p.hard), 2)
+
+    def test_an_integration_target_with_fail_lines_is_named_by_its_tests_and_one_without_is_coarse(self):
+        p = G.parse_integration_log(integration_log("t.ts", "s > one", "s > two"))
+        self.assertEqual((p.tests, p.coarse, p.hard), ({"t.ts :: s > one", "t.ts :: s > two"}, frozenset(), ()))
+        q = G.parse_integration_log(integration_log("t.ts"))
+        self.assertEqual((q.tests, q.coarse, q.hard), (frozenset(), {"t.ts"}, ()))
+
+    def test_an_integration_runner_crash_a_watchdog_kill_and_an_odd_exit_code_are_hard(self):
+        self.assertEqual(G.parse_integration_log(integration_log("t.ts", "s > one", crash="boom")).hard, ("the integration runner crashed: boom",))
+        self.assertEqual(G.parse_integration_log(integration_log("t.ts", "s > one", watchdog=True)).hard, ("t.ts hung past its watchdog and was killed",))
+        self.assertEqual(G.parse_integration_log(integration_log("t.ts", "s > one", exit_code=139)).hard, ("t.ts exited 139, not bun's 1 for failed tests",))
+
+
 if __name__ == "__main__":
     unittest.main()
