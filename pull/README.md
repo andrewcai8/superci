@@ -214,30 +214,29 @@ registrations lengthened the wait, to 244 s on a dev set). Until a set has eight
 offering them first, and a job is known by its job id. Before Nov 25 19:00Z every arrival (and every `QueueWait`)
 read as none and each pool stayed at its floor; the load tests above pinned their pools, which hid it.
 
-The pool stays between a floor and a cap for the hour (UTC), while jobs are routed to the set. The floors are 1 for 2, 4 and 8 vCPU
-and 0 for 16 and 32; the caps are flat spend guards (120, 200, 130, 40 and 12) above the largest pool the weekday model below asks
-for. A floor is a floor under a pool that has jobs to follow: a burst of 0 (no job arrived in the last `window_minutes` and none is held
-or carried from before a restart) means nothing is routed to the set, and its pool is 0 whatever the hour's floor says. On Nov 26 at
-23:57Z the floors held 70, 100 and 9 idle runners of 4, 8 and 2 vCPU, 43.8 USD an hour, with `SUPERCI_JOBS` unset. One arrival
-brings the hour's floor back, and the pool falls to 0 a window plus the hold (35 minutes) after the last job, and its idle machines go a surplus hold (20 s) after that.
-The 15-minute lead before a busy hour warms only a set that has jobs: after a quiet 35 minutes, the first wave of a surge (14:00Z) finds the pool at 0 and
-meets the cold path (its first job's arrival brings the full floor, which registers under the ceiling of 2 a second and 50 at once, about 85 s for 170
-machines). The Nov 26 replay below was measured inside a busy stretch and did not test that start. A rule that warms ahead of a quiet set from the
-same hour's earlier days is the follow-up if it matters.
-Within 15 minutes of the next hour, the larger of the two hours' bounds applies. A split size divides its bounds among
-its sets. No idle runner is trimmed in the first window after a start, while the set has seen too few jobs to size its
-pool.
+The pool is the measured burst of the jobs routed to the set, bounded by a cap for the hour (UTC) and a floor that ships at 0 for every size and
+hour: the caps are flat spend guards (120, 200, 130, 40 and 12) above the largest pool the weekday model below asks for, and a split size divides
+its bounds among its sets. A burst of 0 (no job arrived in the last `window_minutes`, none is held or carried from before a restart) means nothing
+is routed to the set, and its pool is 0 whatever a floor says. No idle runner is trimmed in the first window after a start, while the set has seen too
+few jobs to size its pool.
 
-The override (`deploy/override.json`) raises the floors of `superci-4cpu` to 70 and `superci-8cpu` to 100 from 14:00 to
-02:59Z, and to 10 otherwise, for as long as they take megpt-mono's `unit-tests` legs and `test-go`. Their bursts outrun a fresh launch.
-In the Nov 26 16:02-16:22Z peak, 15 merge-queue runs brought 24 legs each on 4 vCPU and 2 on 8 vCPU, and 47 PR pushes brought 28
-legs each on 8 vCPU. The jobs within 20 s up to each arrival were p50 33, p88 67 and p99 92 on 4 vCPU, and p50 34, p88 66 and
+Only routed jobs count as arrivals. A job is routed demand unless the batch rule names it (`batch` in the config: events `schedule` and
+`workflow_dispatch`, and any workflow ref or job name it lists): superci's own cache-warm and hydration runs are batch, take a machine like any job,
+and size no pool. The first hand-floor design held 70 (4 vCPU) and 100 (8 vCPU) from 14:00 to 02:59Z and 1 otherwise. On Nov 26 at 23:57Z that
+held 70, 100 and 9 idle runners of 4, 8 and 2 vCPU (43.8 USD an hour with `SUPERCI_JOBS` unset), and after a restart at 02:48Z one cache-warm job per set
+raised the pool to the hour's floor, about 171 registrations and 20 USD for no routed work. A floor is a pool no arrival asked for, so none ships:
+a single job warms what its own burst needs (a burst of 1 is a pool of 1), 40 at once warm about 36, and the pool is 0 a window plus the hold (35 minutes)
+after the last routed job. Pins from `/override` last only until the config changes or the listener restarts, and nothing needs one.
+
+The cost is the first wave of a surge after a quiet stretch: the pool is the burst of the jobs seen so far, not a floor registered ahead. The measurement
+below says what the hand floors bought. In the Nov 26 16:02-16:22Z peak, 15 merge-queue runs brought 24 legs each on 4 vCPU and 2 on 8 vCPU, and 47 PR
+pushes brought 28 legs each on 8 vCPU. The jobs within 20 s up to each arrival were p50 33, p88 67 and p99 92 on 4 vCPU, and p50 34, p88 66 and
 p99 98 on 8 vCPU. Up to 224 8 vCPU legs arrived in a minute and 548 in 5 minutes. Blacksmith's unit legs waited p50 8 s and p90
 10 s on 4 vCPU, and p50 7 s and p90 13 s on 8 vCPU. A replay of those arrivals (each arrival takes an idle runner or the next one
 registered; a launch asks for its token after a 25 s boot; tokens at the ceiling of 2 a second and 50 at once) waits p90 0 s on
-4 vCPU and 5 s on 8 vCPU with these floors. With the 30-minute quantile's pool (about 66 each), 8 vCPU waits p90 17 s at 2/50,
-because the ceiling, not the pool, holds its refills, and 6 s at 3/100. Lower the 8 vCPU floor once the ceiling is raised.
-
+4 vCPU and 5 s on 8 vCPU with floors of 70 and 100, and with the 30-minute quantile's pool alone (about 66 each) 8 vCPU waits p90 17 s at 2/50,
+because the ceiling, not the pool, holds its refills, and 6 s at 3/100. The dashboard's queue wait and `superci-pull-queue-wait-p90` show the
+start of a surge; a rule that warms a quiet set from the same hour's earlier days is the follow-up if it matters.
 Why this rule, measured on Nov 25 2026 (`tools/wait/`):
 
 - The 4cpu canary (lint-test-backend's `verify-tools` and `test-go`, 17:03-17:25Z, 140 jobs) waited 22 s p50 and
@@ -875,8 +874,7 @@ Spot prices on Nov 25 2026 08:00Z (median of each size's 10 cheapest pools), wit
 | | Per hour |
 | --- | --- |
 | The listener (c7g.large on-demand, 30 GB gp3, the Elastic IP's public address) | $0.08 |
-| Idle with no jobs routed here (the floors hold nothing: a set's pool is 0 a window after its last job) | $0.00 |
-| Idle at the floors while jobs arrive (1 machine each of 2, 4 and 8 vCPU, overnight) | $0.20 |
+| Idle with no jobs routed here (no floor ships: a set's pool is 0 a window plus the hold after its last routed job) | $0.00 |
 | Idle pools at full rollout, modelled over a weekday (all of megpt-mono's Linux jobs here, hydrated machines) | $17.7 on average |
 
 A busy hour costs what its jobs run for at those prices, plus about 30 s of boot and shutdown per job (a machine runs

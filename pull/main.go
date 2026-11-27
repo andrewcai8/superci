@@ -218,7 +218,9 @@ func run(ctx context.Context, f flags) error {
 			if err != nil {
 				return err
 			}
-			l.dsets = append(l.dsets, NewDispatchSet(spec, sf, regions, now))
+			ds := NewDispatchSet(spec, sf, regions, now)
+			ds.SetBatch(cfg.Batch)
+			l.dsets = append(l.dsets, ds)
 			continue
 		}
 		scaled = append(scaled, spec)
@@ -1221,6 +1223,7 @@ func (l *Listener) watchConfig() {
 		}
 	}
 	for _, d := range l.dsets {
+		d.SetBatch(cfg.Batch)
 		if n, ok := maxes[d.spec.Name]; ok {
 			d.SetMax(n)
 		}

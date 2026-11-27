@@ -590,7 +590,9 @@ func (s *State) arrived(j scaleset.JobMessageBase, now time.Time) {
 	if t := j.ScaleSetAssignTime; !t.IsZero() && t.Before(now) {
 		at = t
 	}
-	s.arrive(at)
+	if !s.batchRule.Matches(j) { // a batch job (superci's own cache-warm and hydration runs, schedule and dispatch events) is no routed demand: it sizes no pool
+		s.arrive(at)
+	}
 	queued := at
 	if !j.QueueTime.IsZero() && j.QueueTime.Before(now) {
 		queued = j.QueueTime
