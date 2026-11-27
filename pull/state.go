@@ -696,7 +696,7 @@ func (s *State) launchTime(def time.Duration) time.Duration {
 // the launch time up to and including it: each job takes a runner and launches the next, which is ready one launch
 // time later. Burst is that count at the quantile q of the jobs seen in the last window, and no less than the largest
 // burst of the last hold, so the pool shrinks only once bursts have stayed smaller for a while (a pool runner retired
-// is a registration and a boot spent for nothing). Without arrivals it is 0, and the hour's floor holds.
+// is a registration and a boot spent for nothing). Without arrivals it is 0, and with a burst of 0 the pool is 0 whatever the hour's floor says (Config.PoolTarget).
 func (s *State) Burst(now time.Time, r PoolRule) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -765,7 +765,7 @@ func (s *State) Carry(now time.Time, r PoolRule) Carried {
 }
 
 // Resume starts the set from what the last listener carried: its launch times, and its burst for the first window,
-// so a restart does not drop the pool to the floor while the set sees its jobs again.
+// so a restart does not drop the pool to 0 while the set sees its jobs again.
 func (s *State) Resume(c Carried) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
