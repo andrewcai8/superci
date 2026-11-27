@@ -516,14 +516,20 @@ func errString(err error) string {
 	return err.Error()
 }
 
-// Describe lists every scale set's machines of this deployment that are starting or running in a region.
+// listedStates are the states a listing asks EC2 for: starting and running, and leaving running, which lasts seconds
+// and is how a dispatch set learns of a spot reclaim its machine's notice did not bring (DispatchSet.Leaving). The
+// leaving ones add no call: they are a few more instances on the same pages.
+var listedStates = []string{"pending", "running", "shutting-down", "stopping"}
+
+// Describe lists every scale set's machines of this deployment that are starting, running or leaving running in a
+// region (listedStates); live splits off the leaving ones.
 func (f *Fleet) Describe(ctx context.Context, r *Region) ([]*Machine, error) {
 	var out []*Machine
 	p := ec2.NewDescribeInstancesPaginator(r.ec2, &ec2.DescribeInstancesInput{MaxResults: aws.Int32(1000), Filters: []ec2types.Filter{
 		{Name: aws.String("tag:purpose"), Values: []string{"superci-pull"}},
 		{Name: aws.String("tag:" + tagDeployment), Values: []string{f.deployment}},
 		{Name: aws.String("tag-key"), Values: []string{"superci-pull-set"}},
-		{Name: aws.String("instance-state-name"), Values: []string{"pending", "running"}},
+		{Name: aws.String("instance-state-name"), Values: listedStates},
 	}})
 	for p.HasMorePages() {
 		page, err := p.NextPage(ctx)
@@ -549,6 +555,10 @@ func listedMachine(i ec2types.Instance, region string) *Machine {
 	if i.Placement != nil {
 		m.AZ = aws.ToString(i.Placement.AvailabilityZone)
 	}
+	if i.State != nil {
+		m.State = string(i.State.Name)
+	}
+	m.Reclaimed = i.StateReason != nil && strings.HasPrefix(aws.ToString(i.StateReason.Code), "Server.SpotInstance")
 	for _, t := range i.Tags {
 		switch aws.ToString(t.Key) {
 		case "superci-pull-round":
@@ -566,6 +576,19 @@ func listedMachine(i ec2types.Instance, region string) *Machine {
 		}
 	}
 	return m
+}
+
+// live splits a listing into the machines starting or running, which every set reads as its own, and those leaving
+// running, which only a dispatch set reads (DispatchSet.Leaving).
+func live(ms []*Machine) (running, leaving []*Machine) {
+	for _, m := range ms {
+		if m.State == "" || m.State == string(ec2types.InstanceStateNamePending) || m.State == string(ec2types.InstanceStateNameRunning) {
+			running = append(running, m)
+		} else {
+			leaving = append(leaving, m)
+		}
+	}
+	return running, leaving
 }
 
 // TagIssued records on EC2 that machines of a region were issued their runner. Every machine of one call gets the

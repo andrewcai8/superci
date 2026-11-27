@@ -35,6 +35,7 @@ var agentScript []byte
 const dispatchProtocol = "superci-dispatch/1"
 
 const (
+	actionHeader = "X-Superci-Action" // on /notice: IMDS's spot/instance-action as the machine read it
 	resumeHeader = "X-Superci-Resume" // <instance>.<token>: the pair a side rejoins after its connection broke
 	runnerHeader = "X-Superci-Runner" // base64 of the identity's .runner, which names the set
 	labelHeader  = "X-Superci-Label"  // the set, as the shim knows it: when given, it must be the identity's
@@ -119,6 +120,7 @@ type wire struct {
 	mu       sync.Mutex // one frame written at a time
 	dl       sync.Mutex // one change of the read deadline at a time
 	draining atomic.Bool
+	stopped  atomic.Bool // set when the job it carried was lost: no frame is written on it after
 	done     chan struct{}
 	once     sync.Once
 	closed   func()
@@ -145,7 +147,7 @@ func newWire(conn net.Conn, in *bufio.Reader, ping, silence time.Duration, close
 func (w *wire) send(t frameType, p []byte) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.gone() || w.draining.Load() {
+	if w.gone() || w.draining.Load() || w.stopped.Load() {
 		return net.ErrClosed
 	}
 	_ = w.conn.SetWriteDeadline(time.Now().Add(w.silence))
@@ -493,6 +495,55 @@ func (d *Dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// The time an instance-action names is when AWS takes the machine, two minutes after its notice. A notice whose time
+// is past by more than noticeLate, or ahead by more than noticeAhead, is no notice AWS gives now: a stale one replayed,
+// or none at all.
+const (
+	noticeLate  = time.Minute
+	noticeAhead = 3 * time.Minute
+)
+
+// Notice takes in a dispatch machine's word, from the request's verified identity document, that AWS takes it back:
+// action is IMDS's spot/instance-action, {"action": "terminate", "time": "2026-11-27T19:08:14Z"}. It says whether the
+// instance is a machine of a dispatch set, and refuses a notice that is not current or comes from an on-demand
+// machine, which AWS does not reclaim. The reclaim acts on the
+// document's instance alone (DispatchSet.reclaim).
+func (d *Dispatcher) Notice(doc InstanceDocument, action string, now time.Time) (known bool, err error) {
+	for _, st := range d.sets {
+		known, spot := st.spotMachine(doc.InstanceID)
+		if !known {
+			continue
+		}
+		if !spot {
+			return true, fmt.Errorf("%s is no spot machine: AWS reclaims none", doc.InstanceID)
+		}
+		if err := currentNotice(action, now); err != nil {
+			return true, err
+		}
+		st.reclaim(doc.InstanceID, "spot notice")
+		return true, nil
+	}
+	return false, nil
+}
+
+// currentNotice checks an instance-action: an action AWS takes on a spot machine, at a time it gives notice of now.
+func currentNotice(raw string, now time.Time) error {
+	var a struct {
+		Action string    `json:"action"`
+		Time   time.Time `json:"time"`
+	}
+	if err := json.Unmarshal([]byte(raw), &a); err != nil {
+		return fmt.Errorf("instance-action %q: %w", clip(raw, 256), err)
+	}
+	switch {
+	case a.Action != "terminate" && a.Action != "stop" && a.Action != "hibernate":
+		return fmt.Errorf("instance-action %q", clip(a.Action, 64))
+	case a.Time.Before(now.Add(-noticeLate)), a.Time.After(now.Add(noticeAhead)):
+		return fmt.Errorf("instance-action at %s, not current at %s", a.Time.UTC().Format(time.RFC3339), now.UTC().Format(time.RFC3339))
+	}
+	return nil
 }
 
 // machineOf is the dispatch set and machine an identity document names, listing EC2 again if the instance is newer
@@ -971,6 +1022,12 @@ func (d *Dispatcher) hand(st *DispatchSet, s *session, m *dmachine, mw *wire) {
 		d.retry(st, s, m, false)
 		return
 	}
+	// A machine AWS is taking back is spent while the job can still be paired again: until PAIRED, the shim holds its
+	// bytes. A reclaim that comes after this check loses the job at its handed point.
+	if st.isReclaimed(m) {
+		d.retry(st, s, m, false)
+		return
+	}
 	sw := s.shimWire()
 	if sw == nil || sw.send(framePaired, pairedOf(m.ID+"."+token)) != nil {
 		st.abandon(s, m)
@@ -1003,10 +1060,17 @@ func (d *Dispatcher) hand(st *DispatchSet, s *session, m *dmachine, mw *wire) {
 		st.abandon(s, m)
 		return
 	}
-	st.handed(s, time.Now())
-	s.attachMachine(mw)
+	// The job goes live before a reclaim found at the handed point loses it, so the shim has its live frame before the
+	// loss ends its wire (the other order raced the loss's closeAll against goLive's send).
+	reclaimed := st.handed(s, time.Now())
+	if !reclaimed {
+		s.attachMachine(mw)
+	}
 	if s.goLive() {
 		st.finish(s, exitRelayed)
+	}
+	if reclaimed {
+		st.loseReclaimed(s)
 	}
 	slog.Info("dispatch handed", "set", st.spec.Name, "job", s.id, "machine", m.ID, "agent", s.agent, "run", s.head.Run, "name", s.head.Name)
 }
@@ -1203,6 +1267,21 @@ func (s *session) attachMachine(mw *wire) {
 	if old != nil && old != mw {
 		old.close()
 	}
+}
+
+// detach takes the job from its machine, and waits on no write: a write to a machine that does not read holds s.wm
+// for up to the silence, and the caller (a notice, the listing of EC2) is not to wait on it. Its connections are
+// stopped, so no frame starts on them after this; one already being written may finish. None of the machine's frames
+// is the job's after this.
+func (s *session) detach() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, w := range []*wire{s.mach, s.from} {
+		if w != nil {
+			w.stopped.Store(true)
+		}
+	}
+	s.mach, s.from = nil, nil
 }
 
 // machineAway marks the job's machine away once the connection its frames come on ends. That holds from its claim,

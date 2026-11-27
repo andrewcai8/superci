@@ -46,6 +46,7 @@ type DispatchSet struct {
 	ended        map[string]time.Time // jobs over, by id, so a late resume in this process adopts none
 	over         func(job string)     // marks a job over beside its claim, for a resume after a restart
 	stranded     []JobRef             // jobs stranded before their handed point since the reconciler last took them
+	reclaims     []JobRef             // handed jobs lost to a spot reclaim since the reconciler last took them
 }
 
 // A dmachine is one machine of a dispatch set: EC2's facts, and where it is in its one job's life.
@@ -56,6 +57,7 @@ type dmachine struct {
 	session   *session  // the job it was claimed for
 	since     time.Time // when it last had no connection: launched, adopted after a start, or its connection lost
 	firstWork time.Time // its first /work, which ends its launch's time
+	reclaimed bool      // AWS takes it back: its spot notice came, or EC2 lists it leaving for a spot interruption
 }
 
 type machinePhase int
@@ -195,6 +197,25 @@ func (st *DispatchSet) Seen(region string, listed []*Machine, began, now time.Ti
 			delete(st.machines, id)
 		}
 	}
+}
+
+// Leaving takes in the machines of one listing that EC2 shows leaving running (shutting down or stopping): one that
+// leaves for a spot interruption is reclaimed. One that leaves for another reason (it powered off, or was ended) is
+// left to its connection and the window, as before.
+func (st *DispatchSet) Leaving(leaving []*Machine) {
+	for _, m := range leaving {
+		if m.Reclaimed {
+			st.reclaim(m.ID, "EC2 lists it "+m.State+" for a spot interruption")
+		}
+	}
+}
+
+// spotMachine says whether the set has a machine, and whether it is a spot machine, which AWS may reclaim.
+func (st *DispatchSet) spotMachine(id string) (known, spot bool) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	m := st.machines[id]
+	return m != nil, m != nil && m.Lifecycle == "spot"
 }
 
 func (st *DispatchSet) machine(id string) *dmachine {
@@ -459,8 +480,9 @@ func (st *DispatchSet) strand(job string, c jobClaim, inst string) {
 	}
 }
 
-// handed records the handed point: the job's claim names its pair.
-func (st *DispatchSet) handed(s *session, now time.Time) {
+// handed records the handed point: the job's claim names its pair. It says whether AWS is taking the job's machine
+// back: a reclaim that came while the job was paired, too late to pair it again.
+func (st *DispatchSet) handed(s *session, now time.Time) (reclaimed bool) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	s.phase, s.handed = running, now
@@ -468,6 +490,69 @@ func (st *DispatchSet) handed(s *session, now time.Time) {
 	st.waits = append(st.waits, now.Sub(s.arrived).Seconds())
 	close(s.settled)
 	s.settled = nil
+	m := st.machines[s.machine]
+	return m != nil && m.reclaimed
+}
+
+// isReclaimed says whether AWS is taking a machine back.
+func (st *DispatchSet) isReclaimed(m *dmachine) bool {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return m.reclaimed
+}
+
+// reclaim takes in that AWS is taking a machine back: its spot notice, or EC2 listing it leaving for a spot
+// interruption. A machine with no job is spent at once. One being paired is spent by its hand-off, which pairs the job
+// again, unless PAIRED has gone: then the job is lost at its handed point. A handed job is lost now, with the reclaim
+// as the proof its re-run needs, rather than once its machine has been away for the window: its machine gets none of
+// its bytes after this, and ends. A second word of the same reclaim changes nothing. It says whether the set has the
+// machine.
+func (st *DispatchSet) reclaim(id, why string) bool {
+	st.mu.Lock()
+	m := st.machines[id]
+	if m == nil {
+		st.mu.Unlock()
+		return false
+	}
+	if m.reclaimed {
+		st.mu.Unlock()
+		return true
+	}
+	m.reclaimed = true
+	// The job handed to it, if any: a job adopted after a restart is the machine's before the machine rejoins it.
+	s := st.pairs[id]
+	if s == nil || s.phase != running {
+		s = nil
+		if m.phase == mBooting || m.phase == mWaiting {
+			st.end(m, why)
+		}
+	}
+	st.mu.Unlock()
+	slog.Warn("dispatch machine reclaimed", "set", st.spec.Name, "machine", id, "why", why, "handed", s != nil)
+	if s != nil {
+		st.loseReclaimed(s)
+		st.endMachine(m, why)
+	}
+	return true
+}
+
+// loseReclaimed ends a handed job whose machine AWS is taking back: no byte of it goes to the machine after this, its
+// shim gets exit code 1, and the job is reported for its re-run with the reclaim as proof. A job whose exit code came
+// keeps it.
+func (st *DispatchSet) loseReclaimed(s *session) {
+	s.detach()
+	s.mu.Lock()
+	exited := s.exited
+	s.mu.Unlock()
+	if exited || !st.finish(s, machineLost) {
+		return
+	}
+	if j, ok := jobRef(s.head, s.agent, s.machine); ok {
+		j.Reclaimed = true
+		st.mu.Lock()
+		st.reclaims = append(st.reclaims, j)
+		st.mu.Unlock()
+	}
 }
 
 // pairOf is the job a machine was paired with in this process, its token, and while the pairing is still going on a
@@ -507,13 +592,14 @@ func (st *DispatchSet) adopt(inst, token, job string, c jobClaim, now time.Time)
 	return s
 }
 
-// finish ends a job and its machine. A job whose machine was lost gives its shim exit code 1 first. The writes run on
-// their own: a peer that does not read holds a write for up to its silence, and the reconciler is not to wait on it.
-func (st *DispatchSet) finish(s *session, why jobEnd) {
+// finish ends a job and its machine, and says whether this call did. A job whose machine was lost gives its shim exit
+// code 1 first. The writes run on their own: a peer that does not read holds a write for up to its silence, and the
+// reconciler is not to wait on it.
+func (st *DispatchSet) finish(s *session, why jobEnd) bool {
 	st.mu.Lock()
 	if s.phase == over {
 		st.mu.Unlock()
-		return
+		return false
 	}
 	s.phase = over
 	if st.pairs[s.machine] == s {
@@ -552,6 +638,7 @@ func (st *DispatchSet) finish(s *session, why jobEnd) {
 		s.closeAll()
 	}()
 	slog.Info("dispatch job over", "set", st.spec.Name, "job", s.id, "machine", s.machine, "lost", lost)
+	return true
 }
 
 // record is a dispatched job's one record, made when it is over (finish runs once a session). It has no completed
@@ -644,7 +731,8 @@ type dispatchBounds struct {
 
 // Reconcile ends what has outlived its bounds and returns the machines to terminate now and the jobs lost. A handed job
 // whose machine has been away past the window, or that ran past its bound, is lost: its shim gets exit code 1. A job
-// stranded before its handed point is lost too, and no machine got its bytes. A shim
+// stranded before its handed point is lost too, and no machine got its bytes; so is a handed job whose machine AWS is
+// taking back (reclaim), lost when the reclaim was known, with it as proof. A shim
 // away loses nothing: the machine renews its job itself, so the job runs on to its exit code, which is held for the
 // shim until the window after the shim left. A machine waiting past its age, one that has had no connection past the
 // window, any past its life, and surplus waiting machines end; an ending machine is terminated once, then a minute on
@@ -657,6 +745,7 @@ func (st *DispatchSet) Reconcile(now time.Time, b dispatchBounds) (end []*Machin
 		}
 	}
 	lost, st.stranded = st.stranded, nil
+	lost, st.reclaims = append(lost, st.reclaims...), nil
 	st.mu.Unlock()
 	for s, why := range st.expired(now, b) {
 		if why == machineLost {

@@ -176,10 +176,11 @@ DOC=$(curl -s -m 2 -H "X-aws-ec2-metadata-token: $T" http://169.254.169.254/late
 mark doc.got
 ( while sleep 1; do send; done ) > /dev/null 2>&1 &
 SENDER=$!
-call() { curl -s -k --pinnedpubkey "$PIN" -m 60 --data-binary "$DOC" -o "$2" -w '%{http_code}' "$L/$1"; }
+call() { curl -s -k --pinnedpubkey "$PIN" -m 60 --data-binary "$DOC" -o "$2" -w '%{http_code}' "${@:3}" "$L/$1"; }
+# The notice carries IMDS's instance-action, sent until the listener answers.
 ( while sleep 5; do
-    [ "$(curl -s -m 2 -o /dev/null -w '%{http_code}' -H "X-aws-ec2-metadata-token: $T" http://169.254.169.254/latest/meta-data/spot/instance-action)" = 200 ] || continue
-    call notice /dev/null; break
+    A=$(curl -s -f -m 2 -H "X-aws-ec2-metadata-token: $T" http://169.254.169.254/latest/meta-data/spot/instance-action | tr -d '\r\n')
+    [ -n "$A" ] && case $(call notice /dev/null -H "X-Superci-Action: $A") in [24]??) break ;; esac
   done ) &
 uptime_s() { cut -d. -f1 /proc/uptime; }
 # Dispatch mode (pull/agent.py): no runner is registered. The machine fetches its agent with the identity document and

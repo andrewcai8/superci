@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Undoes each fix of round 2, of the fence round (audit E), of the wait round (F1 to F4), of the visible wait (U2), of the priority classes (U4), of the hygiene round (U7), of admission on GitHub's answer (the refusal shapes, the hold, the 2 and 50 start, the ceiling against the cap) and of the identity plane, its fix round and F5's strandings (D-) in a copy of pull/ and runs the test written for it, which must fail. A fix whose
+"""Undoes each fix of round 2, of the fence round (audit E), of the wait round (F1 to F4), of the visible wait (U2), of the priority classes (U4), of the hygiene round (U7), of admission on GitHub's answer (the refusal shapes, the hold, the 2 and 50 start, the ceiling against the cap) and of the identity plane, its fix round, F5's strandings and a dispatch machine's spot reclaim (D-) in a copy of pull/ and runs the test written for it, which must fail. A fix whose
 test still passes without it is reported as NOT RED. A path under cache/ runs its test in the cache module. Run it in pull/ where Go is installed:
 
   python3 tools/redfirst.py [name fragment ...]   # only the mutants whose name holds one of them
@@ -320,7 +320,7 @@ MUTANTS = [
     ("D-fix-8 an EXIT held for an absent shim keeps its machine", "dispatch.go", "\t\t} else if t == frameExit {\n\t\t\tst.exitHeld(s)", "\t\t} else if false {\n\t\t\tst.exitHeld(s)",
      "TestAShimThatDiesAfterTheHandedPointLeavesTheJobRunningToItsExit"),
     ("D-rec a dispatched job leaves no record", "dset.go", "\tst.jobs = append(st.jobs, rec)\n", "", "TestADispatchedJobLeavesExactlyOneRecord"),
-    ("D-rec a finished job leaves a second record", "dset.go", "\tif s.phase == over {\n\t\tst.mu.Unlock()\n\t\treturn\n\t}\n\ts.phase = over\n\tif st.pairs", "\ts.phase = over\n\tif st.pairs", "TestALostDispatchedJobLeavesOneFailedRecord"),
+    ("D-rec a finished job leaves a second record", "dset.go", "\tif s.phase == over {\n\t\tst.mu.Unlock()\n\t\treturn false\n\t}\n\ts.phase = over\n\tif st.pairs", "\ts.phase = over\n\tif st.pairs", "TestALostDispatchedJobLeavesOneFailedRecord"),
     ("D-rec a lost job reads as its exit code", "dset.go", "\tif exited && why == exitRelayed {", "\tif exited && why != shimLeftAfterExit {", "TestALostDispatchedJobLeavesOneFailedRecord"),
     ("D-rec the record has no workflow", "dispatch.go", "WorkflowRef: clip(gh[\"workflow_ref\"], 1<<10),", "WorkflowRef: \"\",", "TestADispatchedJobLeavesExactlyOneRecord"),
     ("D-rec an adopted job's times are the restart's", "dset.go", "\tif c.Handed > 0 {\n", "\tif false {\n", "TestAnAdoptedJobsRecordKeepsItsTimesOrIsPartial"),
@@ -341,9 +341,31 @@ MUTANTS = [
     ("D-F5 a resume with any token strands the job", "dispatch.go", "\tif c.pair != key {\n\t\treturn jobClaim{}, nil\n\t}", "\tif false {\n\t\treturn jobClaim{}, nil\n\t}", "TestAJobPairedByAProcessKilledBeforeItsClaimIsReRunOnceAndWrittenToNoMachine"),
     ("D-F5 a stranding fences nothing", "dispatch.go", "d.take(ctx, jobFence(job), lost.String(), 0)", "d.take(ctx, jobFence(job)+\".lost\", lost.String(), 0)", "TestAJobPairedByAProcessKilledBeforeItsClaimIsReRunOnceAndWrittenToNoMachine"),
     ("D-F5 a stranded job is reported for no re-run", "dset.go", "\tlost, st.stranded = st.stranded, nil\n", "", "TestAJobPairedByAProcessKilledBeforeItsClaimIsReRunOnceAndWrittenToNoMachine"),
-    ("D-F5 a stranded job is re-run only on a reclaim's proof", "rerun.go", "\tproven = proven || j.Unrun\n", "", "TestAJobPairedByAProcessKilledBeforeItsClaimIsReRunOnceAndWrittenToNoMachine"),
+    ("D-F5 a stranded job is re-run only on a reclaim's proof", "rerun.go", "\tproven = proven || j.Unrun || j.Reclaimed\n", "\tproven = proven || j.Reclaimed\n", "TestAJobPairedByAProcessKilledBeforeItsClaimIsReRunOnceAndWrittenToNoMachine"),
     ("D-F5 a claim unanswered past the window drops its job", "dispatch.go", "\tcase err != nil:\n\t\theld, err = d.strand(d.life, st, claim, s.id)\n", "", "TestAJobClaimUnansweredPastTheShimsWindowIsStrandedOrHandedByWhatLanded"),
     ("D-F5 a stranding ignores the pair's claim that landed first", "dispatch.go", "\tcase errors.Is(err, ErrClaimed):\n\t\treturn d.jobClaimOf(ctx, job)\n", "\tcase errors.Is(err, ErrClaimed):\n\t\treturn jobClaim{}, nil\n", "TestAJobClaimUnansweredPastTheShimsWindowIsStrandedOrHandedByWhatLanded"),
+    # A dispatch machine AWS is taking back (Nov 27, test-go e84edfe1 failed 3 minutes after its machine's reclaim): its
+    # notice, or EC2 listing it leaving for a spot interruption, loses its handed job at once with proof for the re-run.
+    ("D-spot a dispatch machine's notice is refused", "server.go", "\t\tif d, ok := h.dispatch.(noticeTaker); ok {", "\t\tif d, ok := h.dispatch.(noticeTaker); ok && false {", "TestAHandedJobWhoseMachinePostsItsSpotNoticeIsLostAtOnceAndReRunOnce"),
+    ("D-spot a noticed handed job waits for the window", "dset.go", "\tif s == nil || s.phase != running {\n\t\ts = nil", "\tif true {\n\t\ts = nil", "TestAHandedJobWhoseMachinePostsItsSpotNoticeIsLostAtOnceAndReRunOnce"),
+    ("D-spot a reclaimed job carries no proof", "dset.go", "\t\tj.Reclaimed = true\n", "", "TestAHandedJobWhoseMachinePostsItsSpotNoticeIsLostAtOnceAndReRunOnce"),
+    ("D-spot the re-runner ignores a reclaim's proof", "rerun.go", "\tproven = proven || j.Unrun || j.Reclaimed\n", "\tproven = proven || j.Unrun\n", "TestAHandedJobWhoseMachinePostsItsSpotNoticeIsLostAtOnceAndReRunOnce"),
+    ("D-spot a job lost at the window is re-run without proof", "rerun.go", "\tproven = proven || j.Unrun || j.Reclaimed\n", "\tproven = true\n", "TestAMachineAwayWithNoNoticeIsLostAtTheWindowAndReRunOnlyOnProof"),
+    ("D-spot an adopted job is its machine's only once the machine rejoins", "dset.go", "\ts := st.pairs[id]\n", "\ts := m.session\n", "TestAnAdoptedJobWhoseMachinePostsItsSpotNoticeBeforeRejoiningIsLostAtOnce"),
+    ("D-spot a reclaim waits on its machine's write", "dispatch.go", "func (s *session) detach() {\n\ts.mu.Lock()", "func (s *session) detach() {\n\ts.wm.Lock()\n\tdefer s.wm.Unlock()\n\ts.mu.Lock()", "TestAReclaimDoesNotWaitOnAMachineWriteThatBlocks"),
+    ("D-spot a lost job keeps its machine", "dset.go", "\ts.detach()\n\ts.mu.Lock()\n\texited := s.exited", "\ts.mu.Lock()\n\texited := s.exited", "TestAJobLostWhileItsHeldBytesGoOutSendsNoMoreOfThem"),
+    ("D-spot a stopped connection still writes", "dispatch.go", "if w.gone() || w.draining.Load() || w.stopped.Load() {", "if w.gone() || w.draining.Load() {", "TestAJobLostWhileItsHeldBytesGoOutSendsNoMoreOfThem"),
+    ("D-spot a reclaim loses a job whose exit code came", "dset.go", "\tif exited || !st.finish(s, machineLost) {", "\tif exited && false || !st.finish(s, machineLost) {", "TestAReclaimAfterTheExitCodeCameKeepsIt"),
+    ("D-spot an on-demand machine's notice is taken", "dispatch.go", "\t\tif !spot {\n", "\t\tif !spot && false {\n", "TestAnOnDemandMachinesNoticeIsRefusedAndChangesNothing"),
+    ("D-spot a listing asks EC2 for running machines only", "fleet.go", 'var listedStates = []string{"pending", "running", "shutting-down", "stopping"}', 'var listedStates = []string{"pending", "running"}', "TestAHandedJobWhoseMachineEC2ListsShuttingDownForASpotInterruptionIsLostAtOnce"),
+    ("D-spot a machine leaving for any reason is reclaimed", "dset.go", "\t\tif m.Reclaimed {\n\t\t\tst.reclaim(", "\t\tif true {\n\t\t\tst.reclaim(", "TestAHandedJobWhoseMachineEC2ListsShuttingDownForASpotInterruptionIsLostAtOnce"),
+    ("D-spot a waiting machine's notice leaves it waiting", "dset.go", "\t\tif m.phase == mBooting || m.phase == mWaiting {\n\t\t\tst.end(m, why)", "\t\tif false {\n\t\t\tst.end(m, why)", "TestASpotNoticeBeforeTheHandedPointPairsTheJobAgainOrLosesItAtTheHandedPoint"),
+    ("D-spot a machine reclaimed while paired is handed the job", "dispatch.go", "\tif st.isReclaimed(m) {\n\t\td.retry(st, s, m, false)", "\tif false {\n\t\td.retry(st, s, m, false)", "TestASpotNoticeBeforeTheHandedPointPairsTheJobAgainOrLosesItAtTheHandedPoint"),
+    ("D-spot a machine reclaimed at the handed point gets the job's bytes", "dispatch.go", "\treclaimed := st.handed(s, time.Now())\n\tif !reclaimed {\n\t\ts.attachMachine(mw)\n\t}", "\treclaimed := false\n\tst.handed(s, time.Now())\n\tif !reclaimed {\n\t\ts.attachMachine(mw)\n\t}", "TestASpotNoticeBeforeTheHandedPointPairsTheJobAgainOrLosesItAtTheHandedPoint"),
+    ("D-spot a stale notice is taken", "dispatch.go", "\tcase a.Time.Before(now.Add(-noticeLate)), a.Time.After(now.Add(noticeAhead)):", "\tcase false:", "TestANoticeFromAnotherInstanceOrStaleOrUnsignedChangesNothing"),
+    ("D-spot a notice of any action is taken", "dispatch.go", 'case a.Action != "terminate" && a.Action != "stop" && a.Action != "hibernate":', "case false:", "TestANoticeFromAnotherInstanceOrStaleOrUnsignedChangesNothing"),
+    ("D-spot boot.sh posts the notice once", "boot.sh", "in [24]??) break ;; esac", "in *) break ;; esac", "TestBootPostsTheSpotNoticeWithItsInstanceActionUntilTheListenerAnswers"),
+    ("D-spot boot.sh's notice carries no instance-action", "boot.sh", '-H "X-Superci-Action: $A"', "", "TestBootPostsTheSpotNoticeWithItsInstanceActionUntilTheListenerAnswers"),
     ("D-pool a dispatch set's pool is not saved", "carry.go", "\tfor _, d := range dsets {\n\t\tsaved.Sets[d.spec.Name] = d.Carry(now, rule)\n\t}", "",
      "TestADispatchSetsBurstSurvivesARestartThroughTheSavedParameter"),
     ("D-pool a dispatch set's pool is not resumed", "carry.go", "\t\t\td.Resume(c)\n", "\t\t\t_ = c\n",

@@ -48,6 +48,10 @@ type Machine struct {
 	Notice       bool // AWS gave notice that it takes this spot machine back
 	Missed       int  // complete listings in a row that showed no runner of it while it was never issued one
 	Dispatch     bool // its superci-pull-mode tag names a dispatch set: it takes a job from the dispatcher, never a runner
+	// State is EC2's state of it in the listing; only a dispatch set reads one other than pending or running
+	// (DispatchSet.Leaving). Reclaimed says EC2 gives a spot interruption as the reason it leaves running.
+	State     string
+	Reclaimed bool
 }
 
 // A Runner is one just-in-time registration, which takes one job.
@@ -71,6 +75,7 @@ type JobRef struct {
 	Runner      string
 	Instance    string // the machine it ran on, when the runner's name does not say (an identity's job)
 	Unrun       bool   // no machine got its bytes (an identity's job stranded before its handed point): its loss is proof enough
+	Reclaimed   bool   // a handed job the dispatcher lost when AWS's notice or EC2's state said a spot reclaim takes its machine
 }
 
 // issuingMax is how long a grant may stay unsettled before Overdue takes the machine back from it.

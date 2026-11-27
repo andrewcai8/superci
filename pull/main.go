@@ -697,13 +697,16 @@ func (l *Listener) refresher() func(context.Context, string) {
 			return
 		}
 		now := time.Now()
+		ms, leaving := live(ms)
 		scaled, dispatched, strays := sortMachines(ms, l.sets, l.dsets)
 		var gone []JobRef
 		for _, s := range l.sets {
 			gone = append(gone, s.state.Seen(region, scaled[s], began, now)...)
 		}
+		_, left, _ := sortMachines(leaving, l.sets, l.dsets)
 		for _, d := range l.dsets {
 			d.Seen(region, dispatched[d], began, now)
+			d.Leaving(left[d])
 		}
 		for _, j := range gone {
 			l.rerun.Add(j, now, false)
