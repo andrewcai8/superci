@@ -212,14 +212,18 @@ registrations lengthened the wait, to 244 s on a dev set). Until a set has eight
 offering them first, and a job is known by its job id. Before Nov 25 19:00Z every arrival (and every `QueueWait`)
 read as none and each pool stayed at its floor; the load tests above pinned their pools, which hid it.
 
-The pool stays between a floor and a cap for the hour (UTC). The floors are 1 for 2, 4 and 8 vCPU and 0 for 16 and
-32; the caps are flat spend guards (120, 200, 130, 40 and 12) above the largest pool the weekday model below asks for.
+The pool stays between a floor and a cap for the hour (UTC), while jobs are routed to the set. The floors are 1 for 2, 4 and 8 vCPU
+and 0 for 16 and 32; the caps are flat spend guards (120, 200, 130, 40 and 12) above the largest pool the weekday model below asks
+for. A floor is a floor under a pool that has jobs to follow: a burst of 0 (no job arrived in the last `window_minutes` and none is held
+or carried from before a restart) means nothing is routed to the set, and its pool is 0 whatever the hour's floor says. On Nov 26 at
+23:57Z the floors held 70, 100 and 9 idle runners of 4, 8 and 2 vCPU, 43.8 USD an hour, with `SUPERCI_JOBS` unset. One arrival
+brings the hour's floor back, and the pool falls to 0 a window (30 minutes) after the last job.
 Within 15 minutes of the next hour, the larger of the two hours' bounds applies. A split size divides its bounds among
 its sets. No idle runner is trimmed in the first window after a start, while the set has seen too few jobs to size its
 pool.
 
 The override (`deploy/override.json`) raises the floors of `superci-4cpu` to 70 and `superci-8cpu` to 100 from 14:00 to
-02:59Z, and to 10 otherwise, while they take megpt-mono's `unit-tests` legs and `test-go`. Their bursts outrun a fresh launch.
+02:59Z, and to 10 otherwise, for as long as they take megpt-mono's `unit-tests` legs and `test-go`. Their bursts outrun a fresh launch.
 In the Nov 26 16:02-16:22Z peak, 15 merge-queue runs brought 24 legs each on 4 vCPU and 2 on 8 vCPU, and 47 PR pushes brought 28
 legs each on 8 vCPU. The jobs within 20 s up to each arrival were p50 33, p88 67 and p99 92 on 4 vCPU, and p50 34, p88 66 and
 p99 98 on 8 vCPU. Up to 224 8 vCPU legs arrived in a minute and 548 in 5 minutes. Blacksmith's unit legs waited p50 8 s and p90
@@ -682,7 +686,8 @@ Spot prices on Nov 25 2026 08:00Z (median of each size's 10 cheapest pools), wit
 | | Per hour |
 | --- | --- |
 | The listener (c7g.large on-demand, 30 GB gp3, the Elastic IP's public address) | $0.08 |
-| Idle at the floors (1 machine each of 2, 4 and 8 vCPU; overnight, or with no jobs routed here) | $0.20 |
+| Idle with no jobs routed here (the floors hold nothing: a set's pool is 0 a window after its last job) | $0.00 |
+| Idle at the floors while jobs arrive (1 machine each of 2, 4 and 8 vCPU, overnight) | $0.20 |
 | Idle pools at full rollout, modelled over a weekday (all of megpt-mono's Linux jobs here, hydrated machines) | $17.7 on average |
 
 A busy hour costs what its jobs run for at those prices, plus about 30 s of boot and shutdown per job (a machine runs

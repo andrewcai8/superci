@@ -327,8 +327,15 @@ func (c Config) PoolBounds(spec SetSpec, t time.Time) (floor, top int) {
 	return share(floor), max(share(floor), share(top))
 }
 
-// PoolTarget is the pool a set keeps given the burst its recent jobs ask for (State.Burst), within the hour's bounds.
+// PoolTarget is the pool a set keeps given the burst its recent jobs ask for (State.Burst), within the hour's bounds. The
+// floor is a floor under a pool that has jobs to follow: a burst of 0 means no job arrived in the last window and none
+// is held, so nothing is routed to the set and its pool is 0 whatever the hour's floor says (a floor under no jobs is
+// idle machines paid for by the hour: 1,050 USD a day at the Nov 26 floors with SUPERCI_JOBS unset). Once a job arrives
+// the burst is 1 or more and the floor applies again.
 func (c Config) PoolTarget(spec SetSpec, t time.Time, burst int) int {
+	if burst <= 0 {
+		return 0
+	}
 	floor, top := c.PoolBounds(spec, t)
 	return min(top, max(floor, burst))
 }

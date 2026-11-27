@@ -69,11 +69,13 @@ func TestThePoolFollowsBurstsWithinTheHoursBounds(t *testing.T) {
 		burst, want int
 		why         string
 	}{
-		{at(3, 10), 0, 1, "no jobs: the floor"},
+		{at(3, 10), 0, 0, "no jobs: nothing is routed here, so no floor holds machines"},
+		{at(3, 10), 1, 1, "one job: the floor (1) and the burst agree"},
 		{at(3, 10), 30, 30, "the burst"},
 		{at(3, 10), 500, 50, "the hour's cap"},
 		{at(3, 50), 500, 120, "within the lead of a busier hour: its cap"},
-		{at(3, 50), 0, 2, "within the lead of a busier hour, no jobs: its floor"},
+		{at(3, 50), 0, 0, "within the lead of a busier hour, no jobs: still none"},
+		{at(3, 50), 1, 2, "within the lead of a busier hour, a job: its floor"},
 	} {
 		if n := c.PoolTarget(spec, tc.at, tc.burst); n != tc.want {
 			t.Fatalf("burst %d at %s: pool %d, want %d (%s)", tc.burst, tc.at.Format("15:04"), n, tc.want, tc.why)
