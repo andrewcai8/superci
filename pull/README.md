@@ -890,6 +890,17 @@ whose message says "burst"); `bench/measure.py BRANCH SINCE UNTIL listener.jsonl
 Spot prices on Nov 25 2026 08:00Z (median of each size's 10 cheapest pools), with its gp3 volume, a machine-hour:
 2 vCPU $0.035, 4 vCPU $0.062, 8 vCPU $0.106, 16 vCPU $0.190, 32 vCPU $0.351.
 
+These are the median of the cheapest pools, not what a size launches into. 8 vCPU runs m8azn.3xlarge (12 vCPUs, 48 GiB) first, with its `on_demand_first`
+rule: spot $0.36 to $0.62 (about $0.48 across the regions, weight 2 to 1) against $0.14 to $0.25 for m8a.2xlarge and r8a.2xlarge, and $1.2388 on demand
+(AWS price list, Nov 27). Over the 14 hours to Nov 27 04:00Z, before the rule, 27% of its machines were m8azn spot, 41% m8a and 32% r8a: about $0.27 a
+machine-hour. With the rule, at 4 vCPU's observed split of 84% spot and 16% on demand (a guess for 8 vCPU), about $0.61: +$0.33 a machine-hour, +$0.017 for a
+machine that lives 3 minutes, under Blacksmith's $0.96 an hour for 8 vCPUs on average and over it ($1.24) for a machine that lands on demand. The rule is
+bounded by the cost cap and nothing else: m8azn on demand is not limited by `on_demand_share`, so a long m8azn spot shortage in both regions puts every 8 vCPU
+machine on demand, and about 33 of them running all day reach the 1,000 USD daily cap, after which the listener launches nothing until 00:00 UTC.
+`spend-daily` (80% of the cap) pages first; no alarm watches the on-demand share. Every on-demand launch, m8azn included, counts toward the
+`on_demand_share` the slower types are held to, so after a burst of m8azn on demand the slower types get none on demand until the half hour's launches
+dilute it.
+
 | | Per hour |
 | --- | --- |
 | The listener (c7g.large on-demand, 30 GB gp3, the Elastic IP's public address) | $0.08 |
