@@ -1969,6 +1969,23 @@ class FailingTests(FailingHarness, unittest.TestCase):
         code, out = self.run_gate(self.baseline(red=[killed]) + self.superci(failed=[unit_log("suite > stampDoubles")]))
         self.assertIn("1 of 1 failed jobs could not be read (the step's process exited 137); no exclusion is drawn from them", out)
 
+    def test_a_cached_read_from_an_older_parser_is_not_served_and_the_job_is_read_again(self):
+        """9152daa cached `hard=[]` for a job that died after a red test; the parser has since learned to mark it, so its entry must not be served."""
+        red = unit_log("suite > stampDoubles")
+        with tempfile.TemporaryDirectory() as cache:
+            old = T.Cache(cache)
+            old.get(f"tests:v2:{G.REPO}:9000", lambda: {"tests": ["src/a.test.ts :: suite > stampDoubles"], "coarse": [], "hard": [], "why": ""})
+            code, out = self.run_gate(self.baseline(red=[red]) + self.superci(failed=[unit_log("suite > stampDoubles", summary=False)]), cache=cache)
+        self.assertRegex(out, r"failures \(superci\)\s+1 of 6")
+        self.assertIn(9000, LogGitHub.reads, "the job's log was read again")
+        self.assertIn("exited 1 with no bun summary", out)
+
+    def test_a_test_s_own_output_saying_the_runner_s_exit_text_does_not_make_a_red_on_main_failure_count(self):
+        red = unit_log("suite > stampDoubles")
+        code, out = self.run_gate(self.baseline(red=[red]) + self.superci(failed=[red + STAMP + "Process completed with exit code 137\n"]))
+        self.assertRegex(out, r"failures \(superci\)\s+0 of 6")
+        self.assertIn("excluded (red on Blacksmith main too)", out)
+
     def test_a_job_with_no_test_name_source_keeps_the_job_level_rule_and_says_so(self):
         self.job = "verify-tools"
         try:
@@ -2084,6 +2101,27 @@ class LogParsers(unittest.TestCase):
         self.assertEqual(G.parse_unit_log(STAMP + "##[error]Process completed with exit code 137.\n").hard, ("the step's process exited 137",))
         self.assertEqual(G.parse_integration_log(STAMP + "##[error]Process completed with exit code 143.\n").hard, ("the step's process exited 143",))
         self.assertEqual(G.parse_unit_log(STAMP + "##[error]Process completed with exit code 1.\n").hard, ())
+
+    def test_a_file_that_runs_twice_is_judged_per_run_so_a_later_run_cannot_finish_an_earlier_one(self):
+        passing = STAMP + "== bun test --isolate src/a.test.ts\n" + STAMP + " 1 pass\n" + STAMP + "Ran 1 test across 1 file. [5.00ms]\n"
+        died = "src/a.test.ts exited 1 with no bun summary: the run died after its failures"
+        self.assertEqual(G.parse_unit_log(unit_log("a > b", summary=False) + passing).hard, (died,), "a died run, then a finished one")
+        self.assertEqual(G.parse_unit_log(unit_log("a > b") + unit_log("a > b", summary=False)).hard, (died,), "a finished red run, then a died one")
+        self.assertEqual(G.parse_unit_log(unit_log("a > b") + passing).hard, (), "a finished red run and a passing one are not hard")
+
+    def test_a_target_that_runs_twice_is_judged_per_run(self):
+        t = "t.ts"
+        passing = "\n".join(STAMP + l for l in ["[integration] ── target 1/2 (worker 1, 3.0s, exit 0): t.ts", " 1 pass", "Ran 1 test across 1 file. [5.00ms]", "[integration] ── end target 1/2"]) + "\n"
+        died = "t.ts exited 1 with no bun summary: the run died after its failures"
+        self.assertEqual(G.parse_integration_log(integration_log(t, "s > one", summary=False) + passing).hard, (died,), "a died target, then a finished one")
+        self.assertEqual(G.parse_integration_log(integration_log(t, "s > one") + integration_log(t, "s > one", summary=False)).hard, (died,), "a finished red target, then a died one")
+        self.assertEqual(G.parse_integration_log(integration_log(t, "s > one") + passing).hard, ())
+
+    def test_the_text_of_the_runner_s_exit_line_inside_a_test_s_output_is_not_the_runner_s_line(self):
+        self.assertEqual(G.parse_unit_log(unit_log("a > b") + STAMP + "Process completed with exit code 137\n").hard, ())
+        self.assertEqual(G.parse_unit_log(unit_log("a > b") + STAMP + "  error: Process completed with exit code 137 was expected\n").hard, ())
+        self.assertEqual(G.parse_unit_log(unit_log("a > b") + STAMP + "##[error]Process completed with exit code 137.\n").hard, ("the step's process exited 137",))
+        self.assertEqual(G.parse_integration_log(integration_log("t.ts", "s > one") + STAMP + "Process completed with exit code 137\n").hard, ())
 
     def test_a_job_cut_by_its_timeout_is_hard(self):
         text = unit_log("a > b") + STAMP + "##[error]The operation was canceled.\n"

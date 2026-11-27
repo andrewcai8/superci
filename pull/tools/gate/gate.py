@@ -371,7 +371,7 @@ def clamp_window(job, since, b_lo, b_hi, floors=None):
     return max(since, at), max(b_lo, at), [f"{name}; " + "; ".join(lines)] if lines else [f"{name}; the window starts after it, nothing clamped"]
 
 
-PARSER_VERSION = 2  # bump with a parser change: the cache keeps what was read by job and version
+PARSER_VERSION = 3  # bump with a parser change or a change to what a read stores: the cache keeps what was read by job and version
 MAX_TEST_READS = 150
 _STAMP = re.compile(r"^\d{4}-\d\d-\d\dT[\d:.]+Z ")
 _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
@@ -380,7 +380,7 @@ _SUMMARY = re.compile(r"^\s*(\d+) (?:fail|errors?)$")  # bun's ` 1 fail` and ` 2
 _UNHANDLED = re.compile(r"^# Unhandled error between tests")
 _CUT = re.compile(r"(The operation was canceled|has exceeded the maximum execution time|received a shutdown signal|lost communication with the server)")
 _RAN = re.compile(r"^Ran \d+ tests? across ")  # bun's last line of a run that finished
-_PROCESS_EXIT = re.compile(r"Process completed with exit code (\d+)")  # GitHub's line when a step's command ends non-zero
+_PROCESS_EXIT = re.compile(r"##\[error\]Process completed with exit code (\d+)")  # GitHub's own line when a step's command ends non-zero; a test's output that says the same is not it
 BUN_FAILED_EXIT = 1  # bun test's exit code when tests failed; any other code of a file or target is a crash, a kill or a harness failure
 
 
@@ -406,10 +406,38 @@ class _Run:
         self.fails, self.reported, self.unhandled, self.ran, self.exit = [], 0, False, False, None
 
 
+class _Runs:
+    """The runs of a log in the order it shows them, one per header: a file or target that runs twice has two, each with its own `ran` and
+    `exit`. Lines of bun's output belong to the current run; the runner's verdict on a name (`exited N`) belongs to the latest run of it."""
+
+    def __init__(self):
+        self.items, self.cur = [], None
+
+    def start(self, name):
+        self.cur = _Run()
+        self.items.append((name, self.cur))
+
+    def end(self):
+        self.cur = None
+
+    def here(self):
+        if self.cur is None:
+            self.start(None)
+        return self.cur
+
+    def latest(self, name):
+        for n, r in reversed(self.items):
+            if n == name:
+                return r
+        self.items.append((name, _Run()))
+        return self.items[-1][1]
+
+
 def _runs_parsed(runs, coarse, hard):
-    """(tests, coarse, hard) from the per-file runs: each `(fail)` name, a summary that counts more than the log names, an error between tests."""
+    """(tests, coarse, hard) from the runs: each `(fail)` name, a summary that counts more than the log names, an error between tests, a run
+    that died after its failures. A job is hard when any one of its runs is."""
     tests = set()
-    for name, r in runs.items():
+    for name, r in runs.items:
         tests |= {f"{name} :: {f}" if name else f for f in r.fails}
         if r.reported > len(r.fails):
             hard.append(f"{name or 'a test file'}: bun's summary counts {r.reported} failures and errors, the log names {len(r.fails)} tests")
@@ -422,17 +450,17 @@ def _runs_parsed(runs, coarse, hard):
 
 def _exit_of(runs, coarse, hard, name, code):
     """A file or target that exited non-zero: coarse when no test is named for it, hard when the code is not bun's failed-tests code."""
-    runs.setdefault(name, _Run()).exit = int(code)
+    runs.latest(name).exit = int(code)
     if int(code) != BUN_FAILED_EXIT:
         hard.append(f"{name} exited {code}, not bun's {BUN_FAILED_EXIT} for failed tests")
-    if not runs[name].fails:
+    if not runs.latest(name).fails:
         coarse.add(name)
 
 
 def _runner_line(line, hard):
     """GitHub's `Process completed with exit code N` for a step: any N other than bun's 1 is a kill or a crash (137 is the OOM killer). Whether it
     was one is decided here; True when the line was one."""
-    m = _PROCESS_EXIT.search(line)
+    m = _PROCESS_EXIT.match(line)
     if m and int(m.group(1)) != BUN_FAILED_EXIT:
         hard.append(f"the step's process exited {m.group(1)}")
     return bool(m)
@@ -444,19 +472,18 @@ def parse_unit_log(text):
     ` N error`. Its own lines name a file that did not finish: `test-files: <file> was stopped at <limit>` and
     `terminated by <signal>` are hard, `exited N` is coarse (no test named) and hard when N is not bun's 1. A job cut by timeout-minutes
     or a cancel shows GitHub's own line, which is hard too."""
-    runs, coarse, hard, file = {}, set(), [], None
+    runs, coarse, hard = _Runs(), set(), []
     for line in log_lines(text):
         if m := re.match(r"== bun test --isolate (.+)$", line):
-            file = m.group(1)
-            runs.setdefault(file, _Run())
+            runs.start(m.group(1))
         elif m := _FAIL.match(line):
-            runs.setdefault(file, _Run()).fails.append(m.group(1))
+            runs.here().fails.append(m.group(1))
         elif m := _SUMMARY.match(line):
-            runs.setdefault(file, _Run()).reported += int(m.group(1))
+            runs.here().reported += int(m.group(1))
         elif _RAN.match(line):
-            runs.setdefault(file, _Run()).ran = True
+            runs.here().ran = True
         elif _UNHANDLED.match(line):
-            runs.setdefault(file, _Run()).unhandled = True
+            runs.here().unhandled = True
         elif m := re.match(r"test-files: (.+?) exited (\d+)$", line):
             _exit_of(runs, coarse, hard, m.group(1), m.group(2))
         elif m := re.match(r"test-files: (.+?) was stopped at (.*)$", line):
@@ -477,7 +504,7 @@ def parse_integration_log(text):
     `[integration] ── target N/M (...): <target>` and `── end target`. A target that failed with no `(fail)` line in it is coarse, and hard when
     its exit code is not bun's 1; one killed by its watchdog, one left unfinished when the shard was cut short, and a crashed runner
     (`Integration runner crashed`) are hard."""
-    runs, coarse, hard, target, listing = {}, set(), [], None, False
+    runs, coarse, hard, listing = _Runs(), set(), [], False
     for line in log_lines(text):
         if listing and (m := re.match(r" - (.+?)(?: \(exit code (\d+)\))?$", line)):
             if listing == "cut":
@@ -488,18 +515,17 @@ def parse_integration_log(text):
             continue
         listing = False
         if m := re.match(r"\[integration\] ── target \S+ \(.*\): (.+)$", line):
-            target = m.group(1)
-            runs.setdefault(target, _Run())
+            runs.start(m.group(1))
         elif line.startswith("[integration] ── end target"):
-            target = None
+            runs.end()
         elif m := _FAIL.match(line):
-            runs.setdefault(target, _Run()).fails.append(m.group(1))
+            runs.here().fails.append(m.group(1))
         elif m := _SUMMARY.match(line):
-            runs.setdefault(target, _Run()).reported += int(m.group(1))
+            runs.here().reported += int(m.group(1))
         elif _RAN.match(line):
-            runs.setdefault(target, _Run()).ran = True
+            runs.here().ran = True
         elif _UNHANDLED.match(line):
-            runs.setdefault(target, _Run()).unhandled = True
+            runs.here().unhandled = True
         elif m := re.match(r"\[integration\] Target failed with exit code (\d+): (.+)$", line):
             _exit_of(runs, coarse, hard, m.group(2), m.group(1))
         elif m := re.match(r"\[integration\] Target hung past its watchdog and was killed: (.+)$", line):
