@@ -1,7 +1,10 @@
+import atexit
 import contextlib
 import io
 import os
+import shutil
 import sys
+import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -10,6 +13,15 @@ import logs as L  # noqa: E402
 
 T = L.T
 Q = 1_000_000.0
+
+# No test reaches the listener: the token command is a stub (honoured only under SUPERCI_TEST=1).
+_STUBS = tempfile.mkdtemp()
+atexit.register(shutil.rmtree, _STUBS, True)
+with open(os.path.join(_STUBS, "token_ok"), "w") as _fh:
+    _fh.write("#!/bin/sh\nprintf '{\"token\":\"ghs_for_the_tests\",\"expires\":\"2999-01-01T00:00:00Z\"}\\n200\\n'\n")
+os.chmod(os.path.join(_STUBS, "token_ok"), 0o755)
+os.environ["SUPERCI_TEST"] = "1"
+os.environ["SUPERCI_APP_TOKEN_CMD"] = os.path.join(_STUBS, "token_ok")
 
 
 def ev(kind, dt, **kw):
@@ -182,6 +194,64 @@ class Cap(unittest.TestCase):
         starts = [c for c in calls if c[1] == "start-query"]
         self.assertEqual((len(starts), len(lines)), (1, 50), "a full answer is not a reason to split the window")
         self.assertTrue(starts[0][-1].endswith("| limit 50"))
+
+
+class GitHubAccess(unittest.TestCase):
+    """logs.py reads one job from GitHub: on the App's budget, or refused, or on the personal one when asked, like gate and timeline."""
+    URL = "https://github.com/Org/repo/actions/runs/9/job/55"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.log = os.path.join(self.tmp, "gh.log")
+        os.makedirs(os.path.join(self.tmp, "bin"))
+        for name, body in {"gh": 'printf "%s\\t%s\\n" "${GH_TOKEN-UNSET}" "$*" >> "$GHLOG"\necho \'{"id":55,"run_id":9,"name":"unit","runner_name":null,"created_at":"2026-11-25T17:00:00Z"}\'\n',
+                           "aws": 'case "$*" in *get-caller-identity*) echo 243891825325 ;; *) echo "stub aws" >&2; exit 1 ;; esac\n',
+                           "down": "echo 'ssh: timed out' >&2\nexit 255\n"}.items():
+            path = os.path.join(self.tmp, "bin", name)
+            with open(path, "w") as fh:
+                fh.write("#!/bin/sh\n" + body)
+            os.chmod(path, 0o755)
+        saved, saved_auth = dict(os.environ), T.AUTH
+        for k in ("GH_TOKEN", "GITHUB_TOKEN"):
+            os.environ.pop(k, None)
+        os.environ.update(PATH=os.path.join(self.tmp, "bin") + os.pathsep + os.environ["PATH"], GHLOG=self.log, SUPERCI_TEST="1",
+                          SUPERCI_APP_TOKEN_CMD=os.path.join(self.tmp, "bin", "down"))
+        T.AUTH = T.apptoken.Auth()
+
+        def restore():
+            os.environ.clear()
+            os.environ.update(saved)
+            T.AUTH = saved_auth
+        self.addCleanup(restore)
+
+    def run_logs(self, *argv):
+        out, err, code = io.StringIO(), io.StringIO(), None
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                L.main([self.URL, "--cache", os.path.join(self.tmp, "cache"), *argv])
+        except SystemExit as e:
+            code = e.code
+        return code, out.getvalue(), err.getvalue()
+
+    def calls(self):
+        if not os.path.exists(self.log):
+            return []
+        with open(self.log) as fh:
+            return [line.split("\t")[0] for line in fh]
+
+    def test_without_an_app_token_it_refuses_before_any_gh_call(self):
+        code, out, err = self.run_logs()
+        self.assertEqual(code, 2, (out, err))
+        self.assertIn("refusing: no GitHub App token", err)
+        self.assertIn("--personal-token", err)
+        self.assertEqual(self.calls(), [])
+
+    def test_the_override_is_announced_and_reads_on_the_callers_own_credential(self):
+        code, out, err = self.run_logs("--personal-token")
+        self.assertIn("spending the shared personal", err)
+        self.assertNotIn("refusing", err)
+        self.assertEqual(self.calls(), ["UNSET"])
 
 
 if __name__ == "__main__":

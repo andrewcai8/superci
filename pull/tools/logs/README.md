@@ -20,7 +20,7 @@ It prints, in this order:
 4. The job's host metrics summary (peaks, IO wait, cold-read MB) from `s3://superci-pull-timeline-243891825325/machines/<instance id>/summary.json` (a machine runs one job, so its instance id is the job's),
    or a line saying none was uploaded.
 
-It makes one GitHub call, the job's REST record, to turn the URL's numeric job id into the run and the machine (not cached: a job read while it waits would stay as it was),
+It makes one GitHub call, the job's REST record, on the superci App's token (it refuses with exit 2 without one; `--personal-token` spends the shared personal budget instead, [README](../../README.md#the-tools-read-github-on-the-apps-budget)), to turn the URL's numeric job id into the run and the machine (not cached: a job read while it waits would stay as it was),
 and reads the rest from CloudWatch Logs and S3 of the ci-runners account with `--profile`, read only. Run it with `python3 -I`.
 
 `superci logs` is the name the task asked for, but the `superci` CLI belongs to upstream and takes no external subcommand, so this is

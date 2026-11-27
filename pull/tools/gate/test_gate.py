@@ -1,11 +1,15 @@
+import atexit
 import collections
 import contextlib
 import io
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -13,6 +17,25 @@ sys.path.insert(0, HERE)
 import gate as G  # noqa: E402
 
 T = G.T
+
+# No test reaches the listener: the token command is a stub from here on, so nothing here runs deploy/ssh.sh.
+_STUBS = tempfile.mkdtemp()
+atexit.register(shutil.rmtree, _STUBS, True)
+
+
+def stub(name, body):
+    path = os.path.join(_STUBS, name)
+    with open(path, "w") as fh:
+        fh.write("#!/bin/sh\n" + body)
+    os.chmod(path, 0o755)
+    return path
+
+
+APP_TOKEN = "ghs_apptoken_for_the_tests"
+TOKEN_OK = stub("token_ok", f"printf '{{\"token\":\"{APP_TOKEN}\",\"expires\":\"2999-01-01T00:00:00Z\"}}\\n200\\n'\n")
+TOKEN_DOWN = stub("token_down", "echo 'ssh: connect to host: Connection timed out' >&2\nexit 255\n")
+os.environ["SUPERCI_APP_TOKEN_CMD"] = TOKEN_OK
+os.environ["SUPERCI_TEST"] = "1"  # the token command is honoured only under this flag
 
 
 def obs(wall, queue=2.0, ok=True, fleet="superci", run=None, sha="a", branch="x", job_id=None, timed_out=False, attempt=1, cancelled=False):
@@ -1218,13 +1241,15 @@ class CachedRunListing(unittest.TestCase):
     """A listing read while its run was in flight, or before a rerun began, must not stay as it was: the check that follows reads it again."""
 
     def setUp(self):
-        self.http, self.saved = FakeHTTP(), subprocess.run
+        self.http, self.saved, self.personal = FakeHTTP(), subprocess.run, T.AUTH.personal
+        T.AUTH.personal = True  # the stub stands for gh itself; the credential it is given is tested elsewhere
         subprocess.run = self.http
         self.tmp = tempfile.TemporaryDirectory()
         self.cache = T.Cache(self.tmp.name)
 
     def tearDown(self):
         subprocess.run = self.saved
+        T.AUTH.personal = self.personal
         self.tmp.cleanup()
 
     def check(self, recs):
@@ -1269,6 +1294,323 @@ class CachedRunListing(unittest.TestCase):
         self.http.runs[7] = []
         _, unmatched, calls = self.check(recs)
         self.assertEqual((len(unmatched), calls), (2, 2), "the listing, and its one second read")
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# GitHub is read on the App's budget, never on the shared personal token unless the operator says so.
+# ---------------------------------------------------------------------------------------------------------------------
+
+PULL = os.path.normpath(os.path.join(HERE, "..", ".."))
+GH_STUB = """printf '%s\\t%s\\n' "${GH_TOKEN-UNSET}" "$*" >> "$GHLOG"
+case "$*" in
+  *rate_limit*) if [ "${GH_TOKEN-}" = "@TOKEN@" ]; then echo ${APP_REMAINING:-4000}; else echo ${PERSONAL_REMAINING:-0}; fi ;;
+  *actions/variables/SUPERCI_JOBS*) echo '["verify-tools"]' ;;
+  *actions/workflows/*) if [ -n "${RUN_CREATED-}" ]; then echo '{"total_count":1,"workflow_runs":[{"id":7,"created_at":"'$RUN_CREATED'","head_branch":"main"}]}'; else echo '{"total_count":0,"workflow_runs":[],"jobs":[]}'; fi ;;
+  *) echo '{"total_count":0,"workflow_runs":[],"jobs":[]}' ;;
+esac
+""".replace("@TOKEN@", APP_TOKEN)
+
+
+class Sandbox(unittest.TestCase):
+    """A PATH of stub aws, gh and sleep, and a log of every gh call with the GH_TOKEN it ran with."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.bin = os.path.join(self.tmp, "bin")
+        os.makedirs(self.bin)
+        self.log = os.path.join(self.tmp, "gh.log")
+        open(self.log, "w").close()
+        for name, body in {
+            "gh": GH_STUB,
+            "aws": 'case "$*" in *get-caller-identity*) echo 243891825325 ;; *) echo "stub aws: no network in tests" >&2; exit 1 ;; esac\n',
+            "sleep": "exec /bin/sleep 1\n",
+        }.items():
+            path = os.path.join(self.bin, name)
+            with open(path, "w") as fh:
+                fh.write("#!/bin/sh\n" + body)
+            os.chmod(path, 0o755)
+        self.env = {k: v for k, v in os.environ.items() if k not in ("GH_TOKEN", "GITHUB_TOKEN", "SUPERCI_PERSONAL_TOKEN")}
+        self.env.update(PATH=self.bin + os.pathsep + os.environ["PATH"], GHLOG=self.log, SUPERCI_APP_TOKEN_CMD=TOKEN_OK, SUPERCI_TEST="1")
+
+    def gh_calls(self):
+        with open(self.log) as fh:
+            return [tuple(line.rstrip("\n").split("\t", 1)) for line in fh if line.strip()]
+
+
+class GateReadsOnTheAppBudget(Sandbox):
+    def run_gate(self, *argv, token_cmd=None):
+        """gate.main in this process with the sandbox's PATH, returning (SystemExit code or None, stdout, stderr)."""
+        env = dict(self.env, **({"SUPERCI_APP_TOKEN_CMD": token_cmd} if token_cmd else {}))
+        saved_env, saved_auth = dict(os.environ), getattr(T, "AUTH", None)
+        os.environ.clear()
+        os.environ.update(env)
+        if saved_auth is not None:
+            T.AUTH = T.apptoken.Auth()
+        out, err, code = io.StringIO(), io.StringIO(), None
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                G.main(["--cache", os.path.join(self.tmp, "cache"), *argv])
+        except SystemExit as e:
+            code = e.code
+        finally:
+            os.environ.clear()
+            os.environ.update(saved_env)
+            if saved_auth is not None:
+                T.AUTH = saved_auth
+        return code, out.getvalue(), err.getvalue()
+
+    def job_args(self, *more):
+        limits = os.path.join(self.tmp, "limits.tsv")
+        with open(limits, "w") as fh:
+            fh.write("lint-test-backend.yml\tverify-tools\t200\tx\n")
+        return [*more, "job", "verify-tools", "--branch-glob", "main", "--limits", limits, "--superci-source", "github"]
+
+    def test_the_gate_refuses_without_an_app_token_and_makes_no_gh_call(self):
+        code, out, err = self.run_gate(*self.job_args(), token_cmd=TOKEN_DOWN)
+        self.assertEqual(code, 2, (out, err))
+        self.assertIn("refusing: no GitHub App token", err)
+        self.assertIn("--personal-token", err, "the refusal says how to spend the personal budget on purpose")
+        self.assertNotIn("Connection timed out", out)
+        self.assertEqual(self.gh_calls(), [], "a refused gate reads nothing from GitHub")
+
+    def test_the_override_is_announced_and_reads_on_the_callers_own_credential(self):
+        code, out, err = self.run_gate(*self.job_args("--personal-token"), token_cmd=TOKEN_DOWN)
+        self.assertIn("spending the shared personal", err)
+        self.assertNotIn("refusing", err)
+        calls = self.gh_calls()
+        self.assertTrue(calls, "the gate read GitHub once it was allowed to")
+        self.assertEqual({tok for tok, _ in calls}, {"UNSET"}, "no App token was made, so no call carries one")
+
+    def test_with_an_app_token_every_gh_call_carries_it(self):
+        code, out, err = self.run_gate(*self.job_args())
+        calls = self.gh_calls()
+        self.assertTrue(calls, (code, out, err))
+        self.assertEqual({tok for tok, _ in calls}, {APP_TOKEN}, calls)
+        self.assertNotIn(APP_TOKEN, out + err, "the token is never printed")
+
+    def test_a_scale_window_the_records_cover_needs_no_token_to_start(self):
+        code, out, err = self.run_gate("scale", "--from", "2026-11-25T14:00:00Z", "--to", "2026-11-25T14:01:00Z", "--trace", os.path.join(self.tmp, "none.json"),
+                                       "--superci-source", "events", token_cmd=TOKEN_DOWN)
+        self.assertNotIn("refusing: no GitHub App token", err)
+        self.assertEqual(self.gh_calls(), [])
+
+    def test_the_limits_file_is_read_on_the_personal_token_as_a_named_exception(self):
+        saved_env, saved_auth = dict(os.environ), getattr(T, "AUTH", None)
+        os.environ.clear()
+        os.environ.update(self.env)
+        if saved_auth is not None:
+            T.AUTH = T.apptoken.Auth()
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                G.gh_raw("scripts/verify/ci-limits.tsv")
+        finally:
+            os.environ.clear()
+            os.environ.update(saved_env)
+            if saved_auth is not None:
+                T.AUTH = saved_auth
+        self.assertEqual({tok for tok, _ in self.gh_calls()}, {"UNSET"})
+        self.assertIn("personal-token exception ci-limits.tsv", err.getvalue())
+
+
+class CanaryReadsOnTheAppBudget(Sandbox):
+    def canary(self, token_cmd=None, **extra):
+        until = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 2))
+        env = dict(self.env, EVERY="600", LOG=self.tmp, **extra)
+        if token_cmd:
+            env["SUPERCI_APP_TOKEN_CMD"] = token_cmd
+        p = subprocess.run(["bash", os.path.join(HERE, "canary.sh"), "2026-11-27T00:00:00Z", until, "verify-tools"], env=env, capture_output=True, text=True, timeout=120)
+        return p.returncode, p.stdout, p.stderr
+
+    def test_the_floor_check_reads_with_the_token_the_checks_use(self):
+        code, out, err = self.canary(APP_REMAINING="100")
+        rate = [tok for tok, args in self.gh_calls() if "rate_limit" in args]
+        self.assertTrue(rate, (code, out, err))
+        self.assertEqual(set(rate), {APP_TOKEN}, "the floor read another token's budget than the checks spend")
+        self.assertIn("skipped, 100 GitHub reads left", out, "and it is the App's budget the floor compares with 1,500")
+        self.assertNotIn(APP_TOKEN, out + err)
+
+    def test_a_canary_without_an_app_token_refuses_and_reads_nothing(self):
+        code, out, err = self.canary(TOKEN_DOWN)
+        self.assertEqual(code, 2, (out, err))
+        self.assertIn("refusing: no GitHub App token", err)
+        self.assertEqual(self.gh_calls(), [])
+
+    def test_the_override_is_announced_and_leaves_the_calls_on_the_personal_credential(self):
+        code, out, err = self.canary(TOKEN_DOWN, SUPERCI_PERSONAL_TOKEN="1", PERSONAL_REMAINING="100")
+        self.assertIn("spending the shared personal", err)
+        self.assertNotIn("refusing", err)
+        rate = [tok for tok, args in self.gh_calls() if "rate_limit" in args]
+        self.assertTrue(rate and set(rate) == {"UNSET"}, (code, out, err))
+        self.assertIn("skipped, 100 GitHub reads left", out)
+
+    def test_the_variable_stays_on_the_personal_token_and_says_so(self):
+        code, out, err = self.canary(APP_REMAINING="100")
+        var = [tok for tok, args in self.gh_calls() if "actions/variables/SUPERCI_JOBS" in args]
+        self.assertTrue(var, (code, out, err))
+        self.assertEqual(set(var), {"UNSET"}, "SUPERCI_JOBS is a named personal-token exception")
+        self.assertIn("personal-token exception SUPERCI_JOBS", err)
+
+
+class PersonalTokenExceptions(unittest.TestCase):
+    def test_the_exceptions_the_code_makes_are_exactly_the_readmes(self):
+        def read(*parts):
+            try:
+                with open(os.path.join(PULL, *parts)) as fh:
+                    return fh.read()
+            except FileNotFoundError:
+                return ""
+
+        readme = read("README.md")
+        table = readme.partition("Personal-token exceptions")[2]
+        documented = set(re.findall(r"^\| `([^`]+)` \|", table, re.M))
+        keys = set(re.findall(r'^    "([^"]+)": \(', read("tools", "timeline", "apptoken.py"), re.M))
+        used = set(re.findall(r'exception="([^"]+)"', read("tools", "gate", "gate.py") + read("tools", "timeline", "timeline.py")))
+        used |= set(re.findall(r"\bpersonal ([A-Za-z0-9_.-]+) (?:api|variable)\b", read("tools", "gate", "canary.sh")))
+        self.assertTrue(documented, "the README lists the personal-token exceptions")
+        self.assertEqual(keys, documented, "EXCEPTIONS in apptoken.py and the README differ")
+        self.assertEqual(used, documented, "a call site uses an exception the README does not list, or the README lists one nothing uses")
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# A refusal in the middle of a command stops it; it is never a skipped run.
+# ---------------------------------------------------------------------------------------------------------------------
+
+# A listener that answers for its first OK_MINTS asks (each token lives 2 minutes, so every later use asks again) and then fails
+# the way an ssh or Instance Connect flake does: the way a refresh in the middle of a long gate can.
+FLAKY = """n=$(($(cat "$MINTS" 2>/dev/null || echo 0)+1)); echo $n > "$MINTS"
+exp=$(date -u -d '+120 seconds' +%Y-%m-%dT%H:%M:%SZ)
+if [ $n -le ${OK_MINTS:-0} ]; then printf '{"token":"@TOKEN@","expires":"%s"}\\n200\\n' "$exp"; exit 0; fi
+if [ -n "${LEAK-}" ]; then printf '{"token":"@TOKEN@","expires":"%s"}\\n200\\n' "$exp"; fi
+echo 'ssh: Connection timed out during banner exchange' >&2
+exit 255
+""".replace("@TOKEN@", APP_TOKEN)
+
+
+class RefusalMidRun(Sandbox):
+    def setUp(self):
+        super().setUp()
+        self.mints = os.path.join(self.tmp, "mints")
+        self.flaky = stub("flaky", FLAKY)
+        self.env.update(SUPERCI_APP_TOKEN_CMD=self.flaky, MINTS=self.mints, RUN_CREATED=T.iso(time.time() - 3600))
+
+    def in_env(self, **more):
+        saved, saved_auth = dict(os.environ), T.AUTH
+        os.environ.clear()
+        os.environ.update(self.env, **more)
+        T.AUTH = T.apptoken.Auth()
+        def restore():
+            os.environ.clear()
+            os.environ.update(saved)
+            T.AUTH = saved_auth
+        self.addCleanup(restore)
+
+    def test_a_refresh_that_fails_in_the_middle_of_jobs_of_stops_the_command_and_skips_no_run(self):
+        self.in_env(OK_MINTS="1")
+        gh = T.GitHub("o/r", T.Cache(os.path.join(self.tmp, "cache")))
+        try:
+            got, raised = G.jobs_of(gh, [{"id": i} for i in range(1, 7)]), None
+        except BaseException as e:  # noqa: BLE001
+            got, raised = None, e
+        self.assertIsNotNone(raised, f"the refusal was swallowed: {gh.skipped} of 6 runs recorded as skipped, jobs {got}")
+        self.assertEqual(gh.skipped, [], "no run is skipped for want of a token")
+        self.assertIsInstance(raised, T.apptoken.AppTokenRefused)
+        self.assertNotIsInstance(raised, SystemExit, "a SystemExit is what every skip-this-run catch swallows")
+
+    def test_a_refresh_that_fails_in_the_middle_of_a_timeline_compare_is_not_a_skipped_run(self):
+        self.in_env(OK_MINTS="0")
+        gh = T.GitHub("o/r", T.Cache(os.path.join(self.tmp, "cache")))
+        try:
+            got, raised = T.safe(lambda: gh.run_jobs(7), 7), None
+        except BaseException as e:  # noqa: BLE001
+            got, raised = None, e
+        self.assertIsNotNone(raised, f"timeline.safe() turned the refusal into an empty run listing: {got}")
+
+    def test_the_gate_exits_2_with_the_reason_when_the_refresh_fails_after_the_listing_was_read(self):
+        # mints: the gate's start, the run listing's two reads; the fourth is the first run's jobs.
+        self.in_env(OK_MINTS="3")
+        err, out, code = io.StringIO(), io.StringIO(), None
+        limits = os.path.join(self.tmp, "limits.tsv")
+        with open(limits, "w") as fh:
+            fh.write("lint-test-backend.yml\tverify-tools\t200\tx\n")
+        try:
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+                G.main(["--cache", os.path.join(self.tmp, "cache"), "job", "verify-tools", "--branch-glob", "main", "--limits", limits, "--superci-source", "github"])
+        except SystemExit as e:
+            code = e.code
+        self.assertEqual(code, 2, (out.getvalue()[-400:], err.getvalue()[-400:]))
+        self.assertIn("refusing: no GitHub App token", err.getvalue())
+        self.assertNotIn("skipped", out.getvalue(), "no criteria were judged on a sample that lost runs")
+
+    def canary_tree(self, gate_body):
+        """canary.sh beside a gate.py that is a stub, so only the canary's own handling of an exit code is run."""
+        root = os.path.join(self.tmp, "tree")
+        os.makedirs(os.path.join(root, "gate"))
+        os.makedirs(os.path.join(root, "timeline"))
+        shutil.copy(os.path.join(HERE, "canary.sh"), os.path.join(root, "gate", "canary.sh"))
+        shutil.copy(os.path.join(HERE, "..", "timeline", "apptoken.py"), os.path.join(root, "timeline", "apptoken.py"))
+        with open(os.path.join(root, "gate", "gate.py"), "w") as fh:
+            fh.write(gate_body)
+        return os.path.join(root, "gate", "canary.sh")
+
+    def test_a_gate_that_refuses_does_not_send_a_job_back(self):
+        script = self.canary_tree("import sys\nprint('refusing: no GitHub App token (stub)', file=sys.stderr)\nsys.exit(2)\n")
+        until = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 2))
+        env = dict(self.env, EVERY="600", LOG=self.tmp, OK_MINTS="100", APP_REMAINING="4000")
+        p = subprocess.run(["bash", script, "2026-11-27T00:00:00Z", until, "verify-tools"], env=env, capture_output=True, text=True, timeout=120)
+        self.assertIn("(exit 2,", p.stdout, (p.stdout, p.stderr))
+        self.assertNotIn("SUPERCI_JOBS was", p.stdout, "remove() ran")
+        self.assertEqual([a for _, a in self.gh_calls() if a.startswith("variable")], [], "the variable was edited")
+
+
+class NoTokenInAMessage(Sandbox):
+    def setUp(self):
+        super().setUp()
+        self.mints = os.path.join(self.tmp, "mints")
+        self.env.update(SUPERCI_APP_TOKEN_CMD=stub("flaky", FLAKY), MINTS=self.mints, LEAK="1")
+        self.tmpdir = os.path.join(self.tmp, "tmpdir")
+        os.makedirs(self.tmpdir)
+
+    def canary(self, **extra):
+        until = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 2))
+        env = dict(self.env, EVERY="600", LOG=self.tmp, TMPDIR=self.tmpdir, **extra)
+        p = subprocess.run(["bash", os.path.join(HERE, "canary.sh"), "2026-11-27T00:00:00Z", until, "verify-tools"], env=env, capture_output=True, text=True, timeout=120)
+        return p
+
+    def test_ssh_failing_after_curl_printed_a_token_puts_no_token_in_the_refusal(self):
+        self.env["OK_MINTS"] = "0"
+        p = subprocess.run([sys.executable, "-B", os.path.join(HERE, "..", "timeline", "apptoken.py")], env=self.env, capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2, p)
+        self.assertNotIn("ghs_", p.stdout + p.stderr)
+        self.assertIn("exit 255", p.stderr, "the refusal still says what failed")
+
+    def test_the_canary_log_holds_no_token_when_the_refresh_of_a_tick_fails_that_way(self):
+        p = self.canary(OK_MINTS="1")  # the start's mint answers; the tick's prints a token and then fails
+        self.assertIn("no GitHub App token, no check", p.stdout, (p.stdout, p.stderr))
+        self.assertNotIn("ghs_", p.stdout + p.stderr)
+        self.assertNotIn("ghs_", "".join(open(os.path.join(self.tmp, f)).read() for f in os.listdir(self.tmp) if f.startswith("canary-")))
+
+    def test_the_canary_log_holds_no_token_when_the_start_is_refused_that_way(self):
+        p = self.canary(OK_MINTS="0")
+        self.assertEqual(p.returncode, 2, (p.stdout, p.stderr))
+        self.assertNotIn("ghs_", p.stdout + p.stderr)
+
+    def test_the_temp_file_is_removed_after_a_refusal(self):
+        self.canary(OK_MINTS="0")
+        self.assertEqual(os.listdir(self.tmpdir), [])
+
+    def test_the_temp_file_is_removed_when_the_watch_is_killed(self):
+        until = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 60))
+        env = dict(self.env, EVERY="600", LOG=self.tmp, TMPDIR=self.tmpdir, OK_MINTS="100")
+        p = subprocess.Popen(["bash", os.path.join(HERE, "canary.sh"), "2026-11-27T00:00:00Z", until, "verify-tools"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        deadline = time.time() + 30
+        while not self.gh_calls() and time.time() < deadline:  # the watch is in its loop once it has read SUPERCI_JOBS
+            time.sleep(0.1)  # a bounded wait on a condition (the watch has started), not a fixed delay
+        self.assertTrue(os.listdir(self.tmpdir), "the watch made no temp file to remove")
+        p.terminate()
+        p.communicate(timeout=30)
+        self.assertEqual(os.listdir(self.tmpdir), [], "a killed watch left its temp file")
 
 
 if __name__ == "__main__":

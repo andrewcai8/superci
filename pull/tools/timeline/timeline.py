@@ -31,6 +31,11 @@ import sys
 import time
 import urllib.parse
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import apptoken  # noqa: E402
+
+AUTH = apptoken.AUTH
+
 LISTENER_GROUP = "/superci-pull/listener"
 EC2_GROUP = "/superci-pull/ec2-state"
 SUPERCI_RUNNER_GROUP = "superci-pull"
@@ -297,7 +302,7 @@ class GitHub:
         def fetch():
             for attempt in range(4):
                 self.calls += 1
-                p = subprocess.run(["gh", "api", f"repos/{self.repo}/{path}"], capture_output=True, text=True)
+                p = AUTH.gh(["api", f"repos/{self.repo}/{path}"])
                 if not p.returncode:
                     return p.stdout if raw else json.loads(p.stdout)
                 if "HTTP 4" in p.stderr and "HTTP 429" not in p.stderr:
@@ -682,12 +687,14 @@ def cmd_export(a):
         print(f"export task {t['taskId']}: {region} {group} {a.day} to s3://{bucket}/timeline/{region}{group}/{a.day}")
 
 
+@apptoken.refuse_as_exit
 def main(argv=None):
     p = argparse.ArgumentParser(prog="timeline", description=__doc__.split("\n")[0])
     p.add_argument("--profile", default=os.environ.get("AWS_PROFILE", "ci-runners"), help="AWS profile of the superci account")
     p.add_argument("--repo", default="Authentic-Intelligence/megpt-mono")
     p.add_argument("--cache", default=os.path.expanduser("~/.cache/superci-timeline"), help="directory of cached GitHub answers")
     p.add_argument("--legacy", action="store_true", help="also rebuild launches and registrations from CloudTrail and the old listener lines")
+    p.add_argument("--personal-token", action="store_true", help="read GitHub on the shared personal token's budget when the superci App's token cannot be had (default: refuse)")
     sub = p.add_subparsers(dest="cmd", required=True)
     j = sub.add_parser("job", help="one job's phase-by-phase breakdown")
     j.add_argument("job_id")
@@ -711,6 +718,9 @@ def main(argv=None):
     e.add_argument("--day", required=True, help="UTC day, YYYY-MM-DD")
     e.set_defaults(fn=cmd_export)
     a = p.parse_args(argv)
+    AUTH.personal = a.personal_token
+    if a.cmd != "export":
+        AUTH.require()
     a.fn(a)
 
 

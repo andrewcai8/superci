@@ -12,6 +12,11 @@ gate scale --from T --to T --trace trace.json [--workflow superci-load.yml] [--b
 gate replay-trace --hour T [--hours 1] [--bucket 60] [--out trace.json]                         a real hour's arrivals
 ```
 
+GitHub is read on the superci App's installation budget through a token the listener mints
+([how, the refusal and the two personal-token exceptions](../../README.md#the-tools-read-github-on-the-apps-budget)):
+with no App token `gate job` and `gate replay-trace` exit 2 before reading anything, unless `--personal-token` (before the
+subcommand) spends the shared personal budget on purpose. `canary.sh` takes `SUPERCI_PERSONAL_TOKEN=1` for the same.
+
 `--cache DIR` (before the subcommand) keeps GitHub's answers; a finished job never changes, so a rerun costs no calls.
 Exit 0 only when every criterion passes. 1 is FAIL, or INCONCLUSIVE when every miss is a pass inside the noise.
 

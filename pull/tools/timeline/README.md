@@ -47,6 +47,13 @@ ec2, machine, network, runner).
 - **Warm or cold** is the machine's launch against the job's creation. With no launch event and a queue wait under 6 s the
   machine is `warm (inferred)`: a machine cannot launch and boot that fast.
 
+## GitHub access
+
+Every GitHub read goes through `apptoken.py`: a read-only installation token the listener's admin endpoint mints
+(`deploy/ssh.sh`), kept in memory and given to `gh` as `GH_TOKEN`. With none, the command exits 2 and says why;
+`--personal-token` (before the subcommand) spends the shared personal budget instead. See the
+[README](../../README.md#the-tools-read-github-on-the-apps-budget).
+
 ## Events and where they are written
 
 | Event | Written by |

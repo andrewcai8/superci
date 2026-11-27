@@ -132,14 +132,18 @@ def select(events, run, name, inst):
     return mine + assigned[-1:]
 
 
+@T.apptoken.refuse_as_exit
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("url")
     p.add_argument("--profile", default=os.environ.get("AWS_PROFILE", "ci-runners"))
     p.add_argument("--cache", default=os.path.expanduser("~/.cache/superci-timeline"))
     p.add_argument("--no-metrics", action="store_true", help="skip the S3 read of the host metrics summary")
+    p.add_argument("--personal-token", action="store_true", help="read GitHub on the shared personal token's budget when the superci App's token cannot be had (default: refuse)")
     a = p.parse_args(argv)
     repo, run, job_id = parse_url(a.url)
+    T.AUTH.personal = a.personal_token
+    T.AUTH.require()
     job = T.GitHub(repo, T.Cache(a.cache)).api(f"actions/jobs/{job_id}", keep=False)  # not cached: a job read while it waits would stay as it was
     run = job.get("run_id") or run
     inst = T.instance_of(job.get("runner_name"))
