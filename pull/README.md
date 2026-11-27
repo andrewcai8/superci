@@ -26,10 +26,14 @@ superci-pull: one process on one c7g.large, an Auto Scaling group of one in us-e
               then m8a and r8a; the others: c8a and m8a, then c8i, m8i, c7a and m7a, then older families) x every zone of us-east-1 that
               offers them (5 of 6: use1-az3 offers none) at weight 2 and of us-east-2 (3 of 3) at weight 1; a
               region's spot shortfall goes to the other, then on-demand, at most 10% of the last half hour's
-              launches. A size's `on_demand_first` leading types (superci-4cpu: m8azn) go first, spot then on
-              demand outside that 10%, before any slower type: m8azn spot is thin (10 of 11 m8azn-only asks
+              launches. A size's `on_demand_first` leading types (superci-4cpu and superci-8cpu: m8azn) go first, spot then
+              on demand outside that 10%, before any slower type: m8azn spot is thin (10 of 11 m8azn-only asks
               failed, Nov 26), on-demand m8azn.xlarge is $0.41/h against Blacksmith's $0.48/h for 4 vCPUs, and
-              unit legs ran 12% slower on m8a and r8a (93 s against 83 s); a ClientToken on every call
+              unit legs ran 12% slower on m8a and r8a (93 s against 83 s). superci-8cpu had no such rule: 1,062 of
+              its 1,461 launches in 14 hours to Nov 27 04:00Z (73%) were m8a.2xlarge or r8a.2xlarge. On demand its
+              m8azn.3xlarge (12 vCPUs, 48 GiB) is $1.2388/h (AWS price list, us-east-1) against Blacksmith's $0.96/h for
+              8 vCPUs, and spot $0.36 to $0.62 against $0.14 to $0.25 for the slower types, so the rule adds about
+              $0.33 per machine-hour (below); a ClientToken on every call
   /jit      : POST with the machine's signed identity document; a runner only for a machine never issued one, only
               once its grant has made the machine's claim (s3://superci-pull-claims-<account>/issued/<instance>),
               and its config leaves only after EC2 has the machine's superci-pull-issued tag
