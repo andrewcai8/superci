@@ -186,7 +186,7 @@ func TestAlarmsAreOnTheDashboardPageOneTopicAndNameNoPerson(t *testing.T) {
 	for _, g := range regexp.MustCompile(`(?m)^(?:alarm|math) (\S+) `).FindAllStringSubmatch(string(script), -1) {
 		made["superci-pull-"+g[1]] = true
 	}
-	for _, want := range []string{"superci-pull-job-failure-rate", "superci-pull-idle-spend-unrouted", "superci-pull-oldest-job-wait"} {
+	for _, want := range []string{"superci-pull-job-failure-rate", "superci-pull-idle-spend-unrouted", "superci-pull-on-demand-share", "superci-pull-oldest-job-wait"} {
 		if !made[want] {
 			t.Errorf("alarms.sh does not make %s", want)
 		}
@@ -223,7 +223,7 @@ func TestAlarmsAreOnTheDashboardPageOneTopicAndNameNoPerson(t *testing.T) {
 func TestHarmAlarmsReadTheJobMetricsTheyNameWithTheirThresholds(t *testing.T) {
 	script, _ := os.ReadFile("deploy/alarms.sh")
 	s := string(script)
-	for _, want := range []string{`IF(failed + passed >= 20, 100 * failed / (failed + passed), 0)`, `GreaterThanThreshold 20 3 2 notBreaching`,
+	for _, want := range []string{`IF(machines >= 10, share, 0)`, `GreaterThanThreshold 0.4 6 6 notBreaching`, `"MetricName":"OnDemandShare"`, `IF(failed + passed >= 20, 100 * failed / (failed + passed), 0)`, `GreaterThanThreshold 20 3 2 notBreaching`,
 		`IF(FILL(started, 0) < 1 AND idle > 8, idle, 0)`, `GreaterThanThreshold 8 6 6 notBreaching`, `"MetricName":"JobsCompleted"`, `"MetricName":"SpendIdlePerHourUSD"`,
 		`"BudgetName": "superci-pull-daily"`, `"TimeUnit": "DAILY"`, `for t in (80, 100)`} {
 		if !strings.Contains(s, want) {
