@@ -135,7 +135,7 @@ func (f *Fleet) AddSet(ctx context.Context, spec SetSpec, userData string, group
 	}
 	for _, r := range f.regions {
 		sr := &setRegion{}
-		if err := sr.ensureTemplate(ctx, r, "superci-pull-"+spec.Name, userData, groups[r.Name], spec.DiskGB, sf.tags); err != nil {
+		if err := sr.ensureTemplate(ctx, r, "superci-pull-"+spec.Name, userData, groups[r.Name], spec.DiskGB, spec, sf.tags); err != nil {
 			return nil, fmt.Errorf("%s %s template: %w", spec.Name, r.Name, err)
 		}
 		if err := sr.findPools(ctx, r, spec.Types); err != nil {
@@ -152,7 +152,14 @@ func (f *Fleet) AddSet(ctx context.Context, spec SetSpec, userData string, group
 	return sf, nil
 }
 
-func (sr *setRegion) ensureTemplate(ctx context.Context, r *Region, name, userData, group string, diskGB int, tags []ec2types.Tag) error {
+// rootDevice is a machine's root volume: gp3 at the size's IOPS and throughput.
+func rootDevice(name string, diskGB int, spec SetSpec) []ec2types.LaunchTemplateBlockDeviceMappingRequest {
+	iops, mbps := spec.RootVolume()
+	return []ec2types.LaunchTemplateBlockDeviceMappingRequest{{DeviceName: aws.String(name), Ebs: &ec2types.LaunchTemplateEbsBlockDeviceRequest{
+		VolumeSize: aws.Int32(int32(diskGB)), VolumeType: ec2types.VolumeTypeGp3, Iops: aws.Int32(int32(iops)), Throughput: aws.Int32(int32(mbps)), DeleteOnTermination: aws.Bool(true)}}}
+}
+
+func (sr *setRegion) ensureTemplate(ctx context.Context, r *Region, name, userData, group string, diskGB int, spec SetSpec, tags []ec2types.Tag) error {
 	data := &ec2types.RequestLaunchTemplateData{
 		ImageId:                           aws.String(r.image),
 		UserData:                          aws.String(base64.StdEncoding.EncodeToString([]byte(userData))),
@@ -161,9 +168,8 @@ func (sr *setRegion) ensureTemplate(ctx context.Context, r *Region, name, userDa
 		InstanceInitiatedShutdownBehavior: ec2types.ShutdownBehaviorTerminate,
 		MetadataOptions: &ec2types.LaunchTemplateInstanceMetadataOptionsRequest{HttpTokens: ec2types.LaunchTemplateHttpTokensStateRequired,
 			HttpPutResponseHopLimit: aws.Int32(1), HttpEndpoint: ec2types.LaunchTemplateInstanceMetadataEndpointStateEnabled},
-		BlockDeviceMappings: []ec2types.LaunchTemplateBlockDeviceMappingRequest{{DeviceName: aws.String(r.root), Ebs: &ec2types.LaunchTemplateEbsBlockDeviceRequest{
-			VolumeSize: aws.Int32(int32(diskGB)), VolumeType: ec2types.VolumeTypeGp3, Iops: aws.Int32(3000), Throughput: aws.Int32(250), DeleteOnTermination: aws.Bool(true)}}},
-		TagSpecifications: []ec2types.LaunchTemplateTagSpecificationRequest{{ResourceType: ec2types.ResourceTypeInstance, Tags: tags}, {ResourceType: ec2types.ResourceTypeVolume, Tags: tags}},
+		BlockDeviceMappings: rootDevice(r.root, diskGB, spec),
+		TagSpecifications:   []ec2types.LaunchTemplateTagSpecificationRequest{{ResourceType: ec2types.ResourceTypeInstance, Tags: tags}, {ResourceType: ec2types.ResourceTypeVolume, Tags: tags}},
 	}
 	got, err := r.ec2.DescribeLaunchTemplates(ctx, &ec2.DescribeLaunchTemplatesInput{LaunchTemplateNames: []string{name}})
 	if err == nil && len(got.LaunchTemplates) == 1 {
@@ -203,6 +209,7 @@ func sameData(have *ec2types.ResponseLaunchTemplateData, want *ec2types.RequestL
 		have.IamInstanceProfile != nil && strings.HasSuffix(aws.ToString(have.IamInstanceProfile.Arn), "/superci-pull-cache-machine") &&
 		aws.ToString(h.DeviceName) == aws.ToString(w.DeviceName) &&
 		aws.ToInt32(h.Ebs.VolumeSize) == aws.ToInt32(w.Ebs.VolumeSize) && aws.ToInt32(h.Ebs.Throughput) == aws.ToInt32(w.Ebs.Throughput) &&
+		aws.ToInt32(h.Ebs.Iops) == aws.ToInt32(w.Ebs.Iops) &&
 		aws.ToInt32(have.MetadataOptions.HttpPutResponseHopLimit) == aws.ToInt32(want.MetadataOptions.HttpPutResponseHopLimit) &&
 		string(have.MetadataOptions.HttpTokens) == string(want.MetadataOptions.HttpTokens)
 }

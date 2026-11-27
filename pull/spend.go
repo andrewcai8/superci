@@ -37,7 +37,9 @@ type Spend struct {
 const (
 	onDemandPerVCPUHour = 0.155            // m8azn.3xlarge's list price ($1.24) over the 8 vCPUs of the set it serves, the most of the types used
 	gp3PerGBHour        = 0.08 / 730       // storage
-	gp3ExtraPerHour     = 125 * 0.04 / 730 // 250 MB/s is 125 above the free 125; 3,000 IOPS are free
+	gp3ExtraPerHour     = 125 * 0.04 / 730 // the defaults' extra: 250 MiB/s is 125 above the free 125, and 3,000 IOPS are free
+	gp3PerMBpsHour      = 0.04 / 730       // a MiB/s above 125
+	gp3PerIOPSHour      = 0.005 / 730      // an IOPS above 3,000
 	ipv4PerHour         = 0.005            // every machine has a public IPv4 address (the default subnets give one)
 )
 
@@ -64,6 +66,12 @@ func (s *Spend) SetPrices(p map[string]float64) {
 	}
 }
 
+// volumeExtraPerHour is what a machine's root volume costs an hour beyond its storage: the throughput over 125 MiB/s and the IOPS over 3,000.
+func volumeExtraPerHour(spec SetSpec) float64 {
+	iops, mbps := spec.RootVolume()
+	return float64(mbps-125)*gp3PerMBpsHour + float64(max(0, iops-3000))*gp3PerIOPSHour
+}
+
 // price is a machine's cost an hour.
 func (s *Spend) price(m Machine) float64 {
 	spec := s.sets[m.Set]
@@ -74,7 +82,7 @@ func (s *Spend) price(m Machine) float64 {
 			p = v
 		}
 	}
-	return p + float64(spec.DiskGB)*gp3PerGBHour + gp3ExtraPerHour + ipv4PerHour
+	return p + float64(spec.DiskGB)*gp3PerGBHour + volumeExtraPerHour(spec) + ipv4PerHour
 }
 
 // Price is a machine's estimated cost an hour, for a record of the job it ran.

@@ -55,11 +55,16 @@ type Config struct {
 
 // SizeConfig is one runner size: the label jobs ask for is its key (superci-<cpu>cpu).
 type SizeConfig struct {
-	CPU    int      `json:"cpu"`
-	Split  int      `json:"split"`
-	Max    int      `json:"max"`
-	DiskGB int      `json:"disk_gb"`
-	Types  []string `json:"types"`
+	CPU    int `json:"cpu"`
+	Split  int `json:"split"`
+	Max    int `json:"max"`
+	DiskGB int `json:"disk_gb"`
+	// DiskMBps and DiskIOPS are the root volume's gp3 throughput (MiB/s) and IOPS; 0 is the defaults, 250 and 3,000. The config takes 125 to
+	// 1,000 and 3,000 to 16,000 (the range priced and measured: gp3 itself now takes more), at most 0.25 MiB/s for each IOPS (1,000 needs 4,000)
+	// and 500 IOPS for each GiB of disk_gb.
+	DiskMBps int      `json:"disk_mbps"`
+	DiskIOPS int      `json:"disk_iops"`
+	Types    []string `json:"types"`
 	// OnDemandFirst is how many of the leading types are asked on demand, when their spot is short, before any slower type:
 	// on_demand_share bounds only the on-demand machines of the others. 0 asks every type's spot first.
 	OnDemandFirst int `json:"on_demand_first"`
@@ -235,6 +240,9 @@ func (c Config) validate() error {
 		}
 	}
 	for label, s := range c.Sizes {
+		if err := s.validVolume(); err != nil {
+			return fmt.Errorf("config: size %s: %w", label, err)
+		}
 		if !ownSetName.MatchString(label) || s.CPU <= 0 || s.Split < 1 || s.Max < 0 || len(s.Types) == 0 || s.DiskGB <= 0 {
 			return fmt.Errorf("config: size %s needs a name superci-<N>cpu, cpu, split >= 1, max, disk_gb and types", label)
 		}
@@ -299,10 +307,50 @@ type SetSpec struct {
 	CPU    int
 	Max    int
 	DiskGB int
-	Types  []string
+	// DiskMBps and DiskIOPS are SizeConfig's (0 for the defaults: RootVolume says what a machine gets).
+	DiskMBps, DiskIOPS int
+	Types              []string
 	// OnDemandFirst and Dispatch are SizeConfig's.
 	OnDemandFirst int
 	Dispatch      bool
+}
+
+// The root volume's defaults, and the range the config takes: 125 to 1,000 MiB/s, 3,000 to 16,000 IOPS, within gp3's ratios (0.25 MiB/s for each IOPS, 500 IOPS for each GiB).
+const (
+	defaultDiskMBps = 250
+	defaultDiskIOPS = 3000
+)
+
+// RootVolume is the gp3 IOPS and throughput (MiB/s) of a machine's root volume.
+func (s SetSpec) RootVolume() (iops, mbps int) {
+	iops, mbps = s.DiskIOPS, s.DiskMBps
+	if iops == 0 {
+		iops = defaultDiskIOPS
+	}
+	if mbps == 0 {
+		mbps = defaultDiskMBps
+	}
+	return iops, mbps
+}
+
+// validVolume says whether a size's gp3 settings are in the range this config takes and within gp3's ratios: a launch template EC2 refuses fails the
+// listener's start, so the config refuses first.
+func (s SizeConfig) validVolume() error {
+	spec := SetSpec{DiskMBps: s.DiskMBps, DiskIOPS: s.DiskIOPS}
+	iops, mbps := spec.RootVolume()
+	switch {
+	case s.DiskMBps < 0 || s.DiskIOPS < 0:
+		return fmt.Errorf("disk_mbps and disk_iops are not negative")
+	case mbps < 125 || mbps > 1000:
+		return fmt.Errorf("disk_mbps %d: gp3 takes 125 to 1,000", mbps)
+	case iops < 3000 || iops > 16000:
+		return fmt.Errorf("disk_iops %d: gp3 takes 3,000 to 16,000", iops)
+	case mbps*4 > iops:
+		return fmt.Errorf("disk_mbps %d needs disk_iops of at least %d: gp3 allows 0.25 MiB/s for each IOPS", mbps, mbps*4)
+	case s.DiskGB > 0 && iops > 500*s.DiskGB:
+		return fmt.Errorf("disk_iops %d needs disk_gb of at least %d: gp3 allows 500 IOPS for each GiB", iops, (iops+499)/500)
+	}
+	return nil
 }
 
 func (c Config) Sets() []SetSpec {
@@ -320,7 +368,7 @@ func (c Config) Sets() []SetSpec {
 				name = l + "-" + strconv.Itoa(k+1)
 			}
 			out = append(out, SetSpec{Name: name, Label: l, Index: k, Split: s.Split, CPU: s.CPU,
-				Max: int(math.Ceil(float64(s.Max) / float64(s.Split))), DiskGB: s.DiskGB, Types: s.Types, OnDemandFirst: s.OnDemandFirst, Dispatch: s.Dispatch})
+				Max: int(math.Ceil(float64(s.Max) / float64(s.Split))), DiskGB: s.DiskGB, DiskMBps: s.DiskMBps, DiskIOPS: s.DiskIOPS, Types: s.Types, OnDemandFirst: s.OnDemandFirst, Dispatch: s.Dispatch})
 		}
 	}
 	return out
