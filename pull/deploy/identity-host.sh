@@ -10,6 +10,7 @@
 #   superci-id register <label> <url> <group|-> <name>...   registers each name not held yet; token on stdin
 #   superci-id adopt <name>...                           uploads and starts identities already registered here; no token
 #   superci-id status                                    identities, listeners running, private memory per listener against its 64 MiB
+#   superci-id harden                                    no path root runs from stays writable by anyone else (boot runs it first)
 set -euo pipefail
 umask 077
 ROOT=${ID_ROOT:-/opt/id}
@@ -21,6 +22,7 @@ LOCK=${ID_LOCK:-/run/superci-id.lock}
 UNIT_DIR=${UNIT_DIR:-/etc/systemd/system}
 LOG=${ID_LOG:-/var/log/superci-id}
 PROC=${PROC_ROOT:-/proc}
+FSROOT=${FS_ROOT:-/}   # the filesystem harden walks: / on a host, a fake one in identity_test.sh
 FILES=".runner .credentials .credentials_rsaparams"
 BUDGET_KIB=65536 # private memory a listener may hold (64 MiB); its unit's MemoryMax restarts one at 192 MiB
 export AWS_DEFAULT_REGION=us-east-1
@@ -114,9 +116,40 @@ adopt() {
   done
 }
 
+# writable_by_others: the paths under FSROOT, outside /proc, /sys, /dev and /run, that anyone may write: every file and
+# every directory but a sticky one (/tmp's kind, where only an owner may remove or rename). The first one, with -q.
+writable_by_others() {
+  local r=${FSROOT%/} quit=()
+  [ "${1:-}" != -q ] || quit=(-quit)
+  find "${r:-/}" -xdev \( -path "$r/proc" -o -path "$r/sys" -o -path "$r/dev" -o -path "$r/run" \) -prune -o \
+    ! -type l -perm -0002 \( -type f -o \( -type d ! -perm -1000 \) \) -print "${quit[@]}"
+}
+
+# harden: nothing root runs from may be written by anyone but root, since this host holds long-lived credentials. The
+# machines' image leaves much of /usr/share, /usr/local and /opt (/opt/id's parent) mode 777 for jobs' tool installs,
+# and its runner tree, which every identity hard-links and root runs, the runner user's. sshd refuses Instance Connect's
+# key command on such a path ("Unsafe AuthorizedKeysCommand"), so before this no operator could log in either. Every
+# path anyone may write loses group and other write, Instance Connect's scripts and each directory above them lose
+# group write too (sshd refuses either), and the runner tree becomes root's. It fails while any path stays writable.
+harden() {
+  local r=${FSROOT%/} d p left
+  [ -n "$r" ] || [ "$(id -u)" = 0 ] || { echo "superci-id: harden walks / only as root" >&2; exit 1; }
+  writable_by_others | xargs -r -d '\n' chmod go-w
+  for d in "" /usr /usr/share /usr/share/ec2-instance-connect; do p=${r}${d:-/}; [ ! -e "$p" ] || chmod go-w "$p"; done
+  for d in "$r"/usr/share/ec2-instance-connect/*; do [ ! -e "$d" ] || chmod go-w "$d"; done
+  chown "${HARDEN_OWNER:-root:root}" "$SRC"
+  chown -R "${HARDEN_OWNER:-root:root}" "$SRC/bin" "$SRC/externals" "$SRC"/*.sh "$SRC/run-helper.sh.template"
+  chmod -R go-w "$SRC/bin" "$SRC/externals" "$SRC"/*.sh "$SRC/run-helper.sh.template"
+  chmod go-w "$SRC"
+  left=$(writable_by_others -q)
+  [ -z "$left" ] || { echo "superci-id: $left is still writable by others; starting nothing" >&2; exit 1; }
+  echo "hardened: nothing outside /proc, /sys, /dev, /run and sticky directories is writable by others"
+}
+
 boot() {
   local stage release want got
   for _ in $(seq 1 60); do [ -x "$SRC/bin/Runner.Listener" ] && break; sleep 5; done
+  harden
   command -v aws > /dev/null || { echo "superci-id: no aws cli on this image" >&2; exit 1; }
   # Only the shim the release names runs (release.sh writes bin/RELEASE.json).
   release=$(mktemp)
@@ -191,5 +224,6 @@ case "${1:-}" in
   register) shift; [ $# -ge 4 ] || { echo "register <label> <url> <group|-> <name>..." >&2; exit 2; }; locked; register "$@" ;;
   adopt) shift; locked; adopt "$@" ;;
   status) status ;;
-  *) echo "usage: superci-id boot|register|adopt|status" >&2; exit 2 ;;
+  harden) locked; harden ;;
+  *) echo "usage: superci-id boot|register|adopt|status|harden" >&2; exit 2 ;;
 esac

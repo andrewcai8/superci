@@ -145,8 +145,17 @@ ensure_key() {
   policy=$(render "$here/identity-key-policy.json" ACCOUNT="$ACCOUNT" ROLE=$NAME OPERATOR="$(operator_principal)")
   KEY_ARN=$($A kms describe-key --key-id $KEY_ALIAS --query KeyMetadata.Arn --output text 2> /dev/null) || KEY_ARN=""
   if [ -z "$KEY_ARN" ] || [ "$KEY_ARN" = None ]; then
-    KEY_ARN=$($A kms create-key --description 'superci-pull identity files: persistent runner credentials' --tags TagKey=purpose,TagValue=superci-pull \
-      --policy "$policy" --query KeyMetadata.Arn --output text)
+    # The role ensure_role just made is not a principal KMS knows for some seconds (IAM is eventually consistent):
+    # create-key refuses a policy naming it with MalformedPolicyDocumentException, so that answer alone is asked again.
+    local try
+    for try in $(seq 1 "${KEY_TRIES:-12}"); do
+      if KEY_ARN=$($A kms create-key --description 'superci-pull identity files: persistent runner credentials' --tags TagKey=purpose,TagValue=superci-pull \
+        --policy "$policy" --query KeyMetadata.Arn --output text 2> "$kdir/create-key.err"); then break; fi
+      if ! grep -q MalformedPolicyDocumentException "$kdir/create-key.err" || [ "$try" = "${KEY_TRIES:-12}" ]; then
+        cat "$kdir/create-key.err" >&2; die "refusing: create-key failed"
+      fi
+      sleep "${RUN_RETRY_SLEEP:-10}"
+    done
     [[ $KEY_ARN =~ ^arn:aws:kms:us-east-1:$ACCOUNT:key/[0-9a-f-]+$ ]] || die "refusing: create-key answered $KEY_ARN"
     # A key with no alias would be made again by the next run.
     $A kms create-alias --alias-name $KEY_ALIAS --target-key-id "$KEY_ARN" ||
@@ -230,7 +239,7 @@ RELEASE=$LISTENER_BUCKET
 KMS_KEY=$KEY_ARN
 CONF
 printf 'LISTENER=%s\nPIN=%s\n' '$1' '$2' > /etc/superci-shim.env
-echo '$(base64 -w0 "$here/identity-host.sh")' | base64 -d > /usr/local/bin/superci-id
+echo '$(gzip -9n < "$here/identity-host.sh" | base64 -w0)' | base64 -d | gunzip > /usr/local/bin/superci-id
 chmod 755 /usr/local/bin/superci-id
 /usr/local/bin/superci-id boot
 EOF
