@@ -29,6 +29,7 @@ type JobRecord struct {
 	Machine     *Machine // a copy; nil when the listener holds no machine of the runner (after a restart, once it is gone)
 	USD         float64  // the machine's estimated cost from its launch to the job's finish
 	BusyUSD     float64  // the share of it spent while the job ran
+	Dispatched  bool     // run by the identity plane: Queued is when an identity took the job, Started when its machine did
 }
 
 // Partial says the record lacks the job's start: its completion came after a listener restart, with no start time in the
@@ -94,6 +95,9 @@ func tlJobRecord(r JobRecord, now time.Time) {
 		"labels", r.Labels, "runner", r.Runner, "inst", r.Inst, "result", r.Result, "conclusion", r.Conclusion(),
 		"queue_time", tlTime(r.Queued), "start_time", tlTime(r.Started), "finish_time", tlTime(r.Finished),
 		"partial", r.Partial()}
+	if r.Dispatched {
+		kv = append(kv, "dispatch", true)
+	}
 	if !r.Partial() {
 		kv = append(kv, "queue_ms", r.QueueMS(), "wall_ms", r.WallMS())
 	}

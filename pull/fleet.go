@@ -41,7 +41,8 @@ type fleetAPI interface {
 // Fleet is the machines of every scale set. Every instance carries the tags purpose=superci-pull,
 // superci-pull-deployment=<deployment> and superci-pull-set=<set>, which are all the reconciler needs to find them
 // again; a listener sees and ends only the machines of its own deployment. A machine issued its runner also carries
-// superci-pull-issued.
+// superci-pull-issued, and a machine of a dispatch set superci-pull-mode=dispatch, so a size moving between the two
+// never gives one set's machines to the other.
 type Fleet struct {
 	regions    []*Region
 	deployment string
@@ -51,6 +52,8 @@ const (
 	tagDeployment = "superci-pull-deployment"
 	tagIssued     = "superci-pull-issued"
 	tagNoticed    = "superci-pull-noticed" // <owner>/<repo>/<run id> of the job a spot notice found running
+	tagMode       = "superci-pull-mode"    // "dispatch" on a machine of a dispatch set
+	tagRole       = "superci-pull-role"    // "identity" on an identity host
 )
 
 type ImageConfig struct {
@@ -127,6 +130,9 @@ func (f *Fleet) AddSet(ctx context.Context, spec SetSpec, userData string, group
 	sf := &SetFleet{fleet: f, spec: spec, regions: map[string]*setRegion{},
 		tags: []ec2types.Tag{{Key: aws.String("purpose"), Value: aws.String("superci-pull")}, {Key: aws.String(tagDeployment), Value: aws.String(f.deployment)},
 			{Key: aws.String("superci-pull-set"), Value: aws.String(spec.Name)}}}
+	if spec.Dispatch {
+		sf.tags = append(sf.tags, ec2types.Tag{Key: aws.String(tagMode), Value: aws.String("dispatch")})
+	}
 	for _, r := range f.regions {
 		sr := &setRegion{}
 		if err := sr.ensureTemplate(ctx, r, "superci-pull-"+spec.Name, userData, groups[r.Name], spec.DiskGB, sf.tags); err != nil {
@@ -489,6 +495,8 @@ func listedMachine(i ec2types.Instance, region string) *Machine {
 			m.Issued, m.Tagged = true, true
 		case tagNoticed:
 			m.Notice = true
+		case tagMode:
+			m.Dispatch = aws.ToString(t.Value) == "dispatch"
 		case "aws:ec2launchtemplate:version":
 			m.Template = aws.ToString(t.Value)
 		}
@@ -643,6 +651,27 @@ func toTypes(names []string) []ec2types.InstanceType {
 		out[i] = ec2types.InstanceType(n)
 	}
 	return out
+}
+
+// Tags is an instance's tags, read from EC2 in its region.
+func (f *Fleet) Tags(ctx context.Context, region, id string) (map[string]string, error) {
+	r := f.Region(region)
+	if r == nil {
+		return nil, fmt.Errorf("no region %q", region)
+	}
+	out, err := r.ec2.DescribeInstances(ctx, &ec2.DescribeInstancesInput{InstanceIds: []string{id}})
+	if err != nil {
+		return nil, err
+	}
+	tags := map[string]string{}
+	for _, res := range out.Reservations {
+		for _, in := range res.Instances {
+			for _, t := range in.Tags {
+				tags[aws.ToString(t.Key)] = aws.ToString(t.Value)
+			}
+		}
+	}
+	return tags, nil
 }
 
 func (f *Fleet) Region(name string) *Region {

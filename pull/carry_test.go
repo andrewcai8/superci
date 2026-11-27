@@ -97,20 +97,20 @@ func TestABurstSurvivesRestartsThroughTheSavedParameter(t *testing.T) {
 	assigned(first.state, t0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
 	at := t0.Add(time.Second)
 	first.state.Burst(at, testRule)
-	if err := savePools(context.Background(), store, name, []*Set{first}, at, testRule); err != nil {
+	if err := savePools(context.Background(), store, name, []*Set{first}, nil, at, testRule); err != nil {
 		t.Fatal(err)
 	}
 	for restart := 1; restart <= 3; restart++ {
 		at = at.Add(5 * time.Minute)
 		next := poolSet("set", at, 0)
-		if err := loadPools(context.Background(), store, name, []*Set{next}, testRule.window(), at); err != nil {
+		if err := loadPools(context.Background(), store, name, []*Set{next}, nil, testRule.window(), at); err != nil {
 			t.Fatal(err)
 		}
 		for tick := time.Duration(0); tick < time.Minute; tick += 15 * time.Second { // a minute of no arrivals, saved at the end
 			next.state.Burst(at.Add(tick), testRule)
 		}
 		at = at.Add(time.Minute)
-		if err := savePools(context.Background(), store, name, []*Set{next}, at, testRule); err != nil {
+		if err := savePools(context.Background(), store, name, []*Set{next}, nil, at, testRule); err != nil {
 			t.Fatal(err)
 		}
 		if got := next.state.Burst(at, testRule); got != 9 {
@@ -130,7 +130,7 @@ func TestTwoDeploymentsSavingDoNotEraseEachOther(t *testing.T) {
 		name string
 		sets []*Set
 	}{{prod, p}, {dev, d}, {prod, p}, {dev, d}} { // interleaved, and each twice
-		if err := savePools(ctx, store, save.name, save.sets, t0.Add(time.Minute), testRule); err != nil {
+		if err := savePools(ctx, store, save.name, save.sets, nil, t0.Add(time.Minute), testRule); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -139,7 +139,7 @@ func TestTwoDeploymentsSavingDoNotEraseEachOther(t *testing.T) {
 		burst map[string]int
 	}{{prod, map[string]int{"superci-96cpu": 56, "superci-8cpu": 12}}, {dev, map[string]int{"superci-96cpu": 2, "superci-8cpu": 0}}} {
 		restarted := []*Set{poolSet("superci-96cpu", t0.Add(2*time.Minute), 0), poolSet("superci-8cpu", t0.Add(2*time.Minute), 0)}
-		if err := loadPools(ctx, store, want.name, restarted, testRule.window(), t0.Add(2*time.Minute)); err != nil {
+		if err := loadPools(ctx, store, want.name, restarted, nil, testRule.window(), t0.Add(2*time.Minute)); err != nil {
 			t.Fatal(err)
 		}
 		for _, s := range restarted {
@@ -170,11 +170,11 @@ func TestSavingTwiceLeavesTheSameValueAsOnce(t *testing.T) {
 	store := &params{}
 	sets := []*Set{poolSet("a", t0, 7), poolSet("b", t0, 0)}
 	at := t0.Add(time.Minute)
-	if err := savePools(context.Background(), store, "p", sets, at, testRule); err != nil {
+	if err := savePools(context.Background(), store, "p", sets, nil, at, testRule); err != nil {
 		t.Fatal(err)
 	}
 	once := store.values["p"]
-	if err := savePools(context.Background(), store, "p", sets, at, testRule); err != nil {
+	if err := savePools(context.Background(), store, "p", sets, nil, at, testRule); err != nil {
 		t.Fatal(err)
 	}
 	if store.values["p"] != once {
@@ -184,7 +184,7 @@ func TestSavingTwiceLeavesTheSameValueAsOnce(t *testing.T) {
 
 func TestASaveThatFailsReportsAndWritesNothing(t *testing.T) {
 	store := &params{putErr: errors.New("throttled")}
-	if err := savePools(context.Background(), store, "p", []*Set{poolSet("a", t0, 7)}, t0, testRule); err == nil {
+	if err := savePools(context.Background(), store, "p", []*Set{poolSet("a", t0, 7)}, nil, t0, testRule); err == nil {
 		t.Fatal("a refused save returned no error: the listener would think its pools are kept")
 	}
 	if len(store.values) != 0 {
@@ -196,14 +196,14 @@ func TestLoadingResumesOnlyWhatWasSavedWithinTheWindow(t *testing.T) {
 	ctx := context.Background()
 	store := &params{}
 	saver := []*Set{poolSet("a", t0, 20), poolSet("b", t0, 30)}
-	if err := savePools(ctx, store, "p", saver, t0, testRule); err != nil {
+	if err := savePools(ctx, store, "p", saver, nil, t0, testRule); err != nil {
 		t.Fatal(err)
 	}
 	burst := func(s *Set, at time.Time) int { return s.state.Burst(at, testRule) }
 
 	fresh := t0.Add(testRule.window() - time.Minute)
 	a, b, c := poolSet("a", fresh, 0), poolSet("b", fresh, 0), poolSet("c", fresh, 0)
-	if err := loadPools(ctx, store, "p", []*Set{a, b, c}, testRule.window(), fresh); err != nil {
+	if err := loadPools(ctx, store, "p", []*Set{a, b, c}, nil, testRule.window(), fresh); err != nil {
 		t.Fatal(err)
 	}
 	if got := []int{burst(a, fresh), burst(b, fresh), burst(c, fresh)}; got[0] != 20 || got[1] != 30 || got[2] != 0 {
@@ -212,7 +212,7 @@ func TestLoadingResumesOnlyWhatWasSavedWithinTheWindow(t *testing.T) {
 
 	late := t0.Add(testRule.window() + time.Minute)
 	l := poolSet("a", late, 0)
-	if err := loadPools(ctx, store, "p", []*Set{l}, testRule.window(), late); err != nil {
+	if err := loadPools(ctx, store, "p", []*Set{l}, nil, testRule.window(), late); err != nil {
 		t.Fatal(err)
 	}
 	if got := burst(l, late); got != 0 {
@@ -222,7 +222,7 @@ func TestLoadingResumesOnlyWhatWasSavedWithinTheWindow(t *testing.T) {
 
 func TestLoadingWithNothingSavedStartsFromTheFloor(t *testing.T) {
 	s := poolSet("a", t0, 0)
-	if err := loadPools(context.Background(), &params{}, "p", []*Set{s}, testRule.window(), t0); err != nil {
+	if err := loadPools(context.Background(), &params{}, "p", []*Set{s}, nil, testRule.window(), t0); err != nil {
 		t.Fatalf("a missing parameter is a first start, not an error: %v", err)
 	}
 	if got := s.state.Burst(t0, testRule); got != 0 {
@@ -236,12 +236,41 @@ func TestLoadingFailsOnAnUnreadableValueOrAFailedRead(t *testing.T) {
 		"denied":  {getErr: errors.New("AccessDenied")},
 	} {
 		s := poolSet("a", t0, 0)
-		err := loadPools(context.Background(), store, "p", []*Set{s}, testRule.window(), t0)
+		err := loadPools(context.Background(), store, "p", []*Set{s}, nil, testRule.window(), t0)
 		if err == nil || strings.Contains(err.Error(), "ParameterNotFound") {
 			t.Errorf("%s: error %v, want one the caller logs", name, err)
 		}
 		if got := s.state.Burst(t0, testRule); got != 0 {
 			t.Errorf("%s: resumed burst %d", name, got)
 		}
+	}
+}
+
+// A dispatch set's burst is carried like a scale set's: with nothing carried, a restart (every release) would start it
+// at 0, no arrival yet, so its pool would be 0 until its next job, and its warm machines would end as surplus once
+// the warmup passed with no job (a burst of 0 is a pool of 0 whatever the hour's floor, #49).
+func TestADispatchSetsBurstSurvivesARestartThroughTheSavedParameter(t *testing.T) {
+	store := &params{}
+	const name = "/superci-pull/pool/prod"
+	spec := SetSpec{Name: "superci-4cpu", Label: "superci-4cpu", Max: 100, Dispatch: true}
+	first := NewDispatchSet(spec, nil, []string{"us-east-1"}, t0)
+	for i := range 10 {
+		first.arrive(t0.Add(time.Duration(i) * 100 * time.Millisecond))
+	}
+	at := t0.Add(time.Second)
+	want := first.Burst(at, testRule)
+	if want < 2 {
+		t.Fatalf("ten jobs at once: burst %d", want)
+	}
+	if err := savePools(context.Background(), store, name, nil, []*DispatchSet{first}, at, testRule); err != nil {
+		t.Fatal(err)
+	}
+	at = at.Add(5 * time.Minute)
+	next := NewDispatchSet(spec, nil, []string{"us-east-1"}, at)
+	if err := loadPools(context.Background(), store, name, nil, []*DispatchSet{next}, testRule.window(), at); err != nil {
+		t.Fatal(err)
+	}
+	if got := next.Burst(at, testRule); got != want {
+		t.Fatalf("after a restart: burst %d, want the %d saved", got, want)
 	}
 }

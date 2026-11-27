@@ -17,7 +17,7 @@ type Rerunner struct {
 	mu    sync.Mutex
 	rest  *REST
 	proof func(ctx context.Context, ids []string) (map[string]bool, error) // which machines a spot reclaim ended
-	lost  map[string]lostJob                                               // by runner name, so a job is run again at most once
+	lost  map[string]lostJob                                               // by key, so a job is run again at most once
 }
 
 type lostJob struct {
@@ -31,18 +31,34 @@ func NewRerunner(rest *REST, proof func(context.Context, []string) (map[string]b
 	return &Rerunner{rest: rest, proof: proof, lost: map[string]lostJob{}}
 }
 
+// key names a lost job: its runner, which takes one job, or for an identity's job (which takes many) its machine.
+func (j JobRef) key() string {
+	if j.Instance != "" {
+		return j.Instance
+	}
+	return j.Runner
+}
+
+// machine is the instance a lost job ran on.
+func (j JobRef) machine() string {
+	if j.Instance != "" {
+		return j.Instance
+	}
+	return instanceOf(j.Runner)
+}
+
 // Add records a job lost with its machine; proven when AWS's notice already says a spot reclaim took the machine.
 func (r *Rerunner) Add(j JobRef, now time.Time, proven bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if old, ok := r.lost[j.Runner]; ok {
+	if old, ok := r.lost[j.key()]; ok {
 		if proven && !old.proven {
 			old.proven = true
-			r.lost[j.Runner] = old
+			r.lost[j.key()] = old
 		}
 		return
 	}
-	r.lost[j.Runner] = lostJob{JobRef: j, at: now, proven: proven}
+	r.lost[j.key()] = lostJob{JobRef: j, at: now, proven: proven}
 	slog.Warn("job lost with its machine", "owner", j.Owner, "repo", j.Repo, "run", j.RunID, "job", j.Name, "runner", j.Runner, "proven", proven)
 }
 
@@ -89,7 +105,7 @@ func (r *Rerunner) pass(ctx context.Context) {
 		case !j.done:
 			todo = append(todo, j)
 			if !j.proven {
-				unproven = append(unproven, instanceOf(j.Runner))
+				unproven = append(unproven, j.machine())
 			}
 		}
 	}
@@ -103,7 +119,7 @@ func (r *Rerunner) pass(ctx context.Context) {
 		}
 	}
 	for _, j := range todo {
-		if !j.proven && !reclaimed[instanceOf(j.Runner)] {
+		if !j.proven && !reclaimed[j.machine()] {
 			slog.Info("lost job not re-run: no spot reclaim took its machine", "run", j.RunID, "job", j.Name, "runner", j.Runner)
 			r.settled(j)
 			continue
@@ -113,7 +129,7 @@ func (r *Rerunner) pass(ctx context.Context) {
 			r.settled(j)
 		} else {
 			r.mu.Lock()
-			r.lost[j.Runner] = j
+			r.lost[j.key()] = j
 			r.mu.Unlock()
 		}
 	}
@@ -123,7 +139,7 @@ func (r *Rerunner) settled(j lostJob) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	j.done = true
-	r.lost[j.Runner] = j
+	r.lost[j.key()] = j
 }
 
 // settle re-runs a lost job once its run has completed, if GitHub concluded it failed. It says whether the job is
@@ -133,7 +149,11 @@ func (r *Rerunner) settle(ctx context.Context, j lostJob) bool {
 	if err != nil || !completed {
 		return false
 	}
-	id, conclusion, err := r.rest.JobOf(ctx, j.Owner, j.Repo, j.RunID, j.Runner)
+	name := ""
+	if j.Instance != "" {
+		name = j.Name
+	}
+	id, conclusion, err := r.rest.JobOf(ctx, j.Owner, j.Repo, j.RunID, j.Runner, name)
 	if err != nil {
 		return false
 	}
