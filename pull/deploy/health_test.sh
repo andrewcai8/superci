@@ -104,4 +104,5 @@ grep -q -- 'set-instance-health.*--health-status Unhealthy --no-should-respect-g
 
 grep -q '^OnUnitActiveSec=15s$' "$here/superci-pull-health.timer" && grep -q '^AccuracySec=1s$' "$here/superci-pull-health.timer"; check $? "the timer fires every 15 s, accurate to a second (systemd coalesces to a minute otherwise)"
 grep -q '^TimeoutStopSec=15$' "$here/superci-pull.service"; check $? "a restart of a hung listener waits 15 s for its stop, not 90"
+grep -q '^OnBootSec=1min$' "$here/superci-pull-health.timer"; check $? "the first check comes a minute after boot, not five: a new host's hung listener is seen at once (health.sh judges nothing in a listener's first 60 s and marks nothing under 600 s of uptime)"
 exit $failed
