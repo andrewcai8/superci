@@ -1,9 +1,10 @@
 [Unit]
-Description=superci-pull: health check every minute
+Description=superci-pull: health check every 15 seconds
 
 [Timer]
-OnBootSec=5min
-OnUnitActiveSec=1min
+OnBootSec=1min
+OnUnitActiveSec=15s
+AccuracySec=1s
 
 [Install]
 WantedBy=timers.target

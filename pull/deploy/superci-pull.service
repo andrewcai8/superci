@@ -11,6 +11,7 @@ StandardOutput=append:/var/log/superci-pull/listener.jsonl
 StandardError=append:/var/log/superci-pull/listener.jsonl
 Restart=always
 RestartSec=5
+TimeoutStopSec=15
 LimitNOFILE=65536
 
 [Install]

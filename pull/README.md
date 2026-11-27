@@ -716,6 +716,7 @@ tail -f /var/log/superci-pull/listener.jsonl    # JSON events: message, fleet, r
                                                 # (also in CloudWatch Logs, group /superci-pull/listener, a stream per instance)
 curl -s localhost:8080/state | jq               # budget, spend, and per set: ready, desired, live, idle, busy, issued, pool, orphans
 curl -s localhost:8080/healthz                  # what the health timer checks (liveness: the reconciler finished a pass within 2 minutes)
+journalctl -u superci-pull-health -n 20         # what it saw: failing for N s, restarting, asking to be replaced
 ```
 
 **Change pool sizes, caps or limits.** Change the override file, `deploy/override.json`, on main, and release (Release,
@@ -850,14 +851,22 @@ To stop taking jobs, send the jobs back to Blacksmith with the fleet switch (meg
 since #34100 routes a switched job to `superci-<N>cpu`); to stop launching at once,
 `curl -s -X POST 'localhost:8080/override?max=0'` (machines end as their jobs finish).
 
-**Resilience.** systemd restarts the process (5 s). A health timer marks the instance unhealthy after five failed
-checks in a row and the Auto Scaling group replaces it. A check fails when the process's reconciler has not finished a
-pass for a minute, or when the instance does not hold the Elastic IP; GitHub's or EC2's slowness does not fail it. An
-instance that cannot take the Elastic IP at boot marks itself unhealthy at once. The group also replaces an instance
-EC2 reports down. A replacement takes the Elastic IP and the TLS key, so machines keep their address and pin, adopts
-every machine of the deployment from EC2 and every runner from GitHub, and decides nothing until every region is
-listed and each set's session has given the queue's statistics. After a crash, GitHub refuses a new session for a
-set while the dead one's lapses (30 to 75 s measured).
+**Resilience.** systemd restarts a process that crashes (5 s), and the health check (`deploy/health.sh`, every 15 s)
+acts on one that hangs. A check fails when `/healthz` does not answer 200 (the reconciler has not finished a pass for 2
+minutes) or when the instance does not hold the Elastic IP; GitHub's or EC2's slowness does not fail it. `/healthz`
+failing for 30 s on a listener that has run for 60 s restarts it, once (`TimeoutStopSec=15`: a graceful stop, else
+killed). From the hang to serving again that is about 3 minutes after a graceful stop, 4 if the process had to be
+killed and GitHub holds its dead sessions; a shim notices a silent connection after 60 s and then waits 3 minutes, so a
+restart inside that window resumes its job. A restart that does not cure it (still failing 30 s after the new
+process has run 60 s), a second hang within 10 minutes of a restart, or any failure that lasts 300 s (the Elastic IP
+lost, a listener that never settles) marks the instance unhealthy, once, and the Auto Scaling group replaces it (the
+call ignores the group's 300 s grace period, which would drop it). A listener started less than 60 s ago, or in
+systemd's starting or stopping state (a release's restart among them), is not judged, and an instance under 10 minutes
+old is not marked. An instance that cannot take the Elastic IP at boot marks itself unhealthy at once. The group also
+replaces an instance EC2 reports down. A replacement takes the Elastic IP and the TLS key, so machines keep their
+address and pin, adopts every machine of the deployment from EC2 and every runner from GitHub, and decides nothing
+until every region is listed and each set's session has given the queue's statistics. After a crash, GitHub refuses a
+new session for a set while the dead one's lapses (30 to 75 s measured).
 
 **Deploy from scratch.** `deploy/up.sh <admin-cidr>` (role, parameters, bucket, groups, address, launch template),
 `deploy/build.sh <dir>`, `deploy/release.sh <dir> pull/deploy/ssh.sh`, `deploy/up.sh` again (it starts the group once a release exists), `deploy/alarms.sh`.
