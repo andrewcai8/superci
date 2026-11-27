@@ -70,6 +70,7 @@ type JobRef struct {
 	Name        string
 	Runner      string
 	Instance    string // the machine it ran on, when the runner's name does not say (an identity's job)
+	Unrun       bool   // no machine got its bytes (an identity's job stranded before its handed point): its loss is proof enough
 }
 
 // issuingMax is how long a grant may stay unsettled before Overdue takes the machine back from it.

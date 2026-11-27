@@ -9,7 +9,8 @@ import (
 )
 
 // Rerunner runs again, once, each job a spot reclaim took: a job on a machine AWS gave notice it takes back, or on a
-// machine EC2 says a spot interruption terminated. It re-runs a job only on that proof, and only if GitHub concluded
+// machine EC2 says a spot interruption terminated, and each identity's job the dispatcher stranded before any machine
+// got it (JobRef.Unrun). It re-runs a job only on that proof, and only if GitHub concluded
 // the job failed, so a job that failed by itself, or that a person cancelled, is left as it ended. GitHub re-runs a
 // job only once its whole run has completed, so a lost job waits here until then. A start rebuilds the list from the
 // machines EC2 lists with a notice tag (for about an hour after a reclaim).
@@ -47,8 +48,10 @@ func (j JobRef) machine() string {
 	return instanceOf(j.Runner)
 }
 
-// Add records a job lost with its machine; proven when AWS's notice already says a spot reclaim took the machine.
+// Add records a job lost with its machine; proven when AWS's notice already says a spot reclaim took the machine, or
+// when no machine ran it, so its failure is superci's own.
 func (r *Rerunner) Add(j JobRef, now time.Time, proven bool) {
+	proven = proven || j.Unrun
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if old, ok := r.lost[j.key()]; ok {

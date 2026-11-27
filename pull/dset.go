@@ -45,6 +45,7 @@ type DispatchSet struct {
 	price        func(Machine) float64
 	ended        map[string]time.Time // jobs over, by id, so a late resume in this process adopts none
 	over         func(job string)     // marks a job over beside its claim, for a resume after a restart
+	stranded     []JobRef             // jobs stranded before their handed point since the reconciler last took them
 }
 
 // A dmachine is one machine of a dispatch set: EC2's facts, and where it is in its one job's life.
@@ -445,6 +446,19 @@ func (st *DispatchSet) abandon(s *session, m *dmachine) {
 	s.closeAll()
 }
 
+// strand records a job stranded before its handed point (Dispatcher.strand), for its re-run. The re-runner knows a lost
+// job by its machine, so a job two sides stranded at once is re-run once.
+func (st *DispatchSet) strand(job string, c jobClaim, inst string) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	j, ok := jobRef(jobHead{Run: c.Run, Name: c.Name, Repo: c.Repo}, c.Agent, inst)
+	slog.Warn("dispatch job stranded before its handed point", "set", st.spec.Name, "job", job, "pair", c.Lost, "run", c.Run, "name", c.Name, "rerun", ok)
+	if ok {
+		j.Unrun = true
+		st.stranded = append(st.stranded, j)
+	}
+}
+
 // handed records the handed point: the job's claim names its pair.
 func (st *DispatchSet) handed(s *session, now time.Time) {
 	st.mu.Lock()
@@ -629,7 +643,8 @@ type dispatchBounds struct {
 }
 
 // Reconcile ends what has outlived its bounds and returns the machines to terminate now and the jobs lost. A handed job
-// whose machine has been away past the window, or that ran past its bound, is lost: its shim gets exit code 1. A shim
+// whose machine has been away past the window, or that ran past its bound, is lost: its shim gets exit code 1. A job
+// stranded before its handed point is lost too, and no machine got its bytes. A shim
 // away loses nothing: the machine renews its job itself, so the job runs on to its exit code, which is held for the
 // shim until the window after the shim left. A machine waiting past its age, one that has had no connection past the
 // window, any past its life, and surplus waiting machines end; an ending machine is terminated once, then a minute on
@@ -641,10 +656,11 @@ func (st *DispatchSet) Reconcile(now time.Time, b dispatchBounds) (end []*Machin
 			delete(st.ended, job)
 		}
 	}
+	lost, st.stranded = st.stranded, nil
 	st.mu.Unlock()
 	for s, why := range st.expired(now, b) {
 		if why == machineLost {
-			if j, ok := s.jobRef(); ok {
+			if j, ok := jobRef(s.head, s.agent, s.machine); ok {
 				lost = append(lost, j)
 			}
 		}
@@ -741,12 +757,12 @@ func (st *DispatchSet) surplus(now time.Time, warmup time.Duration) {
 }
 
 // jobRef is a lost job as the re-run path finds it: its run, its name and the identity that took it.
-func (s *session) jobRef() (JobRef, bool) {
-	owner, repo, ok := strings.Cut(s.head.Repo, "/")
-	if !ok || s.head.Run == 0 {
+func jobRef(head jobHead, agent, machine string) (JobRef, bool) {
+	owner, repo, ok := strings.Cut(head.Repo, "/")
+	if !ok || head.Run == 0 {
 		return JobRef{}, false
 	}
-	return JobRef{Owner: owner, Repo: repo, RunID: s.head.Run, Name: s.head.Name, Runner: s.agent, Instance: s.machine}, true
+	return JobRef{Owner: owner, Repo: repo, RunID: head.Run, Name: head.Name, Runner: agent, Instance: machine}, true
 }
 
 func (st *DispatchSet) SetPool(n int)           { st.mu.Lock(); st.pool = n; st.mu.Unlock() }

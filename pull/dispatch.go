@@ -367,9 +367,12 @@ func jobFence(job string) string { return "job-" + job }
 const overMark = ".over"
 
 // A jobClaim is what a handed job's claim holds: the pair it was handed to, <instance>.<token>, and on a second line
-// what a dispatcher that adopts the job after a restart needs to have it re-run if its machine is lost.
+// what a dispatcher that adopts the job after a restart needs to have it re-run if its machine is lost. A machine's
+// claim holds the same, without the handed time, so the job's names outlive a process that died before the job's
+// claim. A stranded job's claim has no pair: Lost names the pair the job was PAIRED with and never handed to.
 type jobClaim struct {
 	pair    string
+	Lost    string `json:"lost,omitempty"`
 	Run     int64  `json:"run,omitempty"`
 	Name    string `json:"name,omitempty"`
 	Repo    string `json:"repo,omitempty"`
@@ -419,6 +422,10 @@ type Dispatcher struct {
 	refresh func(ctx context.Context, region string)
 	ping    time.Duration
 	silence time.Duration
+	window  time.Duration // how long a job's claim is asked with its pair before the job is stranded: the shim's resume window
+
+	life context.Context // ends with Close: a stranding waits on S3 no longer
+	stop context.CancelFunc
 
 	handing  sync.WaitGroup // hand-offs in flight
 	readers  sync.WaitGroup // connections' readers
@@ -441,8 +448,9 @@ func NewDispatcher(deployment string, sets []*DispatchSet, verifier interface {
 	Verify(body []byte) (InstanceDocument, error)
 }, claims claimStore, tags tagReader, refresh func(context.Context, string)) *Dispatcher {
 	d := &Dispatcher{deployment: deployment, sets: map[string]*DispatchSet{}, verifier: verifier, claims: claims, tags: tags,
-		refresh: refresh, ping: 20 * time.Second, silence: 60 * time.Second, lookups: make(chan struct{}, tagLookups),
+		refresh: refresh, ping: 20 * time.Second, silence: 60 * time.Second, window: resumeWindow, lookups: make(chan struct{}, tagLookups),
 		hosts: map[string]hostCheck{}, wires: map[*wire]bool{}}
+	d.life, d.stop = context.WithCancel(context.Background())
 	for _, s := range sets {
 		d.sets[s.spec.Name] = s
 		s.over = func(job string) {
@@ -691,8 +699,9 @@ const resumeRedirect = -1
 
 // resume finds the job a side rejoins after its connection broke. In this process its session says. After a restart
 // the job's claim does: it must name this pair, <instance>.<token>, and it was taken only once the machine's claim held
-// that token, so it proves the token too. A job whose claim names another pair sends the shim there. A job never handed is gone (410): a shim drops its job's bytes once PAIRED comes, so it
-// cannot start the job again.
+// that token, so it proves the token too. A job whose claim names another pair sends the shim there. A job never handed
+// is gone (410): a shim drops its job's bytes once PAIRED comes, so it cannot start the job again. A job with no claim
+// at all was PAIRED by a process that ended before its claim, and is stranded for its re-run (strand).
 func (d *Dispatcher) resume(ctx context.Context, st *DispatchSet, inst, token string, shim bool) (*session, int, []byte) {
 	_, job, ok := strings.Cut(token, ".")
 	if !ok || !jobIDForm.MatchString(job) {
@@ -716,8 +725,10 @@ func (d *Dispatcher) resume(ctx context.Context, st *DispatchSet, inst, token st
 		}
 	}
 	key := inst + "." + token
-	holder, err := d.claims.Holder(ctx, jobFence(job))
-	claim := parseJobClaim(holder)
+	claim, err := d.jobClaimOf(ctx, job)
+	if err == nil && claim == (jobClaim{}) {
+		claim, err = d.strandPaired(ctx, st, key, job)
+	}
 	fence := claim.pair
 	switch {
 	case err != nil:
@@ -736,6 +747,46 @@ func (d *Dispatcher) resume(ctx context.Context, st *DispatchSet, inst, token st
 		return nil, http.StatusGone, nil
 	}
 	return nil, resumeRedirect, pairedOf(fence)
+}
+
+// jobClaimOf is the claim a job's claim holds; none, the zero jobClaim.
+func (d *Dispatcher) jobClaimOf(ctx context.Context, job string) (jobClaim, error) {
+	holder, err := d.claims.Holder(ctx, jobFence(job))
+	return parseJobClaim(holder), err
+}
+
+// strandPaired strands a job with no claim that a side rejoins as the pair key. The machine's claim was taken before
+// PAIRED, with the job's names: it must name key, which proves the token, and gives the job's re-run its names. A
+// machine's claim that names another pair, or an earlier build's that holds only a token, strands nothing.
+func (d *Dispatcher) strandPaired(ctx context.Context, st *DispatchSet, key, job string) (jobClaim, error) {
+	inst, _, _ := strings.Cut(key, ".")
+	holder, err := d.claims.Holder(ctx, inst)
+	if err != nil {
+		return jobClaim{}, err
+	}
+	c := parseJobClaim(holder)
+	if c.pair != key {
+		return jobClaim{}, nil
+	}
+	return d.strand(ctx, st, c, job)
+}
+
+// strand settles a job PAIRED with c's pair whose claim S3 has not shown taken. It takes the job's claim with no pair,
+// after which no pair can be handed the job, and reports the job for its re-run: no machine got its bytes. Every
+// strand of one pair writes the same claim, so a strand whose answer was lost, or one from each side, finds it its
+// own. It returns the claim S3 holds: that one, or the pair's own when its claim landed first, which handed the job.
+func (d *Dispatcher) strand(ctx context.Context, st *DispatchSet, c jobClaim, job string) (jobClaim, error) {
+	lost := c
+	lost.pair, lost.Lost, lost.Handed = "", c.pair, 0
+	switch err := d.take(ctx, jobFence(job), lost.String(), 0); {
+	case errors.Is(err, ErrClaimed):
+		return d.jobClaimOf(ctx, job)
+	case err != nil:
+		return jobClaim{}, err
+	}
+	inst, _, _ := strings.Cut(c.pair, ".")
+	st.strand(job, lost, inst)
+	return lost, nil
 }
 
 // pairedOf is the PAIRED frame of a pair, <instance>.<token>.
@@ -803,6 +854,7 @@ func (d *Dispatcher) Close() {
 	case <-drained:
 	case <-time.After(5 * time.Second):
 	}
+	d.stop()
 	d.mu.Lock()
 	ws := make([]*wire, 0, len(d.wires))
 	for w := range d.wires {
@@ -907,7 +959,9 @@ func (d *Dispatcher) hand(st *DispatchSet, s *session, m *dmachine, mw *wire) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	token := newToken() + "." + s.id
-	if err := d.take(ctx, m.ID, token, claimTries); err != nil {
+	claim := jobClaim{pair: m.ID + "." + token, Run: s.head.Run, Name: s.head.Name, Repo: s.head.Repo, Agent: s.agent, Ref: s.head.WorkflowRef, Event: s.head.Event,
+		Arrived: s.arrived.UnixMilli()}
+	if err := d.take(ctx, m.ID, claim.String(), claimTries); err != nil {
 		slog.Warn("dispatch claim", "set", st.spec.Name, "machine", m.ID, "job", s.id, "elsewhere", errors.Is(err, ErrClaimed), "err", err.Error())
 		d.retry(st, s, m, !errors.Is(err, ErrClaimed))
 		return
@@ -922,25 +976,30 @@ func (d *Dispatcher) hand(st *DispatchSet, s *session, m *dmachine, mw *wire) {
 		st.abandon(s, m)
 		return
 	}
-	claim := jobClaim{pair: m.ID + "." + token, Run: s.head.Run, Name: s.head.Name, Repo: s.head.Repo, Agent: s.agent, Ref: s.head.WorkflowRef, Event: s.head.Event,
-		Arrived: s.arrived.UnixMilli(), Handed: time.Now().UnixMilli()}
-	fctx, fcancel := context.WithTimeout(context.Background(), resumeWindow)
+	claim.Handed = time.Now().UnixMilli()
+	fctx, fcancel := context.WithTimeout(context.Background(), d.window)
 	defer fcancel()
 	// The job's claim is asked again while S3's answer is unknown, for as long as a shim would wait to rejoin: a claim
 	// that may have landed names this pair, nothing else may be sent until that is known, and the shim has PAIRED, so
-	// it cannot start the job again.
-	switch err := d.take(fctx, jobFence(s.id), claim.String(), 0); {
+	// it cannot start the job again. Past that the shim may have given up on the job, so it is stranded instead, for as
+	// long as S3 takes to answer; the first of the two claims to land decides.
+	held, err := claim, d.take(fctx, jobFence(s.id), claim.String(), 0)
+	switch {
 	case errors.Is(err, ErrClaimed):
-		holder, herr := d.claims.Holder(fctx, jobFence(s.id))
-		pair := parseJobClaim(holder).pair
-		slog.Warn("dispatch job already handed", "set", st.spec.Name, "job", s.id, "pair", pair, "err", errString(herr))
-		if herr == nil && pair != "" {
-			_ = sw.send(framePaired, pairedOf(pair))
-		}
+		held, err = d.jobClaimOf(fctx, s.id)
+	case err != nil:
+		held, err = d.strand(d.life, st, claim, s.id)
+	}
+	if err != nil {
+		slog.Error("dispatch job claim", "set", st.spec.Name, "job", s.id, "machine", m.ID, "err", err.Error())
 		st.abandon(s, m)
 		return
-	case err != nil:
-		slog.Error("dispatch job claim", "set", st.spec.Name, "job", s.id, "machine", m.ID, "err", err.Error())
+	}
+	if held.pair != claim.pair {
+		slog.Warn("dispatch job not handed to its pair", "set", st.spec.Name, "job", s.id, "pair", held.pair, "stranded", held.Lost)
+		if held.pair != "" {
+			_ = sw.send(framePaired, pairedOf(held.pair))
+		}
 		st.abandon(s, m)
 		return
 	}
