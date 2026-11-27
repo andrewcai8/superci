@@ -59,8 +59,9 @@ type SizeConfig struct {
 	Split  int `json:"split"`
 	Max    int `json:"max"`
 	DiskGB int `json:"disk_gb"`
-	// DiskMBps and DiskIOPS are the root volume's gp3 throughput (MiB/s) and IOPS; 0 is the defaults, 250 and 3,000. A
-	// gp3 volume takes up to 1,000 MiB/s and 16,000 IOPS, at most 0.25 MiB/s for each IOPS (so 1,000 needs 4,000).
+	// DiskMBps and DiskIOPS are the root volume's gp3 throughput (MiB/s) and IOPS; 0 is the defaults, 250 and 3,000. The config takes 125 to
+	// 1,000 and 3,000 to 16,000 (the range priced and measured: gp3 itself now takes more), at most 0.25 MiB/s for each IOPS (1,000 needs 4,000)
+	// and 500 IOPS for each GiB of disk_gb.
 	DiskMBps int      `json:"disk_mbps"`
 	DiskIOPS int      `json:"disk_iops"`
 	Types    []string `json:"types"`
@@ -314,7 +315,7 @@ type SetSpec struct {
 	Dispatch      bool
 }
 
-// The root volume's defaults, and gp3's limits: 125 to 1,000 MiB/s, 3,000 to 16,000 IOPS, at most 0.25 MiB/s for each IOPS.
+// The root volume's defaults, and the range the config takes: 125 to 1,000 MiB/s, 3,000 to 16,000 IOPS, within gp3's ratios (0.25 MiB/s for each IOPS, 500 IOPS for each GiB).
 const (
 	defaultDiskMBps = 250
 	defaultDiskIOPS = 3000
@@ -332,7 +333,8 @@ func (s SetSpec) RootVolume() (iops, mbps int) {
 	return iops, mbps
 }
 
-// validVolume says whether a size's gp3 settings are ones EC2 accepts: a launch template EC2 refuses fails the listener's start.
+// validVolume says whether a size's gp3 settings are in the range this config takes and within gp3's ratios: a launch template EC2 refuses fails the
+// listener's start, so the config refuses first.
 func (s SizeConfig) validVolume() error {
 	spec := SetSpec{DiskMBps: s.DiskMBps, DiskIOPS: s.DiskIOPS}
 	iops, mbps := spec.RootVolume()
@@ -345,6 +347,8 @@ func (s SizeConfig) validVolume() error {
 		return fmt.Errorf("disk_iops %d: gp3 takes 3,000 to 16,000", iops)
 	case mbps*4 > iops:
 		return fmt.Errorf("disk_mbps %d needs disk_iops of at least %d: gp3 allows 0.25 MiB/s for each IOPS", mbps, mbps*4)
+	case s.DiskGB > 0 && iops > 500*s.DiskGB:
+		return fmt.Errorf("disk_iops %d needs disk_gb of at least %d: gp3 allows 500 IOPS for each GiB", iops, (iops+499)/500)
 	}
 	return nil
 }

@@ -132,6 +132,25 @@ func TestAVolumeEC2WouldRefuseIsRefusedByTheConfig(t *testing.T) {
 	}
 }
 
+// gp3 allows 500 IOPS for each GiB: 4,000 IOPS on a 6 GB root is a launch template EC2 refuses, which would fail the listener's start.
+func TestIOPSPastWhatTheDiskSizeAllowsIsRefused(t *testing.T) {
+	c, err := LoadConfig("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := c.Sizes["superci-4cpu"]
+	s.DiskMBps, s.DiskIOPS, s.DiskGB = 1000, 4000, 8
+	c.Sizes["superci-4cpu"] = s
+	if err := c.validate(); err != nil {
+		t.Fatalf("4,000 IOPS on 8 GB is 500 for each GiB, which gp3 allows: %v", err)
+	}
+	s.DiskGB = 7
+	c.Sizes["superci-4cpu"] = s
+	if err := c.validate(); err == nil {
+		t.Fatal("4,000 IOPS on a 7 GB root passed: gp3 allows 500 for each GiB")
+	}
+}
+
 // The spend prices the volume a size asks for: 1000 MiB/s and 4000 IOPS is 0.0548 USD an hour beyond storage against
 // 0.0068 for the defaults, 0.048 more per machine-hour.
 func TestTheSpendPricesTheVolumeASizeAsksFor(t *testing.T) {

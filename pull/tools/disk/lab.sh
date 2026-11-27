@@ -1,5 +1,5 @@
 #!/bin/bash
-# Times the root volume's writes at several gp3 settings, each on its own lab instance (the superci image, the size's instance type and root size), and
+# Times the root volume's writes at several gp3 settings, each on its own lab instance (the newest runs-on image, the size's instance type and root size), and
 # prints the table. Each instance is tagged purpose=superci-disk-lab and terminated at the end, or when this script stops. It changes nothing but those
 # instances and their volumes; it reads the console of each, so it needs no ssh and no credential on the machine.
 #

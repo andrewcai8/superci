@@ -910,8 +910,9 @@ dilute it.
 A busy hour costs what its jobs run for at those prices, plus about 30 s of boot and shutdown per job (a machine runs
 one job), plus the pool. `SpendPerHourUSD` is the listener's live figure.
 
-**The root volume.** gp3, 250 MiB/s and 3,000 IOPS unless a size sets `disk_mbps` and `disk_iops` (gp3 takes 125 to 1,000 MiB/s and 3,000 to 16,000
-IOPS, at most 0.25 MiB/s for each IOPS; the config refuses a size EC2 would refuse). `superci-4cpu` sets 1,000 and 4,000. The gate found
+**The root volume.** gp3, 250 MiB/s and 3,000 IOPS unless a size sets `disk_mbps` and `disk_iops` (the config takes 125 to 1,000 MiB/s and 3,000 to 16,000
+IOPS, the range priced and measured here, though gp3 now takes more, at most 0.25 MiB/s for each IOPS and 500 IOPS for each GiB; it refuses a size outside
+that, since a launch template EC2 refuses fails the listener's start). `superci-4cpu` sets 1,000 and 4,000. The gate found
 mind-snapshot shard 3 about 10 s slower than on Blacksmith, with 41 to 43 CPU-seconds in iowait against under 1, and a 1 GiB `fdatasync` write of
 3.2 to 4.3 s against 0.5 to 0.6 s: the device, not the page cache. `pull/tools/disk/lab.sh` times it on lab instances (one per setting: an `m8azn.xlarge`
 on the superci image with a 60 GB root, boot.sh's `vm.dirty_ratio=50` and `noauto_da_alloc`, the root grown), Nov 27:
@@ -932,7 +933,7 @@ for the defaults: **+0.048 USD per machine-hour** (+0.0016 for a machine that li
 +12% on one on demand (0.41). The listener's spend estimate uses the size's volume. The 5.4 GB that shard 3 writes is 21 s of device time at 250
 MiB/s and 5.4 s at 1,000: that the shard gets its 10 s back is a prediction until the gate measures it. `m8azn.xlarge` bursts to 1,875 MiB/s of EBS
 for 30 minutes a day (312 MiB/s baseline), and a single-use machine always has its burst; `m8a.xlarge` and `r8a.xlarge` burst to 1,250 (156
-baseline) and were not measured. Machines running when this ships keep their old volume: a changed template makes new machines.
+baseline) and were not measured. A changed template makes new machines: the listener retires the idle 4 vCPU machines of the old template version (5 a pass), busy ones finish their job, and the other sizes keep their version.
 
 ## Known limits
 
