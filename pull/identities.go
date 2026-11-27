@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -79,6 +80,17 @@ func (g *REST) RegistrationToken(ctx context.Context, repo string) (token string
 		return "", time.Time{}, fmt.Errorf("registration token: GitHub answered no token")
 	}
 	return body.Token, body.ExpiresAt, nil
+}
+
+// Runner reads one runner of a scope, to tell what it is before anything is done to it.
+func (g *REST) Runner(ctx context.Context, repo string, id int64) (name string, err error) {
+	var body struct {
+		Name string `json:"name"`
+	}
+	if err := g.get(ctx, fmt.Sprintf("%s/%d", g.runnersURL(repo), id), &body); err != nil {
+		return "", err
+	}
+	return body.Name, nil
 }
 
 // SetRunnerLabels replaces a runner's custom labels.
@@ -184,7 +196,7 @@ func (ids *Identities) token(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	give := func(why string, err error) {
-		ids.budget.Settle(time.Now(), l.ID, 0)
+		ids.budget.Settle(time.Now(), l.ID, Settlement{})
 		slog.Error("identities token", "why", why, "lease", l.ID, "err", err.Error())
 		http.Error(w, why+" failed; the lease is given back", http.StatusBadGateway)
 	}
@@ -209,7 +221,8 @@ func (ids *Identities) token(w http.ResponseWriter, r *http.Request) {
 }
 
 // labels replaces one runner's labels: the cutover and its rollback move an identity between the park label and its
-// size's label this way, and no registration is made.
+// size's label this way, and no registration is made. It only touches an identity: the id is read first, because a
+// just-in-time runner of the same scope would otherwise lose the labels its jobs are routed by.
 func (ids *Identities) labels(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	id, err := strconv.ParseInt(q.Get("id"), 10, 64)
@@ -222,8 +235,28 @@ func (ids *Identities) labels(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("labels are 1 to %d non-empty names, comma separated", maxLabels), http.StatusBadRequest)
 		return
 	}
+	name, err := ids.rest.Runner(r.Context(), ids.repo, id)
+	if err != nil {
+		slog.Error("identities labels", "id", id, "err", err.Error())
+		http.Error(w, "GitHub could not say which runner that is", http.StatusBadGateway)
+		return
+	}
+	if !strings.HasPrefix(name, identityPrefix) {
+		slog.Warn("identities labels refused", "id", id, "name", name)
+		http.Error(w, "that runner is not an identity: its name does not start "+identityPrefix, http.StatusForbidden)
+		return
+	}
 	if err := ids.rest.SetRunnerLabels(r.Context(), ids.repo, id, labels); err != nil {
 		slog.Error("identities labels", "id", id, "err", err.Error())
+		// GitHub's write limits answer 403 or 429, with a Retry-After: the caller stops and waits that long.
+		var se *StatusError
+		if errors.As(err, &se) && (se.Code == http.StatusForbidden || se.Code == http.StatusTooManyRequests) {
+			if secs, err := strconv.Atoi(se.RetryAfter); err == nil && secs > 0 {
+				w.Header().Set("Retry-After", strconv.Itoa(secs))
+			}
+			http.Error(w, "GitHub is limiting writes", http.StatusTooManyRequests)
+			return
+		}
 		http.Error(w, "GitHub refused the labels", http.StatusBadGateway)
 		return
 	}

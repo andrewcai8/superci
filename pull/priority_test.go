@@ -253,15 +253,34 @@ func TestALaneLeasesRegistrationsAtBatchPriorityAndSettlesThemAsOurs(t *testing.
 		t.Fatal("the lane took the critical reserve")
 	}
 	before := b.Snapshot(testNow)
-	if !b.Settle(testNow.Add(10*time.Second), l.ID, 5) {
+	if !b.Settle(testNow.Add(10*time.Second), l.ID, Settlement{Made: 5}) {
 		t.Fatal("a held lease was not settled")
 	}
 	after := b.Snapshot(testNow.Add(10 * time.Second))
 	if after.Made != before.Made+5 || after.Leased != 0 || after.Pending != before.Pending-7 {
 		t.Fatalf("settled with 5 made: before %+v after %+v", before, after)
 	}
-	if b.Settle(testNow, l.ID, 5) {
+	if b.Settle(testNow, l.ID, Settlement{Made: 5}) {
 		t.Fatal("a lease settled twice")
+	}
+}
+
+func TestARefusedSettlementHalvesTheRateAndHoldsTheAsksLikeAListenerRefusal(t *testing.T) {
+	b := filled(9, 2)
+	l := b.Lease(testNow, 5, time.Minute)
+	rate := b.Rate()
+	if !b.Settle(testNow, l.ID, Settlement{Made: 2, Failed: 1, Refused: true}) {
+		t.Fatal("a held lease was not settled")
+	}
+	got := b.Snapshot(testNow)
+	if !got.Throttled || got.Refused != 1 || got.Failed != 1 || got.Made != 2 || b.Rate() != rate/2 {
+		t.Fatalf("rate %v -> %v: %+v", rate, b.Rate(), got)
+	}
+	if ok, d := b.Try(testNow, Asker{ID: "i-1", Launched: testNow, P: ForJob}); ok || d != DeniedThrottled {
+		t.Errorf("an ask right after the refusal: %v %v", ok, d)
+	}
+	if got.Pending != 0 {
+		t.Errorf("a settled lease leaves nothing in flight: %+v", got)
 	}
 }
 
@@ -279,7 +298,7 @@ func TestALeaseThatIsNeverSettledIsReleasedWhenItExpires(t *testing.T) {
 	if got := b.Snapshot(testNow.Add(31 * time.Second)); got.Leased != 0 || got.Pending != 2 {
 		t.Fatalf("past its time the lease holds nothing and only the two critical registrations are in flight: %+v", got)
 	}
-	if b.Settle(testNow.Add(32*time.Second), l.ID, 5) {
+	if b.Settle(testNow.Add(32*time.Second), l.ID, Settlement{Made: 5}) {
 		t.Fatal("an expired lease settled")
 	}
 }

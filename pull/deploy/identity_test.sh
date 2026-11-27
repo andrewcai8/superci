@@ -7,7 +7,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 F=$here/testdata/identity
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 export FAKE=$T/fake FAKE_RUNNER=$T/runner PATH=$F:$PATH SSH=$F/listener-ssh AWS_ACCESS_KEY_ID= AWS_SECRET_ACCESS_KEY= AWS_SESSION_TOKEN=
-export READY_TRIES=2 READY_SLEEP=0 LEASE_WAIT=0 LEASE_TRIES=2 RELABEL_PAUSE=0 RUN_RETRY_SLEEP=0 PEAK_TRIES=2 PEAK_WAIT=0
+export READY_TRIES=2 READY_SLEEP=0 LEASE_WAIT=0 LEASE_TRIES=2 RUN_RETRY_SLEEP=0 PEAK_TRIES=2 PEAK_WAIT=0 IDENTITY_LOCK=$T/lock
 # identity.sh under a timeout, so a loop that never ends fails the test instead of hanging it
 printf '#!/bin/bash\nexec timeout 120 %s "$@"\n' "$here/identity.sh" > "$T/id"; chmod 755 "$T/id"; ID=$T/id
 ACCOUNT=243891825325; REL=$FAKE/s3/superci-pull-$ACCOUNT; IDB=$FAKE/s3/superci-pull-identities-$ACCOUNT/superci-pull/hosts
@@ -29,6 +29,7 @@ release() { # the release bucket holds this shim, named by bin/RELEASE.json
   printf '#!/bin/sh\n# shim %s\n' "$1" > "$REL/bin/superci-shim"
   printf '{"commit":"c","built":"b","sha256":{"bin/superci-pull":"%s","bin/superci-shim":"%s"}}\n' "$(printf x | sha256sum | cut -d' ' -f1)" "$(sha256sum < "$REL/bin/superci-shim" | cut -d' ' -f1)" > "$REL/bin/RELEASE.json"
 }
+KEY=arn:aws:kms:us-east-1:243891825325:key/1234abcd-12ab-34cd-56ef-1234567890ab
 flog() { : > "$FAKE/calls.log"; : > "$FAKE/ssh.log"; : > "$FAKE/curl.log"; : > "$FAKE/config.log"; : > "$FAKE/sleep.log"; rm -f "$FAKE/state.json" "$FAKE/state.seq"; }
 flog
 
@@ -37,6 +38,12 @@ for c in "up us-east-1a" "register 4cpu 1" "relabel 4cpu a b" "down us-east-1a" 
   refuses "identity.sh $c refuses another account" "refusing: account 111111111111 is not ci-runners" env FAKE_ACCOUNT=111111111111 "$ID" $c
 done
 [ "$(grep -vc ' sts get-caller-identity' "$FAKE/calls.log")" = 0 ]; check $? "and made no AWS call but the identity check"
+
+# ---- the key ----
+refuses "a key whose alias cannot be made is scheduled for deletion, not left to be made again" "the new key is scheduled for deletion" env FAKE_ALIAS_FAIL=1 "$ID" up us-east-1a
+grep -q 'kms schedule-key-deletion' "$FAKE/calls.log" && [ ! -e "$FAKE/state/key" ]; check $? "and no key is left"
+[ "$(count 'run-instances' "$FAKE/calls.log")" = 0 ]; check $? "and no host is launched"
+flog
 
 # ---- up ----
 refuses "up refuses while the release holds no shim" "refusing" "$ID" up us-east-1a
@@ -49,8 +56,11 @@ for want in "--instance-type r7i.4xlarge" "--image-id ami-1" "HttpTokens=require
   has "$want" "$c" "run-instances carries $want"
 done
 has "ResourceType=volume,Tags=[{Key=purpose,Value=superci-pull}" "$c" "and tags the volume"
+has "--block-device-mappings DeviceName=/dev/sda1,Ebs={Encrypted=true,DeleteOnTermination=true}" "$c" "and encrypts the root volume, on the image's own root device"
+[ "$(count 'kms create-key' "$c")" = 1 ] && [ "$(count 'kms create-alias --alias-name alias/superci-pull-identities' "$c")" = 1 ]; check $? "the key is made once, under its alias"
 U=$FAKE/state/userdata-0001
 has "$PIN" "$U" "user data pins the listener's public key"
+has "KMS_KEY=$KEY" "$U" "and names the key the hosts upload under"
 hasnt "PRIVATE KEY" "$U" "and holds no private key"
 [ "$(wc -c < "$U")" -le 16000 ]; check $? "user data fits EC2's 16 KB"
 has "https://203.0.113.9:8443" "$U" "and names the listener's address"
@@ -65,7 +75,7 @@ python3 -I - "$FAKE/state/role-policy.json" "$FAKE/state/bucket-policy.json" << 
 import json, sys
 role, bucket = json.load(open(sys.argv[1])), json.load(open(sys.argv[2]))
 allowed = {"arn:aws:s3:::superci-pull-identities-243891825325/superci-pull/*", "arn:aws:s3:::superci-pull-identities-243891825325",
-           "arn:aws:s3:::superci-pull-243891825325/bin/superci-shim", "arn:aws:s3:::superci-pull-243891825325/bin/RELEASE.json", "arn:aws:kms:us-east-1:243891825325:key/*"}
+           "arn:aws:s3:::superci-pull-243891825325/bin/superci-shim", "arn:aws:s3:::superci-pull-243891825325/bin/RELEASE.json", "arn:aws:kms:us-east-1:243891825325:key/1234abcd-12ab-34cd-56ef-1234567890ab"}
 res = set()
 for st in role["Statement"]:
     assert st["Effect"] == "Allow"
@@ -79,9 +89,41 @@ for need in ["TlsOnly", "NoPutWithoutKms", "NoPutWithoutAnEncryptionHeader", "On
 assert sids["OnlyTheOperatorDeletes"]["Condition"]["ArnNotLike"]["aws:PrincipalArn"] == ["arn:aws:iam::243891825325:role/ops", "arn:aws:iam::243891825325:role/*/ops"]
 assert sids["OnlyTheIdentityHostsRead"]["Condition"]["ArnNotEquals"]["aws:PrincipalArn"] == "arn:aws:iam::243891825325:role/superci-pull-identity"
 EOF
-check $? "the role may only use its prefix, the shim and KMS; the bucket denies unencrypted puts and others' reads, writes and deletes"
+check $? "the role may only use its prefix, the shim and the one key; the bucket denies unencrypted puts and others' reads, writes and deletes"
+python3 -I - "$FAKE/state/role-policy.json" "$FAKE/state/bucket-policy.json" "$FAKE/state/key-policy.json" "$FAKE/state/bucket-encryption.json" << 'PY'
+import json, sys
+role, bucket, key, enc = (json.load(open(f)) for f in sys.argv[1:5])
+KEY = "arn:aws:kms:us-east-1:243891825325:key/1234abcd-12ab-34cd-56ef-1234567890ab"
+kms = [st for st in role["Statement"] if any(a.startswith("kms:") for a in (st["Action"] if isinstance(st["Action"], list) else [st["Action"]]))]
+assert len(kms) == 1 and kms[0]["Resource"] == KEY, kms
+assert sorted(kms[0]["Action"]) == ["kms:Decrypt", "kms:Encrypt", "kms:GenerateDataKey"], kms[0]["Action"]
+assert kms[0]["Condition"]["StringLike"]["kms:EncryptionContext:aws:s3:arn"] == "arn:aws:s3:::superci-pull-identities-243891825325/superci-pull/*"
+assert kms[0]["Condition"]["StringEquals"]["kms:ViaService"] == "s3.us-east-1.amazonaws.com"
+rule = enc["Rules"][0]
+assert rule["ApplyServerSideEncryptionByDefault"] == {"SSEAlgorithm": "aws:kms", "KMSMasterKeyID": KEY} and rule["BucketKeyEnabled"] is False, rule
+sid = {s["Sid"]: s for s in bucket["Statement"]}["NoPutWithAnotherKey"]
+assert sid["Effect"] == "Deny" and sid["Condition"]["StringNotEquals"]["s3:x-amz-server-side-encryption-aws-kms-key-id"] == KEY
+principals = {}
+for st in key["Statement"]:
+    assert st["Effect"] == "Allow" and list(st["Principal"]) == ["AWS"], st
+    principals[st["Sid"]] = (st["Principal"]["AWS"], set(st["Action"]))
+admin, use = principals["TheOperatorAdministersTheKey"], principals["TheIdentityRoleEncryptsAndDecryptsThroughS3"]
+assert admin[0] == "arn:aws:iam::243891825325:role/ops", admin[0]
+assert use[0] == "arn:aws:iam::243891825325:role/superci-pull-identity" and use[1] == {"kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey"}, use
+assert len(principals) == 2, principals
+assert not any(a.startswith(("kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey", "kms:ReEncrypt", "kms:CreateGrant", "kms:*")) for a in admin[1]), "the operator administers and never uses the key"
+PY
+check $? "the key's policy names only the identity role (encrypt, decrypt) and the operator (administer, never use); the bucket's default is that key and it refuses another"
 grep -q 'put-public-access-block' "$c" && grep -q 'put-bucket-encryption' "$c"; check $? "the bucket blocks public access and encrypts by default"
 A=$FAKE/state/instances; ip_a=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]+"/i-0001"))["ip"])' "$A"); ip_b=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]+"/i-0002"))["ip"])' "$A")
+
+# ---- one identity.sh at a time ----
+exec 7> "$T/lock"; flock -n 7
+for c in "register --rate 1 4cpu 1" "relabel 4cpu a b" "up us-east-1a" "down us-east-1c"; do
+  refuses "identity.sh $c refuses while another run holds the lock" "holds $T/lock" "$ID" $c
+done
+exec 7>&-
+ok "and runs once the lock is free" "$ID" up us-east-1a
 
 # ---- register: the token, the lease, the partition ----
 flog
@@ -93,7 +135,7 @@ hasnt TESTTOKEN "$FAKE/config.log" "no token in a config.sh argument"
 grep -q 'token_in_env=yes' "$FAKE/config.log" && ! grep -q 'token_in_env=no' "$FAKE/config.log"; check $? "config.sh got the token in its environment"
 grep -rq TESTTOKEN "$FAKE" ; check $((1 - $?)) "the token is on no file"
 hasnt TESTTOKEN <(echo "$out") "and not in the output"
-[ "$(count '^token' "$FAKE/curl.log")" = 1 ] && has "settle id=a1b2c3 made=4" "$FAKE/curl.log" "one lease of 4, settled with the 4 made"
+[ "$(count '^token' "$FAKE/curl.log")" = 1 ] && has "settle id=a1b2c3 made=4 failed=0 refused=0" "$FAKE/curl.log" "one lease of 4, settled with the 4 made and nothing failed or refused"
 for want in "--labels superci-park --no-default-labels" "--disableupdate" "--runnergroup superci-pull-identities" "--url https://github.com/Authentic-Intelligence"; do
   has "$want" "$FAKE/config.log" "config.sh ran with $want"
 done
@@ -113,10 +155,16 @@ ok "register with no first continues after the highest" "$ID" register --rate 1 
 
 # ---- the first failure stops the command ----
 flog
-refuses "a config.sh that fails stops the whole command and names the identity" "superci-id-2cpu-0003 was not registered" env FAKE_CONFIG_FAIL=superci-id-2cpu-0003 "$ID" register --rate 1 2cpu 6 1
-grep -q "GitHub refused it (429 or ConfigureTooManyRunners" <<< "$out"; check $? "saying when its log shows GitHub's refusal"
+refuses "a config.sh that GitHub refuses stops the whole command and names the identity" "superci-id-2cpu-0003 was not registered: GitHub refused it" env FAKE_CONFIG_FAIL=superci-id-2cpu-0003 "$ID" register --rate 1 2cpu 6 1
+grep -q "GitHub refused it (429 or ConfigureTooManyRunners" <<< "$out"; check $? "saying so when its log shows the 429"
 [ "$(count . "$FAKE/config.log")" = 3 ] && ! grep -q 'superci-id-2cpu-0004' "$FAKE/config.log"; check $? "no identity after it was tried"
-grep -q "settle id=.* made=2" "$FAKE/curl.log"; check $? "the lease is settled with the 2 made"
+grep -q "settle id=.* made=2 failed=0 refused=1" "$FAKE/curl.log"; check $? "the lease is settled with the 2 made and the refusal, which reaches the listener's budget"
+grep -q "Wait at least 5 minutes" <<< "$out" && grep -q "do not run it again at once" <<< "$out"; check $? "and the operator is told to wait, not to run it again"
+! grep -q "run again to continue" <<< "$out"; check $? "(it does not say run again)"
+flog
+refuses "a config.sh that fails for another reason stops the command too" "superci-id-2cpu-0003 was not registered" env FAKE_CONFIG_FAIL_PLAIN=superci-id-2cpu-0003 "$ID" register --rate 1 2cpu 6 1
+grep -q "settle id=.* made=0 failed=1 refused=0" "$FAKE/curl.log"; check $? "the lease is settled as a failure, not a refusal"
+! grep -q "GitHub refused it" <<< "$out"; check $? "and does not claim GitHub refused it"
 grep -q "run again to continue: identity.sh register 2cpu 6 1" <<< "$out"; check $? "and the re-run is named"
 flog
 ok "run again continues from the failed identity" "$ID" register --rate 1 2cpu 6 1
@@ -150,10 +198,62 @@ refuses "up refuses a type that is not one" "--type is an instance type" "$ID" u
 ok "up of a third AZ, on the smaller type" "$ID" up --type r7i.2xlarge us-east-1c
 [ "$(count '--instance-type r7i.2xlarge' "$FAKE/calls.log")" = 1 ] && [ "$(count '--instance-type r7i.4xlarge' "$FAKE/calls.log")" = 0 ]; check $? "the flag sets the instance type"
 flog
-ok "register across three hosts" "$ID" register --rate 1 16cpu 6 1
+ok "register across three hosts" env IDENTITY_AZS="us-east-1a us-east-1b us-east-1c" "$ID" register --rate 1 16cpu 6 1
 for p in "1 b" "2 c" "3 a" "4 b" "5 c" "6 a"; do set -- $p
   [ -s "$IDB/us-east-1$2/superci-id-16cpu-000$1/.runner" ]; check $? "identity $1 is on host $((10#$1 % 3)) (us-east-1$2)"
 done
+
+# ---- identity i lives on IDENTITY_AZS[i mod n], whichever hosts are up ----
+flog
+ok "with three hosts up, the default AZs still hold identities on a and b only" "$ID" register --rate 1 4cpu 2 20
+for p in "20 a" "21 b"; do set -- $p
+  [ -s "$IDB/us-east-1$2/superci-id-4cpu-00$1/.runner" ]; check $? "identity $1 is on us-east-1$2, not on the third host"
+done
+[ -z "$(ls "$IDB/us-east-1c" | grep '4cpu-002')" ]; check $? "and nothing of them is on us-east-1c"
+refuses "an AZ named twice is refused" "names an AZ twice" env IDENTITY_AZS="us-east-1a us-east-1a" "$ID" register --rate 1 4cpu 1
+refuses "an AZ that is not one is refused" "az is one of" env IDENTITY_AZS="us-east-1a eu-west-1a" "$ID" register --rate 1 4cpu 1
+python3 -I - "$FAKE/state/instances/i-0003" << 'PY'
+import json, sys
+i = json.load(open(sys.argv[1]))
+i["state"] = "stopped"
+json.dump(i, open(sys.argv[1], "w"))
+PY
+flog
+refuses "register refuses while an expected host is down, though others are up" "refusing: us-east-1c has no running identity host" env IDENTITY_AZS="us-east-1a us-east-1b us-east-1c" "$ID" register --rate 1 4cpu 1 30
+[ "$(count '^token' "$FAKE/curl.log")" = 0 ] && [ "$(count . "$FAKE/config.log")" = 0 ] && [ "$(count . "$FAKE/ssh.log")" = 0 ]; check $? "and takes no lease, registers nothing and reaches no host"
+ok "a host that is not in the list may be down" "$ID" register --rate 1 4cpu 1 30
+python3 -I - "$FAKE/state/instances/i-0003" << 'PY'
+import json, sys
+i = json.load(open(sys.argv[1]))
+i["state"] = "running"
+json.dump(i, open(sys.argv[1], "w"))
+PY
+
+# ---- a lease that has run out is not used ----
+flog; printf '%s\n' -60 600 > "$FAKE/lease_ttls"
+ok "a lease past its time is settled with nothing made, and a new one is asked for" "$ID" register --rate 1 4cpu 2 40
+[ "$(count '^token' "$FAKE/curl.log")" = 2 ]; check $? "two leases"
+sed -n '/^settle/p' "$FAKE/curl.log" | head -1 | grep -q "made=0 failed=0 refused=0"; check $? "the first was settled with none made"
+sed -n '/^settle/p' "$FAKE/curl.log" | tail -1 | grep -q "made=2 failed=0 refused=0"; check $? "and both identities were registered under the second"
+[ "$(count . "$FAKE/config.log")" = 2 ]; check $? "no registration was made under the lease that had run out"
+flog; printf '%s\n' -60 -60 -60 > "$FAKE/lease_ttls"
+refuses "leases that are always past their time end in a stop, not a loop" "no registration was made under" "$ID" register --rate 1 4cpu 2 42
+[ "$(count . "$FAKE/config.log")" = 0 ]; check $? "with nothing registered"
+rm -f "$FAKE/lease_ttls"
+
+# ---- a call that hangs is cut off ----
+flog; touch "$FAKE/ssh-hang"
+start=$SECONDS
+refuses "a host that never answers a registration is given up on" "superci-id-4cpu-0044 was not registered" env REGISTER_TIMEOUT=1 "$ID" register --rate 1 4cpu 1 44
+[ $((SECONDS - start)) -lt 20 ]; check $? "within its timeout"
+grep -q "no answer from the host" <<< "$out"; check $? "saying it gave no answer"
+grep -q "settle id=.* made=0 failed=1 refused=0" "$FAKE/curl.log"; check $? "and the lease is settled with the failure"
+rm -f "$FAKE/ssh-hang"; flog
+start=$SECONDS
+refuses "a config.sh that hangs is killed on the host" "superci-id-4cpu-0045 was not registered" env FAKE_CONFIG_HANG=superci-id-4cpu-0045 CONFIG_TIMEOUT=1 "$ID" register --rate 1 4cpu 1 45
+[ $((SECONDS - start)) -lt 20 ]; check $? "within its timeout"
+for h in $FAKE/hosts/*/opt/id; do [ ! -e "$h/superci-id-4cpu-0045" ]; done; check $? "and leaves no half-made identity tree"
+grep -q "settle id=.* made=0 failed=1 refused=0" "$FAKE/curl.log"; check $? "and is settled as a failure"
 
 # ---- the rate ----
 flog
@@ -162,10 +262,11 @@ ok "register at the default rate" "$ID" register 64cpu 3 1
 flog
 ok "register at 1 a second" "$ID" register --rate 1 64cpu 3 4
 awk '$1 > 0.2 {n++; if ($1 > 1.001) bad = 1} END {exit bad || n != 2}' "$FAKE/sleep.log"; check $? "is paced at a second"
+flog
 for r in 1.5 2 0 x -1; do
   refuses "--rate $r is refused" "above 0 and at most 1" "$ID" register --rate $r 64cpu 1
 done
-[ "$(count '^token' "$FAKE/curl.log")" = 0 ] || [ "$(count '^token' "$FAKE/curl.log")" = 1 ]; check 0 "(a refused rate takes no lease)"
+[ "$(count '^token' "$FAKE/curl.log")" = 0 ] && [ "$(count . "$FAKE/config.log")" = 0 ]; check $? "a refused rate takes no lease and registers nothing"
 flog
 refuses "--rate over 1 takes no lease" "above 0 and at most 1" "$ID" register --rate 5 64cpu 2
 [ "$(count '^token' "$FAKE/curl.log")" = 0 ] && [ "$(count . "$FAKE/config.log")" = 0 ]; check $? "and registers nothing"
@@ -200,21 +301,42 @@ python3 -I -c 'import json,sys
 p = sys.argv[1] + "/github.json"
 r = json.load(open(p))
 r.append({"id": 5001, "name": "superci-id-4cpu-9001", "status": "online", "busy": False, "labels": ["self-hosted", "superci-park", "superci-4cpu"]})
+r.append({"id": 5002, "name": "superci-pull-jit-0f3a", "status": "online", "busy": True, "labels": ["self-hosted", "superci-park", "superci-4cpu"]})
 json.dump(r, open(p, "w"))' "$FAKE"
 flog
 ok "relabel moves one size to its label" "$ID" relabel 4cpu superci-park superci-4cpu
-[ "$(count '^labels' "$FAKE/curl.log")" = 7 ]; check $? "7 relabels for the 7 identities of the size (one of them carried both labels)"
+[ "$(count '^labels' "$FAKE/curl.log")" -ge 7 ]; check $? "a relabel for each of the identities of the size (one of them carried both labels)"
+! grep -q 'labels id=5002' "$FAKE/curl.log"; check $? "and none for the runner that is not an identity"
 python3 -I -c 'import json,sys
 r = json.load(open(sys.argv[1] + "/github.json"))
-assert all(("superci-4cpu" in x["labels"]) == x["name"].startswith("superci-id-4cpu-") for x in r), r
-assert all("superci-park" not in x["labels"] for x in r if x["name"].startswith("superci-id-4cpu-"))' "$FAKE"
-check $? "only that size carries the new label"
+assert all(("superci-4cpu" in x["labels"]) == x["name"].startswith("superci-id-4cpu-") for x in r if x["name"].startswith("superci-id-")), r
+assert all("superci-park" not in x["labels"] for x in r if x["name"].startswith("superci-id-4cpu-"))
+jit = [x for x in r if x["id"] == 5002]
+assert jit and jit[0]["labels"] == ["self-hosted", "superci-park", "superci-4cpu"], "the non-identity runner was relabelled"' "$FAKE"
+check $? "only that size's identities carry the new label, and the runner that is not an identity keeps its own"
+N4=$(count '^labels' "$FAKE/curl.log")
+awk -v n4="$N4" '$1 >= 1 {n++} END {exit n < n4 - 1}' "$FAKE/sleep.log"; check $? "paced at one a second at most: each relabel waits 1 s (60 a minute)"
 flog
 ok "relabel again" "$ID" relabel 4cpu superci-park superci-4cpu
 [ "$(count '^labels' "$FAKE/curl.log")" = 0 ]; check $? "changes nothing"
 flog
 ok "relabel back is the rollback" "$ID" relabel 4cpu superci-4cpu superci-park
-[ "$(count '^labels' "$FAKE/curl.log")" = 7 ] && [ "$(count '^token' "$FAKE/curl.log")" = 0 ]; check $? "7 relabels and no lease"
+[ "$(count '^labels' "$FAKE/curl.log")" = "$N4" ] && [ "$(count '^token' "$FAKE/curl.log")" = 0 ]; check $? "$N4 relabels and no lease"
+flog; printf '429 30 2\n' > "$FAKE/labels-limit"
+refuses "relabel stops at the first 429" "GitHub answered 429" "$ID" relabel 4cpu superci-park superci-4cpu
+[ "$(count '^labels' "$FAKE/curl.log")" = 3 ]; check $? "after 2 relabels and the one refused: no call after it"
+grep -q "Retry-After is 30 s" <<< "$out"; check $? "and gives its Retry-After"
+refuses "a relabel inside the Retry-After waits" "GitHub asked for a pause" "$ID" relabel 4cpu superci-park superci-4cpu
+[ "$(count '^labels' "$FAKE/curl.log")" = 3 ]; check $? "without a call to GitHub"
+rm -f "$FAKE/labels-limit" "$T/lock.retry-after"
+flog; printf '403 0 0\n' > "$FAKE/labels-limit"
+refuses "relabel stops at the first 403 too, and holds a minute when GitHub names no Retry-After" "GitHub answered 403" "$ID" relabel 4cpu superci-park superci-4cpu
+[ "$(count '^labels' "$FAKE/curl.log")" = 1 ] && [ "$(( $(cat "$T/lock.retry-after") - $(date +%s) ))" -gt 0 ]; check $? "after a single call, and the pause is kept"
+rm -f "$FAKE/labels-limit" "$T/lock.retry-after"
+flog
+ok "relabel runs on once the pause is over" "$ID" relabel 4cpu superci-park superci-4cpu
+[ "$(count '^labels' "$FAKE/curl.log")" = "$((N4 - 2))" ]; check $? "relabelling the rest: the 2 that went through before the 429 are not touched again"
+flog; "$ID" relabel 4cpu superci-4cpu superci-park > /dev/null 2>&1
 refuses "relabel refuses a label that is not a name" "label is letters" "$ID" relabel 4cpu 'a;b' c
 
 # ---- status ----
@@ -235,8 +357,8 @@ grep -q "no host named superci-pull-identity-us-east-1b" <<< "$out"; check $? "f
 
 HS=$here/identity-host.sh
 N=$T/newhost; mkdir -p "$N"
-printf 'BUCKET=superci-pull-identities-%s\nDEPLOYMENT=superci-pull\nRELEASE=superci-pull-%s\n' "$ACCOUNT" "$ACCOUNT" > "$N/conf"
-newhost() { env ID_ROOT=$N/id RUNNER_SRC=$FAKE_RUNNER SHIM_BIN=$N/shim SHIM_ENV=$N/shim.env ID_CONF=$N/conf UNIT_DIR=$N/units ID_LOG=$N/log ID_AZ=us-east-1b \
+printf 'BUCKET=superci-pull-identities-%s\nDEPLOYMENT=superci-pull\nRELEASE=superci-pull-%s\nKMS_KEY=%s\n' "$ACCOUNT" "$ACCOUNT" "$KEY" > "$N/conf"
+newhost() { env ID_ROOT=$N/id RUNNER_SRC=$FAKE_RUNNER SHIM_BIN=$N/shim SHIM_ENV=$N/shim.env ID_CONF=$N/conf UNIT_DIR=$N/units ID_LOG=$N/log ID_AZ=us-east-1b ID_LOCK=$N/lock \
   READY_FILE=$N/ready FAKE_UNITS=$N/enabled bash "$HS" "$@"; }
 mkdir -p "$N/units"; flog; cp "$FAKE/github.json" "$T/github.before"
 ok "a replacement host boots" newhost boot
@@ -251,12 +373,37 @@ cmp -s "$REL/bin/superci-shim" "$N/id/superci-id-4cpu-0001/bin/Runner.Worker" &&
 U=$N/units/superci-id@.service
 grep -qxF "Environment=DOTNET_gcServer=0 DOTNET_GCgen0size=0x200000 DOTNET_GCHeapHardLimit=0x6000000 DOTNET_TieredPGO=0 DOTNET_TC_QuickJitForLoops=1 DOTNET_GCConserveMemory=7" "$U"
 check $? "every identity's unit sets exactly the measured GC environment"
-for want in MemoryMax=192M Restart=always RestartSec=2 KillMode=process RUNNER_ALLOW_RUNASROOT=1; do
+for want in MemoryMax=192M Restart=always RestartSec=5 StartLimitIntervalSec=600 StartLimitBurst=10 RUNNER_ALLOW_RUNASROOT=1; do
   has "$want" "$U" "every identity's unit has $want"
 done
+! grep -q '^KillMode=' "$U"; check $? "and keeps systemd's default KillMode, so a stop takes the listener and its shim down together"
 printf 'tampered\n' >> "$REL/bin/superci-shim"; rm -rf "$N/id" "$N/enabled" "$N/ready" "$N/shim"
 refuses "a replacement host refuses a shim that is not the release's" "refusing s3://superci-pull-$ACCOUNT/bin/superci-shim" newhost boot
-[ ! -e "$N/id" ] || [ -z "$(ls "$N/id")" ]; [ ! -e "$N/enabled" ]; check $? "and starts nothing"
+{ [ ! -e "$N/id" ] || [ -z "$(ls "$N/id")" ]; } && [ ! -e "$N/enabled" ]; check $? "and starts nothing"
+
+# ---- two runs on a host at once never delete each other's identity ----
+C=$T/conc; mkdir -p "$C/units"
+cp "$N/conf" "$C/conf"; printf '#!/bin/sh\n' > "$C/shim"; chmod 755 "$C/shim"
+chost() { env ID_ROOT=$C/id RUNNER_SRC=$FAKE_RUNNER SHIM_BIN=$C/shim ID_CONF=$C/conf UNIT_DIR=$C/units ID_LOG=$C/log ID_AZ=us-east-1a ID_LOCK=$C/lock \
+  READY_FILE=$C/ready FAKE_UNITS=$C/enabled bash "$HS" "$@"; }
+flog
+( printf 'TESTTOKEN\n' | FAKE_CONFIG_SLEEP=1 chost register superci-park https://github.com/Authentic-Intelligence - superci-id-4cpu-0099 > "$C/a.out" 2>&1 ) &
+pa=$!
+until [ -s "$FAKE/config.log" ]; do [ -e "/proc/$pa" ] || break; command -p sleep 0.1; done
+( printf 'TESTTOKEN\n' | FAKE_CONFIG_SLEEP=1 chost register superci-park https://github.com/Authentic-Intelligence - superci-id-4cpu-0099 > "$C/b.out" 2>&1 ) &
+pb=$!
+wait $pa $pb
+[ "$(count . "$FAKE/config.log")" = 1 ]; check $? "the second run found the first's identity and registered nothing (one config.sh)"
+sort "$C/a.out" "$C/b.out" | tr '\n' ' ' | grep -q "adopted superci-id-4cpu-0099 registered superci-id-4cpu-0099"; check $? "one registered it and the other adopted it"
+for f in .runner .credentials .credentials_rsaparams; do [ -s "$C/id/superci-id-4cpu-0099/$f" ]; done; check $? "and its files are all there"
+[ "$(sort "$C/enabled" | uniq | wc -l)" = 1 ]; check $? "started once as one identity"
+exec 7> "$C/lock"; flock 7
+creg() { printf 'TESTTOKEN\n' | chost register superci-park https://github.com/Authentic-Intelligence - "$@"; }
+export LOCK_WAIT=1
+refuses "a run that cannot get the lock in time says so and changes nothing" "busy: another superci-id run holds" creg superci-id-4cpu-0098
+unset LOCK_WAIT
+exec 7>&-
+[ ! -e "$C/id/superci-id-4cpu-0098" ]; check $? "and registers nothing"
 
 # ---- the image is the one fleet.go runs ----
 grep -qF "Owner: \"$(sed -n 's/^IMAGE_OWNER=//p' "$here/identity.sh")\", Name: \"$(sed -n "s/^IMAGE_NAME='\(.*\)'/\1/p" "$here/identity.sh")\", Pin: \"$(sed -n 's/^IMAGE_PIN=//p' "$here/identity.sh")\"" "$here/../main.go"

@@ -601,12 +601,18 @@ each job to a fresh machine. Its listener runs on an **identity host**, and no j
   `identity.sh status` reads the real figure (Private_Dirty of each `Runner.Listener`, and how many are over 64 MiB).
 - **Memory.** Each identity's unit `superci-id@<name>` sets `DOTNET_gcServer=0 DOTNET_GCgen0size=0x200000
   DOTNET_GCHeapHardLimit=0x6000000 DOTNET_TieredPGO=0 DOTNET_TC_QuickJitForLoops=1 DOTNET_GCConserveMemory=7` and
-  `MemoryMax=192M`, with `Restart=always`: a listener that leaks is restarted, not left to starve the host.
-- **Where an identity lives.** Identity `i` (the number in its name) is on host `i mod H`, with the hosts in AZ order.
-  Its files are in `s3://superci-pull-identities-<account>/<deployment>/hosts/<az>/<name>/`, SSE-KMS. A host that
+  `MemoryMax=192M`, with `Restart=always` and `RestartSec=5`: a listener that leaks is restarted, not left to starve the host.
+  An identity GitHub has removed stops at `StartLimitBurst=10` in `StartLimitIntervalSec=600`, not crash-looping. The
+  unit keeps systemd's default `KillMode`: a stop or restart takes the listener and its shim down together, so two
+  listeners never share credentials, and a shim that dies alone loses no job (its machine renews the job itself).
+- **Where an identity lives.** Identity `i` (the number in its name) is on the host of `IDENTITY_AZS[i mod n]`, whichever
+  hosts are up. Its files are in `s3://superci-pull-identities-<account>/<deployment>/hosts/<az>/<name>/`, SSE-KMS under
+  the customer-managed key `alias/superci-pull-identities` (made once by `up`; its policy names only the identity role,
+  to encrypt and decrypt through S3, and the operator, to administer). The hosts' root volumes are encrypted. A host that
   replaces another in the same AZ restores that share at boot and registers nothing.
 - **Who may read them.** The host's role `superci-pull-identity` may read and write that prefix and read the released
-  shim and `bin/RELEASE.json`, nothing else (`identity-policy.json`). The bucket policy
+  shim and `bin/RELEASE.json`, nothing else (`identity-policy.json`; its KMS statement is that one key, for objects of
+  that prefix only). The bucket policy
   (`identity-bucket-policy.json`) blocks public access, refuses a put that is not SSE-KMS or not the role's, refuses a
   read that is not the role's, and refuses a delete that is not the operator's. The host starts a shim only if its
   sha256 is the one `bin/RELEASE.json` names, as the listener does for its own binary.
@@ -631,10 +637,18 @@ pull/deploy/identity.sh down us-east-1a                       # terminates the h
   each started at least `1/rate` seconds after the last. 1,550 identities take about 1.7 hours at the default.
 - In leases of at most 20 (fewer at a low rate, so a batch fits the lease's 10 minutes), from the listener's
   `/identities/token`. Each lease is settled with the count made before the next is asked for. The listener grants
-  at batch priority, never a token a waiting machine is owed.
+  at batch priority, never a token a waiting machine is owed. A registration starts only while its lease has longer
+  to run than the registration may take (`REGISTER_TIMEOUT`, 180 s: its ssh, and `config.sh` inside it at 120 s);
+  otherwise the lease is settled and a new one asked for.
+- Identity `i` lives on `IDENTITY_AZS[i mod n]` (`us-east-1a us-east-1b` by default), whichever hosts are up, and
+  `register` refuses while any of those hosts is down.
+- One run at a time: `identity.sh` holds `flock` on `IDENTITY_LOCK`, and each host script holds its own, so two runs
+  never delete each other's `.runner` or `.credentials`.
 - Stopped by the first failure. A `config.sh` that exits non-zero (a 429 or `ConfigureTooManyRunners` in its log is
   named as GitHub's refusal) ends the command, settles the lease with what was made, and exits 1 naming the identity.
-  Run the same command again to continue: names already held, in S3 and at GitHub, are skipped, and one registered
+  A refusal is settled with `refused=1` (and `failed=<n>` for other failures), which halves the budget's rate and holds
+  its asks as the listener's own refusal does, and the operator is told to wait 5 minutes, not to run it again at once.
+  Otherwise run the same command again to continue: names already held, in S3 and at GitHub, are skipped, and one registered
   whose upload failed is stored without a new registration.
 - Held back at peak unless `--peak-ok`: it waits (30 s a poll, 30 minutes at most) while the listener's `/state` shows
   the budget throttled after a refusal, the organization's rate unknown, or above 3.5 a second.
@@ -646,7 +660,10 @@ The token goes from the listener's admin endpoint to the host's stdin, and to `c
 
 **Cutover and rollback of a size.** Delete the size's scale set, then `relabel <size> superci-park superci-<size>`.
 Rollback relabels back to `superci-park` and recreates the scale set. A relabel makes no registration: it is one
-REST write per identity, paced at `RELABEL_PAUSE` (0.6 s), and resumes where it stopped when run again.
+REST write per identity, at most one a second (60 a minute). It stops at the first 403 or 429, keeps the Retry-After
+(the listener passes it on; 60 s when GitHub names none) beside the lock, refuses to start inside it, and resumes where
+it stopped when run again. `/identities/labels` reads the runner first and refuses (403) any name that does not start
+`superci-id-`, so a just-in-time runner is never relabelled.
 
 **The listener's endpoints** (admin, localhost; from another host through `deploy/ssh.sh`):
 

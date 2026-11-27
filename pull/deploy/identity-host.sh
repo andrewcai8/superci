@@ -3,7 +3,8 @@
 # each command). An identity is one classic runner under $ROOT/<name>, hard-linked to the image's runner tree, with the
 # shim as its bin/Runner.Worker, run by the systemd unit superci-id@<name>. Its .runner, .credentials and
 # .credentials_rsaparams are kept in s3://<bucket>/<deployment>/hosts/<az>/<name>/, so a replacement host in the same AZ
-# restores its share and registers nothing. Nothing here prints a token.
+# restores its share and registers nothing. Nothing here prints a token. Boot, register and adopt run one at a time
+# (flock on $LOCK): two of them at once would delete each other's identity tree.
 #
 #   superci-id boot                                      installs the shim and the unit, restores the share, starts it
 #   superci-id register <label> <url> <group|-> <name>...   registers each name not held yet; token on stdin
@@ -16,6 +17,7 @@ SRC=${RUNNER_SRC:-/home/runner}
 SHIM=${SHIM_BIN:-/usr/local/bin/superci-shim}
 SHIM_ENV=${SHIM_ENV:-/etc/superci-shim.env}
 CONF=${ID_CONF:-/etc/superci-id.conf}
+LOCK=${ID_LOCK:-/run/superci-id.lock}
 UNIT_DIR=${UNIT_DIR:-/etc/systemd/system}
 LOG=${ID_LOG:-/var/log/superci-id}
 PROC=${PROC_ROOT:-/proc}
@@ -23,7 +25,7 @@ FILES=".runner .credentials .credentials_rsaparams"
 BUDGET_KIB=65536 # private memory a listener may hold (64 MiB); its unit's MemoryMax restarts one at 192 MiB
 export AWS_DEFAULT_REGION=us-east-1
 # shellcheck disable=SC1090
-. "$CONF"   # BUCKET, DEPLOYMENT, RELEASE (the release bucket)
+. "$CONF"   # BUCKET, DEPLOYMENT, RELEASE (the release bucket), KMS_KEY (the identity files' key)
 mkdir -p "$LOG" "$ROOT"
 
 az() {
@@ -44,17 +46,27 @@ make_dir() {
   ln -f "$SHIM" "$d/bin/Runner.Worker" 2> /dev/null || install -m 755 "$SHIM" "$d/bin/Runner.Worker"
 }
 
+# locked: takes the host's one lock for the rest of this run, or fails if another run still holds it after LOCK_WAIT.
+locked() {
+  exec 9> "$LOCK"
+  flock -w "${LOCK_WAIT:-900}" 9 || { echo "busy: another superci-id run holds $LOCK" >&2; exit 1; }
+}
+
 upload() {
   local name=$1 f t
   for f in $FILES; do [ -s "$ROOT/$name/$f" ] || { echo "superci-id: $name has no $f" >&2; return 1; }; done
   t=$(mktemp -d)
   mkdir "$t/$name"
   for f in $FILES; do cp -p "$ROOT/$name/$f" "$t/$name/$f"; done
-  aws s3 cp --recursive --only-show-errors --sse aws:kms "$t/$name" "$PREFIX/$name/" || { rm -rf "$t"; return 1; }
+  aws s3 cp --recursive --only-show-errors --sse aws:kms --sse-kms-key-id "${KMS_KEY:?no KMS_KEY in $CONF}" "$t/$name" "$PREFIX/$name/" || { rm -rf "$t"; return 1; }
   rm -rf "$t"
 }
 
-start() { systemctl enable --now --no-block "superci-id@$1" > /dev/null 2>&1 || systemctl start --no-block "superci-id@$1"; }
+# A unit that GitHub's removal of its identity made crash-loop stops at its start limit; a start here asks again.
+start() {
+  systemctl reset-failed "superci-id@$1" > /dev/null 2>&1 || true
+  systemctl enable --now --no-block "superci-id@$1" > /dev/null 2>&1 || systemctl start --no-block "superci-id@$1"
+}
 
 register() {
   local label=$1 url=$2 group=$3 name d status args rc token=""
@@ -70,12 +82,17 @@ register() {
       make_dir "$name"
       args=(--unattended --url "$url" --labels "$label" --no-default-labels --name "$name" --disableupdate --work _work)
       [ "$group" = - ] || args+=(--runnergroup "$group")
-      # The token goes in the environment the runner reads its inputs from, not in its arguments.
+      # The token goes in the environment the runner reads its inputs from, not in its arguments. A config.sh that hangs
+      # is killed: it may still have registered at GitHub, which the next run reports as an orphan.
       rc=0
-      (cd "$d" && ACTIONS_RUNNER_INPUT_TOKEN=$token RUNNER_ALLOW_RUNASROOT=1 ./config.sh "${args[@]}" > "$LOG/config-$name.log" 2>&1) || rc=$?
+      (cd "$d" && ACTIONS_RUNNER_INPUT_TOKEN=$token RUNNER_ALLOW_RUNASROOT=1 timeout "${CONFIG_TIMEOUT:-120}" ./config.sh "${args[@]}" > "$LOG/config-$name.log" 2>&1) || rc=$?
       if [ "$rc" != 0 ]; then
         rm -rf "$d"
-        echo "failed $name: config.sh exit $rc$(grep -qiE '429|ConfigureTooManyRunners|rate limit' "$LOG/config-$name.log" && echo ', GitHub refused it (429 or ConfigureTooManyRunners in its log)') (log $LOG/config-$name.log)"
+        if grep -qiE '429|ConfigureTooManyRunners|rate limit' "$LOG/config-$name.log"; then
+          echo "refused $name: config.sh exit $rc, GitHub refused it (429 or ConfigureTooManyRunners in its log) (log $LOG/config-$name.log)"
+        else
+          echo "failed $name: config.sh exit $rc$([ "$rc" = 124 ] && echo ' (timed out)') (log $LOG/config-$name.log)"
+        fi
         continue
       fi
       status=registered
@@ -116,6 +133,9 @@ boot() {
 Description=superci identity %i
 After=network-online.target
 Wants=network-online.target
+# An identity GitHub has removed fails to start for good: it stops after 10 starts in 10 minutes, not crash-looping.
+StartLimitIntervalSec=600
+StartLimitBurst=10
 
 [Service]
 WorkingDirectory=/opt/id/%i
@@ -125,11 +145,7 @@ Environment=DOTNET_gcServer=0 DOTNET_GCgen0size=0x200000 DOTNET_GCHeapHardLimit=
 MemoryMax=192M
 ExecStart=/opt/id/%i/run.sh
 Restart=always
-RestartSec=2
-# A listener that dies or restarts leaves its running shim (bin/Runner.Worker) alive: the shim's job goes on, and its
-# machine renews the job itself (measured Nov 26: with the shim killed with its listener, the job ran on and failed only
-# when the machine was ended).
-KillMode=process
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
@@ -171,9 +187,9 @@ status() {
 }
 
 case "${1:-}" in
-  boot) boot ;;
-  register) shift; [ $# -ge 4 ] || { echo "register <label> <url> <group|-> <name>..." >&2; exit 2; }; register "$@" ;;
-  adopt) shift; adopt "$@" ;;
+  boot) locked; boot ;;
+  register) shift; [ $# -ge 4 ] || { echo "register <label> <url> <group|-> <name>..." >&2; exit 2; }; locked; register "$@" ;;
+  adopt) shift; locked; adopt "$@" ;;
   status) status ;;
   *) echo "usage: superci-id boot|register|adopt|status" >&2; exit 2 ;;
 esac

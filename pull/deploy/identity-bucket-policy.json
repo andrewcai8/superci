@@ -7,6 +7,8 @@
       "Condition": { "StringNotEquals": { "s3:x-amz-server-side-encryption": "aws:kms" } } },
     { "Sid": "NoPutWithoutAnEncryptionHeader", "Effect": "Deny", "Principal": "*", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::@BUCKET@/*",
       "Condition": { "Null": { "s3:x-amz-server-side-encryption": "true" } } },
+    { "Sid": "NoPutWithAnotherKey", "Effect": "Deny", "Principal": "*", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::@BUCKET@/*",
+      "Condition": { "StringNotEquals": { "s3:x-amz-server-side-encryption-aws-kms-key-id": "@KEY_ARN@" } } },
     { "Sid": "OnlyTheIdentityHostsWrite", "Effect": "Deny", "Principal": "*", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::@BUCKET@/*",
       "Condition": { "ArnNotEquals": { "aws:PrincipalArn": "arn:aws:iam::@ACCOUNT@:role/@ROLE@" } } },
     { "Sid": "OnlyTheIdentityHostsRead", "Effect": "Deny", "Principal": "*", "Action": ["s3:GetObject", "s3:GetObjectVersion"], "Resource": "arn:aws:s3:::@BUCKET@/*",

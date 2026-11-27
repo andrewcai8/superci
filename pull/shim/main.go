@@ -60,6 +60,9 @@ const (
 
 const envFile = "/etc/superci-shim.env"
 
+// revision is the commit the binary was built from, set by deploy/build.sh with -ldflags "-X main.revision=<sha>".
+var revision = "unknown"
+
 type config struct {
 	Listener string // https URL of the listener
 	Pin      string // curl's --pinnedpubkey form: sha256//<base64>, several joined by ;
@@ -608,6 +611,10 @@ func readRunner(path string) ([]byte, error) {
 }
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "-version" {
+		fmt.Println(revision)
+		return
+	}
 	// A write to a closed stdout or stderr kills a Go program with SIGPIPE; the listener closing its end of the Worker's
 	// output must not end the job (lenient drops the error).
 	signal.Ignore(syscall.SIGPIPE)

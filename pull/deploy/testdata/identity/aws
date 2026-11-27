@@ -8,6 +8,7 @@ args = sys.argv[1:]
 with open(os.path.join(root, "calls.log"), "a") as log:
     log.write(" ".join(args) + "\n")
 
+KEY_ARN = "arn:aws:kms:us-east-1:243891825325:key/1234abcd-12ab-34cd-56ef-1234567890ab"
 BOOL = {"--quiet", "--only-show-errors", "--with-decryption", "--recursive", "--associate-public-ip-address"}
 
 
@@ -92,6 +93,7 @@ elif svc == "s3" and cmd == "cp":
             sys.stderr.write("upload failed\n")
             sys.exit(1)
         assert opt("--sse") == "aws:kms", "an upload without SSE-KMS"
+        assert opt("--sse-kms-key-id") == KEY_ARN, "an upload under another key than the identities'"
         for f in os.listdir(src):
             p = s3path(dst) + f
             os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -118,6 +120,8 @@ elif svc == "s3api" and cmd == "head-bucket":
     sys.exit(0 if os.path.isdir(os.path.join(root, "s3", opt("--bucket"))) else 254)
 elif svc == "s3api" and cmd == "create-bucket":
     os.makedirs(os.path.join(root, "s3", opt("--bucket")), exist_ok=True)
+elif svc == "s3api" and cmd == "put-bucket-encryption":
+    open(os.path.join(state, "bucket-encryption.json"), "w").write(opt("--server-side-encryption-configuration"))
 elif svc == "s3api" and cmd == "put-bucket-policy":
     open(os.path.join(state, "bucket-policy.json"), "w").write(opt("--policy"))
 elif svc == "s3api" and cmd == "list-objects-v2":
@@ -129,6 +133,24 @@ elif svc == "iam" and cmd in ("create-role", "create-instance-profile"):
     open(os.path.join(state, "iam-" + (opt("--role-name") or opt("--instance-profile-name")) + cmd.replace("create", "get")), "w").write("")
 elif svc == "iam" and cmd == "put-role-policy":
     open(os.path.join(state, "role-policy.json"), "w").write(opt("--policy-document"))
+elif svc == "kms" and cmd == "describe-key":
+    if not os.path.exists(os.path.join(state, "key")):
+        sys.stderr.write("NotFoundException: alias/superci-pull-identities is not found\n")
+        sys.exit(254)
+    print(KEY_ARN)
+elif svc == "kms" and cmd == "create-key":
+    open(os.path.join(state, "key"), "w").write("")
+    open(os.path.join(state, "key-policy.json"), "w").write(opt("--policy"))
+    print(KEY_ARN)
+elif svc == "kms" and cmd == "create-alias":
+    if os.environ.get("FAKE_ALIAS_FAIL"):
+        sys.stderr.write("the alias could not be made\n")
+        sys.exit(255)
+    open(os.path.join(state, "alias"), "w").write(opt("--alias-name"))
+elif svc == "kms" and cmd == "put-key-policy":
+    open(os.path.join(state, "key-policy.json"), "w").write(opt("--policy"))
+elif svc == "kms" and cmd == "schedule-key-deletion":
+    os.remove(os.path.join(state, "key"))
 elif svc == "ssm" and cmd == "get-parameter":
     sys.stdout.write(open(os.path.join(root, "tls.json")).read())
 elif svc == "ec2" and cmd == "describe-vpcs":
@@ -146,6 +168,8 @@ elif svc == "ec2" and cmd == "describe-addresses":
     print("203.0.113.9")
 elif svc == "ec2" and cmd == "describe-subnets":
     print("subnet-" + filters()["availability-zone"][0][-1])
+elif svc == "ec2" and cmd == "describe-images" and "--image-ids" in args:
+    print("/dev/sda1")
 elif svc == "ec2" and cmd == "describe-images":
     for i, b in enumerate(["20261001000000", "20261102081424", "20261120000000"]):
         print("ami-%d\truns-on-v2.2-ubuntu24-full-x64-%s" % (i, b))

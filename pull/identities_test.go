@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -27,8 +28,15 @@ type fakeREST struct {
 	runners   []map[string]any // what the listings page through
 	mintCode  int              // status of the registration token, 201 when 0
 	groupList string
-	srv       *httptest.Server
+	// anyRunnerNamed is the name of every runner id asked for that the listings do not hold, so a relabel finds an identity.
+	anyRunnerNamed string
+	// labelsCode and labelsRetry make the label writes answer that status, with a Retry-After header when it is set.
+	labelsCode  int
+	labelsRetry string
+	srv         *httptest.Server
 }
+
+var runnerOne = regexp.MustCompile(`^/(?:orgs|repos)/o/(?:r\d/)?actions/runners/(\d+)$`)
 
 func newFakeREST(t *testing.T) *fakeREST {
 	f := &fakeREST{bodies: map[string]string{}, groupList: `{"runner_groups":[]}`}
@@ -64,6 +72,25 @@ func (f *fakeREST) serve(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `{}`)
 	case r.Method == http.MethodPut && strings.HasSuffix(path, "/repositories"):
 		w.WriteHeader(http.StatusNoContent)
+	case r.Method == http.MethodGet && runnerOne.MatchString(path):
+		id := runnerOne.FindStringSubmatch(path)[1]
+		for _, rr := range f.runners {
+			if fmt.Sprint(rr["id"]) == id {
+				out, _ := json.Marshal(rr)
+				w.Write(out)
+				return
+			}
+		}
+		if f.anyRunnerNamed != "" {
+			fmt.Fprintf(w, `{"id":%s,"name":%q}`, id, f.anyRunnerNamed)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	case strings.HasSuffix(path, "/labels") && r.Method == http.MethodPut && f.labelsCode != 0:
+		if f.labelsRetry != "" {
+			w.Header().Set("Retry-After", f.labelsRetry)
+		}
+		w.WriteHeader(f.labelsCode)
 	case strings.HasSuffix(path, "/labels") && r.Method == http.MethodPut:
 		fmt.Fprint(w, `{"total_count":1,"labels":[]}`)
 	case strings.HasSuffix(path, "/runners"):
@@ -244,6 +271,7 @@ func TestAtRepositoryScopeATokenIsTheRepositorysAndTheGroupIsTheDefault(t *testi
 
 func TestRelabellingReplacesOneRunnersLabelsAndMakesNoRegistration(t *testing.T) {
 	f, b := newFakeREST(t), spare()
+	f.anyRunnerNamed = "superci-id-4cpu-0001"
 	h := idsAdmin(f, b, "")
 	if w := do(h, http.MethodPost, "/identities/labels?id=123&labels=superci-park,extra"); w.Code != http.StatusNoContent {
 		t.Fatalf("%d %s", w.Code, w.Body.String())
@@ -257,6 +285,87 @@ func TestRelabellingReplacesOneRunnersLabelsAndMakesNoRegistration(t *testing.T)
 	do(idsAdmin(f, b, "repository"), http.MethodPost, "/identities/labels?id=5&labels=a")
 	if f.called("PUT /repos/o/r1/actions/runners/5/labels") != 1 {
 		t.Errorf("repository scope relabels at the repository: %v", f.calls)
+	}
+}
+
+func TestARelabelOfARunnerThatIsNotAnIdentityIsRefusedAndChangesNothing(t *testing.T) {
+	f := newFakeREST(t)
+	f.runners = []map[string]any{
+		{"id": 777, "name": "superci-pull-jit-0f3a", "status": "online", "busy": false, "labels": []any{map[string]any{"name": "superci-4cpu"}}},
+		{"id": 778, "name": "superci-id-4cpu-0001", "status": "online", "busy": false, "labels": []any{}},
+	}
+	h := idsAdmin(f, spare(), "")
+	if w := do(h, http.MethodPost, "/identities/labels?id=777&labels=superci-park"); w.Code != http.StatusForbidden {
+		t.Fatalf("a just-in-time runner's id: %d %s", w.Code, w.Body.String())
+	}
+	if f.called("PUT") != 0 {
+		t.Errorf("its labels were replaced: %v", f.calls)
+	}
+	if w := do(h, http.MethodPost, "/identities/labels?id=999&labels=superci-park"); w.Code != http.StatusBadGateway || f.called("PUT") != 0 {
+		t.Errorf("a runner GitHub cannot name: %d, calls %v", w.Code, f.calls)
+	}
+	if w := do(h, http.MethodPost, "/identities/labels?id=778&labels=superci-park"); w.Code != http.StatusNoContent || f.called("PUT /orgs/o/actions/runners/778/labels") != 1 {
+		t.Errorf("an identity: %d %v", w.Code, f.calls)
+	}
+}
+
+func TestARelabelGitHubLimitsIsAnswered429WithItsRetryAfterAndOtherFailuresAre502(t *testing.T) {
+	for _, tc := range []struct {
+		code        int
+		retry       string
+		want        int
+		wantRetryIn string
+	}{
+		{http.StatusTooManyRequests, "30", http.StatusTooManyRequests, "30"},
+		{http.StatusForbidden, "120", http.StatusTooManyRequests, "120"},
+		{http.StatusForbidden, "", http.StatusTooManyRequests, ""},
+		{http.StatusInternalServerError, "30", http.StatusBadGateway, ""},
+	} {
+		f := newFakeREST(t)
+		f.anyRunnerNamed, f.labelsCode, f.labelsRetry = "superci-id-4cpu-0001", tc.code, tc.retry
+		w := do(idsAdmin(f, spare(), ""), http.MethodPost, "/identities/labels?id=9&labels=a")
+		if w.Code != tc.want || w.Header().Get("Retry-After") != tc.wantRetryIn {
+			t.Errorf("GitHub %d (Retry-After %q): %d, Retry-After %q", tc.code, tc.retry, w.Code, w.Header().Get("Retry-After"))
+		}
+	}
+}
+
+func TestARefusalSettledAgainstALeaseThrottlesTheBudget(t *testing.T) {
+	f, b := newFakeREST(t), spare()
+	h := idsAdmin(f, b, "")
+	tok := do(h, http.MethodPost, "/identities/token?n=3")
+	var lease IdentityToken
+	if err := json.Unmarshal(tok.Body.Bytes(), &lease); err != nil || lease.Granted != 3 {
+		t.Fatalf("%v %s", err, tok.Body.String())
+	}
+	if b.Snapshot(time.Now()).Throttled {
+		t.Fatal("throttled before any refusal")
+	}
+	if w := do(h, http.MethodPost, "/lease/settle?id="+lease.Lease+"&made=1&failed=1&refused=1"); w.Code != http.StatusNoContent {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
+	}
+	snap := b.Snapshot(time.Now())
+	if !snap.Throttled || snap.Refused != 1 || snap.Failed != 1 || snap.Made != 1 || snap.Leased != 0 {
+		t.Fatalf("a refusal settled with the lease: %+v", snap)
+	}
+	if b.Take(time.Now(), ForJob) {
+		t.Error("the budget gave a token right after GitHub refused a registration")
+	}
+	for _, q := range []string{"refused=2", "refused=x", "failed=-1", "failed=x"} {
+		if w := do(h, http.MethodPost, "/lease/settle?id=none&made=0&"+q); w.Code != http.StatusBadRequest {
+			t.Errorf("%s: %d", q, w.Code)
+		}
+	}
+}
+
+func TestARefusalIsHeldAgainstTheBudgetEvenWhenItsLeaseExpired(t *testing.T) {
+	b := spare()
+	h := idsAdmin(newFakeREST(t), b, "")
+	if w := do(h, http.MethodPost, "/lease/settle?id=gone&made=0&refused=1"); w.Code != http.StatusGone {
+		t.Fatalf("%d", w.Code)
+	}
+	if snap := b.Snapshot(time.Now()); !snap.Throttled || snap.Refused != 1 {
+		t.Errorf("the refusal was dropped with its lease: %+v", snap)
 	}
 }
 

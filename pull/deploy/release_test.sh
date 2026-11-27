@@ -26,7 +26,10 @@ D=$W/pull/deploy
 # A release directory as build.sh writes it, its programs standing in for the Go binaries and carrying the commit.
 R=$T/release; mkdir -p "$R/listener/bin" "$R/listener/deploy" "$R/listener/config" "$R/cache/bin"
 printf '#!/bin/sh\n# %s\ncase "$1" in -version) echo %s ;; -validate) cat > /dev/null; echo valid ;; esac\n' "$C" "$C" > "$R/listener/bin/superci-pull"
-printf '#!/bin/sh\necho shim %s\n' "$C" > "$R/listener/bin/superci-shim"
+# The shim is the real one, built as build.sh builds it: a missing `revision` variable leaves the commit out of the
+# binary, and manifest.sh then refuses the whole listener tree.
+(cd "$here/.." && CGO_ENABLED=0 GOFLAGS=-buildvcs=false go build -trimpath -ldflags="-s -w -X main.revision=$C" -o "$R/listener/bin/superci-shim" ./shim) || { echo "FAIL  the shim does not build"; exit 1; }
+[ "$("$R/listener/bin/superci-shim" -version)" = "$C" ]; check $? "superci-shim -version prints the commit it was built from"
 for a in amd64 arm64; do printf '#!/bin/sh\necho %s\n' "$C" > "$R/cache/bin/pullcache-linux-$a"; done
 printf 'bootstrap %s\n' "$C" > "$T/bootstrap"; (cd "$T" && python3 -I -m zipfile -c "$R/cache/bin/pullcache-lambda-arm64.zip" bootstrap)
 chmod 755 "$R"/listener/bin/* "$R"/cache/bin/*
@@ -65,7 +68,9 @@ grep -q update-function-code "$FAKE_AWS/calls.log"; check $((1 - $?)) "and updat
 echo junk >> "$L/bin/superci-pull"
 refuses "deploy/up.sh keeps the template when bin/superci-pull is not RELEASE.json's" "bin/superci-pull in superci-pull-243891825325 has sha256" "$D/up.sh" 203.0.113.7/32
 
-cp -r "$R" "$T/bad"; rm "$T/bad/listener/bin/RELEASE.json"; echo '# edit' >> "$T/bad/listener/deploy/health.sh"
+cp -r "$R" "$T/bad"; rm "$T/bad/listener/bin/RELEASE.json"; printf '#!/bin/sh\necho a shim of no commit\n' > "$T/bad/listener/bin/superci-shim"
+refuses "release.sh refuses a shim that does not carry the commit" "listener/bin/superci-shim does not carry $C" "$D/release.sh" "$T/bad" "$here/testdata/ssh"
+rm -rf "$T/bad"; cp -r "$R" "$T/bad"; rm "$T/bad/listener/bin/RELEASE.json"; echo '# edit' >> "$T/bad/listener/deploy/health.sh"
 refuses "release.sh refuses a script that is not the commit's" "listener/deploy/health.sh differs" "$D/release.sh" "$T/bad" "$here/testdata/ssh"
 git -C "$W" config remote.origin.url https://github.com/someone/superci
 refuses "release.sh refuses another origin" "not andrewcai8/superci" "$D/release.sh" "$R" "$here/testdata/ssh"

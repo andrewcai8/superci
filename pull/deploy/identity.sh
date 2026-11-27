@@ -8,13 +8,20 @@
 #                                  it has restored its share
 #   register [--rate R] [--peak-ok] <size> <n> [first]
 #                                  registers identities superci-id-<size>-<first> .. <first+n-1> (n at most 100) under the
-#                                  park label, on host (number mod hosts); first is the number after the highest there is.
-#                                  At most R a second (0.25 by default, 1 at most), in leases of at most 20, stopped at the
-#                                  first failure, and held back while the budget is held or the organization registers over
-#                                  3.5 a second (unless --peak-ok)
-#   relabel <size> <from> <to>     moves every superci-id-<size>-* from one label to the other (no registration)
+#                                  park label, identity i on the host of IDENTITY_AZS[i mod their number] (us-east-1a
+#                                  us-east-1b by default), and refuses while any of those hosts is down; first is the
+#                                  number after the highest there is. At most R a second (0.25 by default, 1 at most), in
+#                                  leases of at most 20 (a new lease once one has run out), stopped at the first failure,
+#                                  and held back while the budget is held or the organization registers over 3.5 a second
+#                                  (unless --peak-ok). A refusal by GitHub is passed to the listener's budget, which holds
+#                                  every ask for a while: wait, do not run it again at once
+#   relabel <size> <from> <to>     moves every superci-id-<size>-* from one label to the other (no registration), at most
+#                                  60 a minute, stopped at the first 403 or 429 and held until its Retry-After has passed
 #   down <az>                      terminates that host; its identities stay registered, and `up <az>` restores them
 #   status                         hosts, identities per host, listeners running, private memory per listener
+#
+# up, register, relabel and down run one at a time (flock on IDENTITY_LOCK): two registers at once would race for the same
+# identities, and the host takes the same care for its own files.
 #
 # The operator's SSH to the listener is `SSH` (deploy/ssh.sh by default); to a host, a key made for each call and pushed
 # with EC2 Instance Connect. A registration token goes from the listener's admin endpoint to a host's stdin through this
@@ -27,6 +34,10 @@ DEPLOYMENT=${DEPLOYMENT:-superci-pull}
 NAME=superci-pull-identity
 TAGS="Key=purpose,Value=superci-pull"
 PARK=superci-park
+# The AZs that hold identities, in the order identity i picks from: it lives on AZS[i mod their number], whichever hosts are up.
+IDENTITY_AZS=${IDENTITY_AZS:-us-east-1a us-east-1b}
+read -ra AZS <<< "$IDENTITY_AZS"
+KEY_ALIAS=alias/superci-pull-identities
 SSH_USER=${IDENTITY_SSH_USER:-ubuntu}
 # The machines' image, as fleet.go picks it (ImageConfig in main.go): the pinned build, or the oldest newer, or the newest.
 IMAGE_OWNER=135269210855
@@ -43,6 +54,12 @@ BUCKET=superci-pull-identities-$ACCOUNT
 
 here=$(cd "$(dirname "$0")" && pwd)
 . "$here/release-lib.sh"
+LOCK=${IDENTITY_LOCK:-${XDG_RUNTIME_DIR:-$HOME/.cache}/superci-identity.lock}
+case $cmd in
+  up | register | relabel | down)
+    mkdir -p "$(dirname "$LOCK")"; exec 8> "$LOCK"
+    flock -n 8 || die "another identity.sh run holds $LOCK: wait for it to end" ;;
+esac
 SSH=${SSH:-$here/ssh.sh}
 kdir=$(mktemp -d); trap 'rm -rf "$kdir"' EXIT
 ssh-keygen -q -t ed25519 -N '' -f "$kdir/key"
@@ -69,12 +86,31 @@ hosts() {
     Name=instance-state-name,Values=running --query 'Reservations[].Instances[].[Placement.AvailabilityZone,InstanceId,PublicIpAddress]' --output text | sort
 }
 
-# hssh <instance id> <az> <ip> command...: runs it on the host with a key made for this run, pushed for the call.
+# resolve_hosts: HOSTS is the running host of each of IDENTITY_AZS, in that order, so identity i is on HOSTS[i mod n]
+# whichever other hosts are up. It refuses while any of them is down, or up twice.
+resolve_hosts() {
+  local az line n running
+  [ ${#AZS[@]} -ge 1 ] || die "IDENTITY_AZS names no AZ"
+  [ "$(printf '%s\n' "${AZS[@]}" | sort -u | wc -l)" = ${#AZS[@]} ] || die "IDENTITY_AZS names an AZ twice ($IDENTITY_AZS)"
+  mapfile -t running < <(hosts)
+  HOSTS=()
+  for az in "${AZS[@]}"; do
+    check_az "$az"
+    n=0
+    for line in "${running[@]}"; do
+      if [[ $line == "$az"[[:space:]]* ]]; then n=$((n + 1)); HOSTS+=("$line"); fi
+    done
+    [ "$n" = 1 ] || die "refusing: $az has $([ "$n" = 0 ] && echo 'no running identity host' || echo "$n identity hosts"); identity i lives on IDENTITY_AZS[i mod ${#AZS[@]}] ($IDENTITY_AZS), so up $az first"
+  done
+}
+
+# hssh <instance id> <az> <ip> command...: runs it on the host with a key made for this run, pushed for the call, and
+# gives up on it after HOST_TIMEOUT seconds.
 hssh() {
   local id=$1 zone=$2 ip=$3; shift 3
   $A ec2-instance-connect send-ssh-public-key --instance-id "$id" --availability-zone "$zone" --instance-os-user "$SSH_USER" \
     --ssh-public-key "file://$kdir/key.pub" > /dev/null < /dev/null
-  ssh -q -i "$kdir/key" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$kdir/known" -o ConnectTimeout=10 "$SSH_USER@$ip" "$@"
+  timeout "${HOST_TIMEOUT:-300}" ssh -q -i "$kdir/key" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$kdir/known" -o ConnectTimeout=10 "$SSH_USER@$ip" "$@"
 }
 # hpush <host line>: the current host script, so the host runs the script of this checkout.
 hpush() {
@@ -97,6 +133,31 @@ else:
     sys.exit("cannot name the operator from " + arn)'
 }
 
+# operator_principal: the role or user the operator is, as a principal of the key's policy (no wildcards there).
+operator_principal() {
+  operator_arns | python3 -I -c 'import json,sys; print(json.dumps(json.load(sys.stdin)[0]))'
+}
+
+# ensure_key: sets KEY_ARN, the customer-managed key behind alias/superci-pull-identities, made once. Its policy names the
+# identity role (encrypt and decrypt through S3, nothing else) and the operator (administer, never use), and no one else.
+ensure_key() {
+  local policy
+  policy=$(render "$here/identity-key-policy.json" ACCOUNT="$ACCOUNT" ROLE=$NAME OPERATOR="$(operator_principal)")
+  KEY_ARN=$($A kms describe-key --key-id $KEY_ALIAS --query KeyMetadata.Arn --output text 2> /dev/null) || KEY_ARN=""
+  if [ -z "$KEY_ARN" ] || [ "$KEY_ARN" = None ]; then
+    KEY_ARN=$($A kms create-key --description 'superci-pull identity files: persistent runner credentials' --tags TagKey=purpose,TagValue=superci-pull \
+      --policy "$policy" --query KeyMetadata.Arn --output text)
+    [[ $KEY_ARN =~ ^arn:aws:kms:us-east-1:$ACCOUNT:key/[0-9a-f-]+$ ]] || die "refusing: create-key answered $KEY_ARN"
+    # A key with no alias would be made again by the next run.
+    $A kms create-alias --alias-name $KEY_ALIAS --target-key-id "$KEY_ARN" ||
+      { $A kms schedule-key-deletion --key-id "$KEY_ARN" --pending-window-in-days 7 > /dev/null; die "the alias $KEY_ALIAS was not made; the new key is scheduled for deletion, run again"; }
+  else
+    [[ $KEY_ARN =~ ^arn:aws:kms:us-east-1:$ACCOUNT:key/[0-9a-f-]+$ ]] || die "refusing: $KEY_ALIAS is $KEY_ARN"
+    $A kms put-key-policy --key-id "$KEY_ARN" --policy-name default --policy "$policy"
+  fi
+  echo "identity key: $KEY_ALIAS ($KEY_ARN)"
+}
+
 ensure_bucket() {
   if ! $A s3api head-bucket --bucket "$BUCKET" 2> /dev/null; then
     $A s3api create-bucket --bucket "$BUCKET" > /dev/null
@@ -105,9 +166,9 @@ ensure_bucket() {
     $A s3api put-bucket-tagging --bucket "$BUCKET" --tagging 'TagSet=[{Key=purpose,Value=superci-pull}]'
   fi
   $A s3api put-bucket-encryption --bucket "$BUCKET" --server-side-encryption-configuration \
-    '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"aws:kms"}}]}'
-  $A s3api put-bucket-policy --bucket "$BUCKET" --policy "$(render "$here/identity-bucket-policy.json" BUCKET="$BUCKET" ACCOUNT="$ACCOUNT" ROLE=$NAME OPERATOR="$(operator_arns)")"
-  echo "identities bucket: s3://$BUCKET (SSE-KMS, public access blocked)"
+    "{\"Rules\":[{\"ApplyServerSideEncryptionByDefault\":{\"SSEAlgorithm\":\"aws:kms\",\"KMSMasterKeyID\":\"$KEY_ARN\"},\"BucketKeyEnabled\":false}]}"
+  $A s3api put-bucket-policy --bucket "$BUCKET" --policy "$(render "$here/identity-bucket-policy.json" BUCKET="$BUCKET" ACCOUNT="$ACCOUNT" ROLE=$NAME KEY_ARN="$KEY_ARN" OPERATOR="$(operator_arns)")"
+  echo "identities bucket: s3://$BUCKET (SSE-KMS with $KEY_ALIAS, public access blocked)"
 }
 
 ensure_role() {
@@ -115,8 +176,9 @@ ensure_role() {
     $A iam create-role --role-name $NAME --tags $TAGS --assume-role-policy-document \
       '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}' > /dev/null
   fi
+  ensure_key # (its policy names the role, so the role comes first, and the role's policy names the key)
   $A iam put-role-policy --role-name $NAME --policy-name $NAME --policy-document \
-    "$(render "$here/identity-policy.json" BUCKET="$BUCKET" DEPLOYMENT="$DEPLOYMENT" ACCOUNT="$ACCOUNT" RELEASE="$LISTENER_BUCKET")"
+    "$(render "$here/identity-policy.json" BUCKET="$BUCKET" DEPLOYMENT="$DEPLOYMENT" KEY_ARN="$KEY_ARN" RELEASE="$LISTENER_BUCKET")"
   if ! $A iam get-instance-profile --instance-profile-name $NAME > /dev/null 2>&1; then
     $A iam create-instance-profile --instance-profile-name $NAME --tags $TAGS > /dev/null
     $A iam add-role-to-instance-profile --instance-profile-name $NAME --role-name $NAME
@@ -165,6 +227,7 @@ cat > /etc/superci-id.conf << 'CONF'
 BUCKET=$BUCKET
 DEPLOYMENT=$DEPLOYMENT
 RELEASE=$LISTENER_BUCKET
+KMS_KEY=$KEY_ARN
 CONF
 printf 'LISTENER=%s\nPIN=%s\n' '$1' '$2' > /etc/superci-shim.env
 echo '$(base64 -w0 "$here/identity-host.sh")' | base64 -d > /usr/local/bin/superci-id
@@ -174,7 +237,7 @@ EOF
 }
 
 up() {
-  local type=r7i.4xlarge az existing eip pin ami subnet sg ud shim id ip
+  local type=r7i.4xlarge az existing eip pin ami subnet sg ud shim id ip rootdev
   while [ $# -gt 0 ]; do
     case $1 in
       --type) type=${2:-}; shift; shift || true ;;
@@ -188,7 +251,7 @@ up() {
   existing=$($A ec2 describe-instances --filters Name=tag:Name,Values=$NAME-"$az" Name=instance-state-name,Values=pending,running \
     --query 'Reservations[].Instances[].InstanceId' --output text)
   if [ -n "$existing" ] && [ "$existing" != None ]; then echo "already up: $existing ($NAME-$az)"; return 0; fi
-  ensure_bucket; ensure_role
+  ensure_role; ensure_bucket
   sg=$(ensure_sg); echo "security group: $sg"
   shim=$(mktemp); released_object "$LISTENER_BUCKET" $R bin/superci-shim "$shim" || die "refusing: no released shim for the host to run"
   rm -f "$shim"
@@ -197,11 +260,14 @@ up() {
   pin=$(tls_pin); [[ $pin =~ ^sha256//[A-Za-z0-9+/=]+$ ]] || die "refusing: no public pin from /superci-pull/tls"
   ami=$(image); subnet=$($A ec2 describe-subnets --filters Name=default-for-az,Values=true Name=availability-zone,Values="$az" --query 'Subnets[0].SubnetId' --output text)
   [ "$subnet" != None ] || die "refusing: no default subnet in $az"
+  # The root volume is encrypted: its device is the image's own, or the mapping would add a second volume instead.
+  rootdev=$($A ec2 describe-images --image-ids "$ami" --query 'Images[0].RootDeviceName' --output text)
+  [[ $rootdev =~ ^/dev/[a-z0-9]+$ ]] || die "refusing: $ami names no root device ($rootdev)"
   ud=$(userdata "https://$eip:8443" "$pin")
   [ ${#ud} -le 16000 ] || die "refusing: user data is ${#ud} bytes, over EC2's 16 KB"
   for _ in 1 2 3 4 5 6; do # (a new instance profile takes a few seconds to be usable)
     id=$($A ec2 run-instances --image-id "$ami" --instance-type "$type" --subnet-id "$subnet" --security-group-ids "$sg" --associate-public-ip-address \
-      --iam-instance-profile Name=$NAME --metadata-options HttpTokens=required,HttpPutResponseHopLimit=1,HttpEndpoint=enabled \
+      --iam-instance-profile Name=$NAME --block-device-mappings "DeviceName=$rootdev,Ebs={Encrypted=true,DeleteOnTermination=true}" --metadata-options HttpTokens=required,HttpPutResponseHopLimit=1,HttpEndpoint=enabled \
       --user-data "$ud" \
       --tag-specifications "ResourceType=instance,Tags=[{$TAGS},{Key=superci-pull-role,Value=identity},{Key=superci-pull-deployment,Value=$DEPLOYMENT},{Key=Name,Value=$NAME-$az}]" \
       "ResourceType=volume,Tags=[{$TAGS},{Key=Name,Value=$NAME-$az}]" --query 'Instances[0].InstanceId' --output text) && break
@@ -266,9 +332,11 @@ elif b["org_rate"] > 3.5:
 
 # Registering identities spends the organization's cap like any registration: at most --rate a second (default 0.25, never
 # above 1), one identity at a time over all hosts, in leases of at most 20 each settled before the next is asked, and
-# stopped at the first one that fails. A batch also never outlasts a lease (10 minutes) at the rate.
+# stopped at the first one that fails. A registration is only started while its lease has longer to run than the
+# registration may take (REGISTER_TIMEOUT), else a new lease is asked for.
 register() {
   local rate=0.25 peak_ok=0 size n first i name line az id ip tries=0 granted lease resp token url group gname k code
+  local lease_exp failed_n refused_n HOST_TIMEOUT=${REGISTER_TIMEOUT:-180}
   while [ $# -gt 0 ]; do
     case $1 in
       --rate) rate=${2:-}; shift; shift || true ;;
@@ -282,8 +350,7 @@ register() {
   check_size "$size"
   [[ $n =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le 100 ] || die "n is 1 to 100 identities a call"
   [ -z "$first" ] || { [[ $first =~ ^[0-9]+$ ]] && [ "$first" -ge 1 ] || die "first is a number from 1"; }
-  mapfile -t HOSTS < <(hosts)
-  [ ${#HOSTS[@]} -ge 1 ] || die "no identity host is running: up <az> first"
+  resolve_hosts
   [ ${#HOSTS[@]} -ge 2 ] || echo "warning: one identity host; the plane needs two, in different AZs" >&2
   local s3names gh
   s3names=$(complete_in_s3)
@@ -299,7 +366,7 @@ for l in sys.stdin:
         top = max(top, int(m.group(1)))
 print(top + 1)' "$size")
   fi
-  local todo=() adopt=() held=0 orphans=0
+  local todo=() adopt=() held=0 orphans=0 refused=0
   for ((i = first; i < first + n; i++)); do
     name=$(printf 'superci-id-%s-%04d' "$size" "$i")
     if grep -q "^$name " <<< "$s3names"; then held=$((held + 1))
@@ -338,14 +405,16 @@ print(top + 1)' "$size")
       sleep "${LEASE_WAIT:-15}"
       continue
     fi
-    tries=0
     lease=$(printf '%s' "$resp" | jget lease); token=$(printf '%s' "$resp" | jget token)
-    url=$(printf '%s' "$resp" | jget url); gname=$(printf '%s' "$resp" | jget group_name); unset resp
+    url=$(printf '%s' "$resp" | jget url); gname=$(printf '%s' "$resp" | jget group_name)
+    lease_exp=$(date -d "$(printf '%s' "$resp" | jget lease_expires)" +%s 2> /dev/null) || die "the listener named no valid lease_expires"
+    unset resp
     [[ $url =~ ^https://github\.com/[A-Za-z0-9._/-]+$ ]] || die "the listener named no registration target ($url)"
     group=${gname:--}; [[ $group =~ ^[A-Za-z0-9._-]+$ ]] || die "bad runner group name"
     [[ $lease =~ ^[0-9a-f]+$ ]] || die "bad lease id"
-    round_made=0; done_n=0
+    round_made=0; done_n=0; failed_n=0; refused_n=0
     for name in "${todo[@]:0:granted}"; do
+      if [ "$(date +%s)" -ge $((lease_exp - HOST_TIMEOUT)) ]; then echo "lease $lease has too little time left for a registration; settling it and asking for another"; break; fi
       now=$(date +%s.%N)
       awk -v a="$next_at" -v b="$now" 'BEGIN { exit !(a > b) }' && sleep "$(awk -v a="$next_at" -v b="$now" 'BEGIN { printf "%.3f", a - b }')"
       next_at=$(awk -v a="$(date +%s.%N)" -v i="$interval" 'BEGIN { printf "%.3f", a + i }')
@@ -356,18 +425,29 @@ print(top + 1)' "$size")
       case $line in
         "registered $name") round_made=$((round_made + 1)); done_n=$((done_n + 1)) ;;
         "unstored $name"*) round_made=$((round_made + 1)); stop="$name registered but its files were not stored: run again, it is stored without a new registration"; break ;;
-        *) stop="$name was not registered"; break ;;
+        "refused $name"*) refused_n=1; refused=1; stop="$name was not registered: GitHub refused it"; break ;;
+        *) failed_n=$((failed_n + 1)); stop="$name was not registered"; break ;;
       esac
     done
     unset token
-    code=$($SSH "curl -s -o /dev/null -w '%{http_code}' -X POST 'localhost:8080/lease/settle?id=$lease&made=$round_made'" || true)
-    [ "$code" = 204 ] || echo "warning: lease $lease settled with $code (an expired lease was released already)" >&2
+    # A refusal goes to the budget with the settlement: it holds every ask, ours and the machines', while the cap clears.
+    code=$($SSH "curl -s -o /dev/null -w '%{http_code}' -X POST 'localhost:8080/lease/settle?id=$lease&made=$round_made&failed=$failed_n&refused=$refused_n'" || true)
+    [ "$code" = 204 ] || echo "warning: lease $lease settled with $code (an expired lease was released already$([ "$refused_n" = 0 ] || echo ', but its refusal reached the budget'))" >&2
     made=$((made + round_made))
     todo=("${todo[@]:$done_n}")
     progress "batch:"
+    if [ "$round_made" -gt 0 ]; then tries=0
+    elif [ -z "$stop" ]; then
+      tries=$((tries + 1))
+      [ "$tries" -le "${LEASE_TRIES:-40}" ] || stop="no registration was made under $((tries - 1)) leases in a row"
+    fi
   done
   progress "done:"
   echo "registered $made, orphaned $orphans, already held $held"
+  if [ "$refused" = 1 ]; then
+    echo "stopped: $stop. GitHub's cap of registrations is spent: the listener's budget is held now. Wait at least 5 minutes (the cap's window) and let /state show it not held; do not run it again at once. Then: identity.sh register $size $n $first" >&2
+    exit 1
+  fi
   if [ -n "$stop" ] || [ "$orphans" -gt 0 ]; then
     echo "stopped: ${stop:-orphans}; run again to continue: identity.sh register $size $n $first" >&2
     exit 1
@@ -376,20 +456,38 @@ print(top + 1)' "$size")
 
 # ---- relabel ----
 
+# GitHub's write limits are secondary ones: relabel makes at most one PUT a second (60 a minute), stops at the first 403 or
+# 429 and keeps its Retry-After in a file beside the lock, which the next relabel waits out.
 relabel() {
-  local size=${1:-} from=${2:-} to=${3:-} ids bad=0 out chunk ok
+  local size=${1:-} from=${2:-} to=${3:-} ids bad=0 out chunk ok stopline pause not_before now
   check_size "$size"; check_label "$from"; check_label "$to"
+  not_before=$(cat "$LOCK.retry-after" 2> /dev/null || echo 0); now=$(date +%s)
+  [[ $not_before =~ ^[0-9]+$ ]] || not_before=0
+  [ "$now" -ge "$not_before" ] || die "GitHub asked for a pause: wait $((not_before - now)) s more (until $(date -d "@$not_before" +%T)), then run the same command again"
   ids=$(at_github | python3 -I -c 'import json,sys
 for r in json.load(sys.stdin)["runners"]:
     if r["name"].startswith("superci-id-%s-" % sys.argv[1]) and sys.argv[2] in r["labels"]:
         print(r["id"])' "$size" "$from")
   [ -n "$ids" ] || { echo "nothing to relabel: no superci-id-$size-* carries $from"; return 0; }
   echo "relabelling $(wc -l <<< "$ids") identities of $size: $from -> $to"
-  # One SSH to the listener for each 50, which the GitHub App's write rate allows at one a call every RELABEL_PAUSE.
+  # One SSH to the listener for each 50. The listener answers GitHub's 403 and 429 as 429 with the Retry-After.
   while read -r -a chunk; do
-    out=$($SSH "for id in ${chunk[*]}; do if curl -sf -o /dev/null -X POST \"localhost:8080/identities/labels?id=\$id&labels=$to\"; then echo ok \$id; else echo fail \$id; fi; sleep ${RELABEL_PAUSE:-0.6}; done") || out=""
+    out=$($SSH "h=\$(mktemp); for id in ${chunk[*]}; do
+      code=\$(curl -s -o /dev/null -D \"\$h\" -w '%{http_code}' -X POST \"localhost:8080/identities/labels?id=\$id&labels=$to\")
+      if [ \"\$code\" = 204 ]; then echo ok \$id
+      elif [ \"\$code\" = 403 ] || [ \"\$code\" = 429 ]; then echo \"stop \$id \$code \$(sed -n 's/^[Rr]etry-[Aa]fter: *\\([0-9]*\\).*/\\1/p' \"\$h\")\"; break
+      else echo fail \$id \$code; fi
+      sleep 1
+    done; rm -f \"\$h\"") || out=""
     ok=$(grep -c '^ok' <<< "$out" || true)
     echo "  relabelled $ok"
+    stopline=$(grep '^stop ' <<< "$out" || true)
+    if [ -n "$stopline" ]; then
+      read -r _ id code pause <<< "$stopline"
+      pause=${pause:-60}
+      printf '%s\n' "$(($(date +%s) + pause))" > "$LOCK.retry-after"
+      die "GitHub answered $code to runner $id: stopped after $ok of this 50 (and nothing after it). Retry-After is $pause s: wait it out, then run the same command again"
+    fi
     bad=$((bad + ${#chunk[@]} - ok))
   done < <(xargs -n 50 <<< "$ids")
   [ "$bad" = 0 ] || die "$bad identities were not relabelled; run the same command again"

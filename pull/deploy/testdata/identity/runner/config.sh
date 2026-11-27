@@ -3,6 +3,9 @@
 echo "args=[$*] token_in_env=$([ -n "${ACTIONS_RUNNER_INPUT_TOKEN:-}" ] && echo yes || echo no) cwd=$PWD" >> "$FAKE/config.log"
 name=""; labels=""
 while [ $# -gt 0 ]; do case $1 in --name) name=$2; shift ;; --labels) labels=$2; shift ;; esac; shift; done
+[ "$name" != "${FAKE_CONFIG_HANG:-}" ] || exec python3 -I -c 'import time; time.sleep(30)'
+[ -z "${FAKE_CONFIG_SLEEP:-}" ] || python3 -I -c 'import sys,time; time.sleep(float(sys.argv[1]))' "$FAKE_CONFIG_SLEEP"
+[ "$name" != "${FAKE_CONFIG_FAIL_PLAIN:-}" ] || { echo "Http response code: InternalServerError from the registration"; exit 1; }
 [ "$name" != "${FAKE_CONFIG_FAIL:-}" ] || { echo "Http response code: TooManyRequests (429) ConfigureTooManyRunners"; exit 1; }
 echo "{\"agentName\":\"$name\"}" > .runner; echo '{"data":"x"}' > .credentials; echo '{"d":"x"}' > .credentials_rsaparams
 python3 -I -c 'import json,os,sys
