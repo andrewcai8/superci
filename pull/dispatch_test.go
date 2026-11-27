@@ -93,6 +93,9 @@ func (p *dispatcher) dial(t *testing.T, path, instance string, headers ...string
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A peer lives until its test ends: one the test no longer names would be closed by its socket's finalizer at the
+	// next GC, which the dispatcher rightly reads as that side leaving (a shim gone mid-pairing drops its job).
+	t.Cleanup(func() { _ = conn.Close() })
 	var req strings.Builder
 	fmt.Fprintf(&req, "POST %s HTTP/1.1\r\nHost: listener\r\nConnection: Upgrade\r\nUpgrade: %s\r\nContent-Length: %d\r\n", path, dispatchProtocol, len(instance))
 	for i := 0; i+1 < len(headers); i += 2 {
@@ -558,31 +561,28 @@ func TestAnExitSentAgainAfterARestartIsHarmless(t *testing.T) {
 	if code := exitCode(s.expect(frameExit)); code != 100 {
 		t.Fatalf("exit %d", code)
 	}
-	p = p.restart(t, store, identityTags(), "i-0m1")
-	m = p.machine(t, "i-0m1", resumeHeader, "i-0m1."+token)
-	if m.code != 101 {
-		t.Fatalf("resume: %d", m.code)
-	}
-	m.send(frameExit, i32(100))
-	m.send(frameExit, i32(100))
-	waitUntil(t, "the dispatcher holds the exit code", func() bool {
-		st := p.st
-		st.mu.Lock()
-		j := st.pairs["i-0m1"]
-		st.mu.Unlock()
-		if j == nil {
-			return false
-		}
-		j.mu.Lock()
-		defer j.mu.Unlock()
-		return j.exited
+	waitUntil(t, "the job's over mark", func() bool {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		_, ok := store.objects["issued/"+jobFence(jobA)+overMark]
+		return ok
 	})
+	p = p.restart(t, store, identityTags(), "i-0m1")
+	// The agent resends its EXIT on a resume when the last close was not clean; its job is over, so it is told 410 and
+	// powers off: nothing is adopted, so no second record and no lost job.
+	m = p.machine(t, "i-0m1", resumeHeader, "i-0m1."+token)
+	if m.code != 410 {
+		t.Fatalf("resume of a machine whose job is over: %d, want 410", m.code)
+	}
 	end, _ := p.st.Reconcile(time.Now().Add(4*time.Minute), bounds)
 	if len(end) != 1 || end[0].ID != "i-0m1" {
-		t.Fatalf("terminate %v, want the machine", end)
+		t.Fatalf("terminate %v, want the claimed machine with no connection", end)
 	}
 	if c := p.st.TakeCounts(); c.Lost != 0 {
 		t.Fatalf("counts %+v: a job whose exit code came is not lost", c)
+	}
+	if n := len(p.st.TakeJobs()); n != 0 {
+		t.Fatalf("%d records after the restart, want none", n)
 	}
 }
 
@@ -1407,7 +1407,9 @@ func TestADispatchedJobLeavesExactlyOneRecord(t *testing.T) {
 	m.pipeBytes(len(msg))
 	m.send(frameExit, i32(100))
 	s.expect(frameExit)
-	waitUntil(t, "the job is over", func() bool { return phaseOf(p.st, "i-0m1") == mEnding })
+	// The job is over once its record is written. The machine's end is no sign of it: an EXIT that comes before the
+	// job is live ends the machine (exitHeld), and the hand-off finishes the job a moment later as it goes live.
+	waitUntil(t, "the job is over", func() bool { st := p.st; st.mu.Lock(); defer st.mu.Unlock(); return len(st.jobs) > 0 })
 	bounds := dispatchBounds{maxAge: time.Hour, life: 9 * time.Hour, job: 6 * time.Hour, window: 3 * time.Minute}
 	p.st.Reconcile(time.Now(), bounds)
 	p.st.Reconcile(time.Now().Add(time.Hour), bounds)
@@ -1445,5 +1447,204 @@ func TestALostDispatchedJobLeavesOneFailedRecord(t *testing.T) {
 	st.finish(s, machineLost)
 	if recs := st.TakeJobs(); len(recs) != 1 || recs[0].Conclusion() != "failure" {
 		t.Fatalf("a lost job: records %+v, want one failure", recs)
+	}
+}
+
+// A job's record after a restart keeps the times its claim kept, so the gate reads no queue of 0 and no wall from the
+// restart; a claim from before the times were kept gives a partial record, which the gate leaves out.
+func TestAnAdoptedJobsRecordKeepsItsTimesOrIsPartial(t *testing.T) {
+	arrived, handed := time.Now().Add(-5*time.Minute), time.Now().Add(-4*time.Minute)
+	st := dispatchSet("i-0m1")
+	s := st.adopt("i-0m1", "tok", "job-1", jobClaim{Run: 7, Name: "n", Repo: "acme/mono", Agent: "superci-id-4cpu-17",
+		Arrived: arrived.UnixMilli(), Handed: handed.UnixMilli()}, time.Now())
+	s.exited, s.code, s.exitAt = true, 100, time.Now()
+	st.finish(s, exitRelayed)
+	r := st.TakeJobs()[0]
+	if r.Partial() || r.Queued.UnixMilli() != arrived.UnixMilli() || r.Started.UnixMilli() != handed.UnixMilli() || r.QueueMS() != 60000 || r.Inst != "i-0m1" {
+		t.Fatalf("adopted record %+v: want the claim's times and the machine", r)
+	}
+	old := dispatchSet("i-0m1")
+	s = old.adopt("i-0m1", "tok", "job-2", jobClaim{Run: 7, Agent: "superci-id-4cpu-17"}, time.Now())
+	s.exited, s.code = true, 100
+	old.finish(s, exitRelayed)
+	if r := old.TakeJobs()[0]; !r.Partial() {
+		t.Fatalf("a claim without times gave %+v, want a partial record", r)
+	}
+}
+
+// A shim that rejoins after its job is over gets 410, in the same process and after a restart, instead of being adopted
+// into a session whose machine is gone, which would end as a second record and a lost job.
+func TestAResumeAfterTheJobIsOverIsRefusedAndLeavesNoSecondRecord(t *testing.T) {
+	store := &fakeS3{objects: map[string]string{}}
+	p := startDispatcher(t, store, identityTags(), dispatchSet("i-0m1"))
+	m, s, token := handOne(t, p, "i-0m1", jobA)
+	m.send(frameExit, i32(100))
+	s.expect(frameExit)
+	waitUntil(t, "the job's over mark", func() bool {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		_, ok := store.objects["issued/"+jobFence(jobA)+overMark]
+		return ok
+	})
+	if again := p.shim(t, resumeHeader, "i-0m1."+token); again.code != 410 {
+		t.Fatalf("a resume of a job that is over answered %d, want 410", again.code)
+	}
+	p = p.restart(t, store, identityTags(), "i-0m1")
+	if again := p.shim(t, resumeHeader, "i-0m1."+token); again.code != 410 {
+		t.Fatalf("after a restart a resume of a job that is over answered %d, want 410", again.code)
+	}
+	if n := len(p.st.TakeJobs()); n != 0 {
+		t.Fatalf("%d records after the restart, want none: the job's one record was the first process's", n)
+	}
+}
+
+// A job whose exit code never reached its shim is failed at GitHub by the identity's listener, so its record says so,
+// and it ends when the exit code came, not when the window ran out.
+func TestAJobWhoseExitNeverReachedItsShimIsRecordedAsAFailureAtItsExit(t *testing.T) {
+	st := dispatchSet("i-0m1")
+	exitAt := time.Now().Add(-4 * time.Minute)
+	s := &session{set: st, id: "job-1", agent: "superci-id-4cpu-17", machine: "i-0m1", arrived: exitAt.Add(-time.Minute), handed: exitAt.Add(-50 * time.Second),
+		phase: running, exited: true, code: 100, exitAt: exitAt}
+	st.pairs["i-0m1"], st.byJob["job-1"] = s, s
+	st.finish(s, shimLeftAfterExit)
+	r := st.TakeJobs()[0]
+	if r.Conclusion() != "failure" || !r.Finished.Equal(exitAt) {
+		t.Fatalf("record %+v: want a failure finished at the exit", r)
+	}
+}
+
+func TestADispatchSetKeepsABoundedBufferOfRecords(t *testing.T) {
+	st := dispatchSet()
+	for i := range maxJobBuffer + 10 {
+		id := fmt.Sprintf("job-%d", i)
+		s := &session{set: st, id: id, agent: "superci-id-4cpu-17", machine: "i-x", arrived: time.Now(), handed: time.Now(), phase: running, exited: true, code: 100}
+		st.byJob[id] = s
+		st.finish(s, exitRelayed)
+	}
+	if n := len(st.TakeJobs()); n != maxJobBuffer {
+		t.Fatalf("%d records held, want the bound %d", n, maxJobBuffer)
+	}
+}
+
+// The over mark is written after the job ends; until it lands the set itself refuses to adopt the job again.
+func TestAJobOverIsNotAdoptedAgainBeforeItsMarkLands(t *testing.T) {
+	st := dispatchSet("i-0m1")
+	s := st.adopt("i-0m1", "tok", "job-1", jobClaim{Agent: "superci-id-4cpu-17"}, time.Now())
+	s.exited, s.code = true, 100
+	st.finish(s, exitRelayed)
+	if again := st.adopt("i-0m1", "tok", "job-1", jobClaim{Agent: "superci-id-4cpu-17"}, time.Now()); again != nil {
+		t.Fatal("a job that is over was adopted again")
+	}
+}
+
+// After a restart mid-job, a machine that resumes and sends its EXIT while the shim never comes back has finished its
+// job: it is not a lost job (no exit code 1, no re-run), and its record is a failure, since the identity's listener
+// fails a job whose exit code it never heard.
+func TestAnExitHeldForAShimThatNeverCameBackIsNoLostJob(t *testing.T) {
+	store := &fakeS3{objects: map[string]string{}}
+	p := startDispatcher(t, store, identityTags(), dispatchSet("i-0m1"))
+	_, _, token := handOne(t, p, "i-0m1", jobA)
+	p = p.restart(t, store, identityTags(), "i-0m1")
+	m := p.machine(t, "i-0m1", resumeHeader, "i-0m1."+token)
+	if m.code != 101 {
+		t.Fatalf("resume: %d", m.code)
+	}
+	m.send(frameExit, i32(100))
+	waitUntil(t, "the dispatcher holds the exit code", func() bool {
+		st := p.st
+		st.mu.Lock()
+		j := st.pairs["i-0m1"]
+		st.mu.Unlock()
+		if j == nil {
+			return false
+		}
+		j.mu.Lock()
+		defer j.mu.Unlock()
+		return j.exited
+	})
+	end, lost := p.st.Reconcile(time.Now().Add(4*time.Minute), bounds)
+	if len(end) != 1 || end[0].ID != "i-0m1" || len(lost) != 0 {
+		t.Fatalf("terminate %v, lost %v: want the machine ended and no lost job", end, lost)
+	}
+	if c := p.st.TakeCounts(); c.Lost != 0 {
+		t.Fatalf("counts %+v: a job whose exit code came is not lost", c)
+	}
+	if recs := p.st.TakeJobs(); len(recs) != 1 || recs[0].Conclusion() != "failure" {
+		t.Fatalf("records %+v, want one failure", recs)
+	}
+}
+
+// hookConn is a connection whose writes go nowhere and whose first PIPE frame runs onPipe, as a peer that leaves the
+// moment the job's first bytes reach it would.
+type hookConn struct {
+	net.Conn
+	onPipe func()
+	once   sync.Once
+}
+
+func (c *hookConn) Write(p []byte) (int, error) {
+	if len(p) > 0 && frameType(p[0]) == framePipe && c.onPipe != nil {
+		defer c.once.Do(c.onPipe)
+	}
+	return len(p), nil
+}
+func (c *hookConn) Close() error                     { return nil }
+func (c *hookConn) SetWriteDeadline(time.Time) error { return nil }
+func (c *hookConn) SetReadDeadline(time.Time) error  { return nil }
+
+// A machine whose connection ends as its job is handed (while its held bytes go out, or after them and before the job
+// is live) is away, so the window loses the job: the shim gets 1 rather than waiting out the job's bound.
+func TestAMachineThatLeavesAsItsJobIsHandedIsLost(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		inSend bool
+	}{{"while its held bytes go out", true}, {"after them, before the job is live", false}} {
+		t.Run(c.name, func(t *testing.T) {
+			st := dispatchSet("i-0m1")
+			m := st.machine("i-0m1")
+			conn := &hookConn{}
+			mw := newWire(conn, nil, time.Hour, time.Hour, nil)
+			defer mw.close()
+			leave := func() { mw.close(); st.machineClosed(m, mw) }
+			if c.inSend {
+				conn.onPipe = leave
+			}
+			st.mu.Lock()
+			m.wire, m.phase = mw, mWaiting
+			st.mu.Unlock()
+			s := &session{set: st, id: "job-1", agent: "superci-id-4cpu-17", head: jobHead{ID: "job-1", Run: 7, Name: "unit", Repo: "o/r"},
+				arrived: time.Now(), settled: make(chan struct{}), toMach: [][]byte{[]byte("job message")}}
+			st.byJob["job-1"] = s
+			st.claimed(s, m, mw, "tok.job-1")
+			st.handed(s, time.Now())
+			s.attachMachine(mw)
+			if !c.inSend {
+				leave()
+			}
+			s.goLive()
+			_, lost := st.Reconcile(time.Now().Add(4*time.Minute), bounds)
+			if len(lost) != 1 {
+				t.Fatalf("lost %v, want the job: its machine left as it was handed", lost)
+			}
+			waitUntil(t, "the exit code 1 is held for the shim", func() bool {
+				s.mu.Lock()
+				defer s.mu.Unlock()
+				return len(s.toShim) == 1 && s.toShim[0].t == frameExit && exitCode(s.toShim[0].p) == 1
+			})
+		})
+	}
+}
+
+// A lost job's exit code 1 is held for a shim that is not attached at the moment of the loss (its resume answered, its
+// connection not yet the session's), as the Worker's own exit code would be: the shim gets it when it attaches.
+func TestALostJobsExitCodeIsHeldForAShimNotYetAttached(t *testing.T) {
+	st := dispatchSet("i-0m1")
+	s := &session{set: st, id: "job-1", agent: "superci-id-4cpu-17", machine: "i-0m1", arrived: time.Now(), handed: time.Now(), phase: running, live: true}
+	st.pairs["i-0m1"], st.byJob["job-1"] = s, s
+	s.lose()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.toShim) != 1 || s.toShim[0].t != frameExit || exitCode(s.toShim[0].p) != 1 {
+		t.Fatalf("held for the shim %+v, want the one exit code 1", s.toShim)
 	}
 }

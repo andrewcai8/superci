@@ -248,7 +248,7 @@ func run(ctx context.Context, f flags) error {
 		d.SetPricer(l.spend.Price)
 	}
 	poolParam := poolParamName(f.poolParam, cfg.Deployment)
-	if err := loadPools(ctx, ssmc, poolParam, l.sets, cfg.Pool.window(), now); err != nil {
+	if err := loadPools(ctx, ssmc, poolParam, l.sets, l.dsets, cfg.Pool.window(), now); err != nil {
 		slog.Error("load pools", "err", err.Error())
 	}
 	refresh := l.refresher()
@@ -298,7 +298,7 @@ func run(ctx context.Context, f flags) error {
 		if err := l.spend.Save(ctx, ssmc, f.spendParam); err != nil {
 			slog.Error("save spend", "err", err.Error())
 		}
-		if err := savePools(ctx, ssmc, poolParam, l.sets, time.Now(), l.config().Pool); err != nil {
+		if err := savePools(ctx, ssmc, poolParam, l.sets, l.dsets, time.Now(), l.config().Pool); err != nil {
 			slog.Error("save pools", "err", err.Error())
 		}
 	})

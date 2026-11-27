@@ -42,6 +42,8 @@ type DispatchSet struct {
 	waits        []float64      // seconds from a job's arrival to its hand-off, since the metrics last took them
 	jobs         []JobRecord    // records of the jobs over since the metrics last took them
 	price        func(Machine) float64
+	ended        map[string]time.Time // jobs over, by id, so a late resume in this process adopts none
+	over         func(job string)     // marks a job over beside its claim, for a resume after a restart
 }
 
 // A dmachine is one machine of a dispatch set: EC2's facts, and where it is in its one job's life.
@@ -76,7 +78,7 @@ type DispatchCounts struct {
 func NewDispatchSet(spec SetSpec, fleet *SetFleet, regions []string, now time.Time) *DispatchSet {
 	st := &DispatchSet{spec: spec, fleet: fleet, wake: make(chan struct{}, 1), started: now, boot: fmt.Sprintf("%x", now.UnixNano()),
 		max: spec.Max, listings: map[string]time.Time{}, machines: map[string]*dmachine{}, reserved: map[string]int{},
-		pairs: map[string]*session{}, byJob: map[string]*session{}}
+		pairs: map[string]*session{}, byJob: map[string]*session{}, ended: map[string]time.Time{}}
 	for _, r := range regions {
 		st.listings[r] = time.Time{}
 	}
@@ -471,8 +473,19 @@ func (st *DispatchSet) adopt(inst, token, job string, c jobClaim, now time.Time)
 	if s := st.pairs[inst]; s != nil {
 		return s
 	}
+	if _, gone := st.ended[job]; gone {
+		return nil
+	}
 	s := &session{set: st, id: job, head: jobHead{ID: job, Run: c.Run, Name: c.Name, Repo: c.Repo, WorkflowRef: c.Ref, Event: c.Event}, agent: c.Agent, machine: inst,
-		token: token, phase: running, handed: now, arrived: now, live: true, away: [2]time.Time{now, now}}
+		token: token, phase: running, handed: now, arrived: now, live: true, away: [2]time.Time{now, now}, adopted: true}
+	// A claim that kept the job's times gives them back; one that did not (an earlier build's) leaves its record
+	// partial, rather than a queue of 0 and a wall from the restart.
+	if c.Handed > 0 {
+		s.handed, s.recHanded = time.UnixMilli(c.Handed), true
+	}
+	if c.Arrived > 0 {
+		s.arrived = time.UnixMilli(c.Arrived)
+	}
 	st.pairs[inst], st.byJob[job] = s, s
 	return s
 }
@@ -505,9 +518,17 @@ func (st *DispatchSet) finish(s *session, why jobEnd) {
 	}
 	rec := st.record(s, why, mach, time.Now())
 	st.jobs = append(st.jobs, rec)
+	if len(st.jobs) > maxJobBuffer { // a listener run with metrics off takes none
+		st.jobs = st.jobs[len(st.jobs)-maxJobBuffer:]
+	}
+	st.ended[s.id] = time.Now()
+	over := st.over
 	st.mu.Unlock()
 	tlJobRecord(rec, time.Now())
 	go func() {
+		if over != nil {
+			over(s.id)
+		}
 		if why == machineLost {
 			s.lose()
 		}
@@ -523,21 +544,28 @@ func (st *DispatchSet) finish(s *session, why jobEnd) {
 // GitHub's own queue before an identity took the job is not in it (identities idle at once take a job).
 func (st *DispatchSet) record(s *session, why jobEnd, m *Machine, now time.Time) JobRecord {
 	s.mu.Lock()
-	exited, code := s.exited, s.code
+	exited, code, exitAt := s.exited, s.code, s.exitAt
 	s.mu.Unlock()
+	// A lost machine's job, and one whose exit code never reached its shim, are failures: the identity's listener fails
+	// them at GitHub, whatever the Worker said.
 	result := "Failed"
-	if exited && why != machineLost {
+	if exited && why == exitRelayed {
 		result = dispatchResult(code)
+	}
+	if exited && !exitAt.IsZero() {
+		now = exitAt
+	}
+	started := s.handed
+	if s.adopted && !s.recHanded {
+		started = time.Time{}
 	}
 	owner, repo, _ := strings.Cut(s.head.Repo, "/")
 	j := &scaleset.JobCompleted{Result: result, RunnerName: s.agent, JobMessageBase: scaleset.JobMessageBase{JobID: s.id, WorkflowRunID: s.head.Run,
 		JobDisplayName: s.head.Name, OwnerName: owner, RepositoryName: repo, JobWorkflowRef: s.head.WorkflowRef, EventName: s.head.Event,
-		RequestLabels: []string{st.spec.Label}, QueueTime: s.arrived, RunnerAssignTime: s.handed, FinishTime: now}}
+		RequestLabels: []string{st.spec.Label}, QueueTime: s.arrived, RunnerAssignTime: started, FinishTime: now}}
 	r := newJobRecord(st.spec.Name, j, m, st.price, began{})
 	r.Dispatched = true
-	if m != nil {
-		r.Inst = m.ID
-	}
+	r.Inst = s.machine
 	return r
 }
 
@@ -604,6 +632,13 @@ type dispatchBounds struct {
 // window, any past its life, and surplus waiting machines end; an ending machine is terminated once, then a minute on
 // if EC2 still lists it.
 func (st *DispatchSet) Reconcile(now time.Time, b dispatchBounds) (end []*Machine, lost []JobRef) {
+	st.mu.Lock()
+	for job, at := range st.ended {
+		if now.Sub(at) > b.job+b.window {
+			delete(st.ended, job)
+		}
+	}
+	st.mu.Unlock()
 	for s, why := range st.expired(now, b) {
 		if why == machineLost {
 			if j, ok := s.jobRef(); ok {
@@ -714,6 +749,19 @@ func (s *session) jobRef() (JobRef, bool) {
 func (st *DispatchSet) SetPool(n int)     { st.mu.Lock(); st.pool = n; st.mu.Unlock() }
 func (st *DispatchSet) SetMax(n int)      { st.mu.Lock(); st.max = n; st.mu.Unlock() }
 func (st *DispatchSet) SetCapped(on bool) { st.mu.Lock(); st.capped = on; st.mu.Unlock() }
+
+// Carry and Resume keep the set's pool across a restart as State's do (carry.go).
+func (st *DispatchSet) Carry(now time.Time, r PoolRule) Carried {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.carry(now, st.started, r)
+}
+
+func (st *DispatchSet) Resume(c Carried) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.resume(c)
+}
 
 // Burst is the pool the set's recent arrivals at the dispatcher ask for (State.Burst's rule).
 func (st *DispatchSet) Burst(now time.Time, r PoolRule) int {

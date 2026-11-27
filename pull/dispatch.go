@@ -361,16 +361,22 @@ func runnerIdentity(header string) (runner, agent, set string, err error) {
 // jobFence is the claim of a handed job: issued/job-<job id>, holding a jobClaim.
 func jobFence(job string) string { return "job-" + job }
 
+// overMark names the mark beside a job's claim that the job is over: a shim that rejoins after the job ended, in this
+// process or after a restart, is refused rather than adopted into a session whose machine is gone.
+const overMark = ".over"
+
 // A jobClaim is what a handed job's claim holds: the pair it was handed to, <instance>.<token>, and on a second line
 // what a dispatcher that adopts the job after a restart needs to have it re-run if its machine is lost.
 type jobClaim struct {
-	pair  string
-	Run   int64  `json:"run,omitempty"`
-	Name  string `json:"name,omitempty"`
-	Repo  string `json:"repo,omitempty"`
-	Agent string `json:"agent,omitempty"`
-	Ref   string `json:"ref,omitempty"`
-	Event string `json:"event,omitempty"`
+	pair    string
+	Run     int64  `json:"run,omitempty"`
+	Name    string `json:"name,omitempty"`
+	Repo    string `json:"repo,omitempty"`
+	Agent   string `json:"agent,omitempty"`
+	Ref     string `json:"ref,omitempty"`
+	Event   string `json:"event,omitempty"`
+	Arrived int64  `json:"arrived,omitempty"` // unix ms: when the identity's shim brought the job
+	Handed  int64  `json:"handed,omitempty"`  // unix ms: the handed point, when this claim was taken
 }
 
 func (c jobClaim) String() string {
@@ -438,6 +444,13 @@ func NewDispatcher(deployment string, sets []*DispatchSet, verifier interface {
 		hosts: map[string]hostCheck{}, wires: map[*wire]bool{}}
 	for _, s := range sets {
 		d.sets[s.spec.Name] = s
+		s.over = func(job string) {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := claims.Take(ctx, jobFence(job)+overMark, "over"); err != nil && !errors.Is(err, ErrClaimed) {
+				slog.Warn("dispatch over mark", "job", job, "err", err.Error())
+			}
+		}
 	}
 	return d
 }
@@ -709,7 +722,15 @@ func (d *Dispatcher) resume(ctx context.Context, st *DispatchSet, inst, token st
 	case err != nil:
 		return nil, http.StatusServiceUnavailable, nil
 	case fence == key:
-		return st.adopt(inst, token, job, claim, time.Now()), 0, nil
+		if over, err := d.claims.Holder(ctx, jobFence(job)+overMark); err != nil {
+			return nil, http.StatusServiceUnavailable, nil
+		} else if over != "" {
+			return nil, http.StatusGone, nil
+		}
+		if s := st.adopt(inst, token, job, claim, time.Now()); s != nil {
+			return s, 0, nil
+		}
+		return nil, http.StatusGone, nil
 	case fence == "" || !shim:
 		return nil, http.StatusGone, nil
 	}
@@ -900,7 +921,8 @@ func (d *Dispatcher) hand(st *DispatchSet, s *session, m *dmachine, mw *wire) {
 		st.abandon(s, m)
 		return
 	}
-	claim := jobClaim{pair: m.ID + "." + token, Run: s.head.Run, Name: s.head.Name, Repo: s.head.Repo, Agent: s.agent, Ref: s.head.WorkflowRef, Event: s.head.Event}
+	claim := jobClaim{pair: m.ID + "." + token, Run: s.head.Run, Name: s.head.Name, Repo: s.head.Repo, Agent: s.agent, Ref: s.head.WorkflowRef, Event: s.head.Event,
+		Arrived: s.arrived.UnixMilli(), Handed: time.Now().UnixMilli()}
 	fctx, fcancel := context.WithTimeout(context.Background(), resumeWindow)
 	defer fcancel()
 	// The job's claim is asked again while S3's answer is unknown, for as long as a shim would wait to rejoin: a claim
@@ -980,20 +1002,23 @@ type session struct {
 	ws sync.Mutex // one writer of frames to the shim at a time, in order
 	mu sync.Mutex
 	// The session's own lock guards these.
-	from     *wire // the machine connection whose frames are this job's
-	mach     *wire // the machine connection PIPE bytes go to, once handed and while it holds
-	shim     *wire // the shim's connection, while it holds
-	live     bool  // handed: frames for the shim go out rather than wait
-	toMach   [][]byte
-	held     int
-	toShim   []shimFrame
-	shimCost int // what toShim holds, at heldCost a frame beyond its payload
-	out      int
-	infos    int
-	exited   bool
-	code     int32        // the Worker's exit code, once exited
-	away     [2]time.Time // since when the machine (0) and the shim (1) have been away, once handed
-	shimDone bool
+	from      *wire // the machine connection whose frames are this job's
+	mach      *wire // the machine connection PIPE bytes go to, once handed and while it holds
+	shim      *wire // the shim's connection, while it holds
+	live      bool  // handed: frames for the shim go out rather than wait
+	toMach    [][]byte
+	held      int
+	toShim    []shimFrame
+	shimCost  int // what toShim holds, at heldCost a frame beyond its payload
+	out       int
+	infos     int
+	exited    bool
+	code      int32        // the Worker's exit code, once exited
+	exitAt    time.Time    // when it came
+	adopted   bool         // a session a previous process handed, rejoined after a restart
+	recHanded bool         // its claim kept the handed time
+	away      [2]time.Time // since when the machine (0) and the shim (1) have been away, once handed
+	shimDone  bool
 }
 
 type sessionPhase int
@@ -1103,6 +1128,15 @@ func (s *session) attachMachine(mw *wire) {
 		}
 	}
 	s.mu.Lock()
+	// A connection that ended while its bytes went is away, not attached: machineAway may have run before mach
+	// named it, and nothing else would mark it.
+	if mw.gone() {
+		if s.away[0].IsZero() {
+			s.away[0] = time.Now()
+		}
+		s.mu.Unlock()
+		return
+	}
 	old := s.mach
 	s.mach, s.away[0] = mw, time.Time{}
 	s.mu.Unlock()
@@ -1111,13 +1145,15 @@ func (s *session) attachMachine(mw *wire) {
 	}
 }
 
+// machineAway marks the job's machine away once the connection its frames come on ends. That holds from its claim,
+// not only once the job is live: a machine that leaves between the first PIPE byte and goLive is away like any other.
 func (s *session) machineAway(mw *wire) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.mach == mw {
 		s.mach = nil
 	}
-	if s.from == mw && s.live && s.away[0].IsZero() {
+	if s.from == mw && s.away[0].IsZero() {
 		s.away[0] = time.Now()
 	}
 }
@@ -1149,6 +1185,7 @@ func (s *session) fromMachine(mw *wire, t frameType, p []byte) bool {
 		if len(p) == 4 {
 			s.code = int32(binary.LittleEndian.Uint32(p))
 		}
+		s.exitAt = time.Now()
 	}
 	s.mu.Unlock()
 	if !keep {
@@ -1284,13 +1321,19 @@ func (s *session) shimAway(sw *wire) {
 
 // lose ends a handed job whose machine is lost: the shim gets exit code 1, which is no TaskResult, so the identity's
 // listener fails the job.
+//
+// The 1 goes the way the Worker's own exit code would: to the shim now, or held for it, so a shim whose resume was
+// answered while its job was being lost (adopted, not yet attached) still gets it when it attaches. A job whose exit
+// code came keeps that code for its shim.
 func (s *session) lose() {
-	s.ws.Lock()
-	sw := s.shimWire()
-	if sw != nil {
-		_ = sw.send(frameExit, binary.LittleEndian.AppendUint32(nil, 1))
+	s.mu.Lock()
+	if s.exited {
+		s.mu.Unlock()
+		return
 	}
-	s.ws.Unlock()
+	s.exited = true
+	s.mu.Unlock()
+	s.toShimFrame(frameExit, binary.LittleEndian.AppendUint32(nil, 1))
 }
 
 // closeAll ends both connections of a job that is over, each after what was sent on it.
