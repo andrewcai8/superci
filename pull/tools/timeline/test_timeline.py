@@ -314,6 +314,66 @@ class AppToken(unittest.TestCase):
             T.apptoken.mint()
         self.assertNotIn("ghs_abc123", str(raised.exception))
 
+    def scoped_listener(self, status="200"):
+        """A token command that numbers tokens by the scope asked for (SUPERCI_TOKEN_SCOPE) and counts each scope's asks."""
+        os.environ["SUPERCI_TEST"] = "1"
+        asks = os.path.join(self.tmp, "scope-asks")
+        os.environ["SUPERCI_APP_TOKEN_CMD"] = self.script("scoped", f"echo \"$SUPERCI_TOKEN_SCOPE\" >> {asks}\n"
+                                                          f"if [ \"$SUPERCI_TOKEN_SCOPE\" = variables ] && [ {status} != 200 ]; then printf 'lacks \"actions_variables: write\"\\n{status}\\n'; exit 0; fi\n"
+                                                          "printf '{\"token\":\"ghs_%s\",\"expires\":\"2999-01-01T00:00:00Z\"}\\n200\\n' \"$SUPERCI_TOKEN_SCOPE\"\n")
+
+        def scopes():
+            with open(asks) as fh:
+                return fh.read().split()
+
+        return scopes
+
+    def test_each_scope_has_its_own_token_held_apart_from_the_others(self):
+        scopes = self.scoped_listener()
+        auth = T.apptoken.Auth()
+        self.assertEqual([auth.token(), auth.token("variables"), auth.token("contents"), auth.token("variables"), auth.token()],
+                         ["ghs_actions", "ghs_variables", "ghs_contents", "ghs_variables", "ghs_actions"])
+        self.assertEqual(scopes(), ["actions", "variables", "contents"], "each scope is asked for once")
+
+    def test_a_gh_call_carries_the_token_of_the_scope_it_names(self):
+        self.scoped_listener()
+        T.AUTH.gh(["api", "x"], scope="variables")
+        T.AUTH.gh(["api", "y"], scope="contents")
+        T.AUTH.gh(["api", "z"])
+        self.assertEqual(self.calls(), ["ghs_variables", "ghs_contents", "ghs_actions"])
+
+    def test_a_refused_scope_refuses_with_the_listeners_reason_and_names_the_scope(self):
+        self.scoped_listener(status="422")
+        with self.assertRaises(T.apptoken.AppTokenRefused) as raised:
+            T.AUTH.gh(["api", "x"], scope="variables")
+        self.assertIn("refusing: no GitHub App token for variables (Variables: read and write)", str(raised.exception))
+        self.assertIn('actions_variables: write', str(raised.exception))
+        self.assertIn("scope=variables", str(raised.exception))
+        self.assertFalse(os.path.exists(self.log), "gh was never run")
+
+    def test_an_unknown_scope_is_never_asked_for(self):
+        self.scoped_listener()
+        with self.assertRaises(ValueError):
+            T.apptoken.mint("administration")
+
+    def test_the_command_line_prints_one_scopes_token_and_exits_3_when_the_permission_is_missing(self):
+        self.scoped_listener()
+        env = dict(os.environ)
+        ok = subprocess.run([sys.executable, "-B", T.apptoken.__file__, "variables"], env=env, capture_output=True, text=True)
+        self.assertEqual((ok.returncode, ok.stdout), (0, "ghs_variables"), ok)
+        bad = subprocess.run([sys.executable, "-B", T.apptoken.__file__, "administration"], env=env, capture_output=True, text=True)
+        self.assertEqual(bad.returncode, 2, "an unknown scope is a usage error")
+        self.scoped_listener(status="422")
+        gone = subprocess.run([sys.executable, "-B", T.apptoken.__file__, "variables"], env=dict(os.environ), capture_output=True, text=True)
+        self.assertEqual(gone.returncode, 3, "a missing permission is permanent: the canary does not retry it")
+        self.assertIn("refusing: no GitHub App token for variables", gone.stderr)
+        self.scoped_listener(status="502")
+        flaky = subprocess.run([sys.executable, "-B", T.apptoken.__file__, "variables"], env=dict(os.environ), capture_output=True, text=True)
+        self.assertEqual(flaky.returncode, 2, "any other refusal may pass")
+
+    def test_the_only_named_exception_is_the_rollbacks_write(self):
+        self.assertEqual(set(T.apptoken.EXCEPTIONS), {"SUPERCI_JOBS write"})
+
     def test_only_a_named_exception_may_use_the_personal_token_by_name(self):
         with self.assertRaises(ValueError):
             T.AUTH.env("anything-else")

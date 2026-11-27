@@ -33,6 +33,22 @@ def stub(name, body):
 
 APP_TOKEN = "ghs_apptoken_for_the_tests"
 TOKEN_OK = stub("token_ok", f"printf '{{\"token\":\"{APP_TOKEN}\",\"expires\":\"2999-01-01T00:00:00Z\"}}\\n200\\n'\n")
+# A listener that answers by scope (the stub finds it in SUPERCI_TOKEN_SCOPE): a token of its own for each, or, for a scope named in
+# REFUSE_SCOPES, the listener's own refusal of a permission the installation lacks (HTTP 422). SCOPE_ASKS logs each scope asked for.
+VARS_TOKEN = "ghs_variables_token_for_the_tests"
+LIMITS_TOKEN = "ghs_contents_token_for_the_tests"
+TOKEN_SCOPED = stub("token_scoped", """scope=${SUPERCI_TOKEN_SCOPE:-actions}
+[ -n "${SCOPE_ASKS-}" ] && echo "$scope" >> "$SCOPE_ASKS"
+case ",${REFUSE_SCOPES-}," in
+  *,"$scope",*) printf 'the superci App installation lacks the repository permission "%s"\\n422\\n' "$scope"; exit 0 ;;
+esac
+case "$scope" in
+  variables) t=@VARS@ ;;
+  contents) t=@LIMITS@ ;;
+  *) t=@APP@ ;;
+esac
+printf '{"token":"%s","expires":"2999-01-01T00:00:00Z"}\\n200\\n' "$t"
+""".replace("@VARS@", VARS_TOKEN).replace("@LIMITS@", LIMITS_TOKEN).replace("@APP@", APP_TOKEN))
 TOKEN_DOWN = stub("token_down", "echo 'ssh: connect to host: Connection timed out' >&2\nexit 255\n")
 os.environ["SUPERCI_APP_TOKEN_CMD"] = TOKEN_OK
 os.environ["SUPERCI_TEST"] = "1"  # the token command is honoured only under this flag
@@ -1339,9 +1355,9 @@ class Sandbox(unittest.TestCase):
 
 
 class GateReadsOnTheAppBudget(Sandbox):
-    def run_gate(self, *argv, token_cmd=None):
+    def run_gate(self, *argv, token_cmd=None, env=None):
         """gate.main in this process with the sandbox's PATH, returning (SystemExit code or None, stdout, stderr)."""
-        env = dict(self.env, **({"SUPERCI_APP_TOKEN_CMD": token_cmd} if token_cmd else {}))
+        env = dict(self.env, **({"SUPERCI_APP_TOKEN_CMD": token_cmd} if token_cmd else {}), **(env or {}))
         saved_env, saved_auth = dict(os.environ), getattr(T, "AUTH", None)
         os.environ.clear()
         os.environ.update(env)
@@ -1395,23 +1411,46 @@ class GateReadsOnTheAppBudget(Sandbox):
         self.assertNotIn("refusing: no GitHub App token", err)
         self.assertEqual(self.gh_calls(), [])
 
-    def test_the_limits_file_is_read_on_the_personal_token_as_a_named_exception(self):
-        saved_env, saved_auth = dict(os.environ), getattr(T, "AUTH", None)
+    def read_limits(self, token_cmd, **env):
+        """gate.gh_raw for ci-limits.tsv in this process with the sandbox's PATH: (what it returned or the refusal raised, stderr)."""
+        saved_env, saved_auth = dict(os.environ), T.AUTH
         os.environ.clear()
-        os.environ.update(self.env)
-        if saved_auth is not None:
-            T.AUTH = T.apptoken.Auth()
+        os.environ.update(self.env, SUPERCI_APP_TOKEN_CMD=token_cmd, **env)
+        T.AUTH = T.apptoken.Auth()
         err = io.StringIO()
         try:
             with contextlib.redirect_stderr(err):
-                G.gh_raw("scripts/verify/ci-limits.tsv")
+                try:
+                    return G.gh_raw("scripts/verify/ci-limits.tsv"), err.getvalue()
+                except T.apptoken.AppTokenRefused as e:
+                    return e, err.getvalue()
         finally:
             os.environ.clear()
             os.environ.update(saved_env)
-            if saved_auth is not None:
-                T.AUTH = saved_auth
-        self.assertEqual({tok for tok, _ in self.gh_calls()}, {"UNSET"})
-        self.assertIn("personal-token exception ci-limits.tsv", err.getvalue())
+            T.AUTH = saved_auth
+
+    def test_the_limits_file_is_read_on_the_contents_token(self):
+        got, err = self.read_limits(TOKEN_SCOPED)
+        self.assertNotIsInstance(got, Exception, got)
+        self.assertEqual({tok for tok, _ in self.gh_calls()}, {LIMITS_TOKEN}, "ci-limits.tsv is read with the contents token, not the actions token and not the personal one")
+        self.assertNotIn("personal-token exception", err)
+        self.assertNotIn(LIMITS_TOKEN, err)
+
+    def test_a_refused_contents_token_stops_the_gate_with_the_reason_and_the_limits_hint(self):
+        code, out, err = self.run_gate("job", "verify-tools", "--branch-glob", "main", "--superci-source", "github", token_cmd=TOKEN_SCOPED, env={"REFUSE_SCOPES": "contents"})
+        self.assertEqual(code, 2, (out, err))
+        self.assertIn("refusing: no GitHub App token for contents", err)
+        self.assertIn("the repository permission", err, "the listener's reason is shown")
+        self.assertIn("--limits FILE", err, "and how to go on without the call")
+        self.assertNotIn("ghs_", out + err)
+        self.assertNotIn("UNSET", {tok for tok, _ in self.gh_calls()}, "a refused contents token falls back to nothing")
+        self.assertFalse([a for _, a in self.gh_calls() if "contents/" in a], "no limits read was made")
+
+    def test_with_limits_file_no_contents_token_is_asked_for(self):
+        asks = os.path.join(self.tmp, "asks")
+        self.run_gate(*self.job_args(), token_cmd=TOKEN_SCOPED, env={"SCOPE_ASKS": asks})
+        with open(asks) as fh:
+            self.assertEqual(set(fh.read().split()), {"actions"})
 
 
 class CanaryReadsOnTheAppBudget(Sandbox):
@@ -1445,12 +1484,362 @@ class CanaryReadsOnTheAppBudget(Sandbox):
         self.assertTrue(rate and set(rate) == {"UNSET"}, (code, out, err))
         self.assertIn("skipped, 100 GitHub reads left", out)
 
-    def test_the_variable_stays_on_the_personal_token_and_says_so(self):
-        code, out, err = self.canary(APP_REMAINING="100")
+    def test_the_variable_is_read_on_the_variables_token(self):
+        code, out, err = self.canary(TOKEN_SCOPED, APP_REMAINING="100")
         var = [tok for tok, args in self.gh_calls() if "actions/variables/SUPERCI_JOBS" in args]
         self.assertTrue(var, (code, out, err))
-        self.assertEqual(set(var), {"UNSET"}, "SUPERCI_JOBS is a named personal-token exception")
-        self.assertIn("personal-token exception SUPERCI_JOBS", err)
+        self.assertEqual(set(var), {VARS_TOKEN}, "SUPERCI_JOBS is read with the variables token, neither the actions token nor the personal one")
+        self.assertNotIn("personal-token exception", err)
+        self.assertNotIn(VARS_TOKEN, out + err)
+
+    def test_a_refused_variables_token_skips_the_check_aloud_and_reads_nothing_on_the_personal_token(self):
+        code, out, err = self.canary(TOKEN_SCOPED, REFUSE_SCOPES="variables")
+        self.assertIn("no GitHub App token, no check (SUPERCI_JOBS, variables:", out, (out, err))
+        self.assertEqual([a for _, a in self.gh_calls() if "actions/variables" in a], [])
+
+
+class CanaryTree(Sandbox):
+    """canary.sh beside a gate.py that is a stub (by default one answering ROLL BACK, exit 3), over a gh stub that records every call and its GH_TOKEN."""
+
+    def setUp(self):
+        super().setUp()
+        # Writes of the variable are logged by the gh stub like every call; a write with a token in FAIL_WRITE_FOR fails like GitHub's 403.
+        self.env.update(SUPERCI_APP_TOKEN_CMD=TOKEN_SCOPED, SCOPE_ASKS=os.path.join(self.tmp, "asks"))
+        gh = os.path.join(self.bin, "gh")
+        with open(gh) as fh:
+            body = fh.read()
+        body = body.replace('case "$*" in\n', 'case "$*" in\n  *"variable set"*|*"variable delete"*) [ "${GH_TOKEN-UNSET}" = "${FAIL_WRITE_FOR-}" ] && { echo "HTTP 403: Resource not accessible by integration" >&2; exit 1; }; touch "$GHLOG.written"; echo ok ;;\n', 1)
+        # After a write of the variable GitHub no longer finds it (the stub's deleted it), so a later tick has nothing to check.
+        body = body.replace('case "$*" in\n', 'if [ -e "$GHLOG.written" ]; then case "$*" in *actions/variables/SUPERCI_JOBS*) echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;; esac; fi\ncase "$*" in\n', 1)
+        with open(gh, "w") as fh:
+            fh.write(body)
+
+    def tree(self, gate="print('canary FAIL: stub')\nraise SystemExit(3)\n"):
+        root = os.path.join(self.tmp, "tree")
+        os.makedirs(os.path.join(root, "gate"), exist_ok=True)
+        os.makedirs(os.path.join(root, "timeline"), exist_ok=True)
+        shutil.copy(os.path.join(HERE, "canary.sh"), os.path.join(root, "gate", "canary.sh"))
+        shutil.copy(os.path.join(HERE, "..", "timeline", "apptoken.py"), os.path.join(root, "timeline", "apptoken.py"))
+        with open(os.path.join(root, "gate", "gate.py"), "w") as fh:
+            fh.write(gate)
+        return os.path.join(root, "gate", "canary.sh")
+
+    def rollback(self, gate="print('canary FAIL: stub')\nraise SystemExit(3)\n", lasts=2, **extra):
+        until = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + lasts))
+        env = dict(self.env, EVERY="600", LOG=self.tmp, APP_REMAINING="4000", **extra)
+        return subprocess.run(["bash", self.tree(gate), "2026-11-27T00:00:00Z", until, "verify-tools"], env=env, capture_output=True, text=True, timeout=300)
+
+    def writes(self):
+        return [(tok, args) for tok, args in self.gh_calls() if args.startswith("variable ")]
+
+    def refuse_after(self, n):
+        """A token command that answers the first n asks for the variables scope and refuses the rest."""
+        counter = os.path.join(self.tmp, "vasks")
+        cmd = stub("after", f"""if [ "${{SUPERCI_TOKEN_SCOPE:-actions}}" = variables ]; then
+  k=$(($(cat {counter} 2>/dev/null || echo 0)+1)); echo $k > {counter}
+  [ $k -gt {n} ] && {{ printf 'the superci App installation lacks the repository permission "actions_variables: write"\\n422\\n'; exit 0; }}
+fi
+exec {TOKEN_SCOPED}
+""")
+        return {"SUPERCI_APP_TOKEN_CMD": cmd}
+
+
+
+class RollbackWritesOnTheVariablesToken(CanaryTree):
+    """canary.sh beside a gate.py that is a stub answering ROLL BACK (exit 3), so only the rollback's own writes are run."""
+
+    def test_the_rollback_writes_with_the_variables_token(self):
+        p = self.rollback()
+        self.assertIn("SUPERCI_JOBS was", p.stdout, (p.stdout, p.stderr))
+        writes = self.writes()
+        self.assertEqual([args for _, args in writes], ["variable delete SUPERCI_JOBS -R Authentic-Intelligence/megpt-mono"], "verify-tools was the only job listed, so the variable is deleted")
+        self.assertEqual({tok for tok, _ in writes}, {VARS_TOKEN}, "the rollback's write carries the variables token")
+        self.assertNotIn("UNSET", {tok for tok, _ in self.gh_calls() if "actions/variables" in tok or "variable" in _})
+        self.assertNotIn("personal-token exception", p.stderr)
+        self.assertNotIn("ROLLBACK FAILED", p.stdout)
+        self.assertNotIn(VARS_TOKEN, p.stdout + p.stderr)
+
+    def test_a_refused_variables_token_fails_the_rollback_loudly_and_writes_nothing(self):
+        # The token is asked for by the start's probe and the tick's read, and again (VT_TTL=0) for the rollback, which the listener now refuses.
+        p = self.rollback(VT_TTL="0", TOKEN_TIMEOUT="5", **self.refuse_after(2))
+        self.assertIn("ROLLBACK FAILED", p.stdout, (p.stdout, p.stderr))
+        self.assertIn("ROLLBACK FAILED", p.stderr, "and on stderr too")
+        self.assertIn("SUPERCI_PERSONAL_TOKEN=1", p.stdout, "it says how to roll back on the personal token")
+        self.assertEqual(self.writes(), [], "nothing was written, with any token")
+        self.assertNotIn("ghs_", p.stdout + p.stderr)
+
+    def test_the_personal_token_is_used_for_the_rollback_only_when_the_operator_set_it(self):
+        p = self.rollback(SUPERCI_PERSONAL_TOKEN="1", PERSONAL_REMAINING="4000", VT_TTL="0", TOKEN_TIMEOUT="5", **self.refuse_after(0))
+        writes = self.writes()
+        self.assertEqual([tok for tok, _ in writes], ["UNSET"], (p.stdout, p.stderr, self.gh_calls()))
+        self.assertIn("personal-token exception SUPERCI_JOBS write", p.stderr, "the fallback says it is the personal budget")
+        self.assertNotIn("ROLLBACK FAILED", p.stdout)
+        self.assertIn("SUPERCI_JOBS was", p.stdout)
+
+    def test_a_write_the_variables_token_is_refused_by_github_falls_back_only_when_asked(self):
+        p = self.rollback(FAIL_WRITE_FOR=VARS_TOKEN)
+        self.assertIn("ROLLBACK FAILED", p.stdout, (p.stdout, p.stderr))
+        self.assertEqual({tok for tok, _ in self.writes()}, {VARS_TOKEN}, "one attempt on the App's token, none on the personal one")
+        open(self.log, "w").close()
+        p = self.rollback(FAIL_WRITE_FOR=VARS_TOKEN, SUPERCI_PERSONAL_TOKEN="1", PERSONAL_REMAINING="4000")
+        self.assertEqual([tok for tok, _ in self.writes()][-1], "UNSET", (p.stdout, p.stderr))
+        self.assertIn("personal-token exception SUPERCI_JOBS write", p.stderr)
+
+    def test_an_endpoint_that_hangs_does_not_hang_the_rollback(self):
+        hang = stub("hang", """if [ "${SUPERCI_TOKEN_SCOPE:-actions}" = variables ]; then exec /bin/sleep 60; fi
+exec @OK@
+""".replace("@OK@", TOKEN_SCOPED))
+        start = time.time()
+        p = subprocess.run(["bash", os.path.join(HERE, "canary.sh"), "unset"], env=dict(self.env, SUPERCI_APP_TOKEN_CMD=hang, TOKEN_TIMEOUT="1"),
+                           capture_output=True, text=True, timeout=60)
+        self.assertLess(time.time() - start, 30, "three asks of a second each, with the stubbed sleeps between")
+        self.assertEqual(p.returncode, 1, (p.stdout, p.stderr))
+        self.assertIn("ROLLBACK FAILED", p.stdout)
+        self.assertEqual(self.writes(), [])
+
+
+class RollbackWhenNoReadAnswers(CanaryTree):
+    """The rollback when GitHub answers none of its reads of SUPERCI_JOBS, and a gate that dies without a verdict."""
+
+    def test_a_rollback_whose_five_reads_all_fail_deletes_the_variable_and_the_watch_goes_on(self):
+        # The probe's read and the tick's read answer; every read after them (the rollback's five) gets a 502.
+        gh = os.path.join(self.bin, "gh")
+        with open(gh) as fh:
+            body = fh.read()
+        body = body.replace('case "$*" in\n', 'case "$*" in *actions/variables/SUPERCI_JOBS*) n=$(($(cat "$GHLOG.reads" 2>/dev/null || echo 0)+1)); echo $n > "$GHLOG.reads"; [ $n -gt 2 ] && [ ! -e "$GHLOG.written" ] && { echo "gh: HTTP 502: Bad Gateway" >&2; exit 1; } ;; esac\ncase "$*" in\n', 1)
+        with open(gh, "w") as fh:
+            fh.write(body)
+        p = self.rollback()
+        self.assertNotIn("unbound variable", p.stderr, (p.stdout, p.stderr))
+        self.assertIn("GitHub did not answer reading SUPERCI_JOBS (try 5)", p.stdout, (p.stdout, p.stderr))
+        self.assertIn("SUPERCI_JOBS unread after 5 tries: deleting it", p.stdout, (p.stdout, p.stderr))
+        self.assertEqual([args for _, args in self.writes()], ["variable delete SUPERCI_JOBS -R Authentic-Intelligence/megpt-mono"], "every job goes back to Blacksmith")
+        self.assertEqual({tok for tok, _ in self.writes()}, {VARS_TOKEN}, "on the variables token")
+        self.assertNotIn("ROLLBACK FAILED", p.stdout)
+
+    def test_a_gate_that_dies_without_a_verdict_is_no_check(self):
+        for code in (1, 137):
+            p = self.rollback(gate=f"import sys\nprint('Traceback: boom ghs_leak_in_text')\nsys.exit({code})\n")
+            self.assertIn("NO CHECK (the gate failed: Traceback: boom", p.stdout, (code, p.stdout, p.stderr))
+            self.assertIn(f"(exit {code},", p.stdout)
+            self.assertNotIn("ghs_leak_in_text", p.stdout, "a token-shaped word is scrubbed")
+            self.assertEqual(self.writes(), [], "no verdict rolls nothing back")
+
+
+class CanaryTokenLifetime(CanaryTree):
+    """The variables token as the listener hands it out: it may expire 10 minutes after the ask. A virtual clock (the date and sleep stubs) moves the
+    canary through ticks 600 s apart in no real time, and the listener stub numbers its tokens (ghs_vars_N), each valid for 600 s of that clock."""
+
+    def setUp(self):
+        super().setUp()
+        self.clock = os.path.join(self.tmp, "clock")
+        self.toks = os.path.join(self.tmp, "toks")
+        os.makedirs(self.toks)
+        for name, body in {
+            "date": 'off=$(cat "$VCLOCK" 2>/dev/null || echo 0)\n[ "$1 $2" = "-u +%s" ] && { echo $(( $(/bin/date +%s) + off )); exit 0; }\nexec /bin/date "$@"\n',
+            "sleep": 'if [ -n "${NO_ADVANCE-}" ]; then exec /bin/sleep 1; fi\necho $(( $(cat "$VCLOCK" 2>/dev/null || echo 0) + ${1%%[!0-9]*} )) > "$VCLOCK"\n',
+        }.items():
+            path = os.path.join(self.bin, name)
+            with open(path, "w") as fh:
+                fh.write("#!/bin/sh\n" + body)
+            os.chmod(path, 0o755)
+        gh = os.path.join(self.bin, "gh")
+        with open(gh) as fh:
+            body = fh.read()
+        shebang, first, rest = body.split("\n", 2)
+        first = shebang + "\n" + first
+        # A variables token is refused (401) once its 600 s are up on the virtual clock, or when it is listed in dead (any call) or deadwrite (a write).
+        check = """case "${GH_TOKEN-}" in ghs_vars_*)
+  now=$(( $(/bin/date +%s) + $(cat "$VCLOCK" 2>/dev/null || echo 0) ))
+  if [ "$now" -ge "$(cat "$TOKS/exp.$GH_TOKEN" 2>/dev/null || echo 0)" ] || grep -qx "$GH_TOKEN" "$TOKS/dead" 2>/dev/null; then echo "gh: Bad credentials (HTTP 401)" >&2; exit 1; fi
+  case "$*" in variable*) if grep -qx "$GH_TOKEN" "$TOKS/deadwrite" 2>/dev/null; then echo "gh: Bad credentials (HTTP 401)" >&2; exit 1; fi ;; esac ;;
+esac
+case "$*" in *actions/variables/SUPERCI_JOBS*) if [ -n "${FORBID_READ_FOR-}" ] && [ "${GH_TOKEN-}" = "$FORBID_READ_FOR" ]; then echo "gh: Resource not accessible by integration (HTTP 403)" >&2; exit 1; fi ;; esac"""
+        with open(gh, "w") as fh:
+            fh.write(first + "\n" + check + "\n" + rest)
+        listener = stub("lifetime_listener", """scope=${SUPERCI_TOKEN_SCOPE:-actions}
+echo "$scope" >> "$TOKS/asks"
+if [ "$scope" = variables ]; then
+  n=$(($(cat "$TOKS/n" 2>/dev/null || echo 0)+1)); echo $n > "$TOKS/n"
+  if [ -n "${REFUSE_AFTER-}" ] && [ $n -gt "$REFUSE_AFTER" ]; then printf 'the superci App installation lacks the repository permission "actions_variables: write"\\n422\\n'; exit 0; fi
+  now=$(( $(/bin/date +%s) + $(cat "$VCLOCK" 2>/dev/null || echo 0) ))
+  echo $((now + 600)) > "$TOKS/exp.ghs_vars_$n"
+  printf '{"token":"ghs_vars_%s","expires":"2999-01-01T00:00:00Z"}\\n200\\n' $n
+else
+  printf '{"token":"@APP@","expires":"2999-01-01T00:00:00Z"}\\n200\\n'
+fi
+""".replace("@APP@", APP_TOKEN))
+        self.env.update(SUPERCI_APP_TOKEN_CMD=listener, VCLOCK=self.clock, TOKS=self.toks)
+
+    def mark(self, name, *tokens):
+        with open(os.path.join(self.toks, name), "w") as fh:
+            fh.write("".join(t + "\n" for t in tokens))
+
+    def asks(self, scope="variables"):
+        with open(os.path.join(self.toks, "asks")) as fh:
+            return fh.read().split().count(scope)
+
+    def test_a_token_ten_minutes_from_expiry_at_the_ask_is_not_used_past_it(self):
+        # Three ticks 600 s apart: a token kept longer than 600 s (the listener's reserve) is expired at the next tick and answers 401.
+        p = self.rollback(gate="print('canary keep')\nraise SystemExit(0)\n", lasts=1500)
+        self.assertNotIn("unset or unread", p.stdout, "a tick read SUPERCI_JOBS with an expired token")
+        self.assertEqual(p.stdout.count("canary keep"), 3, p.stdout)
+        reads = [tok for tok, args in self.gh_calls() if "actions/variables/SUPERCI_JOBS" in args]
+        self.assertEqual(len(set(reads)), len(reads), "each tick, 600 s apart, reads with a token asked for since the last: " + str(reads))
+        self.assertNotIn("ghs_vars_", p.stdout + p.stderr)
+
+    def test_a_401_on_the_read_drops_the_token_asks_again_and_reads_with_the_fresh_one(self):
+        self.mark("dead", "ghs_vars_1")
+        p = self.rollback(gate="print('canary keep')\nraise SystemExit(0)\n", NO_ADVANCE="1")
+        self.assertNotIn("unset or unread", p.stdout, (p.stdout, p.stderr))
+        self.assertIn("canary keep", p.stdout)
+        reads = [tok for tok, args in self.gh_calls() if "actions/variables/SUPERCI_JOBS" in args]
+        self.assertEqual(reads[:2], ["ghs_vars_1", "ghs_vars_2"], "the refused token is replaced once, and the fresh one is kept")
+        self.assertEqual(set(reads[2:]), {"ghs_vars_2"})
+
+    def test_a_401_on_the_rollbacks_write_asks_again_and_writes_with_the_fresh_token(self):
+        self.mark("deadwrite", "ghs_vars_1")
+        p = self.rollback(NO_ADVANCE="1")
+        self.assertNotIn("ROLLBACK FAILED", p.stdout, (p.stdout, p.stderr))
+        self.assertEqual([tok for tok, _ in self.writes()], ["ghs_vars_1", "ghs_vars_2"], "one failed write on the old token, then the fresh one")
+        self.assertIn("SUPERCI_JOBS was", p.stdout)
+
+    def test_the_failure_line_names_a_fresh_token_github_refused(self):
+        self.mark("deadwrite", "ghs_vars_1", "ghs_vars_2")
+        p = self.rollback(NO_ADVANCE="1")
+        self.assertIn("ROLLBACK FAILED: GitHub refused the write with a fresh variables token (gh: Bad credentials (HTTP 401))", p.stdout, (p.stdout, p.stderr))
+        self.assertEqual([tok for tok, _ in self.writes()][:2], ["ghs_vars_1", "ghs_vars_2"])
+
+    def test_the_failure_line_names_a_listener_that_would_not_give_a_new_token(self):
+        self.mark("deadwrite", "ghs_vars_1")
+        p = self.rollback(NO_ADVANCE="1", REFUSE_AFTER="1")
+        self.assertIn("ROLLBACK FAILED: GitHub refused the write with the variables token (gh: Bad credentials (HTTP 401)), which may have expired, and the listener would not give a new one", p.stdout, (p.stdout, p.stderr))
+        self.assertIn("actions_variables: write", p.stdout, "with the listener's own reason")
+        self.assertEqual([tok for tok, _ in self.writes()][:1], ["ghs_vars_1"])
+
+    def test_the_failure_line_names_a_listener_that_gave_no_token_at_all(self):
+        p = self.rollback(NO_ADVANCE="1", REFUSE_AFTER="0", VT_TTL="0")
+        self.assertNotIn("ghs_", p.stdout)
+        self.assertEqual(self.writes(), [])
+        p = subprocess.run(["bash", self.tree(), "unset"], env=dict(self.env, REFUSE_AFTER="0"), capture_output=True, text=True, timeout=60)
+        self.assertIn("ROLLBACK FAILED: the listener would not give a variables token", p.stdout, (p.stdout, p.stderr))
+
+    def test_an_exit_2_of_the_gate_is_no_check_and_says_why(self):
+        p = self.rollback(gate="import sys\nprint('refusing: no GitHub App token for contents (the listener lacks it). ghs_leak_in_text', file=sys.stderr)\nsys.exit(2)\n")
+        self.assertIn("NO CHECK (the gate refused: refusing: no GitHub App token for contents", p.stdout, (p.stdout, p.stderr))
+        self.assertIn("(exit 2,", p.stdout)
+        self.assertNotIn("ghs_leak_in_text", p.stdout, "a token-shaped word is scrubbed")
+        self.assertEqual(self.writes(), [], "a refusal rolls nothing back")
+
+    def test_a_watch_that_cannot_read_SUPERCI_JOBS_does_not_start(self):
+        # An old listener answers the read token for scope=variables, and every read of the variable with it is refused (403).
+        old = TOKEN_OK
+        ran = os.path.join(self.tmp, "gate-ran")
+        gate = f"open({ran!r}, 'w').close()\nraise SystemExit(0)\n"
+        p = self.rollback(gate=gate, SUPERCI_APP_TOKEN_CMD=old, FORBID_READ_FOR=APP_TOKEN, NO_ADVANCE="1")
+        self.assertEqual(p.returncode, 2, (p.stdout, p.stderr))
+        self.assertIn("refusing: SUPERCI_JOBS cannot be read with the variables token", p.stderr)
+        self.assertFalse(os.path.exists(ran), "the gate was never run: the watch did not start")
+        self.assertEqual(p.stdout, "", "and no tick was logged")
+
+    def test_a_watch_whose_variable_is_simply_unset_starts(self):
+        p = self.rollback(gate="raise SystemExit(0)\\n", NO_ADVANCE="1")
+        gh = os.path.join(self.bin, "gh")
+        with open(gh) as fh:
+            body = fh.read()
+        with open(gh, "w") as fh:
+            fh.write(body.replace('case "$*" in\n', 'case "$*" in\n  *actions/variables/SUPERCI_JOBS*) echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;\n', 1))
+        p = self.rollback(gate="raise SystemExit(0)\\n", NO_ADVANCE="1")
+        self.assertEqual(p.returncode, 0, (p.stdout, p.stderr))
+        self.assertIn("SUPERCI_JOBS unset or unread, no check", p.stdout)
+
+    def test_under_the_personal_override_the_rollback_asks_the_app_once_and_does_not_wait_on_it(self):
+        flaky = stub("flaky_listener", 'echo variables >> "$TOKS/asks"\nprintf "bad gateway\\n502\\n"\n')
+        p = subprocess.run(["bash", self.tree(), "unset"], env=dict(self.env, SUPERCI_APP_TOKEN_CMD=flaky, SUPERCI_PERSONAL_TOKEN="1"), capture_output=True, text=True, timeout=120)
+        self.assertEqual(p.returncode, 0, (p.stdout, p.stderr))
+        self.assertEqual(self.asks(), 1, "no retries: the personal fallback is not kept waiting on the App")
+        self.assertEqual([tok for tok, _ in self.writes()], ["UNSET"])
+        self.assertIn("personal-token exception SUPERCI_JOBS write", p.stderr)
+
+    def test_a_hung_listener_delays_the_personal_fallback_by_seconds(self):
+        hang = stub("hang_listener", 'echo variables >> "$TOKS/asks"\nexec /bin/sleep 120\n')
+        start = time.time()
+        p = subprocess.run(["bash", self.tree(), "unset"], env=dict(self.env, SUPERCI_APP_TOKEN_CMD=hang, SUPERCI_PERSONAL_TOKEN="1"), capture_output=True, text=True, timeout=400)
+        self.assertLess(time.time() - start, 30, "one ask, bounded to 10 s")
+        self.assertEqual((p.returncode, self.asks()), (0, 1), (p.stdout, p.stderr))
+        self.assertEqual([tok for tok, _ in self.writes()], ["UNSET"])
+
+    def test_without_the_override_the_rollback_still_retries_the_ask(self):
+        flaky = stub("flaky_listener", 'echo variables >> "$TOKS/asks"\nprintf "bad gateway\\n502\\n"\n')
+        p = subprocess.run(["bash", self.tree(), "unset"], env=dict(self.env, SUPERCI_APP_TOKEN_CMD=flaky), capture_output=True, text=True, timeout=120)
+        self.assertEqual((p.returncode, self.asks()), (1, 3), (p.stdout, p.stderr))
+        self.assertIn("ROLLBACK FAILED", p.stdout)
+
+
+class TheRerouteHelper(Sandbox):
+    def run_helper(self, *args, **extra):
+        env = dict(self.env, SUPERCI_APP_TOKEN_CMD=TOKEN_SCOPED, **extra)
+        return subprocess.run(["bash", os.path.join(HERE, "canary.sh"), *args], env=env, capture_output=True, text=True, timeout=60)
+
+    def test_set_and_unset_write_SUPERCI_JOBS_on_the_variables_token(self):
+        p = self.run_helper("set", '["test-go","verify-tools"]')
+        self.assertEqual(p.returncode, 0, (p.stdout, p.stderr))
+        p2 = self.run_helper("unset")
+        self.assertEqual(p2.returncode, 0, (p2.stdout, p2.stderr))
+        calls = self.gh_calls()
+        self.assertEqual([args for tok, args in calls if args.startswith("variable ")],
+                         ['variable set SUPERCI_JOBS -R Authentic-Intelligence/megpt-mono --body ["test-go","verify-tools"]', "variable delete SUPERCI_JOBS -R Authentic-Intelligence/megpt-mono"])
+        self.assertEqual({tok for tok, _ in calls}, {VARS_TOKEN}, "the reads and both writes carry the variables token")
+        self.assertNotIn(VARS_TOKEN, p.stdout + p.stderr + p2.stdout + p2.stderr)
+
+    def test_unset_of_an_unset_variable_is_not_a_failure(self):
+        gh = os.path.join(self.bin, "gh")
+        with open(gh) as fh:
+            body = fh.read()
+        with open(gh, "w") as fh:
+            fh.write(body.replace('case "$*" in\n', 'case "$*" in\n  *actions/variables/SUPERCI_JOBS*) echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;\n', 1))
+        p = self.run_helper("unset")
+        self.assertEqual((p.returncode, p.stdout.strip()), (0, "SUPERCI_JOBS already unset"), p)
+        self.assertEqual([a for _, a in self.gh_calls() if a.startswith("variable ")], [], "nothing to delete")
+
+    def test_a_value_that_is_not_a_list_of_job_names_is_refused_before_any_call(self):
+        for bad in ('{"a":1}', "test-go", "[1]", ""):
+            p = self.run_helper("set", bad)
+            self.assertEqual(p.returncode, 2, (bad, p.stdout, p.stderr))
+        self.assertEqual(self.gh_calls(), [])
+
+    def test_a_refused_variables_token_refuses_loudly_unless_the_operator_allows_the_personal_one(self):
+        p = self.run_helper("set", '["test-go"]', REFUSE_SCOPES="variables")
+        self.assertEqual(p.returncode, 1, (p.stdout, p.stderr))
+        self.assertIn("ROLLBACK FAILED", p.stdout)
+        self.assertIn("repository permission", p.stdout, "the listener's reason is shown")
+        self.assertEqual(self.gh_calls(), [], "no call was made on any token")
+        p = self.run_helper("set", '["test-go"]', REFUSE_SCOPES="variables", SUPERCI_PERSONAL_TOKEN="1")
+        self.assertEqual(p.returncode, 0, (p.stdout, p.stderr))
+        self.assertEqual([tok for tok, args in self.gh_calls() if args.startswith("variable set")], ["UNSET"])
+        self.assertIn("personal-token exception SUPERCI_JOBS write", p.stderr)
+
+    def test_the_helper_needs_neither_aws_nor_the_actions_token(self):
+        asks = os.path.join(self.tmp, "asks")
+        p = self.run_helper("unset", SCOPE_ASKS=asks, PATH=self.bin.replace("bin", "nowhere") + os.pathsep + "/usr/bin" + os.pathsep + "/bin")
+        with open(asks) as fh:
+            self.assertEqual(set(fh.read().split()), {"variables"}, "only the variables token was asked for")
+
+
+class NoTokenInTheNewPaths(Sandbox):
+    def test_no_token_reaches_the_output_of_a_rollback_a_helper_or_a_refused_gate(self):
+        self.env.update(SUPERCI_APP_TOKEN_CMD=TOKEN_SCOPED)
+        outs = []
+        for args, extra in ((("set", '["a"]'), {}), (("unset",), {"REFUSE_SCOPES": "variables"}), (("unset",), {"SUPERCI_PERSONAL_TOKEN": "1", "REFUSE_SCOPES": "variables"})):
+            p = subprocess.run(["bash", os.path.join(HERE, "canary.sh"), *args], env=dict(self.env, **extra), capture_output=True, text=True, timeout=60)
+            outs.append(p.stdout + p.stderr)
+        leaky = stub("leaky", """printf '{"token":"ghs_leaked_in_a_refusal","expires":"2999-01-01T00:00:00Z"}\\n200\\n'\necho 'ssh: reset' >&2\nexit 255\n""")
+        p = subprocess.run(["bash", os.path.join(HERE, "canary.sh"), "unset"], env=dict(self.env, SUPERCI_APP_TOKEN_CMD=leaky), capture_output=True, text=True, timeout=60)
+        outs.append(p.stdout + p.stderr)
+        self.assertIn("ROLLBACK FAILED", p.stdout)
+        for out in outs:
+            for token in (APP_TOKEN, VARS_TOKEN, LIMITS_TOKEN, "ghs_leaked_in_a_refusal"):
+                self.assertNotIn(token, out)
 
 
 class PersonalTokenExceptions(unittest.TestCase):
@@ -1465,10 +1854,11 @@ class PersonalTokenExceptions(unittest.TestCase):
         readme = read("README.md")
         table = readme.partition("Personal-token exceptions")[2]
         documented = set(re.findall(r"^\| `([^`]+)` \|", table, re.M))
-        keys = set(re.findall(r'^    "([^"]+)": \(', read("tools", "timeline", "apptoken.py"), re.M))
+        keys = set(re.findall(r'^    "([^"]+)": \(', read("tools", "timeline", "apptoken.py").partition("EXCEPTIONS = {")[2].partition("\n}")[0], re.M))
         used = set(re.findall(r'exception="([^"]+)"', read("tools", "gate", "gate.py") + read("tools", "timeline", "timeline.py")))
-        used |= set(re.findall(r"\bpersonal ([A-Za-z0-9_.-]+) (?:api|variable)\b", read("tools", "gate", "canary.sh")))
-        self.assertTrue(documented, "the README lists the personal-token exceptions")
+        used |= set(re.findall(r'\bpersonal_fallback "([^"]+)"', read("tools", "gate", "canary.sh")))
+        self.assertEqual(documented, {"SUPERCI_JOBS write"}, "the one personal-token exception is the rollback's write of SUPERCI_JOBS")
+        self.assertNotRegex(read("tools", "gate", "canary.sh"), r"(?m)^\s*(?!#)[^#\n]*\bpersonal\s+[A-Z_]+\s+(api|variable)\b", "an old personal-token call site is left in canary.sh")
         self.assertEqual(keys, documented, "EXCEPTIONS in apptoken.py and the README differ")
         self.assertEqual(used, documented, "a call site uses an exception the README does not list, or the README lists one nothing uses")
 
