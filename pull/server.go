@@ -45,6 +45,11 @@ type Server struct {
 	dispatchMachine func(id string) (set string, m *Machine)
 }
 
+// noticeTaker is what of the dispatcher takes a dispatch machine's spot notice (Dispatcher.Notice).
+type noticeTaker interface {
+	Notice(doc InstanceDocument, action string, now time.Time) (known bool, err error)
+}
+
 func (h *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST the instance's signed identity document", http.StatusMethodNotAllowed)
@@ -214,15 +219,52 @@ func (h *Server) jit(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(cfg.EncodedJITConfig))
 }
 
-// notice takes in a machine's word that AWS gave notice it takes the machine back. The machine is no longer supply;
-// an idle runner of it retires (the reconciler removes it before the machine ends). A job it runs is recorded on the
-// machine (EC2's superci-pull-noticed tag), so a restart can still re-run the job once AWS has taken the machine.
+// notice takes in a machine's word that AWS gave notice it takes the machine back. A dispatch machine's goes to the
+// dispatcher, which fails and re-runs the job it was handed at once (Dispatcher.Notice). A scale set's machine is no
+// longer supply; an idle runner of it retires (the reconciler removes it before the machine ends). A job it runs is
+// recorded on the machine (EC2's superci-pull-noticed tag), so a restart can still re-run the job once AWS has taken
+// the machine. The machine is looked up as a /mark's is (marker), listing EC2 again only while no set knows it.
 func (h *Server) notice(w http.ResponseWriter, r *http.Request) {
-	s, m, err := h.machine(r)
+	doc, err := h.document(r)
 	if err != nil {
 		http.Error(w, "unknown machine", http.StatusForbidden)
 		return
 	}
+	for try := 0; try < 3; try++ {
+		if s, m := h.scaleMachine(doc.InstanceID); m != nil {
+			h.scaleNotice(w, r, s, m)
+			return
+		}
+		if d, ok := h.dispatch.(noticeTaker); ok {
+			if known, err := d.Notice(doc, r.Header.Get(actionHeader), time.Now()); known {
+				h.dispatchNoticed(w, doc, err)
+				return
+			}
+		}
+		h.refresh(r.Context(), doc.Region)
+	}
+	http.Error(w, "unknown machine", http.StatusForbidden)
+}
+
+// dispatchNoticed answers a dispatch machine's notice: 204 once the dispatcher took it, 400 for one that is not current,
+// which the machine does not send again.
+func (h *Server) dispatchNoticed(w http.ResponseWriter, doc InstanceDocument, err error) {
+	if err != nil {
+		slog.Warn("spot notice refused", "machine", doc.InstanceID, "err", err.Error())
+		http.Error(w, "no current spot notice", http.StatusBadRequest)
+		return
+	}
+	if h.dispatchMachine != nil {
+		if set, m := h.dispatchMachine(doc.InstanceID); m != nil {
+			slog.Warn("spot notice", "set", set, "machine", m.ID, "region", m.Region, "type", m.Type, "az", m.AZ)
+			tlNotice(set, m, time.Now())
+		}
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// scaleNotice takes in a scale set's machine's notice.
+func (h *Server) scaleNotice(w http.ResponseWriter, r *http.Request, s *Set, m *Machine) {
 	job := s.state.Noticed(m.ID)
 	slog.Warn("spot notice", "set", s.spec.Name, "machine", m.ID, "region", m.Region, "type", m.Type, "az", m.AZ)
 	tlNotice(s.spec.Name, m, time.Now())

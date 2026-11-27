@@ -316,7 +316,8 @@ once it holds no machine it is deleted at GitHub, so no job fails.
 - A job lost to a spot reclaim is re-run once with GitHub's re-run API, only on proof of the reclaim:
   - the job completed on a machine AWS gave notice it takes back (the notice is recorded on the machine as
     `superci-pull-noticed`), or
-  - the job's machine left before the job completed, and EC2 says a spot interruption terminated it.
+  - the job's machine left before the job completed, and EC2 says a spot interruption terminated it, or
+  - a dispatched job the dispatcher lost to a reclaim it learnt of (Identity plane, Reclaim): that is its proof.
 
   It is re-run once its run has completed (GitHub re-runs a job only in a completed run), and only if GitHub
   concluded the job `failure`; a job that succeeded, or that a person cancelled, is left alone. A start rebuilds the
@@ -509,11 +510,25 @@ size is one set (`split` 1), since an identity names its size, not a set of it.
   flight finish for 5 s, and ends every connection, which each side rejoins on the next dispatcher.
 - **Loss.** A machine away for 3 minutes with no EXIT, a job past `job_minutes` + `margin_minutes`, or a machine
   past its life loses its job: the shim gets exit code 1, which is no TaskResult, and the identity's listener fails
-  the job. A shim that is away loses nothing: the machine renews its job itself, so the job runs on to its EXIT
+  the job. A reclaim loses it sooner (below). A shim that is away loses nothing: the machine renews its job itself, so the job runs on to its EXIT
   however long the shim stays away. An EXIT that comes while the shim is away ends the machine and is held for the
   shim until 3 minutes after the shim left. A spot reclaim's lost job is re-run as a scale set's is, known by its
   machine and found in its run by its name (an identity takes many jobs). A stranded job is re-run the same way with no
   reclaim to prove: no machine ever got its bytes, so its failure is superci's own.
+- **Reclaim.** AWS's notice that it takes a dispatch machine back reaches the dispatcher from the machine: boot.sh
+  watches IMDS's `spot/instance-action` and posts `/notice` with its identity document and the instance-action
+  (`X-Superci-Action`), again until the listener answers. The dispatcher acts on the document's instance only, and
+  refuses (400) a notice from an on-demand machine, which AWS does not reclaim, or an instance-action whose time is more
+  than a minute past or three minutes ahead, which no notice AWS gives now has: a stale one replayed. A notice that did
+  not come is caught by the listing of EC2 the reconciler makes anyway (every 10 s, at most once a second a region): it
+  also asks for `shutting-down` and `stopping`, a few more instances on the same pages, and a dispatch machine it shows
+  leaving with a `Server.SpotInstance*` state reason is reclaimed; one leaving for another reason is left to the window.
+  A reclaimed machine with no job ends at once; one being paired is spent and the job paired again, unless PAIRED had
+  gone, when the job is lost at its handed point. A handed job is lost at once, waiting on no write to the machine: no
+  frame starts on its connection after, its shim gets exit code 1, the machine ends (terminated by the next pass), and
+  the job is reported with the reclaim as the proof its re-run needs, since it is failed before AWS takes the machine
+  and its run may complete before EC2 could prove the reclaim. Its notice tag is not written, so a restart before the
+  re-run forgets it, as it forgets a job lost at the window.
 - **Machines.** A dispatch machine carries `superci-pull-mode=dispatch`, so a scale set and a dispatch set of one size
   never take each other's machines. Its demand is the jobs waiting plus the jobs running, and its pool follows the
   jobs that arrive at the dispatcher, by the same rule as a scale set's (Pools). It ends when its EXIT has been
