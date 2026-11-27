@@ -20,7 +20,7 @@ type Metrics struct {
 	Budget        BudgetSnapshot
 	Spend         SpendSnapshot
 	Sets          []Snapshot
-	OnDemandFirst map[string]bool      // the sets whose size asks its leading types on demand first (on_demand_first), by name
+	OnDemandFirst map[string]bool      // onDemandFirstSets: the sets whose size asks its leading types on demand first, by name
 	Waits         []float64            // queue waits of jobs started this minute, seconds
 	SetWaits      map[string][]float64 // the same, by set
 	Orphans       int                  // orphaned machines and runners of every set, and machines of no configured set
@@ -118,7 +118,7 @@ func metricData(m Metrics, now time.Time) []cwtypes.MetricDatum {
 		data = append(data, d("BudgetDenied", float64(m.Denied[reason.String()]), cwtypes.StandardUnitCount,
 			cwtypes.Dimension{Name: aws.String("Reason"), Value: aws.String(reason.String())}))
 	}
-	// OnDemandFirstMachines and OnDemandFirstShare are over the sets whose size asks m8azn on demand before a slower spot type: the share the alarm reads, which
+	// OnDemandFirstMachines and OnDemandFirstShare are over onDemandFirstSets (superci-4cpu): the share the alarm reads, which
 	// the spot-only sets' machines (2 vCPU, 600 at most) do not dilute.
 	data = append(data, d("Machines", float64(machines), cwtypes.StandardUnitCount), d("OnDemandShare", float64(od)/math.Max(1, float64(machines)), cwtypes.StandardUnitNone),
 		d("OnDemandFirstMachines", float64(fastMachines), cwtypes.StandardUnitCount), d("OnDemandFirstShare", float64(fastOD)/math.Max(1, float64(fastMachines)), cwtypes.StandardUnitNone))
@@ -222,4 +222,15 @@ func jobData(jobs []JobRecord, at *time.Time) []cwtypes.MetricDatum {
 		}
 	}
 	return data
+}
+
+// onDemandFirstSets marks each set whose size asks its leading types on demand before a slower type's spot (on_demand_first):
+// the on-demand-share alarm reads those sets alone. A spot_first size asks no type on demand outside on_demand_share, so it
+// is not one of them.
+func onDemandFirstSets(specs []SetSpec) map[string]bool {
+	out := map[string]bool{}
+	for _, s := range specs {
+		out[s.Name] = s.OnDemandFirst > 0
+	}
+	return out
 }

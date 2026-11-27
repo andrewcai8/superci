@@ -22,10 +22,9 @@
       "disk_gb": 80,
       "types": [
         "m8azn.3xlarge",
-        "m8a.2xlarge",
-        "r8a.2xlarge"
+        "m8a.2xlarge"
       ],
-      "on_demand_first": 1,
+      "spot_first": 1,
       "dispatch": true
     }
   }

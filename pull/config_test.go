@@ -17,8 +17,10 @@ func TestTheBuiltInConfigHasEverySize(t *testing.T) {
 	}
 	for _, label := range []string{"superci-2cpu", "superci-4cpu", "superci-8cpu", "superci-16cpu", "superci-32cpu"} {
 		s, ok := c.Sizes[label]
-		if !ok || len(s.Types) < 3 {
-			t.Fatalf("%s: %+v, want 3 or more types", label, s)
+		// Two types at least, so a size outlives one type's spot running out. superci-8cpu has exactly two: r8a.2xlarge
+		// runs 12 to 20% slower and took jobs ahead of m8a.2xlarge, whose spot gave 609 launches on Nov 26-27.
+		if !ok || len(s.Types) < 2 {
+			t.Fatalf("%s: %+v, want 2 or more types", label, s)
 		}
 		if _, ok := c.Pools[label]; !ok {
 			t.Fatalf("%s has no pool bounds", label)

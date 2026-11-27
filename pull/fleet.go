@@ -270,15 +270,18 @@ func (sr *setRegion) poolsOf(types []string) []ec2types.FleetLaunchTemplateOverr
 // chunk is the most capacity one CreateFleet asks for; a burst is a handful of these per region.
 const chunk = 250
 
-// Launch starts n machines. The size's leading OnDemandFirst types go first: spot across every region, then on demand,
-// whatever the on-demand share. Then the other types' spot across every region, and only then their on-demand, at most
-// odRoom of them. A region's spot shortfall is asked again of the others. It returns what started.
+// Launch starts n machines. The size's leading OnDemandFirst or SpotFirst types go first: spot across every region, then,
+// for OnDemandFirst only, on demand whatever the on-demand share. Then the other types' spot across every region, and only
+// then their on-demand, at most odRoom of them. A region's spot shortfall is asked again of the others. It returns what started.
 func (sf *SetFleet) Launch(ctx context.Context, round string, n, odRoom int) []*Machine {
-	fast, rest := sf.spec.Types[:sf.spec.OnDemandFirst], sf.spec.Types[sf.spec.OnDemandFirst:]
+	lead := max(sf.spec.OnDemandFirst, sf.spec.SpotFirst)
+	fast, rest := sf.spec.Types[:lead], sf.spec.Types[lead:]
 	var got []*Machine
 	if len(fast) > 0 {
 		got = append(got, sf.spot(ctx, round, "fast-", n, fast)...)
-		got = append(got, sf.onDemand(ctx, round, "fast-", n-len(got), n, fast)...)
+		if sf.spec.OnDemandFirst > 0 {
+			got = append(got, sf.onDemand(ctx, round, "fast-", n-len(got), n, fast)...)
+		}
 	}
 	if len(rest) > 0 {
 		got = append(got, sf.spot(ctx, round, "", n-len(got), rest)...)

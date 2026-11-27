@@ -315,3 +315,28 @@ func TestTheOnDemandShareTheAlarmReadsIsOverTheSetsThatAskOnDemandFirst(t *testi
 		}
 	}
 }
+
+// superci-8cpu asks m8azn.3xlarge spot alone and never on demand (spot_first): the alarm keeps reading superci-4cpu, whose
+// m8azn.xlarge is still asked on demand first, and the 8 vCPU machines neither enter its share nor dilute it.
+func TestTheOnDemandAlarmStillWatchesSuperci4cpuOnceSuperci8cpuIsSpotFirst(t *testing.T) {
+	scope := onDemandFirstSets(shippedConfig(t).Sets())
+	if !scope["superci-4cpu"] || scope["superci-8cpu"] {
+		t.Fatalf("the alarm's sets are %v, want superci-4cpu and not superci-8cpu", scope)
+	}
+	m := Metrics{
+		Sets:          []Snapshot{{Set: "superci-2cpu", Machines: 300}},
+		Dispatch:      []DispatchSnapshot{{Set: "superci-4cpu", Machines: 20, OnDemand: 10}, {Set: "superci-8cpu", Machines: 200, OnDemand: 5}},
+		OnDemandFirst: scope,
+		SetWaits:      map[string][]float64{}, Denied: map[string]int{},
+	}
+	got := map[string]float64{}
+	for _, d := range metricData(m, t0) {
+		if len(d.Dimensions) == 0 {
+			got[aws.ToString(d.MetricName)] = aws.ToFloat64(d.Value)
+		}
+	}
+	if got["OnDemandFirstMachines"] != 20 || got["OnDemandFirstShare"] != 0.5 {
+		t.Errorf("superci-4cpu's 10 on-demand of 20 read as %v machines, share %v; want 20 and 0.5, which the alarm (10 or more machines, over 0.4) sees",
+			got["OnDemandFirstMachines"], got["OnDemandFirstShare"])
+	}
+}
