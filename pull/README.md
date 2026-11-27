@@ -489,7 +489,9 @@ size is one set (`split` 1), since an identity names its size, not a set of it.
   across restarts and overlapping listeners: a replay of a handed job is sent the PAIRED of the pair that has it. A
   stop lets the hand-offs in flight finish for 5 s first.
 - **Resume.** A side whose connection broke after the handed point reconnects with `X-Superci-Resume:
-  <instance>.<token>` for up to 3 minutes. The token carries the job's id, so a new dispatcher reads the job's claim:
+  <instance>.<token>` for up to 3 minutes. Each retry waits a random time up to a ceiling that doubles from 1 s to 15 s with
+  each failure in a row (the shim and the agent both; the agent also waits at least a 503's `Retry-After`), so a
+  restarted listener is not met by every side at once, and none starts a retry after the 3 minutes end. The token carries the job's id, so a new dispatcher reads the job's claim:
   it must name the pair (it was taken only once the machine's claim held that token), or the answer is 410. A pair
   never handed is also 410: the shim drops its job's bytes once PAIRED comes, so it cannot start the job again. Bytes
   in flight at the break may be lost; the shim sends what it read while away, and the machine sends its EXIT again

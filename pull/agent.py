@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import pwd
+import random
 import socket
 import ssl
 import struct
@@ -47,7 +48,8 @@ class Config:
     silence: float = 60
     window: float = 180  # how long a broken connection with a job is resumed
     wait_window: float = 900  # how long a machine without a job keeps asking
-    retry: float = 1
+    retry: float = 1  # the longest the first reconnect waits; the ceiling doubles with each failure in a row
+    retry_max: float = 15  # the longest any reconnect waits
     renew_every: float = 60
     exit_settle: float = 10  # an EXIT sent and not answered by a reset or a close in this long is taken as delivered
     hydrate_timeout: float = 10
@@ -102,9 +104,22 @@ def pin_matches(cert, pin):
 
 
 class Refused(Exception):
-    def __init__(self, status):
+    def __init__(self, status, retry_after=None):
         super().__init__(f"the dispatcher answered {status}")
         self.status = status
+        self.retry_after = retry_after  # seconds the dispatcher asked to wait, or None
+
+
+def retry_after_seconds(value):
+    """The delay of a Retry-After header, which the dispatcher sends as whole seconds; None for anything else."""
+    value = value.strip()
+    return int(value) if value.isascii() and value.isdigit() else None
+
+
+def backoff(attempt, base, cap, draw):
+    """The wait before reconnect number attempt (0 is the first after a connection that worked): a uniform draw from
+    [0, min(cap, base * 2**attempt)], so a fleet that lost its dispatcher together does not come back together."""
+    return draw * min(cap, base * 2 ** min(attempt, 32))
 
 
 def http_get(opener, url, headers=None, method="GET", timeout=5):
@@ -150,11 +165,16 @@ def upgrade(cfg, doc, path, resume=None):
         status = rf.readline(8192).split()
         if len(status) < 2 or not status[1].isdigit():
             raise OSError("no HTTP answer")
+        retry_after = None
         for _ in range(64):
-            if rf.readline(8192) in (b"\r\n", b"\n", b""):
+            line = rf.readline(8192)
+            if line in (b"\r\n", b"\n", b""):
                 break
+            name, _, value = line.decode("latin-1").partition(":")
+            if name.strip().lower() == "retry-after":
+                retry_after = retry_after_seconds(value)
         if int(status[1]) != 101:
-            raise Refused(int(status[1]))
+            raise Refused(int(status[1]), retry_after)
     except BaseException:
         s.close()
         raise
@@ -239,6 +259,9 @@ class Agent:
         self.finished = threading.Event()  # nothing more to ask of the dispatcher
         self.delivered = False
         self.job_taken = threading.Event()
+        self.clock = time.monotonic  # the clock, wait and draw of the reconnect loop, replaced by the tests
+        self.sleep = time.sleep
+        self.jitter = random.random
 
     def mark(self, name, value=None):
         """A line of the spool boot.sh posts to the listener: name=epoch=ms since the previous mark[=value]."""
@@ -480,8 +503,10 @@ class Agent:
                 self.exit_sent_at = time.monotonic()
 
     def connect_loop(self):
-        outage = time.monotonic()
+        outage = self.clock()
+        attempt = 0
         while not self.finished.is_set():
+            asked = 0  # the Retry-After of a refusal, a floor under the wait
             resume = f"{self.instance}.{self.token}" if self.token else None
             try:
                 s, rf = upgrade(self.cfg, self.doc, "/work", resume)
@@ -489,6 +514,7 @@ class Agent:
                 log(str(e))
                 if e.status in (403, 410):
                     break
+                asked = e.retry_after or 0
             except (OSError, ssl.SSLError, EOFError) as e:
                 log(f"connect: {type(e).__name__}")
             else:
@@ -505,11 +531,15 @@ class Agent:
                 if self.finished.is_set():
                     return
                 if progressed:
-                    outage = time.monotonic()
+                    outage = self.clock()
+                    attempt = 0
             limit = self.cfg.window if self.token else self.cfg.wait_window
-            if time.monotonic() - outage > limit:
+            left = limit - (self.clock() - outage)
+            if left <= 0:
                 break
-            time.sleep(self.cfg.retry)
+            wait = asked + backoff(attempt, self.cfg.retry, self.cfg.retry_max, self.jitter())
+            attempt += 1
+            self.sleep(min(wait, left))  # the last reconnect starts at the window's end, never after
         self.finished.set()
 
     def run(self):

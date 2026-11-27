@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -55,7 +56,8 @@ const (
 	pingEvery    = 20 * time.Second
 	silenceLimit = 60 * time.Second
 	resumeWindow = 3 * time.Minute
-	retryEvery   = time.Second
+	retryMin     = time.Second      // the longest the first reconnect waits
+	retryMax     = 15 * time.Second // the longest any reconnect waits
 )
 
 const envFile = "/etc/superci-shim.env"
@@ -362,7 +364,14 @@ type shim struct {
 	stdout io.Writer
 	stderr io.Writer
 
-	pingEvery, silence, window, retry time.Duration
+	pingEvery, silence, window time.Duration
+
+	// A reconnect waits a random time up to retry, doubling to retryMax with each failure in a row ("full jitter"), so
+	// the shims of a restarted listener do not return together. The clock, the wait and the draw are fields for the tests.
+	retry, retryMax time.Duration
+	now             func() time.Time
+	sleep           func(ctx context.Context, d time.Duration) bool
+	jitter          func() float64
 
 	instance, token string
 	out             int // STDOUT and STDERR bytes taken so far, across connections
@@ -378,11 +387,46 @@ type pairedMsg struct {
 	Token    string `json:"token"`
 }
 
+// backoff is the wait before reconnect number attempt (0 is the first after a connection that worked): a uniform draw
+// from [0, min(max, base<<attempt)].
+func backoff(attempt int, base, max time.Duration, draw float64) time.Duration {
+	ceiling := max
+	if attempt < 32 && base<<attempt < max {
+		ceiling = base << attempt
+	}
+	return time.Duration(draw * float64(ceiling))
+}
+
+// sleepCtx waits d and reports false if ctx ended first.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
 // run relays one job and returns the exit code of the process: the Worker's code once the machine reports it, 1 once
 // the machine is lost.
 func (s *shim) run(ctx context.Context, in io.Reader) int {
+	if s.now == nil {
+		s.now = time.Now
+	}
+	if s.sleep == nil {
+		s.sleep = sleepCtx
+	}
+	if s.jitter == nil {
+		s.jitter = rand.Float64
+	}
+	if s.retryMax < s.retry {
+		s.retryMax = s.retry
+	}
 	go s.ob.pump(in)
-	outage := time.Now()
+	outage := s.now()
+	attempt := 0
 	for {
 		resume := ""
 		if s.instance != "" {
@@ -397,7 +441,8 @@ func (s *shim) run(ctx context.Context, in io.Reader) int {
 				return code
 			}
 			if progressed {
-				outage = time.Now()
+				outage = s.now()
+				attempt = 0
 			}
 		} else {
 			var refused dispatcherRefused
@@ -406,13 +451,14 @@ func (s *shim) run(ctx context.Context, in io.Reader) int {
 				return 1
 			}
 		}
-		if time.Since(outage) > s.window {
+		left := s.window - s.now().Sub(outage)
+		if left <= 0 {
 			s.logf("no dispatcher for %v: the job is lost", s.window)
 			return 1
 		}
-		select {
-		case <-time.After(s.retry):
-		case <-ctx.Done():
+		wait := min(backoff(attempt, s.retry, s.retryMax, s.jitter()), left) // the last reconnect starts at the window's end, never after
+		attempt++
+		if !s.sleep(ctx, wait) {
 			return 1
 		}
 	}
@@ -653,6 +699,6 @@ func main() {
 		fail(err)
 	}
 	s := &shim{dial: d.dial, ob: newOutbox(maxBuffered), stdout: os.Stdout, stderr: os.Stderr,
-		pingEvery: pingEvery, silence: silenceLimit, window: resumeWindow, retry: retryEvery}
+		pingEvery: pingEvery, silence: silenceLimit, window: resumeWindow, retry: retryMin, retryMax: retryMax}
 	os.Exit(s.run(context.Background(), in) & 0xff)
 }
