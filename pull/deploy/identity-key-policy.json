@@ -1,0 +1,16 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Sid": "TheOperatorAdministersTheKey", "Effect": "Allow", "Principal": { "AWS": @OPERATOR@ },
+      "Action": ["kms:CreateAlias", "kms:Describe*", "kms:Enable*", "kms:Disable*", "kms:Get*", "kms:List*", "kms:Put*", "kms:Update*",
+                 "kms:Revoke*", "kms:TagResource", "kms:UntagResource", "kms:ScheduleKeyDeletion", "kms:CancelKeyDeletion"],
+      "Resource": "*" },
+    { "Sid": "TheAccountCanStillAdministerTheKey", "Effect": "Allow", "Principal": { "AWS": "arn:aws:iam::@ACCOUNT@:root" },
+      "Action": ["kms:CreateAlias", "kms:Describe*", "kms:Enable*", "kms:Disable*", "kms:Get*", "kms:List*", "kms:Put*", "kms:Update*",
+                 "kms:Revoke*", "kms:TagResource", "kms:UntagResource", "kms:ScheduleKeyDeletion", "kms:CancelKeyDeletion"],
+      "Resource": "*" },
+    { "Sid": "TheIdentityRoleEncryptsAndDecryptsThroughS3", "Effect": "Allow", "Principal": { "AWS": "arn:aws:iam::@ACCOUNT@:role/@ROLE@" },
+      "Action": ["kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey"], "Resource": "*",
+      "Condition": { "StringEquals": { "kms:ViaService": "s3.us-east-1.amazonaws.com" } } }
+  ]
+}

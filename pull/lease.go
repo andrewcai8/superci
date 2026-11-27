@@ -46,22 +46,35 @@ func (b *Budget) Lease(now time.Time, n int, ttl time.Duration) Lease {
 	return Lease{ID: id, Granted: got, Expires: exp}
 }
 
-// Settle ends a lease with the number of registrations the lane made under it, each one of ours from now. It says
-// whether the lease was still held: an expired lease was released already, and its registrations are the lane's own risk.
-func (b *Budget) Settle(now time.Time, id string, made int) bool {
+// Settlement is how a lane's lease ended: the registrations GitHub made, the ones that failed for another reason, and
+// whether GitHub refused one for the cap, which backs the budget off as a refusal to the listener's own ask does.
+type Settlement struct {
+	Made, Failed int
+	Refused      bool
+}
+
+// Settle ends a lease with what the lane did under it, each registration made one of ours from now. It says whether
+// the lease was still held: an expired lease was released already, and its registrations are the lane's own risk. A
+// refusal is GitHub's answer whether or not the lease is held, so it backs the budget off either way.
+func (b *Budget) Settle(now time.Time, id string, s Settlement) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.expire(now)
-	l, ok := b.leases[id]
-	if !ok {
-		return false
+	l, held := b.leases[id]
+	if held {
+		delete(b.leases, id)
+		b.pending -= l.n
+		for i := 0; i < min(max(s.Made, 0), l.n); i++ {
+			b.made1(now)
+		}
+		for i := 0; i < min(max(s.Failed, 0), l.n); i++ {
+			b.outcome(now, Failed, 0)
+		}
 	}
-	delete(b.leases, id)
-	b.pending -= l.n
-	for i := 0; i < min(max(made, 0), l.n); i++ {
-		b.made1(now)
+	if s.Refused {
+		b.outcome(now, Refused, 0)
 	}
-	return true
+	return held
 }
 
 // expire releases the leases whose time is past.

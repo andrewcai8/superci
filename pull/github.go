@@ -142,8 +142,17 @@ func (g *REST) call(ctx context.Context, method, url string, in, out any, ok ...
 			return json.NewDecoder(resp.Body).Decode(out)
 		}
 	}
-	return fmt.Errorf("%s %s: %s", method, url, resp.Status)
+	return &StatusError{Method: method, URL: url, Status: resp.Status, Code: resp.StatusCode, RetryAfter: resp.Header.Get("Retry-After")}
 }
+
+// StatusError is GitHub's answer to a request that was not one of the expected statuses.
+type StatusError struct {
+	Method, URL, Status string
+	Code                int
+	RetryAfter          string // the header's value as sent, when there was one
+}
+
+func (e *StatusError) Error() string { return fmt.Sprintf("%s %s: %s", e.Method, e.URL, e.Status) }
 
 // RunnerGroup finds or makes the organization's runner group of this name, open to the given repositories of the
 // organization only (never public ones), and keeps it so: a runner of the group takes jobs of those repositories

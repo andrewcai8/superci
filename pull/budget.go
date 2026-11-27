@@ -366,6 +366,11 @@ func (b *Budget) Done(now time.Time, outcome Outcome, runnerID int64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.pending--
+	b.outcome(now, outcome, runnerID)
+}
+
+// outcome applies GitHub's answer to the counts and the rate, under the lock. It leaves the in-flight count to its caller.
+func (b *Budget) outcome(now time.Time, outcome Outcome, runnerID int64) {
 	switch outcome {
 	case Made:
 		b.made1(now)

@@ -1,0 +1,3 @@
+#!/bin/bash
+# sleep, without sleeping: every wait of the scripts under test is logged to $FAKE/sleep.log.
+echo "$*" >> "$FAKE/sleep.log"

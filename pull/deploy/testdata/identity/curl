@@ -1,0 +1,87 @@
+#!/usr/bin/env -S python3 -I
+"""The listener's admin endpoint as identity_test.sh needs it, as curl on the listener sees it. Tokens never go to the log."""
+import json, os, sys, time, urllib.parse
+
+root = os.environ["FAKE"]
+a = sys.argv[1:]
+method, out, fmt, url, hdr, i = "GET", None, None, None, None, 0
+while i < len(a):
+    if a[i] == "-X":
+        method = a[i + 1]; i += 1
+    elif a[i] == "-o":
+        out = a[i + 1]; i += 1
+    elif a[i] == "-D":
+        hdr = a[i + 1]; i += 1
+    elif a[i] == "-w":
+        fmt = a[i + 1]; i += 1
+    elif not a[i].startswith("-"):
+        url = a[i]
+    i += 1
+u = urllib.parse.urlparse("http://" + url)
+q = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
+log = open(os.path.join(root, "curl.log"), "a")
+gh = os.path.join(root, "github.json")
+runners = json.load(open(gh)) if os.path.exists(gh) else []
+code, body = 200, ""
+if method == "POST" and u.path == "/identities/token":
+    n = int(q["n"])
+    grants = os.path.join(root, "grants")
+    granted = n
+    if os.path.exists(grants):
+        lines = open(grants).read().split()
+        if lines:
+            granted = min(n, int(lines[0]))
+            open(grants, "w").write("\n".join(lines[1:]))
+    lease = "%x" % (0xa1b2c3 + sum(1 for l in open(os.path.join(root, "curl.log")) if l.startswith("token")))
+    # how long each lease lasts, in seconds from now, one line for each token call (600 once the lines are used)
+    ttls, ttl = os.path.join(root, "lease_ttls"), 600
+    if os.path.exists(ttls):
+        lines = open(ttls).read().split()
+        if lines:
+            ttl = int(lines[0])
+            open(ttls, "w").write("\n".join(lines[1:]))
+    expires = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + ttl))
+    log.write("token n=%d granted=%d lease=%s\n" % (n, granted, lease))
+    body = json.dumps({"lease": lease, "granted": granted, "token": "" if granted == 0 else "TESTTOKEN-8f3a1c-secret", "expires": "2026-11-27T01:00:00Z",
+                       "url": "https://github.com/Authentic-Intelligence", "group": 55, "group_name": "superci-pull-identities", "lease_expires": expires})
+elif method == "POST" and u.path == "/lease/settle":
+    log.write("settle id=%s made=%s failed=%s refused=%s\n" % (q["id"], q["made"], q.get("failed", ""), q.get("refused", "")))
+    code = 204 if q["id"] != "gone" else 410
+elif method == "POST" and u.path == "/identities/labels":
+    log.write("labels id=%s labels=%s\n" % (q["id"], q["labels"]))
+    # the listener reads the runner first and touches only an identity, as listener identities.go does
+    mine = [r for r in runners if str(r["id"]) == q["id"]]
+    limit = os.path.join(root, "labels-limit")  # "<status> <retry-after> <calls to let through first>"
+    if not mine or not mine[0]["name"].startswith("superci-id-"):
+        code = 403
+    elif os.path.exists(limit) and sum(1 for l in open(os.path.join(root, "curl.log")) if l.startswith("labels ")) >= int(open(limit).read().split()[2]):
+        code = int(open(limit).read().split()[0])
+        retry = open(limit).read().split()[1]
+        if hdr:
+            open(hdr, "w").write("HTTP/1.1 %d\r\n%s\r\n" % (code, "" if retry == "0" else "Retry-After: " + retry + "\r\n"))
+    else:
+        mine[0]["labels"] = q["labels"].split(",")
+        json.dump(runners, open(gh, "w"))
+        code = 204
+elif method == "GET" and u.path == "/state":
+    log.write("state\n")
+    seq, one = os.path.join(root, "state.seq"), os.path.join(root, "state.json")
+    if os.path.exists(seq):
+        lines = open(seq).read().split("\n")
+        lines = [l for l in lines if l]
+        body = lines[0]
+        if len(lines) > 1:
+            open(seq, "w").write("\n".join(lines[1:]) + "\n")
+    else:
+        body = open(one).read() if os.path.exists(one) else '{"budget":{"known":true,"org_rate":1.0,"throttled":false}}'
+elif method == "GET" and u.path == "/identities":
+    body = json.dumps({"group": 55, "runners": [r for r in runners if r["name"].startswith("superci-id-")]})
+else:
+    code = 404
+if out and out != "/dev/null":
+    open(out, "w").write(body)
+elif not out or out != "/dev/null":
+    sys.stdout.write(body)
+if fmt:
+    sys.stdout.write(fmt.replace("%{http_code}", str(code)))
+sys.exit(0 if code < 400 or fmt else 22)

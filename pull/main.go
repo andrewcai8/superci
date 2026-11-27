@@ -266,7 +266,7 @@ func run(ctx context.Context, f flags) error {
 	srv := &Server{sets: byName, budget: l.budget, verifier: verifier, client: client, refresh: refresh, claim: claims.Take, issue: l.tagger.Issue, notices: fleet.TagNoticed,
 		slots: make(chan struct{}, max(1, cfg.Registration.Concurrency)), maxAge: l.maxAge, dispatch: l.dispatch}
 	go serve(ctx, &http.Server{Addr: f.listen, Handler: srv, ReadHeaderTimeout: 10 * time.Second}, &id)
-	go serve(ctx, &http.Server{Addr: f.admin, Handler: Admin(l.status, l.healthy, l.override, l.budget)}, nil)
+	go serve(ctx, &http.Server{Addr: f.admin, Handler: Admin(l.status, l.healthy, l.override, l.budget, NewIdentities(rest, l.budget, cfg).Routes)}, nil)
 	errs := make(chan error, len(l.sets))
 	var sessions sync.WaitGroup
 	for _, s := range l.sets {

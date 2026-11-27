@@ -31,7 +31,7 @@ on_main() {
 # source_of <key>: the path at the commit a key's file is, or "binary" for a Go program built from it.
 source_of() {
   case "$1" in
-    bin/superci-pull | bin/pullcache-linux-amd64 | bin/pullcache-linux-arm64 | bin/pullcache-lambda-arm64.zip) echo binary ;;
+    bin/superci-pull | bin/superci-shim | bin/pullcache-linux-amd64 | bin/pullcache-linux-arm64 | bin/pullcache-lambda-arm64.zip) echo binary ;;
     bin/up.sh) echo pull/cache/deploy/machine-up.sh ;;
     deploy/*) echo "pull/$1" ;;
     config/config.json) echo pull/deploy/override.json ;;

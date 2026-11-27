@@ -33,6 +33,7 @@ type Config struct {
 	AppParam     string                `json:"app_param"`
 	Deployment   string                `json:"deployment"`   // tags its machines and names its runner group: a listener acts only on its own
 	Repositories []string              `json:"repositories"` // the repositories its runner group serves, and whose lost jobs it re-runs
+	Scope        string                `json:"scope"`        // where identities register: "org" (the default) or "repository" (the first of Repositories)
 	Regions      map[string]int        `json:"regions"`
 	Sizes        map[string]SizeConfig `json:"sizes"`
 	Pools        map[string]PoolConfig `json:"pools"`
@@ -252,6 +253,9 @@ func (c Config) validate() error {
 	}
 	if c.Deployment == "" || len(c.Repositories) == 0 {
 		return errors.New("config: deployment and repositories are needed")
+	}
+	if c.Scope != "" && c.Scope != "org" && c.Scope != "repository" {
+		return fmt.Errorf("config: scope %q is org or repository", c.Scope)
 	}
 	if c.DailyUSD < 0 || c.MonthlyUSD < 0 || c.OnDemand < 0 || c.OnDemand > 1 {
 		return errors.New("config: caps must not be negative, and on_demand_share is in [0, 1]")

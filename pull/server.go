@@ -239,8 +239,10 @@ type Status struct {
 // time (the config file is the lasting way).
 //
 // A lane that registers runners outside the listener leases registrations from the budget first (lease.go):
-// POST /lease?n=40&ttl=120 answers {"id", "granted", "expires"}, and POST /lease/settle?id=<id>&made=<k> ends it.
-func Admin(status func() Status, healthy func() error, override func(set string, pool, max int), budget *Budget) http.Handler {
+// POST /lease?n=40&ttl=120 answers {"id", "granted", "expires"}, and POST /lease/settle?id=<id>&made=<k> ends it. A
+// lane that GitHub refused a registration for the cap adds refused=1 (and failed=<f> for its other failures), which
+// holds the budget back as the listener's own refusal does.
+func Admin(status func() Status, healthy func() error, override func(set string, pool, max int), budget *Budget, routes ...func(*http.ServeMux)) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /state", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -286,14 +288,29 @@ func Admin(status func() Status, healthy func() error, override func(set string,
 			http.Error(w, "made is the number of registrations the lane made", http.StatusBadRequest)
 			return
 		}
-		held := budget.Settle(time.Now(), q.Get("id"), made)
-		slog.Info("lease settled", "id", q.Get("id"), "made", made, "held", held)
+		failed := 0
+		if q.Has("failed") {
+			if failed, err = strconv.Atoi(q.Get("failed")); err != nil || failed < 0 {
+				http.Error(w, "failed is the number of registrations that failed", http.StatusBadRequest)
+				return
+			}
+		}
+		if v := q.Get("refused"); v != "" && v != "0" && v != "1" {
+			http.Error(w, "refused is 1 when GitHub refused a registration", http.StatusBadRequest)
+			return
+		}
+		refused := q.Get("refused") == "1"
+		held := budget.Settle(time.Now(), q.Get("id"), Settlement{Made: made, Failed: failed, Refused: refused})
+		slog.Info("lease settled", "id", q.Get("id"), "made", made, "failed", failed, "refused", refused, "held", held)
 		if !held {
 			http.Error(w, "no such lease: it expired or was settled", http.StatusGone)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
+	for _, add := range routes {
+		add(mux)
+	}
 	return mux
 }
 
