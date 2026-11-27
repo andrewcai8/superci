@@ -56,7 +56,12 @@ SIZES = (2, 4, 8, 16, 32)
 # runner of the organization shares. GitHub's registration cap is the organization's: a job moved from Blacksmith takes one
 # registration on either fleet, so a refusal (superci-pull-registration-refusals) pages and is counted, and moves nothing.
 ROLLBACK_ROWS = ("wall p50", "wall p90", "queue wait p50", "queue wait p90", "failures (superci)")
-ROLLBACK_ALARMS = ("superci-pull-oldest-job-wait", "superci-pull-jobs-stalled", "superci-pull-listener-down", "superci-pull-spend-capped")
+# listener-down and spend-capped stop every set, so they send back every job listed. A wait or a stall is one set's: a canary
+# reads the alarms of the sets its job ran on (SET_ROLLBACK_ALARMS, one `superci-pull-<alarm>-<size>` each) and no other set's, so a
+# size with a cold machine, or one that is new, cannot send back a job that ran elsewhere. The listener-wide oldest-job-wait and
+# jobs-stalled still page and roll nothing back.
+ROLLBACK_ALARMS = ("superci-pull-listener-down", "superci-pull-spend-capped")
+SET_ROLLBACK_ALARMS = ("superci-pull-oldest-job-wait", "superci-pull-jobs-stalled")
 CANARY_P90_RUNS = 20  # a p90 of fewer runs is one job: one outlier must not send a job back
 ROLLBACK, KEEP = 3, 0
 
@@ -242,18 +247,38 @@ def evaluate_job(S, B, ceiling, unexplained, min_runs=MIN_RUNS):
     return rows
 
 
-def canary_verdict(rows, alarms):
-    """The reasons a live canary must go back to Blacksmith, from gate 1's rows and the alarm states; empty keeps it. A p50 row
-    counts once n passes and a p90 row once there are CANARY_P90_RUNS runs, each only as FAIL (NOISE asks for runs, not a
-    rollback), and never when Blacksmith had no runs to compare with; the failures row counts from the first run. Of the
-    alarms only ROLLBACK_ALARMS count: each is a superci job not served, so it sends back every job listed."""
+def set_alarm(alarm, superci_set):
+    """The per-set alarm of a set: superci-pull-oldest-job-wait for superci-4cpu is superci-pull-oldest-job-wait-4cpu."""
+    return f"{alarm}-{superci_set.removeprefix('superci-')}"
+
+
+def rollback_alarms(sets):
+    """The alarms a canary that ran on `sets` rolls back on: the global ROLLBACK_ALARMS and each set's own SET_ROLLBACK_ALARMS."""
+    return list(ROLLBACK_ALARMS) + [set_alarm(a, s) for s in sorted(set(sets)) for a in SET_ROLLBACK_ALARMS]
+
+
+def canary_verdict(rows, alarms, sets=()):
+    """The reasons a live canary must go back to Blacksmith, from gate 1's rows, the alarm states and `sets`, the superci sets the
+    job ran on (job_sets); empty keeps it. A p50 row counts once n passes and a p90 row once there are CANARY_P90_RUNS runs, each
+    only as FAIL (NOISE asks for runs, not a rollback), and never when Blacksmith had no runs to compare with; the failures row
+    counts from the first run. Of the alarms only rollback_alarms(sets) count: each is a superci job not served, and the job's
+    sets alone are the ones that serve it, bar the two that stop every set."""
     by = {r.name: r for r in rows}
     n = by.get("n (superci runs)")
     runs = int(n.value) if n and n.value.isdigit() else 0
     need = {"wall p50": MIN_RUNS, "queue wait p50": MIN_RUNS, "wall p90": CANARY_P90_RUNS, "queue wait p90": CANARY_P90_RUNS, "failures (superci)": 0}
     harmed = [r for r in (by.get(k) for k in ROLLBACK_ROWS) if r and r.status == FAIL and runs >= need[r.name] and not r.note.startswith("no Blacksmith runs")]
     return ([f"{r.name}: {r.value} vs {r.threshold}" for r in harmed]
-            + [f"{a} in ALARM" for a in ROLLBACK_ALARMS if alarms.get(a) == "ALARM"])
+            + [f"{a} in ALARM" for a in rollback_alarms(sets) if alarms.get(a) == "ALARM"])
+
+
+def job_sets(S_jobs, B_jobs):
+    """The superci sets a job runs on, for the canary's alarms: the `set` of each of its superci records or, for a job read from
+    GitHub, the superci label of its runner. A job with no superci run yet is judged on the sets of the label it ran under on
+    Blacksmith (blacksmith-4vcpu-ubuntu-2404 is superci-4cpu), read with Blacksmith's listing and no further call; one with
+    neither has no set, and only the alarms that stop every set can send it back."""
+    ran = {j.get("set") or superci_label(j.get("labels")) for j in S_jobs} - {None}
+    return sorted(ran or {superci_label(j.get("labels")) for j in B_jobs} - {None})
 
 
 def parse_limits(text):
@@ -333,7 +358,7 @@ def synth_job(e, group=T.SUPERCI_RUNNER_GROUP):
             "head_branch": record_branch(e), "created_at": e.get("queue_time") or e.get("start_time") or e.get("finish_time"),
             "started_at": e["start_time"] if started else None, "completed_at": e.get("finish_time"), "conclusion": e.get("conclusion"),
             "run_attempt": 1, "runner_name": e.get("runner") if started else None,
-            "runner_group_name": group if started else None, "labels": list(e.get("labels") or []) or [e.get("set") or ""], "steps": []}
+            "runner_group_name": group if started else None, "labels": list(e.get("labels") or []) or [e.get("set") or ""], "set": e.get("set"), "steps": []}
 
 
 def timeline_job(j):
@@ -714,8 +739,9 @@ def cmd_job(a):
     if not a.canary:
         return code
     alarms = alarm_states(a.profile, now, now)
-    reasons = canary_verdict(rows, alarms)
-    paging = sorted(n for n, st in alarms.items() if st == "ALARM" and n not in ROLLBACK_ALARMS)
+    sets = job_sets(S_jobs, B_jobs)
+    reasons = canary_verdict(rows, alarms, sets)
+    paging = sorted(n for n, st in alarms.items() if st == "ALARM" and n not in rollback_alarms(sets))
     print(f"\ncanary {a.job}: " + (f"ROLL BACK ({'; '.join(reasons)})" if reasons else "KEEP") + (f"   [paging, no rollback: {paging}]" if paging else ""))
     return ROLLBACK if reasons else KEEP
 
@@ -809,7 +835,7 @@ def build_parser():
                    "GitHub's REST API, or auto (default): events when the window starts after the first record, GitHub before")
     j.add_argument("--limits", help="a ci-limits.tsv to read instead of origin/main's")
     j.add_argument("--superci-group", default=T.SUPERCI_RUNNER_GROUP)
-    j.add_argument("--canary", action="store_true", help=f"judge a live canary: exit {ROLLBACK} to roll it back (a FAIL of {', '.join(ROLLBACK_ROWS)}, or one of {', '.join(ROLLBACK_ALARMS)} in ALARM), else {KEEP}")
+    j.add_argument("--canary", action="store_true", help=f"judge a live canary: exit {ROLLBACK} to roll it back (a FAIL of {', '.join(ROLLBACK_ROWS)}, or {', '.join(ROLLBACK_ALARMS)}, or the wait or stall alarm of a set the job ran on, in ALARM), else {KEEP}")
     j.set_defaults(fn=cmd_job)
     s = sub.add_parser("scale", help="gate 2: the plane over a replay window")
     s.add_argument("--from", dest="since", required=True)

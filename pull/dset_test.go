@@ -317,3 +317,26 @@ func TestADispatchStrayIsKeptWhileItMayRunItsJob(t *testing.T) {
 		t.Fatalf("ended %v, want the scale set's stray and the dispatch stray past its life, not the one that may run its job", got)
 	}
 }
+
+// Each set publishes its own StalledSets (1 while its jobs have waited 10 minutes with none started, else 0), which its per-set
+// alarm reads; the dimensionless count the listener-wide alarm reads is unchanged.
+func TestEachSetPublishesItsOwnStalledSets(t *testing.T) {
+	m := Metrics{Stalled: 1, StalledBy: map[string]bool{"superci-8cpu": true},
+		Sets:     []Snapshot{{Set: "superci-2cpu"}},
+		Dispatch: []DispatchSnapshot{{Set: "superci-4cpu"}, {Set: "superci-8cpu", OldestJobS: 700}}}
+	got, total := map[string]float64{}, -1.0
+	for _, d := range metricData(m, time.Now()) {
+		if aws.ToString(d.MetricName) != "StalledSets" {
+			continue
+		}
+		if len(d.Dimensions) == 0 {
+			total = aws.ToFloat64(d.Value)
+		} else {
+			got[aws.ToString(d.Dimensions[0].Value)] = aws.ToFloat64(d.Value)
+		}
+	}
+	want := map[string]float64{"superci-2cpu": 0, "superci-4cpu": 0, "superci-8cpu": 1}
+	if fmt.Sprint(got) != fmt.Sprint(want) || total != 1 {
+		t.Errorf("StalledSets by set %v, total %v; want %v, 1", got, total, want)
+	}
+}

@@ -1339,7 +1339,7 @@ func (l *Listener) metrics() Metrics {
 	now := time.Now()
 	st := l.status()
 	m := Metrics{Budget: st.Budget, Spend: st.Spend, Sets: st.Sets, SetWaits: map[string][]float64{}, Dispatch: st.Dispatch,
-		DispatchCounts: map[string]DispatchCounts{}}
+		DispatchCounts: map[string]DispatchCounts{}, StalledBy: map[string]bool{}}
 	cfg := l.config()
 	m.OnDemandFirst = onDemandFirstSets(l.specs())
 	for i, s := range l.sets {
@@ -1349,6 +1349,7 @@ func (l *Listener) metrics() Metrics {
 		m.SetWaits[s.spec.Name] = waits
 		if s.state.Stalled(now, 10*time.Minute) {
 			m.Stalled++
+			m.StalledBy[s.spec.Name] = true
 		}
 		snap := st.Sets[i]
 		waiting := snap.Stats.TotalAssignedJobs - snap.Stats.TotalRunningJobs + snap.Stats.TotalAvailableJobs
@@ -1369,6 +1370,7 @@ func (l *Listener) metrics() Metrics {
 	for _, d := range st.Dispatch {
 		if d.OldestJobS > (10 * time.Minute).Seconds() {
 			m.Stalled++
+			m.StalledBy[d.Set] = true
 		}
 	}
 	l.mu.Lock()
