@@ -138,7 +138,7 @@ func TestTheHydrationPostsItsStartAndEndAsTimelineMarksAndEndsWithItsPidFileGone
 			t.Fatal(err)
 		}
 	}
-	stub("aws", `cp "$@" 2>/dev/null; echo '{}' > "${@: -1}"`)
+	stub("aws", `case "$*" in *bin/warm/*) exit 1 ;; esac; cp "$@" 2>/dev/null; echo '{}' > "${@: -1}"`)
 	stub("setpriv", `shift 4; exec "$@"`)
 	stub("chown", `true`)
 	stub("pullcache", `echo "hydrate: log line on stderr" >&2; echo "hydrated 4/5 entries 1210 MB"`)

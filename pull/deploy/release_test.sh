@@ -38,6 +38,7 @@ for f in superci-pull.service superci-pull-sync.service superci-pull-sync.timer 
 done
 cp "$W/pull/deploy/override.json" "$R/listener/config/config.json"
 cp "$W/pull/cache/deploy/machine-up.sh" "$R/cache/bin/up.sh"
+mkdir -p "$R/cache/bin/warm"; cp "$W/pull/readsets/superci-8cpu.list" "$R/cache/bin/warm/superci-8cpu.list"
 printf '{"commit":"%s","built":"2026-11-25T00:00:00Z"}\n' "$C" > "$R/REVISION"
 
 refuses "deploy/up.sh keeps the listener's template before a release" "keeps its boot until a release" "$D/up.sh" 203.0.113.7/32
@@ -49,6 +50,8 @@ cmp -s "$R/listener/bin/superci-pull" "$FAKE_HOST/usr/local/bin/superci-pull"; c
 ok "cache/deploy/release.sh releases the cache, through cache/deploy/up.sh" "$W/pull/cache/deploy/release.sh" "$R"
 [ "$(cat "$FAKE_AWS/lambda/us-east-2/superci-pull-cache-mirror")" = "$(python3 -I -c 'import base64,hashlib,sys; print(base64.b64encode(hashlib.sha256(open(sys.argv[1],"rb").read()).digest()).decode())' "$R/cache/bin/pullcache-lambda-arm64.zip")" ]
 check $? "the functions run the released zip"
+cmp -s "$R/cache/bin/warm/superci-8cpu.list" "$FAKE_AWS/s3/superci-pull-cache-243891825325-us-east-2/bin/warm/superci-8cpu.list"
+check $? "the cache buckets hold superci-8cpu's read set, as RELEASE.json names it"
 ok "verify-release.sh passes on the release" env SSH="$here/testdata/ssh" "$D/verify-release.sh" all
 ok "deploy/up.sh moves the template once a release is in place" "$D/up.sh" 203.0.113.7/32
 grep -q create-launch-template-version "$FAKE_AWS/calls.log"; check $? "and wrote a template version"
@@ -72,6 +75,8 @@ cp -r "$R" "$T/bad"; rm "$T/bad/listener/bin/RELEASE.json"; printf '#!/bin/sh\ne
 refuses "release.sh refuses a shim that does not carry the commit" "listener/bin/superci-shim does not carry $C" "$D/release.sh" "$T/bad" "$here/testdata/ssh"
 rm -rf "$T/bad"; cp -r "$R" "$T/bad"; rm "$T/bad/listener/bin/RELEASE.json"; echo '# edit' >> "$T/bad/listener/deploy/health.sh"
 refuses "release.sh refuses a script that is not the commit's" "listener/deploy/health.sh differs" "$D/release.sh" "$T/bad" "$here/testdata/ssh"
+rm -rf "$T/bad"; cp -r "$R" "$T/bad"; rm "$T/bad/cache/bin/RELEASE.json"; echo /etc/ssh/ssh_host_ed25519_key >> "$T/bad/cache/bin/warm/superci-8cpu.list"
+refuses "cache/deploy/release.sh refuses a read set that is not the commit's" "cache/bin/warm/superci-8cpu.list differs" "$W/pull/cache/deploy/release.sh" "$T/bad"
 git -C "$W" config remote.origin.url https://github.com/someone/superci
 refuses "release.sh refuses another origin" "not andrewcai8/superci" "$D/release.sh" "$R" "$here/testdata/ssh"
 git -C "$W" config remote.origin.url https://github.com/andrewcai8/superci

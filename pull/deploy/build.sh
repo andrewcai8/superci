@@ -7,6 +7,7 @@
 #   listener/bin/superci-shim    the identity hosts' bin/Runner.Worker (linux amd64: they run the machines' image)
 #   listener/deploy/*            its units and scripts, listener/config/config.json its override (deploy/override.json)
 #   cache/bin/pullcache-linux-{amd64,arm64}, cache/bin/pullcache-lambda-arm64.zip, cache/bin/up.sh (cache/deploy/machine-up.sh)
+#   cache/bin/warm/<label>.list  each size's read set (readsets/<label>.list), the image files a machine reads while it waits
 # Each Go binary carries the commit (-X main.revision; -trimpath keeps it out of `go version -m`): `superci-pull
 # -version` and `pullcache version` print it. release.sh and cache/deploy/release.sh release it. The instance is
 # reached with a key made for the run (EC2 Instance Connect): no key pair.
@@ -63,6 +64,9 @@ for f in superci-pull.service superci-pull-sync.service superci-pull-sync.timer 
 done
 install -m 644 "$src/deploy/override.json" "$OUT/listener/config/config.json"
 install -m 644 "$src/cache/deploy/machine-up.sh" "$OUT/cache/bin/up.sh"
+for f in "$src"/readsets/*.list; do
+  [ -e "$f" ] && install -D -m 644 "$f" "$OUT/cache/bin/warm/${f##*/}"
+done
 printf '{"commit":"%s","built":"%s"}\n' "$REV" "$(date -u +%FT%TZ)" > "$OUT/REVISION"
 (cd "$OUT" && find . -type f | LC_ALL=C sort | xargs sha256sum)
 echo "built $OUT at $REV"

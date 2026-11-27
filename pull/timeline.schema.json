@@ -443,6 +443,28 @@
       ],
       "what": "pre-hydration of the machine's caches (pull-prehydrate): ended; val is bytes:entries"
     },
+    "readset.start": {
+      "src": "machine",
+      "fields": [
+        "inst",
+        "set",
+        "offset_ms",
+        "dur_ms",
+        "val"
+      ],
+      "what": "a size with a read set (readsets/<label>.list) began reading the image files its jobs read; offset_ms is from the hydration's start"
+    },
+    "readset.done": {
+      "src": "machine",
+      "fields": [
+        "inst",
+        "set",
+        "offset_ms",
+        "dur_ms",
+        "val"
+      ],
+      "what": "the read set's files were read into the page cache: full, or stopped by the job; such a machine reads no whole root"
+    },
     "preread.start": {
       "src": "machine",
       "fields": [

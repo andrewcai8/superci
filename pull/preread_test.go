@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -34,6 +35,13 @@ func startPreread(t *testing.T, fio, rootBytes string, pullcache string) *prerea
 // catSleep.
 func startPrereadOn(t *testing.T, fio, rootBytes, pullcache, catSleep, walkSleep, memKB string) *prereadBox {
 	t.Helper()
+	return startPrereadWith(t, fio, rootBytes, pullcache, catSleep, walkSleep, memKB, nil)
+}
+
+// startPrereadWith is startPrereadOn for a size whose read set (bin/warm/<label>.list) holds readset, each path's {BOX}
+// standing for the sandbox; nil is a size with none.
+func startPrereadWith(t *testing.T, fio, rootBytes, pullcache, catSleep, walkSleep, memKB string, readset []string) *prereadBox {
+	t.Helper()
 	cfg, err := LoadConfig("")
 	if err != nil {
 		t.Fatal(err)
@@ -59,7 +67,7 @@ func startPrereadOn(t *testing.T, fio, rootBytes, pullcache, catSleep, walkSleep
 	}
 	stub("findmnt", `echo /dev/nvme0n1p1`)
 	stub("fio", fio)
-	stub("aws", `echo '{}' > "${@: -1}"`)
+	stub("aws", `case "$*" in *bin/warm/*) [ -f "$BOX/readset.list" ] && exec /bin/cp "$BOX/readset.list" "${@: -1}"; exit 1 ;; esac; echo '{}' > "${@: -1}"`)
 	stub("setpriv", `shift 4; exec "$@"`)
 	stub("chown", `true`)
 	stub("pullcache", pullcache)
@@ -70,7 +78,7 @@ func startPrereadOn(t *testing.T, fio, rootBytes, pullcache, catSleep, walkSleep
 	// The warm's file list (find ... -print0) is the sandbox's hot/ files, never the host's binaries; each cat is logged
 	// and takes $CAT_SLEEP. systemctl is logged, never run.
 	stub("find", `echo "$@" >> "$BOX/find.log"; case " $* " in *" -print0 "*) exec `+realFind+` "$BOX/hot" -type f -print0 ;; *" -printf "*) sleep "${WALK_SLEEP:-0}" ;; esac; exec `+realFind+` "$@"`)
-	stub("cat", `[ "$1" = -- ] && { echo "$2" >> "$BOX/cat.log"; sleep "${CAT_SLEEP:-0}"; }; exec /bin/cat "$@"`)
+	stub("cat", `[ "$1" = -- ] && { printf '%s\n' "${@:2}" >> "$BOX/cat.log"; sleep "${CAT_SLEEP:-0}"; }; exec /bin/cat "$@"`)
 	stub("systemctl", `echo "$@" >> "$BOX/systemctl.log"`)
 	if err := os.MkdirAll(filepath.Join(b.dir, "hot"), 0o755); err != nil {
 		t.Fatal(err)
@@ -84,13 +92,19 @@ func startPrereadOn(t *testing.T, fio, rootBytes, pullcache, catSleep, walkSleep
 	if err := os.WriteFile(filepath.Join(b.hr, ".warming"), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if readset != nil {
+		list := strings.ReplaceAll(strings.Join(readset, "\n")+"\n", "{BOX}", b.dir)
+		if err := os.WriteFile(b.path("readset.list"), []byte(list), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if err := os.WriteFile(b.spool, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(b.path("meminfo"), []byte("MemTotal:       "+memKB+" kB\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	fn := strings.NewReplacer("/run/superci-marks", b.spool, "/usr/local/bin/pullcache", filepath.Join(bin, "pullcache"), "/proc/meminfo", b.path("meminfo")).Replace(got[start : start+end+3])
+	fn := strings.NewReplacer("/run/superci-marks", b.spool, "/run/superci-readset.list", b.path("readset.fetched"), "/usr/local/bin/pullcache", filepath.Join(bin, "pullcache"), "/proc/meminfo", b.path("meminfo")).Replace(got[start : start+end+3])
 	b.cmd = exec.Command("bash", "-c", fn+"\nhydrate")
 	b.cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "HR="+b.hr, "HM="+b.path("m.json"), "PB=b", "CR=r", "ROOT_BYTES="+rootBytes, "BOX="+b.dir, "CAT_SLEEP="+catSleep, "WALK_SLEEP="+walkSleep)
 	if err := b.cmd.Start(); err != nil {
@@ -304,5 +318,67 @@ func TestTheHydrationRemovesTheWarmMarkWhenItEnds(t *testing.T) {
 	b.wait(t, 20*time.Second)
 	if _, err := os.Stat(filepath.Join(b.hr, ".warming")); !os.IsNotExist(err) {
 		t.Errorf("the warm mark is still there after the hydration ended (%v)", err)
+	}
+}
+
+func TestASizeWithAReadSetReadsOnlyItsFilesAndNotTheWholeRoot(t *testing.T) {
+	b := startPrereadWith(t, `echo ran > "$BOX/fio.ran"`, "30083776512", `true`, "0", "0", "16000000",
+		[]string{"{BOX}/hot/bin0", "{BOX}/hot/bin3", "{BOX}/not/in/this/image"})
+	b.wait(t, 20*time.Second)
+	if b.read("fio.ran") != "" {
+		t.Error("fio read the whole root of a size with a read set")
+	}
+	read := strings.Fields(b.read("cat.log"))
+	slices.Sort(read)
+	if want := []string{b.path("hot/bin0"), b.path("hot/bin3"), b.path("not/in/this/image")}; !slices.Equal(read, want) {
+		t.Errorf("read %q, want the read set's paths %q", read, want)
+	}
+	if walked := b.read("find.log"); walked != "" {
+		t.Errorf("a size with a read set walked trees: find %q", walked)
+	}
+	if got, want := strings.Join(b.marks(), " "), "hydrate.start= readset.start= readset.done=full:missing hydrate.done="; got != want {
+		t.Errorf("marks %q, want %q", got, want)
+	}
+	if got := b.read("systemctl.log"); got != "start docker.service" {
+		t.Errorf("systemctl %q, want dockerd started once the read set is read", got)
+	}
+	if _, err := os.Stat(filepath.Join(b.hr, ".warming")); !os.IsNotExist(err) {
+		t.Errorf("the warm is done, yet the dispatch machine's wait mark remains: %v", err)
+	}
+}
+
+func TestAJobThatStartsDuringTheReadSetEndsItAndNothingReadsAfter(t *testing.T) {
+	b := startPrereadWith(t, `echo ran > "$BOX/fio.ran"`, "30083776512", `true`, "300", "0", "16000000",
+		[]string{"{BOX}/hot/bin0", "{BOX}/hot/bin1"})
+	waitFor(t, "the read set to start", func() bool { return b.read("cat.log") != "" })
+	if err := os.Remove(filepath.Join(b.hr, ".pid")); err != nil {
+		t.Fatal(err)
+	}
+	began := time.Now()
+	b.wait(t, 5*time.Second)
+	if took := time.Since(began); took > 2*time.Second {
+		t.Errorf("the read set outlived the job's start by %v", took)
+	}
+	if got, want := strings.Join(b.marks(), " "), "hydrate.start= readset.start= readset.done=stopped"; !strings.HasPrefix(got, want) {
+		t.Errorf("marks %q, want them to start %q", got, want)
+	}
+	if b.read("fio.ran") != "" || b.read("systemctl.log") != "" || b.read("find.log") != "" {
+		t.Error("the pre-read, the daemon or a walk started after the job")
+	}
+}
+
+func TestAnEmptyReadSetPrereadsAsBeforeAndAWholeOneMarksFull(t *testing.T) {
+	b := startPrereadWith(t, `echo ran > "$BOX/fio.ran"`, "30083776512", `true`, "0", "0", "16000000", []string{""})
+	b.wait(t, 20*time.Second)
+	if b.read("fio.ran") == "" {
+		t.Error("an empty read set switched the pre-read off")
+	}
+	if strings.Contains(strings.Join(b.marks(), " "), "readset.") {
+		t.Errorf("an empty read set posted read set marks: %q", b.marks())
+	}
+	b = startPrereadWith(t, `echo ran > "$BOX/fio.ran"`, "30083776512", `true`, "0", "0", "16000000", []string{"{BOX}/hot/bin0", "{BOX}/hot/bin1"})
+	b.wait(t, 20*time.Second)
+	if got, want := strings.Join(b.marks(), " "), "hydrate.start= readset.start= readset.done=full hydrate.done="; got != want {
+		t.Errorf("marks %q, want %q", got, want)
 	}
 }

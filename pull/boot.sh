@@ -84,7 +84,7 @@ HOOK
 chmod 755 /home/runner/superci-hydrate-stop.sh
 printf '\nSUPERCI_HYDRATED=%s\nACTIONS_RUNNER_HOOK_JOB_STARTED=%s\n' "$HR" /home/runner/superci-hydrate-stop.sh >> /home/runner/.env
 hydrate() {
-  local sp=/run/superci-marks t0 out val
+  local sp=/run/superci-marks t0 out val rs
   us() { local n=${EPOCHREALTIME/[.,]/}; echo "$n"; }
   # A mark for the job timeline (the spool of boot.sh's marks, when the listener keeps one): name=epoch=ms since the start[=value].
   mark_hydrate() { local n=$1; [ -w "$sp" ] && printf '%s=%s.%s=%s%s\n' "$2" "${n:0:10}" "${n:10}" "$(( (n - t0) / 1000 ))" "${3:+=$3}" >> "$sp"; return 0; }
@@ -103,6 +103,26 @@ hydrate() {
       sleep 0.5
     done
     wait "$p" && echo full || echo stopped
+  }
+  # A size with a read set (pull/readsets/<label>.list, released to bin/warm/) reads only the image files its jobs were
+  # recorded reading, 64 at a time and through the page cache, and nothing else: a unit-tests shard read 1.2 GB of the
+  # snapshot's 25 GiB, in 2.2 to 6.8 s on fresh machines against 270 s for the whole root (Nov 27). It runs before the
+  # hydration, and the job-started hook ends it as it ends the rest. A path the image lacks costs nothing.
+  readset() {
+    local list=/run/superci-readset.list
+    # An empty list reads nothing, so that machine pre-reads as before. Paths the image lacks (xargs' 123) mark the read
+    # full:missing, the sign of a list recorded on another image.
+    aws s3 cp --only-show-errors --region "$CR" "s3://$PB/bin/warm/@LABEL@.list" "$list" 2> /dev/null && grep -q . "$list" || return 1
+    readall() {
+      tr '\n' '\0' < "$list" | xargs -0 -r -P 64 -n 8 cat -- > /dev/null 2>&1
+      case $? in 0) ;; 123) : > "$list.missing" ;; *) return 1 ;; esac
+    }
+    mark_hydrate "$(us)" readset.start
+    val=$(until_job readall)
+    [ "$val" = full ] && [ -e "$list.missing" ] && val=full:missing
+    mark_hydrate "$(us)" readset.done "$val"
+    [ -e "$HR/.pid" ] && systemctl start docker.service > /dev/null 2>&1
+    return 0
   }
   preread() {
     local val trees=() d
@@ -140,6 +160,7 @@ hydrate() {
   }
   t0=$(us); mark_hydrate "$t0" hydrate.start
   echo $$ > "$HR/.pid"
+  readset && rs=1
   if [ -x /usr/local/bin/pullcache ] && aws s3 cp --only-show-errors --region "$CR" "s3://$PB/bin/hydrate/@LABEL@.json" "$HM" 2> /dev/null; then
     chown -R runner:runner "$HR"
     out=$(timeout --foreground -k 5 110 setpriv --reuid=runner --regid=runner --init-groups -- env HOME=/home/runner PULLCACHE_BUCKET="$PB" PULLCACHE_REGION="$CR" /usr/local/bin/pullcache hydrate -timeout 100s "$HM" "$HR" || :)
@@ -147,7 +168,7 @@ hydrate() {
     val=$(printf '%s\n' "$out" | sed -n 's|^hydrated \([0-9]*\)/\([0-9]*\) entries \([0-9]*\) MB$|\1/\2:\3MB|p' | tail -1)
     mark_hydrate "$(us)" hydrate.done "$val"
   fi
-  preread
+  [ -n "${rs:-}" ] || preread
   rm -f "$HR/.pid" "$HR/.warming"
 }
 setsid bash -c "$(declare -f hydrate); hydrate" &
