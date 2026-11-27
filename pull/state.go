@@ -112,6 +112,7 @@ type State struct {
 	available   map[string]time.Time // when each waiting job was queued, by jobKey, for its queue wait
 	batch       map[string]bool      // the waiting jobs (keys of available) the batch rule names
 	batchRule   BatchRule
+	noDemand    BatchRule            // the jobs that are no routed demand: they size no pool
 	lost        []JobRef             // jobs that ended on a machine AWS was taking back, for a re-run
 	waits       []float64            // queue waits (s) of jobs started since the metrics last took them
 	began       map[string]began     // when each running job was queued and taken by its runner, by jobKey, for its record
@@ -406,6 +407,10 @@ func (s *State) class(m *Machine, idle int) Priority {
 // SetBatch sets the rule that names the batch jobs.
 func (s *State) SetBatch(r BatchRule) { s.mu.Lock(); s.batchRule = r; s.mu.Unlock() }
 
+// SetNoDemand sets the rule that names the jobs that are no routed demand (superci's own maintenance runs): they take a
+// machine like any job and size no pool.
+func (s *State) SetNoDemand(r BatchRule) { s.mu.Lock(); s.noDemand = r; s.mu.Unlock() }
+
 // Claim is the token of a granted machine's claim: the one its grant made, when it made one, or a new one.
 func (s *State) Claim(m *Machine) string {
 	s.mu.Lock()
@@ -590,7 +595,7 @@ func (s *State) arrived(j scaleset.JobMessageBase, now time.Time) {
 	if t := j.ScaleSetAssignTime; !t.IsZero() && t.Before(now) {
 		at = t
 	}
-	if !s.batchRule.Matches(j) { // a batch job (superci's own cache-warm and hydration runs, schedule and dispatch events) is no routed demand: it sizes no pool
+	if !s.noDemand.Matches(j) { // superci's own cache-warm and hydration runs are no routed demand: they size no pool
 		s.arrive(at)
 	}
 	queued := at

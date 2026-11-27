@@ -40,6 +40,7 @@ type Config struct {
 	Pool         PoolRule              `json:"pool"`
 	Registration RegConfig             `json:"registration"`
 	Batch        BatchRule             `json:"batch"`
+	NoDemand     BatchRule             `json:"no_demand"`
 	DailyUSD     float64               `json:"daily_usd"`
 	MonthlyUSD   float64               `json:"monthly_usd"`
 	OnDemand     float64               `json:"on_demand_share"`
@@ -189,6 +190,9 @@ func LoadConfig(path string) (Config, error) {
 		}
 	}
 	c.keepOnly()
+	if err := c.NoDemand.compile(); err != nil {
+		return c, fmt.Errorf("no_demand: %w", err)
+	}
 	if err := c.Batch.compile(); err != nil {
 		return c, err
 	}

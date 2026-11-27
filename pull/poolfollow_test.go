@@ -52,7 +52,7 @@ func setOf(t *testing.T, c Config, name string) SetSpec {
 func assign(st *State, n int, event, ref string, at time.Time) {
 	var msgs []*scaleset.JobAssigned
 	for i := 0; i < n; i++ {
-		msgs = append(msgs, &scaleset.JobAssigned{JobMessageBase: scaleset.JobMessageBase{JobID: fmt.Sprintf("%s-%d", event, i), EventName: event, JobWorkflowRef: ref, ScaleSetAssignTime: at}})
+		msgs = append(msgs, &scaleset.JobAssigned{JobMessageBase: scaleset.JobMessageBase{JobID: fmt.Sprintf("%s-%s-%d", event, ref, i), EventName: event, JobWorkflowRef: ref, ScaleSetAssignTime: at}})
 	}
 	st.Observe(&scaleset.RunnerScaleSetMessage{Statistics: &scaleset.RunnerScaleSetStatistic{TotalAssignedJobs: n}, JobAssignedMessages: msgs}, at)
 }
@@ -61,6 +61,7 @@ func shippedState(c Config, name string, started time.Time) *State {
 	st := NewState(name, 0, 1200, []string{"us-east-1"}, started)
 	st.listings["us-east-1"] = started
 	st.SetBatch(c.Batch)
+	st.SetNoDemand(c.NoDemand)
 	return st
 }
 
@@ -91,7 +92,7 @@ func TestOneRoutedJobWarmsOnlyItsOwnBurst(t *testing.T) {
 		}
 		spec.Dispatch = true
 		ds := NewDispatchSet(spec, nil, []string{"us-east-1"}, at.Add(-time.Hour))
-		ds.SetBatch(c.Batch)
+		ds.SetNoDemand(c.NoDemand)
 		ds.enqueue(&session{set: ds, arrived: at}, jobHead{ID: "j", Event: "push", WorkflowRef: pushRef}, at)
 		if n := c.PoolTarget(spec, at, ds.Burst(at, c.Pool)); n != 1 {
 			t.Errorf("%s dispatch: one push job made pool %d, want 1", name, n)
@@ -113,9 +114,10 @@ func TestThePoolEqualsTheMeasuredBurstOfRoutedJobs(t *testing.T) {
 	}
 }
 
-// superci's own jobs (the cache-warm and hydration runs, by schedule or dispatch) are not routed demand: 9 of them size
-// no pool on any size, at the peak hour, on a set that just started (a restart: GitHub redelivers the backlog), and on
-// the dispatch plane; a push job beside them counts for itself alone.
+// superci's own maintenance runs (ci-cache-warm.yml, which runs on push to main, on a schedule and on dispatch) are not
+// routed demand: 9 of each size no pool on any size, at the peak hour, on a set that just started (a restart: GitHub
+// redelivers the backlog), and on the dispatch plane. A push job beside them counts for itself alone, and so do a
+// scheduled integration run and a developer's dispatch of another workflow: those are real work routed to the set.
 func TestSupercisOwnMaintenanceJobsSizeNoPool(t *testing.T) {
 	c := shippedConfig(t)
 	at := peak()
@@ -127,10 +129,11 @@ func TestSupercisOwnMaintenanceJobsSizeNoPool(t *testing.T) {
 				started = at.Add(-time.Minute)
 			}
 			st := shippedState(c, name, started)
-			assign(st, 9, "schedule", cacheWarmRef, at)
-			assign(st, 9, "workflow_dispatch", cacheWarmRef, at)
+			for _, event := range []string{"push", "schedule", "workflow_dispatch"} {
+				assign(st, 9, event, cacheWarmRef, at)
+			}
 			if n := c.PoolTarget(spec, at, st.Burst(at, c.Pool)); n != 0 {
-				t.Errorf("%s (%s): 18 cache-warm jobs made pool %d, want 0", name, how, n)
+				t.Errorf("%s (%s): 27 cache-warm jobs made pool %d, want 0", name, how, n)
 			}
 			assign(st, 1, "push", pushRef, at)
 			if n := c.PoolTarget(spec, at, st.Burst(at, c.Pool)); n != 1 {
@@ -139,13 +142,27 @@ func TestSupercisOwnMaintenanceJobsSizeNoPool(t *testing.T) {
 		}
 		spec.Dispatch = true
 		ds := NewDispatchSet(spec, nil, []string{"us-east-1"}, at.Add(-time.Hour))
-		ds.SetBatch(c.Batch)
-		for i := 0; i < 9; i++ {
-			ds.enqueue(&session{set: ds, arrived: at}, jobHead{ID: fmt.Sprintf("w%d", i), Event: "schedule", WorkflowRef: cacheWarmRef}, at)
+		ds.SetNoDemand(c.NoDemand)
+		for i, event := range []string{"push", "schedule", "workflow_dispatch"} {
+			ds.enqueue(&session{set: ds, arrived: at}, jobHead{ID: fmt.Sprintf("w%d", i), Event: event, WorkflowRef: cacheWarmRef}, at)
 		}
 		if n := c.PoolTarget(spec, at, ds.Burst(at, c.Pool)); n != 0 {
-			t.Errorf("%s dispatch: 9 cache-warm jobs made pool %d, want 0", name, n)
+			t.Errorf("%s dispatch: cache-warm jobs made pool %d, want 0", name, n)
 		}
+	}
+}
+
+// What is not superci's own maintenance is routed demand, whatever its event: a scheduled integration run and a developer's
+// workflow_dispatch of a test workflow (and a load test started by dispatch) size the pool they take their runners from.
+func TestRealWorkOnAScheduleOrADispatchIsRoutedDemand(t *testing.T) {
+	c := shippedConfig(t)
+	spec := setOf(t, c, "superci-8cpu")
+	at := peak()
+	st := shippedState(c, spec.Name, at.Add(-time.Hour))
+	assign(st, 5, "schedule", "Authentic-Intelligence/megpt-mono/.github/workflows/integration-tests.yml@refs/heads/main", at)
+	assign(st, 6, "workflow_dispatch", "Authentic-Intelligence/megpt-mono/.github/workflows/selected-backend-tests.yml@refs/heads/ci/x", at)
+	if n := c.PoolTarget(spec, at, st.Burst(at, c.Pool)); n < 8 {
+		t.Fatalf("11 scheduled and dispatched real jobs made pool %d, want their burst (at least 8)", n)
 	}
 }
 

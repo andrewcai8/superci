@@ -220,23 +220,32 @@ its bounds among its sets. A burst of 0 (no job arrived in the last `window_minu
 is routed to the set, and its pool is 0 whatever a floor says. No idle runner is trimmed in the first window after a start, while the set has seen too
 few jobs to size its pool.
 
-Only routed jobs count as arrivals. A job is routed demand unless the batch rule names it (`batch` in the config: events `schedule` and
-`workflow_dispatch`, and any workflow ref or job name it lists): superci's own cache-warm and hydration runs are batch, take a machine like any job,
-and size no pool. The first hand-floor design held 70 (4 vCPU) and 100 (8 vCPU) from 14:00 to 02:59Z and 1 otherwise. On Nov 26 at 23:57Z that
-held 70, 100 and 9 idle runners of 4, 8 and 2 vCPU (43.8 USD an hour with `SUPERCI_JOBS` unset), and after a restart at 02:48Z one cache-warm job per set
-raised the pool to the hour's floor, about 171 registrations and 20 USD for no routed work. A floor is a pool no arrival asked for, so none ships:
-a single job warms what its own burst needs (a burst of 1 is a pool of 1), 40 at once warm about 36, and the pool is 0 a window plus the hold (35 minutes)
-after the last routed job. Pins from `/override` last only until the config changes or the listener restarts, and nothing needs one.
+Only routed jobs count as arrivals. superci's own maintenance runs are not routed demand: `no_demand` in the config names them by workflow ref
+(`/ci-cache-warm\.yml@`: megpt-mono's cache-warm and hydration runs, which come by push to main, by schedule and by dispatch), and they take a machine like
+any job and size no pool. It is narrower than `batch` on purpose. `batch` names the jobs that may wait for the registration budget (events `schedule` and
+`workflow_dispatch`), and many of those are real work: a developer's dispatch of the selected backend tests, a load test started by dispatch, the scheduled
+integration tests. Those are routed demand and size the pool they take their runners from.
 
-The cost is the first wave of a surge after a quiet stretch: the pool is the burst of the jobs seen so far, not a floor registered ahead. The measurement
-below says what the hand floors bought. In the Nov 26 16:02-16:22Z peak, 15 merge-queue runs brought 24 legs each on 4 vCPU and 2 on 8 vCPU, and 47 PR
-pushes brought 28 legs each on 8 vCPU. The jobs within 20 s up to each arrival were p50 33, p88 67 and p99 92 on 4 vCPU, and p50 34, p88 66 and
+No hand floor ships. The first design held 70 (4 vCPU) and 100 (8 vCPU) from 14:00 to 02:59Z and 1 otherwise. On Nov 26 at 23:57Z that held 70, 100 and 9
+idle runners of 4, 8 and 2 vCPU (43.8 USD an hour with `SUPERCI_JOBS` unset), and after a restart at 02:48Z one cache-warm job per set raised the pool to
+the hour's floor: about 171 registrations and 20 USD for no routed work. A floor is a pool no arrival asked for. A single job now warms what its own burst
+needs (a burst of 1 is a pool of 1), 40 at once warm about 36, and the pool is 0 a window plus the hold (35 minutes) after the last routed job. Pins from
+`/override` last only until the config changes or the listener restarts, and nothing needs one.
+
+The cost is the hand floors' benefit, and it is not only the first wave of a surge after a quiet stretch. The replay below measured what they bought: at the
+Nov 26 peak, p90 queue wait of 0 s on 4 vCPU and 5 s on 8 vCPU with floors of 70 and 100, against 17 s on 8 vCPU with the 30-minute quantile's pool alone,
+because the registration ceiling (2 a second, 50 at once, not raised here) holds its refills, not the pool. So 8 vCPU is slower at a steady peak too, and the
+first wave after a quiet stretch meets the pool of the jobs seen so far. 17 s is under the `queue-wait-p90` alarm (60 s) and above Blacksmith's 13 s. Batch and
+other pool runners are taken by any job of their label, so a maintenance run takes a runner a routed job may have wanted; the launcher replaces it at once.
+The dashboard's queue wait shows the cost. Lower the cost by raising the ceiling, or by a rule that warms a quiet set from the same hour's earlier days.
+
+The measurement: in the Nov 26 16:02-16:22Z peak, 15 merge-queue runs brought 24 legs each on 4 vCPU and 2 on 8 vCPU, and 47 PR pushes brought 28
+legs each on 8 vCPU. The jobs within 20 s up to each arrival were p50 33, p88 67 and p99 92 on 4 vCPU, and p50 34, p88 66 and
 p99 98 on 8 vCPU. Up to 224 8 vCPU legs arrived in a minute and 548 in 5 minutes. Blacksmith's unit legs waited p50 8 s and p90
 10 s on 4 vCPU, and p50 7 s and p90 13 s on 8 vCPU. A replay of those arrivals (each arrival takes an idle runner or the next one
 registered; a launch asks for its token after a 25 s boot; tokens at the ceiling of 2 a second and 50 at once) waits p90 0 s on
-4 vCPU and 5 s on 8 vCPU with floors of 70 and 100, and with the 30-minute quantile's pool alone (about 66 each) 8 vCPU waits p90 17 s at 2/50,
-because the ceiling, not the pool, holds its refills, and 6 s at 3/100. The dashboard's queue wait and `superci-pull-queue-wait-p90` show the
-start of a surge; a rule that warms a quiet set from the same hour's earlier days is the follow-up if it matters.
+4 vCPU and 5 s on 8 vCPU with floors of 70 and 100, and 17 s on 8 vCPU with the quantile pool alone (about 66), and 6 s there at a ceiling of 3/100.
+
 Why this rule, measured on Nov 25 2026 (`tools/wait/`):
 
 - The 4cpu canary (lint-test-backend's `verify-tools` and `test-go`, 17:03-17:25Z, 140 jobs) waited 22 s p50 and
@@ -506,8 +515,8 @@ size is one set (`split` 1), since an identity names its size, not a set of it.
   `OldestWaitingJobAgeS`, `DispatchIdleMachines`, `DispatchRunning`, and each minute's `DispatchHandoffs`,
   `DispatchRetries`, `DispatchResumes`, `DispatchLostJobs` and `DispatchDroppedFrames`. Their jobs' waits for a machine
   are in `QueueWait`, and their oldest wait in the alarms' `OldestWaitingJobAgeS`.
-- **Limits.** A crash in a hand-off fails that job once (Known limits). A dispatch set's pool is not carried across a
-  restart; it starts from the hour's floor. Moving a size back to a scale set fails the jobs its machines run.
+- **Limits.** A crash in a hand-off fails that job once (Known limits). A dispatch set's pool is carried across a
+  restart as a scale set's is (`Carry`, `Resume`); it starts from the saved burst. Moving a size back to a scale set fails the jobs its machines run.
 
 ## Hydration
 

@@ -16,10 +16,10 @@ import (
 // waiting for a machine and the jobs running; its pool follows the jobs that arrive at the dispatcher. Its lifecycle
 // is not a runner's (no registration, no GitHub fence before an end), so it is a type of its own, not a mode of State.
 type DispatchSet struct {
-	spec  SetSpec
-	batch BatchRule // the jobs that are no routed demand: they size no pool
-	fleet *SetFleet
-	wake  chan struct{} // a job arrived: the launcher looks at the deficit now
+	spec     SetSpec
+	noDemand BatchRule // the jobs that are no routed demand: they size no pool
+	fleet    *SetFleet
+	wake     chan struct{} // a job arrived: the launcher looks at the deficit now
 
 	mu       sync.Mutex
 	started  time.Time
@@ -324,7 +324,7 @@ func (st *DispatchSet) enqueue(s *session, head jobHead, now time.Time) (pair st
 	case h == nil:
 		s.phase = queued
 		st.queue = append(st.queue, s)
-		if !st.batch.Matches(scaleset.JobMessageBase{EventName: head.Event, JobWorkflowRef: head.WorkflowRef, JobDisplayName: head.Name}) { // a batch job sizes no pool
+		if !st.noDemand.Matches(scaleset.JobMessageBase{EventName: head.Event, JobWorkflowRef: head.WorkflowRef, JobDisplayName: head.Name}) { // superci's own maintenance runs size no pool
 			st.arrive(now)
 		}
 	case h.phase == running:
@@ -749,10 +749,10 @@ func (s *session) jobRef() (JobRef, bool) {
 	return JobRef{Owner: owner, Repo: repo, RunID: s.head.Run, Name: s.head.Name, Runner: s.agent, Instance: s.machine}, true
 }
 
-func (st *DispatchSet) SetPool(n int)        { st.mu.Lock(); st.pool = n; st.mu.Unlock() }
-func (st *DispatchSet) SetMax(n int)         { st.mu.Lock(); st.max = n; st.mu.Unlock() }
-func (st *DispatchSet) SetBatch(r BatchRule) { st.mu.Lock(); st.batch = r; st.mu.Unlock() }
-func (st *DispatchSet) SetCapped(on bool)    { st.mu.Lock(); st.capped = on; st.mu.Unlock() }
+func (st *DispatchSet) SetPool(n int)           { st.mu.Lock(); st.pool = n; st.mu.Unlock() }
+func (st *DispatchSet) SetMax(n int)            { st.mu.Lock(); st.max = n; st.mu.Unlock() }
+func (st *DispatchSet) SetNoDemand(r BatchRule) { st.mu.Lock(); st.noDemand = r; st.mu.Unlock() }
+func (st *DispatchSet) SetCapped(on bool)       { st.mu.Lock(); st.capped = on; st.mu.Unlock() }
 
 // Carry and Resume keep the set's pool across a restart as State's do (carry.go).
 func (st *DispatchSet) Carry(now time.Time, r PoolRule) Carried {

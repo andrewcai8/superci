@@ -92,6 +92,11 @@
     "workflow_refs": [],
     "jobs": []
   },
+  "no_demand": {
+    "events": [],
+    "workflow_refs": ["/ci-cache-warm\\.yml@"],
+    "jobs": []
+  },
   "daily_usd": 1000,
   "monthly_usd": 15000,
   "on_demand_share": 0.1,
