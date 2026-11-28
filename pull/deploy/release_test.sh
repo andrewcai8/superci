@@ -92,6 +92,17 @@ text = gzip.decompress(data).decode() if data[:2] == b"\x1f\x8b" else ""
 sys.exit(0 if scheme == "fileb" and len(data) < 16384 and text.startswith("#!/bin/bash") and "agent.py --probe" in text and "@MODE@" not in text else 1)
 PY2
 check $? "parity.sh gives its machine the rendered boot.sh gzipped, as raw bytes, under EC2's 16384"
+# The image's sshd takes no EC2 Instance Connect key (Nov 28: "Permission denied (publickey)" after a push that answered
+# true): the user data puts this run's public key on a user of the check's own, and no key is pushed.
+python3 -I - "$FAKE_AWS/user-data" "$FAKE_AWS/calls.log" << 'PY3'
+import glob, gzip, sys
+text = gzip.decompress(open(sys.argv[1], "rb").read()).decode()
+calls = open(sys.argv[2]).read()
+ok = ("useradd -m -s /bin/bash parity" in text and "/home/parity/.ssh/authorized_keys" in text and "ssh-ed25519 " in text
+      and "parity ALL=(ALL) NOPASSWD:ALL" in text and "ec2-instance-connect" not in calls)
+sys.exit(0 if ok else 1)
+PY3
+check $? "parity.sh's machine carries this run's key for its own user, and no Instance Connect key is pushed"
 # A machine that stops answering ends the check within its bound, and the machine is terminated.
 : > "$FAKE_AWS/calls.log"; t0=$(date +%s)
 PARITY_SSH_HANG=1 PARITY_TIMEOUT=3 timeout 60 "$D/parity.sh" "$C" > "$T/hang.out" 2>&1; rc=$?
