@@ -214,8 +214,8 @@ jobs_helper() { # set JSON | unset: the operator's re-route, on the same token a
   local usage="usage: $0 set '[\"job\",\"job@50\",...]' | $0 unset" now after rc bad
   case "${1:-}" in
     set) [ $# -eq 2 ] && jq -e 'type == "array" and all(type == "string")' <<<"$2" > /dev/null 2>&1 || { echo "$usage" >&2; return 2; }
-      bad=$(jq -r '.[] | select(test("^[^@]*(@(10|50|90))?$") | not)' <<<"$2" | head -1) # an entry is a job or a split of it, and a split is @10, @50 or @90
-      [ -z "$bad" ] || { echo "refusing: SUPERCI_JOBS entry \"$bad\": a split key is the job (or nothing) then @10, @50 or @90, and nothing else" >&2; return 2; } ;;
+      bad=$(jq -r '.[] | select(test("^([^@*]+(@(10|50|90))?|[*])$") | not)' <<<"$2" | head -1) # an entry is "*", a job, or a job then @10, @50 or @90: megpt-mono reads no "*@50" or bare "@50"
+      [ -z "$bad" ] || { echo "refusing: SUPERCI_JOBS entry \"$bad\": an entry is \"*\", a job, or a job then @10, @50 or @90, and nothing else" >&2; return 2; } ;;
     unset) [ $# -eq 1 ] || { echo "$usage" >&2; return 2; } ;;
   esac
   get_vt 3 || [ "$personal_ok" = 1 ] || { rollback_failed "the listener would not give a variables token ($(vt_why))"; return 1; }

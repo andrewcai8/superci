@@ -3344,10 +3344,31 @@ class SplitWindow(unittest.TestCase):
         code, out = verdict(10)
         self.assertEqual(code, G.ROLLBACK, out)
         self.assertRegex(out, r"FAIL\s+failures \(superci\)\s+10 of 10 \(10 legs\)")
-        self.assertIn("ROLL BACK (failures (superci): 10 of 10 (10 legs) vs <= 5 at a 1% false-rollback bound (Blacksmith 3/15 runs = 20.0%)", out)
+        self.assertIn("ROLL BACK (failures (superci): 10 of 10 (10 legs) vs Fisher's exact p 8.75e-05 > 0.01 that superci's half fails more than Blacksmith's (Blacksmith 3/15 runs = 20.0%)", out)
         self.assertTrue(self.line(out, "canary ").startswith("canary unit-tests@50: ROLL BACK"))
         first = next(n for n in range(1, 11) if verdict(n)[0] == G.ROLLBACK)
         self.assertLessEqual(first, 10)
+
+    # Review of #90: a split's Blacksmith half is small early in a watch, and its rate is no exact rate. Fisher's exact test weighs both halves'
+    # sizes, and a half of under MIN_RUNS runs compares nothing: the floor.
+    def test_a_blacksmith_half_of_four_runs_is_no_rate_and_a_superci_harm_rolls_back(self):
+        superci = self.runs("superci", 34, 100, red=set(range(14)))
+        code, out = self.run_gate(superci + self.runs("blacksmith", 4, 900, red={0}), split="90")
+        self.assertEqual(code, G.ROLLBACK, out)
+        self.assertIn("the split's Blacksmith half has 4 runs, under 5, so the floor", out)
+
+    def test_pr_noise_on_superci_s_half_against_a_clean_blacksmith_half_is_chance_and_keeps(self):
+        code, out = self.run_gate(self.runs("superci", 7, 100, red={0, 1, 2}) + self.runs("blacksmith", 7, 200))
+        self.assertEqual(code, G.KEEP, out)
+        self.assertIn("Fisher's exact p 0.0962 > 0.01", out)
+
+    def test_a_p90_against_a_blacksmith_half_of_three_runs_is_noise_and_sends_nothing_back(self):
+        rows = {r.name: r for r in G.evaluate_job([obs(300.0 if i < 5 else 80.0, 2.0, fleet="superci", run=100 + i) for i in range(25)],
+                                                    [obs(80.0, 2.0, fleet="blacksmith", run=900 + i) for i in range(3)], 400.0, [0.5] * 10, split=True)}
+        for name in ("wall p50", "wall p90", "queue wait p50", "queue wait p90"):
+            self.assertEqual(rows[name].status, G.NOISE, name)
+            self.assertTrue(rows[name].note.startswith("no Blacksmith runs"), rows[name].note)
+        self.assertNotIn("wall p90", " ".join(G.canary_verdict(list(rows.values()), {n: "OK" for n in G.ROLLBACK_ALARMS})))
 
     # The failures row excuses a superci failure on a test red on Blacksmith's main. In a split the red set is read from the same window's
     # Blacksmith half: the main runs of the window that ran on Blacksmith, not a routing fault's Blacksmith leg and not a run before --since.
@@ -3519,7 +3540,7 @@ class SplitCanary(CanaryTree):
         self.assertEqual(self.gate_args(), [])
 
     def test_set_takes_split_keys(self):
-        oks = ('["test-go","unit-tests@50"]', '["@90"]', '["unit-tests@10","test-go"]', '["test-go","unit-tests"]')
+        oks = ('["test-go","unit-tests@50"]', '["*"]', '["unit-tests@10","test-go"]', '["test-go","unit-tests"]')
         for ok in oks:
             p = self.helper(ok)
             self.assertEqual(p.returncode, 0, (ok, p.stdout, p.stderr))
@@ -3527,7 +3548,8 @@ class SplitCanary(CanaryTree):
 
     def test_set_refuses_a_split_that_is_not_ten_fifty_or_ninety_with_a_clear_line_and_no_call(self):
         for bad, entry in (('["test-go","unit-tests@33"]', "unit-tests@33"), ('["unit-tests@"]', "unit-tests@"), ('["unit-tests@50@90"]', "unit-tests@50@90"),
-                           ('["unit-tests@5"]', "unit-tests@5"), ('["unit-tests@100"]', "unit-tests@100"), ('["unit-tests@fifty"]', "unit-tests@fifty")):
+                           ('["unit-tests@5"]', "unit-tests@5"), ('["unit-tests@100"]', "unit-tests@100"), ('["unit-tests@fifty"]', "unit-tests@fifty"),
+                           ('["*@50"]', "*@50"), ('["@50"]', "@50")):
             p = self.helper(bad)
             self.assertEqual(p.returncode, 2, (bad, p.stdout, p.stderr))
             self.assertIn("@10, @50 or @90", p.stderr, bad)

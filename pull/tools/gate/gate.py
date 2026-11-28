@@ -292,10 +292,24 @@ def split_rows(percent, by_run):
                        "" if pv >= FALSE_ROLLBACK_RATE else f"the split is not {percent}%: megpt-mono's routing, report-only, no rollback (the failures row cannot see it)")]
 
 
-def evaluate_job(S, B, ceiling, unexplained, min_runs=MIN_RUNS, tests=None):
+def split_excess_p(s_failed, s_runs, b_failed, b_runs):
+    """Fisher's exact one-sided p-value that the superci half's failed runs are this many or more by chance, given both halves' runs and their
+    failed runs together (Hypergeometric: of s_runs + b_runs runs, s_failed + b_failed failed, the s_runs superci drew). A split's two halves ran in
+    the same window on the same mix of PRs, so the question is whether superci's half fails more than Blacksmith's; unlike a binomial bound at the
+    Blacksmith half's rate, it weighs how little a small half knows on both sides (a 1-of-4 Blacksmith half is not a 25% rate)."""
+    n, k = s_runs + b_runs, s_failed + b_failed
+    if s_runs <= 0 or s_failed <= 0:
+        return 1.0
+    total = math.comb(n, s_runs)
+    return sum(math.comb(k, i) * math.comb(n - k, s_runs - i) for i in range(s_failed, min(k, s_runs) + 1)) / total
+
+
+def evaluate_job(S, B, ceiling, unexplained, min_runs=MIN_RUNS, tests=None, split=False):
     """Gate 1's rows from the superci runs S and Blacksmith's B of one job, the job's ceiling in seconds (None when it has no
     row in ci-limits.tsv), the unexplained seconds of each superci job and `tests` (Tests, or None for a job with no test-name
-    source: the failures row then counts a failed job as one failure). Pure."""
+    source: the failures row then counts a failed job as one failure). `split`: S and B are the two halves of one window (gate job --split), so the
+    failures row is Fisher's exact test of the halves, and a row whose Blacksmith half is too small to compare with (under MIN_RUNS runs for a p50,
+    CANARY_P90_RUNS for a p90) is NOISE and sends nothing back: one slow Blacksmith run of three is no p90. Pure."""
     rows = []
     runs = len({o.run_id for o in S if not o.cancelled})
     rows.append(Row("n (superci runs)", str(runs), f">= {min_runs}", PASS if runs >= min_runs else FAIL, "counts runs, not shards"))
@@ -316,6 +330,12 @@ def evaluate_job(S, B, ceiling, unexplained, min_runs=MIN_RUNS, tests=None):
         rows.append(at_most("wall p90", T.q(sw, 90), bound90, f"<= {th90}", wall_noise))
         rows.append(at_most("queue wait p50", T.q(sq, 50), T.q(bq, 50), f"<= B p50 {T.q(bq, 50):.1f} s", queue_noise))
         rows.append(at_most("queue wait p90", T.q(sq, 90), T.q(bq, 90) + QUEUE_P90_SLACK_S, f"<= B p90 {T.q(bq, 90):.1f} + {QUEUE_P90_SLACK_S:g} s", queue_noise))
+        if split:
+            nb = len({o.run_id for o in B if not o.cancelled})
+            for i, r in enumerate(rows):
+                need = CANARY_P90_RUNS if r.name.endswith("p90") else min_runs if r.name.endswith("p50") else None
+                if need is not None and nb < need:
+                    rows[i] = dataclasses.replace(r, status=NOISE, note=f"no Blacksmith runs enough to compare yet: the split's Blacksmith half has {nb}, under {need}")
     everything = list(S) + list(B)
     S_done, B_done = [o for o in S if not o.cancelled], [o for o in B if not o.cancelled]
     counted = [o for o in S_done if not o.ok and not excused(o, everything)]
@@ -334,11 +354,22 @@ def evaluate_job(S, B, ceiling, unexplained, min_runs=MIN_RUNS, tests=None):
     failed_runs = collections.Counter(o.run_id for o in counted)  # run -> its counted failed legs
     b_failed_runs, b_counted_runs = {o.run_id for o in b_failed}, {o.run_id for o in b_counted}
     b_rate = len(b_counted_runs) / len(b_runs) if b_runs else 0.0
-    allowed = run_failure_allowance(len(s_runs), b_rate)
     legs_of = ", ".join(f"{r} ({c})" for r, c in failed_runs.most_common(10)) + (" ..." if len(failed_runs) > 10 else "")
-    rows.append(Row("failures (superci)", f"{len(failed_runs)} of {len(s_runs)} ({len(counted)} legs)",
-                    f"<= {allowed} at a {100 * FALSE_ROLLBACK_RATE:g}% false-rollback bound (Blacksmith {len(b_counted_runs)}/{len(b_runs)} runs = {100 * b_rate:.1f}%)",
-                    PASS if len(failed_runs) <= allowed else FAIL, "; ".join(notes), tuple(detail) + (
+    if not split:
+        allowed = run_failure_allowance(len(s_runs), b_rate)
+        ok = len(failed_runs) <= allowed
+        threshold = f"<= {allowed} at a {100 * FALSE_ROLLBACK_RATE:g}% false-rollback bound (Blacksmith {len(b_counted_runs)}/{len(b_runs)} runs = {100 * b_rate:.1f}%)"
+    elif len(b_runs) < min_runs:  # a Blacksmith half of a few runs knows no rate: the floor, as against a clean baseline
+        ok = len(failed_runs) <= min(MIN_ALLOWED_FAILED_RUNS, len(s_runs))
+        threshold = (f"<= {min(MIN_ALLOWED_FAILED_RUNS, len(s_runs))}: the split's Blacksmith half has {len(b_runs)} runs, under {min_runs}, so the floor "
+                     f"(Blacksmith {len(b_counted_runs)}/{len(b_runs)} runs = {100 * b_rate:.1f}%)")
+    else:
+        pv = split_excess_p(len(failed_runs), len(s_runs), len(b_counted_runs), len(b_runs))
+        ok = len(failed_runs) <= MIN_ALLOWED_FAILED_RUNS or pv > FALSE_ROLLBACK_RATE
+        threshold = (f"Fisher's exact p {pv:.3g} > {FALSE_ROLLBACK_RATE:g} that superci's half fails more than Blacksmith's "
+                     f"(Blacksmith {len(b_counted_runs)}/{len(b_runs)} runs = {100 * b_rate:.1f}%)")
+    rows.append(Row("failures (superci)", f"{len(failed_runs)} of {len(s_runs)} ({len(counted)} legs)", threshold,
+                    PASS if ok else FAIL, "; ".join(notes), tuple(detail) + (
                         (f"failed superci runs (counted legs): {legs_of}",) if failed_runs else ()) + (
                         (f"Blacksmith failure rate: {100 * len(b_failed_runs) / len(b_runs) if b_runs else 0.0:.1f}% ({len(b_failed_runs)} of {len(b_runs)} runs) before, {100 * b_rate:.1f}% ({len(b_counted_runs)} of {len(b_runs)} runs) "
                          f"after excluding {len(b_failed) - len(b_counted)} failed main job{'' if len(b_failed) - len(b_counted) == 1 else 's'} whose every failing test excused a superci failure; the bound uses the rate after",) if tests is not None else ())))
@@ -1436,7 +1467,7 @@ def cmd_job(a):
     except Exception as e:  # the spend is information: a CloudWatch failure never stops a check
         print(f"  cost of the window: not read ({type(e).__name__})")
     print()
-    rows = (evaluate_job(S, B, ceiling, unexplained, tests=tests) + (split_rows(split, by_fleets) if split is not None else [])
+    rows = (evaluate_job(S, B, ceiling, unexplained, tests=tests, split=split is not None) + (split_rows(split, by_fleets) if split is not None else [])
             + dispatched_row(dispatched, unmatched) + unread(gh, a.allow_unread))
     code = print_rows("criteria", rows, f"gate 1 for {a.job}")
     if not a.canary:
