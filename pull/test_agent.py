@@ -930,7 +930,7 @@ class TestWorkerStart(AgentCase):
         job = json.dumps({"runner": "{}", "token": "t"})
         with unittest.mock.patch.object(agent.pwd, "getpwnam", return_value=self.RUNNER), \
                 unittest.mock.patch.object(os, "getgrouplist", return_value=[41002, 41003]), \
-                unittest.mock.patch.object(os, "chown"), \
+                unittest.mock.patch.object(os, "fchown"), \
                 unittest.mock.patch.object(agent.subprocess, "run", run), \
                 unittest.mock.patch.object(agent.subprocess, "Popen", popen):
             a.start_job(job)
@@ -943,11 +943,11 @@ class TestWorkerStart(AgentCase):
             popped.append(kw)
             raise OSError("not started")
         a, ran = self.start_as_runner(popen)
-        want = dict(user=41001, group=41002, extra_groups=[41002, 41003])
+        want = dict(user=41001, group=41002, extra_groups=[41002, 41003], umask=0o022)
         for kw in ran + popped:
             self.assertEqual({k: kw.get(k) for k in want}, want)
         self.assertEqual((len(ran), len(popped)), (1, 1))
-        self.assertEqual(agent.Agent(self.config()).as_runner(), {}, "a test config runs as the agent's own user")
+        self.assertEqual(agent.Agent(self.config()).as_runner(), {"umask": 0o022}, "a test config runs as the agent's own user, with the job's mask")
 
     def test_a_worker_that_does_not_start_closes_each_of_its_pipes_once(self):
         def popen(*args, **kw):

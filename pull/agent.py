@@ -33,6 +33,10 @@ OUT_CHUNK = 64 << 10
 OUT_BUDGET = 4 << 20
 MAX_MESSAGE = 32 << 20  # the first PIPE message the agent reads for the job's renewal; the dispatcher reads no more
 NEW_JOB_REQUEST = 1
+# The file mode mask of the Worker and every step it starts: Blacksmith's jobs' (pull/parity/blacksmith-ubuntu-2404.txt),
+# whatever mask the agent itself runs under. Under boot's old 077 a job's files were private to it: dpkg-deb refused a
+# package's control directory (700) and tests that make a file 444 read it back 400 (Nov 28).
+JOB_UMASK = 0o022
 
 
 @dataclasses.dataclass
@@ -325,11 +329,11 @@ class Agent:
         return env
 
     def as_runner(self):
-        """Popen's arguments for running as the runner user."""
+        """Popen's arguments for running as the job runs: the runner user and its groups, with the job's file mode mask."""
         if self.cfg.user is None:
-            return {}
+            return dict(umask=JOB_UMASK)
         pw = pwd.getpwnam(self.cfg.user)
-        return dict(user=pw.pw_uid, group=pw.pw_gid, extra_groups=os.getgrouplist(self.cfg.user, pw.pw_gid))
+        return dict(user=pw.pw_uid, group=pw.pw_gid, extra_groups=os.getgrouplist(self.cfg.user, pw.pw_gid), umask=JOB_UMASK)
 
     def start_job(self, payload):
         job = json.loads(payload)
@@ -338,12 +342,14 @@ class Agent:
             raise ValueError("JOB is malformed")
         self.token = token
         self.mark("job.got")
-        path = self.cfg.runner_file
-        with open(path, "w") as f:
+        # The runner's settings are the runner user's alone, by their own mode: the agent's mask is the job's.
+        fd = os.open(self.cfg.runner_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as f:
+            os.fchmod(fd, 0o600)  # a file an earlier write left keeps its own mode through O_CREAT
+            if self.cfg.user is not None:
+                pw = pwd.getpwnam(self.cfg.user)
+                os.fchown(fd, pw.pw_uid, pw.pw_gid)
             f.write(runner)
-        if self.cfg.user is not None:
-            pw = pwd.getpwnam(self.cfg.user)
-            os.chown(path, pw.pw_uid, pw.pw_gid)
         env = self.env()
         # The job-started hook stops the hydration only after "Set up job", which a running pre-read slowed by 19 s, so it ends
         # here, before the Worker starts, as boot.sh does when the runner logs "Running job:".
@@ -382,6 +388,12 @@ class Agent:
         for t in self.threads:
             t.start()
         self.job_taken.set()
+
+    def probe(self, script):
+        """Runs script as start_job runs the Worker (user, groups, mask, environment, directory) and returns its exit code:
+        the release's parity check (pull/deploy/parity.sh) reads the job environment through it."""
+        return subprocess.run(["/bin/bash", script], env=self.env(), cwd=os.path.join(self.cfg.home, "bin"),
+                              stdin=subprocess.DEVNULL, **self.as_runner()).returncode
 
     def pump_out(self, src, typ):
         for chunk in iter(lambda: src.read1(OUT_CHUNK), b""):
@@ -592,8 +604,10 @@ class Agent:
 
 
 def main(argv):
+    if len(argv) == 3 and argv[1] == "--probe":
+        return Agent(Config(listener="", pin="")).probe(argv[2])
     if len(argv) != 3:
-        print("usage: agent.py <listener url> <pinned key>", file=sys.stderr)
+        print("usage: agent.py <listener url> <pinned key> | agent.py --probe <script>", file=sys.stderr)
         return 2
     return Agent(Config(listener=argv[1], pin=argv[2])).run()
 

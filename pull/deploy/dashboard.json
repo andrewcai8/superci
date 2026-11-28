@@ -15,6 +15,7 @@
       "arn:aws:cloudwatch:us-east-1:243891825325:alarm:superci-pull-launch-shortfall",
       "arn:aws:cloudwatch:us-east-1:243891825325:alarm:superci-pull-org-rate-unknown",
       "arn:aws:cloudwatch:us-east-1:243891825325:alarm:superci-pull-pool-at-floor",
+      "arn:aws:cloudwatch:us-east-1:243891825325:alarm:superci-pull-image-refused",
       "arn:aws:cloudwatch:us-east-1:243891825325:alarm:superci-pull-on-demand-share",
       "arn:aws:cloudwatch:us-east-1:243891825325:alarm:superci-pull-job-failure-rate",
       "arn:aws:cloudwatch:us-east-1:243891825325:alarm:superci-pull-idle-spend-unrouted",

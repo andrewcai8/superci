@@ -6,6 +6,10 @@
 # from when it started and an idle runner by the machine's age; the machine also powers off after @LIFE_SECONDS@ s,
 # whatever it is doing.
 exec > >(tee /var/log/superci-pull.log > /dev/console) 2>&1
+# The file mode mask of Blacksmith's jobs (pull/parity): the job and every file boot makes are readable by others unless
+# given a mode of their own. A mask of 077 the job inherited made a package's control directory 700, which dpkg-deb
+# refuses, and every file a test wrote 600 where it asserts 444 (Nov 28). Boot's secrets are private by their own modes.
+umask 022
 # Marks for the job timeline (pull/events.go): the moments of this machine's own clock the listener cannot see. Each is a
 # line of name=epoch=ms since the previous mark[=value] in a spool (the cache daemon appends its own), and a sender posts
 # the lines the listener has not taken to /mark with the identity document, as the ask for the runner does, so the machine
@@ -176,7 +180,16 @@ DOC=$(curl -s -m 2 -H "X-aws-ec2-metadata-token: $T" http://169.254.169.254/late
 mark doc.got
 ( while sleep 1; do send; done ) > /dev/null 2>&1 &
 SENDER=$!
-call() { curl -s -k --pinnedpubkey "$PIN" -m 60 --data-binary "$DOC" -o "$2" -w '%{http_code}' "${@:3}" "$L/$1"; }
+# What the listener answers (the job's runner config, the agent) is written to a file only root can read: curl writes
+# under a mask of 077, so a file it creates is 600 whatever else fails, and one already there is made 600 first, since
+# curl keeps a file's mode.
+call() {
+  (
+    umask 077
+    [ "$2" = /dev/null ] || install -m 600 /dev/null "$2" || :
+    curl -s -k --pinnedpubkey "$PIN" -m 60 --data-binary "$DOC" -o "$2" -w '%{http_code}' "${@:3}" "$L/$1"
+  )
+}
 # The notice carries IMDS's instance-action, sent until the listener answers.
 ( while sleep 5; do
     A=$(curl -s -f -m 2 -H "X-aws-ec2-metadata-token: $T" http://169.254.169.254/latest/meta-data/spot/instance-action | tr -d '\r\n')
@@ -186,7 +199,6 @@ uptime_s() { cut -d. -f1 /proc/uptime; }
 # Dispatch mode (pull/agent.py): no runner is registered. The machine fetches its agent with the identity document and
 # the pin, which proves itself to the dispatcher and runs the one job it is paired with, and powers off as below.
 if [ '@MODE@' = dispatch ]; then
-  umask 077
   # Ask for a job once the warm is done (a cold machine's node took 2.5 s, Blacksmith's 39 ms), or at @WARM_CAP_SECONDS@ s of uptime.
   while [ -e "$HR/.warming" ] && [ "$(uptime_s)" -lt @WARM_CAP_SECONDS@ ]; do sleep 0.5; done
   mark warm.ready
@@ -206,7 +218,6 @@ if [ '@MODE@' = dispatch ]; then
   poweroff
   exit 0
 fi
-umask 077
 fails=0
 while :; do
   [ -n "${asked:-}" ] || mark jit.sent

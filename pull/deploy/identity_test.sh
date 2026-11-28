@@ -14,6 +14,9 @@ mkdir -p "$T/fsroot-none"; export FS_ROOT=$T/fsroot-none HARDEN_OWNER=$(id -u):$
 export READY_TRIES=2 READY_SLEEP=0 LEASE_WAIT=0 LEASE_TRIES=2 RUN_RETRY_SLEEP=0 PEAK_TRIES=2 PEAK_WAIT=0 IDENTITY_LOCK=$T/lock
 # identity.sh under a timeout, so a loop that never ends fails the test instead of hanging it
 printf '#!/bin/bash\nexec timeout 120 %s "$@"\n' "$here/identity.sh" > "$T/id"; chmod 755 "$T/id"; ID=$T/id
+# The image the hosts boot is config.json's pin for the region, an AMI id of our copy (identity.sh's image): a stand-in config here.
+printf '{"image": {"us-east-1": "ami-0aaaa1111bbbb2222"}}\n' > "$T/image.json"; printf '{"image": {"us-east-1": "ami-REPLACE-us-east-1"}}\n' > "$T/placeholder.json"
+export IMAGE_CONFIG=$T/image.json
 ACCOUNT=243891825325; REL=$FAKE/s3/superci-pull-$ACCOUNT; IDB=$FAKE/s3/superci-pull-identities-$ACCOUNT/superci-pull/hosts
 mkdir -p "$FAKE/state" "$REL/bin"; cp -r "$F/runner" "$T/runner"
 failed=0
@@ -64,6 +67,8 @@ check $? "and is asked once, makes no key and launches nothing"
 refuses "up refuses while the release holds no shim" "refusing" "$ID" up us-east-1a
 [ "$(count 'run-instances\|auto-scaling-group\|create-launch-template' "$FAKE/calls.log")" = 0 ]; check $? "and launches nothing, and makes no group or template"
 release one
+refuses "up refuses a placeholder image pin" "not an AMI id" env IMAGE_CONFIG="$T/placeholder.json" "$ID" up us-east-1a
+[ "$(count 'run-instances\|auto-scaling-group\|create-launch-template' "$FAKE/calls.log")" = 0 ]; check $? "and launches nothing, and makes no group or template"
 ok "up makes the host of an AZ a group of one, from a launch template" "$ID" up us-east-1a
 c=$FAKE/calls.log
 [ "$(count 'run-instances' "$c")" = 0 ]; check $? "no instance is launched by hand: the group's template launches it"
@@ -73,7 +78,7 @@ st = sys.argv[1]
 t = json.load(open(os.path.join(st, "lt", "superci-pull-identity-us-east-1a")))
 d = json.loads(t["versions"][0]["data"])
 assert len(t["versions"]) == 1 and t["versions"][0]["desc"].startswith("sha256:"), t["versions"]
-assert d["InstanceType"] == "r7i.4xlarge" and d["ImageId"] == "ami-1", d
+assert d["InstanceType"] == "r7i.4xlarge" and d["ImageId"] == "ami-0aaaa1111bbbb2222", d
 assert d["MetadataOptions"] == {"HttpTokens": "required", "HttpPutResponseHopLimit": 1, "HttpEndpoint": "enabled"}, d["MetadataOptions"]
 assert d["IamInstanceProfile"] == {"Name": "superci-pull-identity"}, d["IamInstanceProfile"]
 ni = d["NetworkInterfaces"]
@@ -947,6 +952,7 @@ dg=$(grep -n 'delete-auto-scaling-group.*"\$g"' "$here/down.sh" | head -1 | cut 
 [ -n "$dg" ] && [ "$dg" -lt "$dt" ]; check $? "deploy/down.sh deletes the identity groups before it terminates every instance, or they would be launched again"
 
 # ---- the image is the one fleet.go runs ----
-grep -qF "Owner: \"$(sed -n 's/^IMAGE_OWNER=//p' "$here/identity.sh")\", Name: \"$(sed -n "s/^IMAGE_NAME='\(.*\)'/\1/p" "$here/identity.sh")\", Pin: \"$(sed -n 's/^IMAGE_PIN=//p' "$here/identity.sh")\"" "$here/../main.go"
-check $? "identity.sh pins the image main.go gives the machines"
+# identity.sh reads the "image" pin of config.json, as fleet.go does; nothing picks a build by name or by date.
+grep -qF 'IMAGE_CONFIG:-' "$here/identity.sh" && ! grep -q 'runs-on-v2\|IMAGE_OWNER\|--owners \$IMAGE' "$here/identity.sh"
+check $? "identity.sh takes the image from config.json's pin, not from a build name"
 exit $failed

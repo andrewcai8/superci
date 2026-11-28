@@ -191,7 +191,7 @@ func run(ctx context.Context, f flags) error {
 	if err != nil {
 		return err
 	}
-	fleet, err := NewFleet(ctx, cfg.Deployment, cfg.Regions, ImageConfig{Owner: "135269210855", Name: "runs-on-v2.2-ubuntu24-full-x64-*", Pin: "20261102081424"})
+	fleet, err := NewFleet(ctx, cfg.Deployment, cfg.Account, cfg.Regions, cfg.Image)
 	if err != nil {
 		return err
 	}
@@ -1346,6 +1346,7 @@ func (l *Listener) metrics() Metrics {
 		DispatchCounts: map[string]DispatchCounts{}, StalledBy: map[string]bool{}}
 	cfg := l.config()
 	m.OnDemandFirst = onDemandFirstSets(l.specs())
+	m.ImageRefused = l.fleet.Refused()
 	for i, s := range l.sets {
 		waits := s.state.TakeWaits()
 		m.Jobs = append(m.Jobs, s.state.TakeJobs()...)

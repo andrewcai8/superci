@@ -28,6 +28,7 @@ type Metrics struct {
 	Refused       int                  // registrations GitHub refused this minute
 	Failed        int                  // registrations that failed otherwise this minute
 	Short         int                  // machines asked of EC2 this minute that did not start (capacity, quotas)
+	ImageRefused  int                  // regions that launch nothing because their pinned image was refused (Fleet.Refused)
 	Stalled       int                  // sets whose jobs have waited 10 minutes with none started
 	StalledBy     map[string]bool      // the same, by set: each set's own StalledSets, which its canary's alarm reads
 	AtFloor       int                  // sets whose pool is at the hour's floor while more jobs wait than it has idle runners
@@ -76,6 +77,7 @@ func metricData(m Metrics, now time.Time) []cwtypes.MetricDatum {
 		d("SpendCapped", b2f(m.Spend.Capped), cwtypes.StandardUnitCount),
 		d("SpendDailyCapUSD", m.Spend.DailyCap, cwtypes.StandardUnitNone),
 		d("StalledSets", float64(m.Stalled), cwtypes.StandardUnitCount),
+		d("ImageRefused", float64(m.ImageRefused), cwtypes.StandardUnitCount),
 		d("PoolsAtFloor", float64(m.AtFloor), cwtypes.StandardUnitCount),
 	}
 	if m.Budget.Known {
