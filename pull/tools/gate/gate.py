@@ -220,16 +220,22 @@ def run_failure_allowance(n, p, alpha=FALSE_ROLLBACK_RATE):
     """The most failed runs out of n a healthy superci shows without rolling back: the smallest k with P(X > k) <= alpha for
     X ~ Binomial(n, p), p Blacksmith's per-run failure rate, summed exactly with math.comb, never below MIN_ALLOWED_FAILED_RUNS (nor above
     n). p = 0 gives the floor (the exact bound, 0, would send a job back on one red run against a clean baseline); p = 1 gives n (every
-    run is expected to fail, nothing can exceed it)."""
+    run is expected to fail, nothing can exceed it). Each term is taken in log space (lgamma): math.comb(n, i) as a float overflows from
+    n = 1,030, which a long canary's window reaches."""
     if n <= 0:
         return 0
     p = min(max(p, 0.0), 1.0)
-    pmf = [math.comb(n, i) * p ** i * (1.0 - p) ** (n - i) for i in range(n + 1)]
+    if p == 0.0:
+        return min(MIN_ALLOWED_FAILED_RUNS, n)
+    if p == 1.0:
+        return n
+    log_p, log_q, log_n = math.log(p), math.log1p(-p), math.lgamma(n + 1)
     tail = 0.0  # P(X > k), summed from the top so the small terms are not lost
     for k in range(n, -1, -1):
-        if tail + pmf[k] > alpha:
+        term = math.exp(log_n - math.lgamma(k + 1) - math.lgamma(n - k + 1) + k * log_p + (n - k) * log_q)
+        if tail + term > alpha:
             return min(max(k, MIN_ALLOWED_FAILED_RUNS), n)
-        tail += pmf[k]
+        tail += term
     return min(MIN_ALLOWED_FAILED_RUNS, n)
 
 

@@ -3,6 +3,7 @@ import collections
 import contextlib
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -272,6 +273,29 @@ class FailedRunsBound(unittest.TestCase):
         verdict = lambda failed: G.canary_verdict(list(self.rows(self.runs("superci", 10, failed), self.runs("blacksmith", 40)).values()), self.QUIET)
         one, two = verdict({0}), verdict({0, 1})
         self.assertEqual((one, len(two)), ([], 1), "against a clean baseline one failed run keeps, two roll back")
+
+    def test_the_bound_matches_an_exact_sum_and_holds_for_a_long_canary(self):
+        # Review of #89: math.comb(n, i) * p ** i overflowed a float from n = 1,030 runs, so the gate crashed and canary.sh said NO CHECK.
+        from fractions import Fraction
+
+        def exact(n, p, a):
+            tail = Fraction(0)
+            for k in range(n, -1, -1):
+                term = math.comb(n, k) * p ** k * (1 - p) ** (n - k)
+                if tail + term > a:
+                    return min(max(k, G.MIN_ALLOWED_FAILED_RUNS), n)
+                tail += term
+            return min(G.MIN_ALLOWED_FAILED_RUNS, n)
+
+        a = Fraction(1, 100)
+        for p in (Fraction(0), Fraction(1, 100), Fraction(1, 20), Fraction(36, 238), Fraction(1, 2), Fraction(99, 100), Fraction(1)):
+            for n in list(range(1, 61)) + [1030]:
+                self.assertEqual(G.run_failure_allowance(n, float(p), 0.01), exact(n, p, a), f"n={n} p={p}")
+        # A canary of 5,000 runs: no overflow, and the bound sits where the normal approximation puts the 99th percentile.
+        n, p = 5000, 36 / 238
+        k = G.run_failure_allowance(n, p)
+        mean, sd = n * p, math.sqrt(n * p * (1 - p))
+        self.assertLess(abs(k - (mean + 2.326 * sd)), 3, f"k={k}")
 
 
 class RecordedCanary(unittest.TestCase):
