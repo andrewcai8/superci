@@ -3175,5 +3175,371 @@ class LogParsers(unittest.TestCase):
         self.assertEqual(G.parse_integration_log(integration_log("t.ts", "s > one", exit_code=139)).hard, ("t.ts exited 139, not bun's 1 for failed tests",))
 
 
+
+# ---------------------------------------------------------------------------------------------------------------------
+# A split key (`unit-tests@50`): one window of runs, partitioned by the fleet each run's legs ran on, and no earlier baseline.
+# ---------------------------------------------------------------------------------------------------------------------
+
+class SplitGitHub(LogGitHub):
+    """LogGitHub that remembers every run whose jobs were read."""
+    read = []
+
+    def run_jobs(self, run_id, attempts="latest", fresh=False):
+        SplitGitHub.read.append(run_id)
+        return super().run_jobs(run_id, attempts, fresh)
+
+
+class SplitWindow(unittest.TestCase):
+    """cmd_job with --split over a canned GitHub (and the listener's records for the events source). A run is `[fleet per leg]`: the legs of a run
+    are one job's matrix. A run created before --since is in the fake listing anyway, as a listing that ignored its window would leave it."""
+    job, workflow = "unit-tests", "lint-test-backend.yml"
+
+    def setUp(self):
+        LogGitHub.logs, LogGitHub.reads, SplitGitHub.read = {}, [], []
+        self.windows = []
+
+    def leg(self, jid, run, conclusion, fleet, log=None, when=3000, branch="pr"):
+        at = NOW - when
+        j = gh_job(jid, run, 1, conclusion, at, at + 2, at + 90, fleet=fleet, name=f"{self.job} (1)", sha=f"sha{jid}", branch=branch)
+        j["steps"] = []
+        if log is not None:
+            LogGitHub.logs[jid] = log
+        return j
+
+    def run_of(self, rid, fleets, red=(), when=3000, branch="pr", logs=None):
+        """(run id, branch, run conclusion, jobs): one leg a fleet; the legs whose index is in `red` fail, with the log `logs` gives them."""
+        jobs = [self.leg(rid * 10 + i, rid, "failure" if i in red else "success", f, (logs or {}).get(i), when, branch) for i, f in enumerate(fleets)]
+        return (rid, branch, "failure" if red else "success", jobs)
+
+    def runs(self, fleet_name, n, first, red=(), legs=1):
+        """n runs on one fleet, ids first.., whose indexes in `red` fail (their first leg)."""
+        return [self.run_of(first + i, [fleet_name] * legs, red={0} if i in red else ()) for i in range(n)]
+
+    def run_gate(self, runs, extra=(), now=NOW, split="50", records=None, canary=True):
+        """(code, output); a refusal (argparse's or the gate's own) is returned as output, not raised."""
+        LogGitHub.jobs, LogGitHub.extra_calls = {}, []
+        listing = []
+        for rid, branch, conclusion, jobs in runs:
+            LogGitHub.jobs[rid] = jobs
+            listing.append({"id": rid, "created_at": jobs[0]["created_at"], "head_branch": branch, "conclusion": conclusion, "event": "push"})
+        saved = (G.T.GitHub, G.runs_of, G.T.gather, G.T.build, G.T.listener_events, G.time.time, G.alarm_states)
+        G.T.GitHub, G.time.time = SplitGitHub, lambda: now
+        G.runs_of = lambda gh, wf, lo, hi: (self.windows.append((lo, hi)), listing)[1]
+        G.T.gather = lambda *a, **k: {}
+        G.T.build = lambda j, ev: type("TL", (), {"wall": 1.0, "unexplained": 0.5})()
+        G.T.listener_events = lambda profile, lo, hi, where=None: records or []
+        G.alarm_states = lambda *a, **k: {}
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                limits = os.path.join(d, "limits.tsv")
+                with open(limits, "w") as fh:
+                    fh.write(f"{self.workflow}\t{self.job}\t200\tx\n")
+                since = [] if "--since" in extra else ["--since", T.iso(now - 7200)]
+                argv = ["--cache", d, "job", self.job, "--workflow", self.workflow, "--branch-glob", "*", "--limits", limits,
+                        "--superci-source", "events" if records is not None else "github", *since, *(["--split", split] if split else []),
+                        *(["--canary"] if canary else []), *extra]
+                try:
+                    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                        a = G.build_parser().parse_args(argv)
+                        code = a.fn(a)
+                except SystemExit as e:
+                    code = e.code
+                    out.write(err.getvalue() + (e.code if isinstance(e.code, str) else ""))
+                return code, out.getvalue()
+        finally:
+            G.T.GitHub, G.runs_of, G.T.gather, G.T.build, G.T.listener_events, G.time.time, G.alarm_states = saved
+
+    def line(self, out, start):
+        return next((l for l in out.splitlines() if l.startswith(start)), "")
+
+    def test_both_halves_are_read_from_one_window_by_the_fleet_each_run_ran_on(self):
+        old = self.run_of(650, ["blacksmith"], red={0}, when=9000)  # before --since: a baseline run, which a split has none of
+        mixed = self.run_of(700, ["superci", "blacksmith"], red={0, 1})
+        code, out = self.run_gate(self.runs("superci", 6, 100) + self.runs("blacksmith", 6, 200) + [mixed, old])
+        self.assertEqual(self.windows, [(NOW - 7200, NOW)], "one listing, of the one window")
+        self.assertNotIn(650, SplitGitHub.read, "a Blacksmith run before --since is not read")
+        self.assertIn(700, SplitGitHub.read)
+        self.assertRegex(out, r"n \(superci runs\)\s+6\b")
+        self.assertRegex(out, r"failures \(superci\)\s+0 of 6 \(0 legs\)")
+        self.assertIn("Blacksmith 0/6 runs = 0.0%", out, "neither the old run nor the mixed run's Blacksmith leg is in the Blacksmith half")
+        self.assertIn("no earlier baseline", out)
+
+    def test_a_run_with_legs_on_both_fleets_is_a_routing_fault_row_and_in_neither_half(self):
+        mixed = self.run_of(700, ["superci", "blacksmith"], red={0, 1})
+        code, out = self.run_gate(self.runs("superci", 6, 100) + self.runs("blacksmith", 6, 200) + [mixed])
+        self.assertRegex(out, r"FAIL\s+routing faults \(runs on both fleets\)\s+1 of 13 runs")
+        self.assertIn("700", self.line(out.replace("  FAIL  ", "").replace("  PASS  ", ""), "routing faults"))
+        self.assertRegex(out, r"n \(superci runs\)\s+6\b", "the mixed run's superci leg is not a superci run")
+        self.assertRegex(out, r"split ratio.*6 of 12 runs = 50\.0%", "nor in the ratio's count")
+
+    def test_a_clean_split_has_a_passing_routing_row(self):
+        code, out = self.run_gate(self.runs("superci", 6, 100) + self.runs("blacksmith", 6, 200))
+        self.assertRegex(out, r"PASS\s+routing faults \(runs on both fleets\)\s+0 of 12 runs")
+
+    def test_a_rerun_attempt_on_the_other_fleet_is_a_routing_fault_too(self):
+        first = self.leg(7001, 701, "failure", "superci")
+        second = gh_job(7002, 701, 2, "success", NOW - 3000, NOW - 2900, NOW - 2800, fleet="blacksmith", name=f"{self.job} (1)", sha="sha7001", branch="pr")
+        second["steps"] = []
+        rerun = (701, "pr", "success", [first, second])
+        code, out = self.run_gate(self.runs("superci", 6, 100) + self.runs("blacksmith", 6, 200) + [rerun])
+        self.assertRegex(out, r"FAIL\s+routing faults \(runs on both fleets\)\s+1 of 13 runs")
+
+    def test_a_routing_fault_is_report_only_the_canary_keeps_and_its_line_says_so(self):
+        mixed = self.run_of(700, ["superci", "blacksmith"], red={0, 1})
+        code, out = self.run_gate(self.runs("superci", 6, 100) + self.runs("blacksmith", 6, 200) + [mixed])
+        self.assertEqual(code, G.KEEP, out)
+        line = self.line(out, "canary ")
+        self.assertTrue(line.startswith("canary unit-tests@50: KEEP"), line)
+        self.assertIn("routing fault", line, "loud: the line canary.sh logs says a run was on both fleets")
+        self.assertIn("no rollback", line)
+        rows = [G.Row(n, "x", "y", G.FAIL) for n in G.SPLIT_ROWS]
+        self.assertEqual(G.canary_verdict(rows, {}), [], "a FAIL of the split rows never reaches a verdict")
+        self.assertFalse(set(G.SPLIT_ROWS) & set(G.ROLLBACK_ROWS))
+
+    def test_the_ratio_row_passes_on_a_fifty_fifty_window_and_fails_on_a_ninety_ten_one_labelled_at_fifty(self):
+        code, out = self.run_gate(self.runs("superci", 10, 100) + self.runs("blacksmith", 10, 200))
+        self.assertRegex(out, r"PASS\s+split ratio \(superci share of runs\)\s+10 of 20 runs = 50\.0%")
+        code, out = self.run_gate(self.runs("superci", 18, 100) + self.runs("blacksmith", 2, 200))
+        self.assertRegex(out, r"FAIL\s+split ratio \(superci share of runs\)\s+18 of 20 runs = 90\.0%")
+        self.assertIn("50%", next(l for l in out.splitlines() if "split ratio" in l), "the row names the percent it was held to")
+        self.assertEqual(code, G.KEEP, "report-only: a skewed split is megpt-mono's routing, and no superci job was harmed")
+        self.assertIn("ratio", self.line(out, "canary "), "but the canary line says so")
+
+    def test_the_same_ninety_ten_window_is_the_split_it_is_labelled_when_the_key_says_ninety(self):
+        code, out = self.run_gate(self.runs("superci", 18, 100) + self.runs("blacksmith", 2, 200), split="90")
+        self.assertRegex(out, r"PASS\s+split ratio.*18 of 20 runs = 90\.0%")
+        self.assertTrue(self.line(out, "canary ").startswith("canary unit-tests@90:"))
+
+    def test_the_ratio_is_an_exact_two_sided_binomial_test_at_the_false_rollback_rate(self):
+        self.assertTrue(hasattr(G, "binomial_two_sided_p"))
+        self.assertAlmostEqual(G.binomial_two_sided_p(10, 20, 0.5), 1.0)
+        self.assertAlmostEqual(G.binomial_two_sided_p(18, 20, 0.5), 2 * (1 + 20 + 190) / 2 ** 20, places=12)
+        self.assertAlmostEqual(G.binomial_two_sided_p(2, 20, 0.1), 1.0, msg="the likeliest outcome of 20 at 10% is 2")
+        p15, p16, p17 = (G.binomial_two_sided_p(k, 20, 0.5) for k in (15, 16, 17))
+        self.assertTrue(p15 > G.FALSE_ROLLBACK_RATE and p16 > G.FALSE_ROLLBACK_RATE and p17 < G.FALSE_ROLLBACK_RATE, (p15, p16, p17))
+        self.assertAlmostEqual(G.binomial_two_sided_p(5000, 10000, 0.5), 1.0, msg="no overflow at a long canary's n")
+        self.assertEqual(G.binomial_two_sided_p(0, 0, 0.5), 1.0)
+
+    def test_nothing_in_either_half_is_inconclusive_not_a_pass(self):
+        self.assertTrue(hasattr(G, "split_rows"))
+        rows = rows_by_name(G.split_rows(50, {}))
+        self.assertEqual((rows[G.ROUTING_ROW].status, rows[G.RATIO_ROW].status), (G.PASS, G.NOISE))
+
+    # Nov 28 07:36Z: unit-tests rolled back on 6 broken PRs, counted against superci's runs of the hour and Blacksmith's of the 24 h before, which
+    # had another mix of PRs. Both halves of one window see the same PRs.
+    def broken(self, fleet_name, ids, first):
+        return [self.run_of(first + i, [fleet_name, fleet_name], red={0} if i in ids else ()) for i in range(15)]
+
+    def test_six_broken_prs_spread_over_both_halves_equally_keep(self):
+        code, out = self.run_gate(self.broken("superci", {0, 1, 2}, 100) + self.broken("blacksmith", {0, 1, 2}, 200))
+        self.assertRegex(out, r"failures \(superci\)\s+3 of 15 \(3 legs\)")
+        self.assertIn("Blacksmith 3/15 runs = 20.0%", out)
+        self.assertEqual(code, G.KEEP, out)
+        self.assertTrue(self.line(out, "canary ").startswith("canary unit-tests@50: KEEP"))
+
+    def test_a_fault_in_one_leg_of_every_superci_run_rolls_back_by_ten_runs(self):
+        blacksmith = self.broken("blacksmith", {0, 1, 2}, 200)
+        verdict = lambda n: self.run_gate([self.run_of(100 + i, ["superci", "superci"], red={0}) for i in range(n)] + blacksmith)
+        code, out = verdict(10)
+        self.assertEqual(code, G.ROLLBACK, out)
+        self.assertRegex(out, r"FAIL\s+failures \(superci\)\s+10 of 10 \(10 legs\)")
+        self.assertIn("ROLL BACK (failures (superci): 10 of 10 (10 legs) vs <= 5 at a 1% false-rollback bound (Blacksmith 3/15 runs = 20.0%)", out)
+        self.assertTrue(self.line(out, "canary ").startswith("canary unit-tests@50: ROLL BACK"))
+        first = next(n for n in range(1, 11) if verdict(n)[0] == G.ROLLBACK)
+        self.assertLessEqual(first, 10)
+
+    # The failures row excuses a superci failure on a test red on Blacksmith's main. In a split the red set is read from the same window's
+    # Blacksmith half: the main runs of the window that ran on Blacksmith, not a routing fault's Blacksmith leg and not a run before --since.
+    def red_main(self, rid, fleets, **kw):
+        red = {i for i, f in enumerate(fleets) if f == "blacksmith"}
+        return self.run_of(rid, fleets, red=red, branch="main", logs={i: unit_log("suite > stampDoubles") for i in red}, **kw)
+
+    def superci_red(self):
+        return [self.run_of(9000, ["superci"], red={0}, logs={0: unit_log("suite > stampDoubles")})] + self.runs("superci", 5, 100)
+
+    def test_a_superci_failure_on_a_test_red_on_the_same_windows_blacksmith_main_is_excluded(self):
+        code, out = self.run_gate(self.superci_red() + self.runs("blacksmith", 6, 200) + [self.red_main(800, ["blacksmith"])])
+        self.assertRegex(out, r"failures \(superci\)\s+0 of 6")
+        self.assertIn("excluded (red on Blacksmith main too): src/a.test.ts :: suite > stampDoubles", out)
+        self.assertIn("red on Blacksmith main in runs 800", out)
+
+    def test_a_main_run_with_legs_on_both_fleets_is_not_blacksmith_main_s_red(self):
+        code, out = self.run_gate(self.superci_red() + self.runs("blacksmith", 6, 200) + [self.red_main(800, ["superci", "blacksmith"])])
+        self.assertRegex(out, r"failures \(superci\)\s+1 of 6")
+        self.assertIn("counted, green on Blacksmith main: src/a.test.ts :: suite > stampDoubles in 9000", out)
+        self.assertNotIn(8001, LogGitHub.reads, "the mixed run's Blacksmith log was not read as main's red")
+
+    def test_a_red_main_run_before_since_is_not_in_the_window_and_excuses_nothing(self):
+        code, out = self.run_gate(self.superci_red() + self.runs("blacksmith", 6, 200) + [self.red_main(800, ["blacksmith"], when=9000)])
+        self.assertRegex(out, r"failures \(superci\)\s+1 of 6")
+        self.assertNotIn(800, SplitGitHub.read)
+
+    def test_a_main_run_that_ran_on_superci_is_not_blacksmith_main_either(self):
+        main_on_superci = self.run_of(800, ["superci"], red={0}, branch="main", logs={0: unit_log("suite > stampDoubles")})
+        code, out = self.run_gate(self.superci_red() + self.runs("blacksmith", 6, 200) + [main_on_superci])
+        self.assertRegex(out, r"failures \(superci\)\s+2 of 7")
+        self.assertNotIn("excluded (red on Blacksmith main too)", out)
+
+    def test_a_split_asks_for_one_window_and_refuses_what_would_make_a_second(self):
+        for extra, why in ((["--baseline-until", "2026-12-01T10:00:00Z"], "--baseline-until"), (["--max-runs", "20"], "--max-runs")):
+            code, out = self.run_gate(self.runs("superci", 5, 100) + self.runs("blacksmith", 5, 200), extra=extra)
+            self.assertIn(f"refusing: {why}", out)
+            self.assertNotEqual(code, 0)
+        code, out = self.run_gate(self.runs("superci", 5, 100), split="33")
+        self.assertIn("10, 50 or 90", out)
+        self.assertNotEqual(code, 0)
+
+    def test_the_window_floor_clamps_since_alone_and_says_so(self):
+        floor, now = "2026-11-28T05:52:41Z", T.ts("2026-11-28T08:00:00Z")
+        runs = self.runs("superci", 5, 100) + self.runs("blacksmith", 5, 200)
+        before = self.run_of(650, ["blacksmith"], red={0})  # created 05:00Z, before the floor
+        for r, at in [(r, now - 3000) for r in runs] + [(before, now - 10_800)]:
+            for j in r[3]:
+                j.update(created_at=T.iso(at), started_at=T.iso(at + 2), completed_at=T.iso(at + 90))
+        code, out = self.run_gate(runs + [before], now=now, extra=["--since", "2026-11-28T03:00:00Z"])
+        self.assertIn(f"--since 2026-11-28T03:00:00Z clamped to {floor}", out)
+        self.assertNotIn("Blacksmith baseline start", out, "a split has no baseline to clamp")
+        self.assertEqual(self.windows, [(T.ts(floor), now)])
+        self.assertNotIn(650, SplitGitHub.read, "a run from before the floor is no parity sample")
+
+    def test_clamp_window_for_a_split_reports_only_since(self):
+        since, b_lo, lines = G.clamp_window("unit-tests", T.ts("2026-11-28T03:00:00Z"), T.ts("2026-11-28T03:00:00Z"), T.ts("2026-11-28T08:00:00Z"), split=True)
+        self.assertEqual((since, b_lo), (T.ts("2026-11-28T05:52:41Z"),) * 2)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("--since 2026-11-28T03:00:00Z clamped to 2026-11-28T05:52:41Z", lines[0])
+        self.assertNotIn("Blacksmith baseline", lines[0])
+
+    def test_superci_records_are_the_superci_half_and_a_record_of_a_run_outside_the_window_is_left_out(self):
+        recs = [record(f"g{i}", 2, 88, run=100 + i, name="unit-tests (1)", queued_at=NOW - 3000) for i in range(6)]
+        recs += [record("m1", 2, 88, run=700, name="unit-tests (1)", queued_at=NOW - 3000), record("old", 2, 88, run=999, name="unit-tests (1)", queued_at=NOW - 3000)]
+        supercis = [self.run_of(100 + i, ["superci"]) for i in range(6)]
+        mixed = self.run_of(700, ["blacksmith"])  # the record says superci took a leg of run 700, GitHub that Blacksmith took another
+        code, out = self.run_gate(supercis + self.runs("blacksmith", 6, 200) + [mixed], records=[dict(r, t=NOW) for r in recs])
+        self.assertRegex(out, r"n \(superci runs\)\s+6\b", "run 999 is not in the window's listing, and run 700 is a routing fault")
+        self.assertRegex(out, r"FAIL\s+routing faults \(runs on both fleets\)\s+1 of 13 runs")
+        self.assertRegex(out, r"split ratio.*6 of 12 runs")
+        self.assertIn("listener's job records", out)
+        self.assertEqual(self.windows, [(NOW - 7200, NOW)])
+
+    def test_without_split_nothing_changes(self):
+        code, out = self.run_gate(self.runs("superci", 5, 100) + self.runs("blacksmith", 5, 200), split=None, canary=False)
+        self.assertNotIn("routing faults", out)
+        self.assertNotIn("split ratio", out)
+        self.assertIn("baseline", out)
+
+
+class SplitCanary(CanaryTree):
+    """canary.sh over a split key: the gate is called with the key and --split, SUPERCI_JOBS is matched by key, and `set` takes only a real split."""
+
+    def setUp(self):
+        super().setUp()
+        self.stateful_jobs()
+        self.trace = os.path.join(self.tmp, "gate-args")
+        self.env["TRACE"] = self.trace
+
+    GATE = "import os, sys\nopen(os.environ['TRACE'], 'a').write(' '.join(sys.argv[1:]) + '\\n')\nprint('canary stub: KEEP')\nraise SystemExit(0)\n"
+    ROLL = "import os, sys\nopen(os.environ['TRACE'], 'a').write(' '.join(sys.argv[1:]) + '\\n')\nprint('canary stub: ROLL BACK')\nraise SystemExit(3)\n"
+
+    def listing(self, value):
+        with open(self.env["JOBS_FILE"], "w") as fh:
+            fh.write(value)
+
+    def gate_args(self):
+        if not os.path.exists(self.trace):
+            return []
+        with open(self.trace) as fh:
+            return [line.split() for line in fh.read().splitlines()]
+
+    def left(self):
+        with open(self.env["JOBS_FILE"]) as fh:
+            return json.load(fh)
+
+    def helper(self, value, **extra):
+        env = dict(self.env, SUPERCI_APP_TOKEN_CMD=TOKEN_SCOPED, **extra)
+        return subprocess.run(["bash", os.path.join(HERE, "canary.sh"), "set", value], env=env, capture_output=True, text=True, timeout=60)
+
+    def test_a_split_job_calls_the_gate_with_its_key_and_split_and_no_baseline_until(self):
+        self.listing('["test-go","unit-tests@50"]')
+        p = self.rollback(gate=self.GATE, jobs=("unit-tests@50",))
+        self.assertEqual(p.returncode, 0, (p.stdout, p.stderr))
+        (args,) = self.gate_args()
+        self.assertEqual(args[args.index("job"):args.index("job") + 2], ["job", "unit-tests"], "the gate gets the key, never `unit-tests@50`")
+        self.assertEqual(args[args.index("--split") + 1], "50")
+        self.assertNotIn("--baseline-until", args)
+        self.assertEqual(args[args.index("--since") + 1], "2026-11-27T00:00:00Z")
+        self.assertIn("--canary", args)
+        self.assertNotIn("unit-tests@50", args)
+
+    def test_a_plain_job_still_passes_its_baseline_until_and_no_split(self):
+        self.listing('["test-go","unit-tests"]')
+        p = self.rollback(gate=self.GATE, jobs=("unit-tests",))
+        self.assertEqual(p.returncode, 0, (p.stdout, p.stderr))
+        (args,) = self.gate_args()
+        self.assertEqual(args[args.index("--baseline-until") + 1], "2026-11-27T00:00:00Z")
+        self.assertNotIn("--split", args)
+
+    def test_a_rollback_removes_the_split_entry_and_leaves_the_other_jobs(self):
+        self.listing('["test-go","unit-tests@50"]')
+        p = self.rollback(gate=self.ROLL, jobs=("unit-tests@50",))
+        self.assertEqual(self.left(), ["test-go"], (p.stdout, p.stderr))
+        self.assertEqual([args for _, args in self.writes()], ['variable set SUPERCI_JOBS -R Authentic-Intelligence/megpt-mono --body ["test-go"]'])
+        self.assertIn("SUPERCI_JOBS was", p.stdout)
+
+    def test_a_rollback_takes_out_every_entry_of_the_key_and_no_other_key(self):
+        self.listing('["test-go","unit-tests","unit-tests@90","unit-tests-x@50","other@10","@50"]')
+        p = self.rollback(gate=self.ROLL, jobs=("unit-tests@50",))
+        self.assertEqual(self.left(), ["test-go", "unit-tests-x@50", "other@10", "@50"], (p.stdout, p.stderr))
+
+    def test_a_split_job_is_still_listed_when_the_variable_holds_it_at_another_percent(self):
+        self.listing('["test-go","unit-tests@10"]')
+        p = self.rollback(gate=self.GATE, jobs=("unit-tests@50",))
+        self.assertEqual(len(self.gate_args()), 1, (p.stdout, p.stderr))
+
+    def test_a_job_the_variable_no_longer_lists_is_not_checked(self):
+        self.listing('["test-go","unit-tests-x@50"]')
+        p = self.rollback(gate=self.GATE, jobs=("unit-tests@50",))
+        self.assertEqual(self.gate_args(), [], "unit-tests-x is another key")
+        self.assertEqual(p.returncode, 0, (p.stdout, p.stderr))
+
+    def test_a_split_job_another_watch_already_took_out_is_not_this_watch_s_rollback(self):
+        # reads 1 (the probe) and 2 (the tick's) list it at @10; the rollback's re-read (3) lists only another job
+        self.gh_prefix("""case "$*" in *actions/variables/SUPERCI_JOBS*) n=$(($(cat "$GHLOG.nreads" 2>/dev/null || echo 0)+1)); echo $n > "$GHLOG.nreads"
+  if [ $n -ge 3 ]; then echo '["test-go"]'; else echo '["test-go","unit-tests@10"]'; fi; exit 0 ;; esac""")
+        p = self.rollback(gate=self.ROLL, jobs=("unit-tests@50",), lasts=4, STOP_ON_ROLLBACK="1")
+        self.assertEqual(p.returncode, 0, "nothing was rolled back here")
+        self.assertEqual(self.writes(), [])
+        self.assertIn("unit-tests@50 is no longer in SUPERCI_JOBS", p.stdout)
+
+    def test_a_split_that_is_not_ten_fifty_or_ninety_is_refused_as_a_job(self):
+        for bad in ("unit-tests@33", "unit-tests@", "unit-tests@50@90", "@50"):
+            p = self.rollback(gate=self.GATE, jobs=(bad,))
+            self.assertEqual(p.returncode, 2, (bad, p.stdout, p.stderr))
+            self.assertIn("@10, @50 or @90", p.stderr, bad)
+        self.assertEqual(self.gate_args(), [])
+
+    def test_set_takes_split_keys(self):
+        oks = ('["test-go","unit-tests@50"]', '["@90"]', '["unit-tests@10","test-go"]', '["test-go","unit-tests"]')
+        for ok in oks:
+            p = self.helper(ok)
+            self.assertEqual(p.returncode, 0, (ok, p.stdout, p.stderr))
+        self.assertEqual([a.split("--body ", 1)[1] for _, a in self.writes()], list(oks))
+
+    def test_set_refuses_a_split_that_is_not_ten_fifty_or_ninety_with_a_clear_line_and_no_call(self):
+        for bad, entry in (('["test-go","unit-tests@33"]', "unit-tests@33"), ('["unit-tests@"]', "unit-tests@"), ('["unit-tests@50@90"]', "unit-tests@50@90"),
+                           ('["unit-tests@5"]', "unit-tests@5"), ('["unit-tests@100"]', "unit-tests@100"), ('["unit-tests@fifty"]', "unit-tests@fifty")):
+            p = self.helper(bad)
+            self.assertEqual(p.returncode, 2, (bad, p.stdout, p.stderr))
+            self.assertIn("@10, @50 or @90", p.stderr, bad)
+            self.assertIn(entry, p.stderr, "the line names the entry it refused")
+        self.assertEqual(self.gh_calls(), [], "refused before any call")
+
+    def test_unset_is_unchanged(self):
+        self.listing('["test-go","unit-tests@50"]')
+        p = subprocess.run(["bash", os.path.join(HERE, "canary.sh"), "unset"], env=dict(self.env, SUPERCI_APP_TOKEN_CMD=TOKEN_SCOPED), capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 0, (p.stdout, p.stderr))
+        self.assertFalse(os.path.exists(self.env["JOBS_FILE"]))
+
+
 if __name__ == "__main__":
     unittest.main()

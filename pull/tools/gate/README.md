@@ -7,6 +7,7 @@ carry the load. Python 3 standard library, `gh`, and `aws --profile ci-runners` 
 ```
 gate job <job> --branch-glob 'ci/superci-load-pull-*' [--workflow lint-test-backend.yml] [--since T]
          [--baseline-hours 24] [--baseline-until T] [--max-runs 600] [--limits ci-limits.tsv]      gate 1, one job
+         [--split 10|50|90]                                                                        ... a split key: one window, no baseline
 gate scale --from T --to T --trace trace.json [--workflow superci-load.yml] [--branch-glob 'ci/superci-load-pull-*']
                                                                                                gate 2, a replay window
 gate replay-trace --hour T [--hours 1] [--bucket 60] [--out trace.json]                         a real hour's arrivals
@@ -145,14 +146,42 @@ baseline start are clamped to it (the output says so), and a Blacksmith window t
 megpt-mono `4e75d94` (#36944, 2026-11-27T20:33:52Z, its committer time on main), which ended 5-25 minute resets between targets.
 `unit-tests` starts at megpt-mono `bdfa0fe` (#36789, 2026-11-28T05:52:41Z), the last of ci-speed's Nov 28 flake fixes (with #36883
 and #36887). The floor is by run creation time: a run on a branch cut before that commit and created after it is not caught.
-A canary's Blacksmith window ends at its T0 (`canary.sh` passes `--baseline-until` = `--since`), so a canary of a floored job whose
+A split's one window is clamped on `--since` alone, and a split canary has no baseline to float over a floor. A plain canary's Blacksmith window ends at its T0 (`canary.sh` passes `--baseline-until` = `--since`), so a canary of a floored job whose
 T0 is at or before the floor gets no check on any tick (the gate's `refusing:` line, exit 1, logged as `NO CHECK`) and is never rolled
 back by it: no Blacksmith run in its window is a parity sample. Route the job
 again after its floor, so T0 is past it, with Blacksmith runs between the floor and T0 for the baseline.
 
+## A split key: `gate job <job> --split N`
+
+megpt-mono's `SUPERCI_JOBS` takes split keys, `"<job>@10"`, `"<job>@50"`, `"<job>@90"` (and `"@50"` for every job). A run goes to superci by the
+last digit of `github.run_id` (`@50`: 0-4 to superci, 5-9 to Blacksmith; `@10`: 0; `@90`: 0-8), and every leg and every rerun of a run stays on
+one side. So both halves run in the same hours on the same PRs, and `--split N` compares them **in that window** instead of superci-now against
+Blacksmith's earlier hours, which had another mix of PRs (that is how the Nov 28 07:36Z rollback of `unit-tests` counted 6 broken PRs against superci).
+
+- **One window.** `[--since, now]` (clamped to the job's [window floor](#failing-tests-and-window-floors); the output reports `--since` alone).
+  Every run of the job's workflow created in it on `--branch-glob` (`*` for a canary) is read whole, so `--max-runs` is refused, as is
+  `--baseline-until`: there is no earlier baseline, no baseline end to fix, and `--baseline-hours` is unused. A split canary's Blacksmith side is
+  every Blacksmith run from T0 on, so a T0 before the floor no longer gets `NO CHECK`.
+- **The halves are by run, from the fleet each leg ran on** (`fleet_or_label`, as everywhere in the gate). All legs of a run (and every attempt)
+  share a fleet: a run on superci is in S, one on Blacksmith in B. With the listener's records (`events`) S is still read from them, but the jobs of every
+  run of the window are read from GitHub too, to see where each run's other legs ran: a split's reads grow with all its runs, not a sample.
+- **`routing faults (runs on both fleets)`.** A run with legs on both fleets (a leg on each, or a rerun on the other fleet) is in neither S nor B and
+  is listed. **Report-only.** It means megpt-mono's routing (the run-id digit, or a per-leg rule) is broken, not that superci harmed a job, and a rollback of the
+  job would not fix a routing bug; the row is FAIL and the canary line carries it: `canary unit-tests@50: KEEP   [split, no rollback: routing faults ...: 1 of 13
+  runs (run 700)]`, which `canary.sh` logs each tick. It is not in `ROLLBACK_ROWS`.
+- **`split ratio (superci share of runs)`.** Superci's runs over S and B runs against N%, an exact two-sided binomial test at `FALSE_ROLLBACK_RATE`
+  (1%): FAIL when the split is further from N% than chance gives. **Report-only**, for the same reason; the failures row cannot see a skewed split.
+  With no run in either half it is NOISE.
+- **Unchanged.** `evaluate_job` takes S and B as before: the p50/p90 rows, the failures row with its per-run binomial bound, `MIN_RUNS`, the same-commit
+  excuse and `canary_verdict`. The bound's Blacksmith rate is now the B half's rate in the same window; early ticks have few B runs, so the floor of one
+  failed run and `MIN_RUNS` carry more of the weight.
+- **Red on Blacksmith main** (`gather_tests`) is read from the same window's B half: the red main runs are the ordinary main runs of `[--since, now]` that ran on
+  Blacksmith (`only_runs`), so a routing fault's Blacksmith leg and a main run that ran on superci are not red-on-Blacksmith-main, and a main run from before
+  `--since` is not read. In non-split mode `(baseline start, baseline end)` still bounds it, as before.
+
 ## A live canary: `gate job --canary` and `canary.sh`
 
-`gate job <job> --canary` prints the rows, then `canary <job>: KEEP` (exit 0) or `ROLL BACK (reasons)` (exit 3). A canary rolls
+`gate job <job> --canary` prints the rows, then `canary <job>: KEEP` (exit 0) or `ROLL BACK (reasons)` (exit 3) (`canary <job>@N` with `--split`). A canary rolls
 back on harm to superci's own jobs, judged against Blacksmith over the same window, and on nothing else:
 
 - a FAIL of wall p50, wall p90, queue wait p50, queue wait p90 or failures. A p50 row counts once n passes (5 runs) and a
@@ -178,11 +207,16 @@ is at the cap, not that superci harmed a job. It pages and is counted. If the re
 queue-wait rows and the per-set `superci-pull-oldest-job-wait-<size>` see it. In canary 4b's minutes over the cap (Nov 26 16:11-16:20Z, the
 organization at 5.03-5.30/s) superci's test-go waited 1-2 s and Blacksmith's 4 vCPU jobs p50 7 s, p90 19 s.
 
-`canary.sh SINCE UNTIL JOB...` runs the check for each job SUPERCI_JOBS still lists, the first at once (right after the start probe, so a harm in the first minutes is seen then, not after a first EVERY sleep), then every 15 minutes, until UNTIL (it never sleeps past UNTIL: when the next tick would start at or after it, the watch ends), with
-Blacksmith's side the 24 h before SINCE (`--baseline-until`), so a job that left Blacksmith still has a baseline. It
+`canary.sh SINCE UNTIL JOB...` (a JOB is a plain job, or a split, `unit-tests@50`: see [a split key](#a-split-key-gate-job-job---split-n)) runs the check for each job SUPERCI_JOBS still lists, the first at once (right after the start probe, so a harm in the first minutes is seen then, not after a first EVERY sleep), then every 15 minutes, until UNTIL (it never sleeps past UNTIL: when the next tick would start at or after it, the watch ends), with
+Blacksmith's side the 24 h before SINCE (`--baseline-until`), so a job that left Blacksmith still has a baseline. A split JOB
+(`unit-tests@50`) calls the gate as `job unit-tests --split 50 --since SINCE` with **no `--baseline-until`**: the Blacksmith half is the same window's.
+SUPERCI_JOBS is matched by **key**, the part of an entry before the `@`: a job is still listed while the variable holds its key at any percent, and
+a rollback removes every entry of that key (the plain job and each percent) and no other key's: `["test-go","unit-tests@50"]` becomes `["test-go"]`. A job with an `@`
+that is not `@10`, `@50` or `@90` is refused at the start (exit 2). It
 removes a job that gets ROLL BACK from SUPERCI_JOBS, and leaves the other jobs listed. SUPERCI_JOBS is read and written on the App's
 `variables` token, and a rollback that cannot get it prints `ROLLBACK FAILED` (or, with `SUPERCI_PERSONAL_TOKEN=1`, writes on the personal
-token and says so). `canary.sh set '["test-go"]'` and `canary.sh unset` re-route by hand the same way, with no watch. `WORKFLOW` names the jobs' workflow
+token and says so). `canary.sh set '["test-go","unit-tests@50"]'` and `canary.sh unset` re-route by hand the same way, with no watch; `set` takes a job, or a job then
+`@10`, `@50` or `@90`, and refuses any other entry (`unit-tests@33`, `unit-tests@`) with a line naming it, before any call. `WORKFLOW` names the jobs' workflow
 file (lint-test-backend.yml by default). A check that crashes exits 1 and rolls nothing back: read its output file.
 
 **Telling the operator.** A rollback is a line in a log unless something reads it (Nov 28 00:57:56Z: test-go was rolled back on its queue
@@ -270,7 +304,8 @@ sample. The bound is Blacksmith's median x 1.25 + 20 ms:
 ## Tests
 
 `python3 -I test_gate.py`: a PASS and a FAIL for every criterion of both gates, the canary's rollback rows and alarms (canary 4b's refusals keep it), the noise rule, the exclusion of a failure
-Blacksmith shares (and not one superci or main-on-superci shares), reruns, timeouts and cancellations, the required flags, minute coverage of the registration datapoints, the alarm history, the trace extraction and the bench's per-bucket workflow, and the recorded
-canary fixtures in `fixtures/`. `python3 -I test_spawn.py`: a warmed fleet passes, one cold machine in five fails, the bound's edge,
+Blacksmith shares (and not one superci or main-on-superci shares), reruns, timeouts and cancellations, the required flags, minute coverage of the registration datapoints, the alarm history, the trace extraction and the bench's per-bucket workflow, the recorded
+canary fixtures in `fixtures/`, and a split key's one window (halves by run and fleet, a routing-fault row, the ratio's exact test, red on Blacksmith main from the B half,
+and `canary.sh`'s key matching and `set` validation). `python3 -I test_spawn.py`: a warmed fleet passes, one cold machine in five fails, the bound's edge,
 failed commands, the 5-sample minimum per measure and fleet, shown rows, the echoed script with ANSI and CRLF, a retried
 attempt, and `main`'s exit codes.
