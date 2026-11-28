@@ -4385,5 +4385,135 @@ class EarlyStoppedPText(unittest.TestCase):
         self.assertEqual(getattr(full, "draws", None), G.PERMUTATIONS)
 
 
+# A split wall row judges a size only when each half has MIN_SHARD_RUNS runs with legs of that size. megpt-mono's unit plan gives 4cpu legs to merge-queue copies
+# and non-PR runs alone (24 legs, shards 1 to 24, about 100 s, and 1 or 2 8cpu legs of their own); a PR run has 28 legs, all 8cpu (about 55 s).
+def size_mix_half(rnd, fleet, n_runs, queue_runs, f4=1.0, f8=1.0, first=1000, run_sigma=0.04, leg_sigma=0.08):
+    """One half of a window of unit-tests runs: `queue_runs` queue copies and the rest PR runs. `f4` and `f8` scale superci's legs of a size."""
+    out, jid = [], 0
+    for r in range(n_runs):
+        queue = r < queue_runs
+        run_factor = rnd.lognormvariate(0, run_sigma)
+        legs = [(i, 4, 100.0) for i in range(1, 25)] + [(i, 1, 55.0) for i in (25, 26)[: rnd.choice((1, 2))]] if queue else [(i, 8, 55.0) for i in range(1, 29)]
+        for i, last, base in legs:
+            cpus = 4 if last == 4 else 8
+            label = f"superci-{cpus}cpu" if fleet == "superci" else f"blacksmith-{cpus}vcpu-ubuntu-2404"
+            wall = base * ((f4 if cpus == 4 else f8) if fleet == "superci" else 1.0) * run_factor * rnd.lognormvariate(0, leg_sigma)
+            jid += 1
+            out.append(G.Obs(first * 100000 + jid, first + r, "", "", fleet, True, 1.0, round(wall), name=f"unit-tests ({i}, {label}, {last})"))
+    return out
+
+
+def size_mix_halves(seed, n_runs, queue_runs, r4=1.0, r8=1.0):
+    """(S, B) of `n_runs` runs a half with `queue_runs` queue copies each, a fixed spread of 3% over the shards on each fleet."""
+    rnd = random.Random(seed)
+    shard = {(f, i, last): rnd.lognormvariate(0, 0.03) for f in ("superci", "blacksmith") for i in range(1, 29) for last in (1, 4, 8)}
+    halves = []
+    for fleet, f4, f8, first in (("superci", r4, r8, 1000), ("blacksmith", 1.0, 1.0, 2000)):
+        half = size_mix_half(rnd, fleet, n_runs, queue_runs, f4, f8, first)
+        halves.append([dataclasses.replace(o, wall=o.wall * shard[(fleet, int(o.name.split("(")[1].split(",")[0]), int(o.name.rstrip(")").split(", ")[-1]))]) for o in half])
+    return halves[0], halves[1]
+
+
+def size_state(row, size):
+    return next(x for x in row.sizes if x.size == size)
+
+
+def with_reruns(obs, size="4cpu", attempts=3):
+    """`obs` with every leg of `size` run `attempts` times (the same run, new attempts a little slower): a shard with 10 legs from fewer runs."""
+    extra = [dataclasses.replace(o, job_id=o.job_id + 10_000_000 * k, attempt=k + 1, wall=o.wall * (1 + 0.02 * k)) for o in obs if G.shard_size(o.name) == size for k in range(1, attempts)]
+    return obs + extra
+
+
+class SizeRunFloor(unittest.TestCase):
+    def rows(self, S, B):
+        return rows_by_name(G.evaluate_job(S, B, 165.0, [0.5] * 10, split=True))
+
+    def test_twelve_runs_a_half_with_four_queue_copies_judge_8cpu_and_not_4cpu_and_are_not_ready_to_ramp(self):
+        rows = self.rows(*size_mix_halves(0, 12, 4))
+        row = want(rows, G.SHARD_ROW)
+        self.assertFalse(size_state(row, "4cpu").judged, f"4 and 4 runs have 4cpu legs, a least p of 1/70 over the alpha: it cannot FAIL, so it is not judged ({row.value})")
+        self.assertEqual(size_state(row, "4cpu").short_runs, (4, 4, G.MIN_SHARD_RUNS))
+        self.assertTrue(size_state(row, "8cpu").judged, f"the 8 PR runs and the queue copies' 8cpu legs make 12 and 12 runs ({row.value})")
+        self.assertEqual(row.status, G.PASS, f"the judged size passes; the row is not NOISE ({row.note})")
+        self.assertRegex(row.value, r"4cpu \d\.\d{3}x over 24 \(4 and 4 runs with 4cpu legs, under 10 a half: not judged\)", row.value)
+        self.assertRegex(row.value, r"8cpu \d\.\d{3}x over \d+ \(p ", row.value)
+        self.assertNotIn("(p ", row.value.split(", 8cpu")[0], "no p for a size that is not judged")
+        ramp = want(rows, RAMP)
+        self.assertEqual(ramp.status, G.NOISE, ramp.note)
+        self.assertIn("4cpu median not judged (4 superci and 4 Blacksmith runs with 4cpu legs, under 10 a half)", ramp.note)
+        self.assertRegex(ramp.value, r"^4cpu: median not judged, tail not judged; 8cpu: median PASS, tail ")
+        self.assertEqual(G.canary_verdict(list(rows.values()), {}), [], "no rollback")
+
+    def test_the_readiness_row_names_the_short_size_and_how_many_runs_each_half_has_on_both_rows(self):
+        # 14 runs a half, 4 of them queue copies, the 4cpu legs run 3 times so that their shards have the 10 legs the tail row needs: the median row and the tail
+        # row both see 4cpu in 4 runs a half, and 8cpu (the 10 PR runs, 10 legs a shard) judged on both.
+        S, B = (with_reruns(h) for h in size_mix_halves(0, 14, 4))
+        rows = self.rows(S, B)
+        for name in (G.SHARD_ROW, G.TAIL_ROW):
+            self.assertEqual(size_state(rows[name], "4cpu").short_runs, (4, 4, G.MIN_SHARD_RUNS), name)
+            self.assertTrue(size_state(rows[name], "8cpu").judged, name)
+        ramp = want(rows, RAMP)
+        self.assertEqual(ramp.status, G.NOISE)
+        self.assertEqual(ramp.value, "4cpu: median not judged, tail not judged; 8cpu: median PASS, tail PASS")
+        self.assertEqual(ramp.note, "not ready: 4cpu median not judged (4 superci and 4 Blacksmith runs with 4cpu legs, under 10 a half), "
+                                    "tail not judged (4 superci and 4 Blacksmith runs with 4cpu legs, under 10 a half); 8cpu ready")
+
+    def test_the_tail_row_has_the_same_floor_and_is_noise_when_no_size_has_the_runs(self):
+        S, B = (with_reruns(h) for h in size_mix_halves(0, 12, 4))
+        row = G.tail_row(S, B, 165.0)
+        self.assertEqual(row.status, G.NOISE, f"12 legs a shard of 4 runs: the shards are enough, the runs are not ({row.value})")
+        self.assertEqual(row.note, "not enough runs yet: no size has 10 runs a half with its legs (4cpu: 4 and 4)")
+        self.assertEqual(G.canary_verdict([row], {}), [])
+
+    def test_a_size_with_the_floor_of_runs_a_half_is_judged_and_one_run_under_it_is_not(self):
+        # 12 runs a half, 4cpu legs in 9 or 10 of each half's runs (the others PR runs). Equal fleets: nothing fails, the question is what is judged.
+        for queue_runs, judged in ((G.MIN_SHARD_RUNS - 1, False), (G.MIN_SHARD_RUNS, True)):
+            row = G.shard_wall_row(*size_mix_halves(0, 12, queue_runs), 165.0)
+            self.assertEqual(size_state(row, "4cpu").judged, judged, f"{queue_runs} runs a half with 4cpu legs: {row.value}")
+            self.assertTrue(size_state(row, "8cpu").judged)
+
+    def test_the_run_floor_is_the_runs_of_the_size_and_not_of_the_half(self):
+        S, B = size_mix_halves(0, 12, 4)
+        self.assertEqual((len({o.run_id for o in S}), len({o.run_id for o in B})), (12, 12), "the whole-half count is 12, over the floor of 10")
+        self.assertFalse(size_state(G.shard_wall_row(S, B, 165.0), "4cpu").judged)
+
+    def test_with_no_size_judged_the_median_row_is_noise_and_says_which_runs_are_short(self):
+        S, B = size_mix_halves(0, 12, 4)
+        S, B = ([o for o in h if not o.name.endswith(", 1)")] for h in (S, B))  # the queue copies' own 8cpu shards out: 8cpu is in the 8 PR runs alone
+        row = G.shard_wall_row(S, B, 165.0)
+        self.assertEqual(row.status, G.NOISE, row.value)
+        self.assertEqual(row.note, "not enough runs yet: no size has 10 runs a half with its legs (4cpu: 4 and 4, 8cpu: 8 and 8)")
+        self.assertEqual(G.canary_verdict([row], {}), [], "NOISE sends nothing back")
+
+    def test_a_size_that_is_not_judged_cannot_fail_even_when_it_is_slow(self):
+        S, B = size_mix_halves(0, 12, 4, r4=1.5)
+        for build in (G.shard_wall_row, G.tail_row):
+            self.assertNotEqual(build(S, B, 165.0).status, G.FAIL)
+
+
+class SizeRunFloorMet(unittest.TestCase):
+    """The floor met: guards (they pass without the floor too). 24 runs a half with 10 queue copies each judge 4cpu, and a real 4cpu +30% still rolls back."""
+    QUEUE = 10
+
+    def rows(self, S, B):
+        return {r.name: r for r in G.evaluate_job(S, B, 165.0, [0.5] * 10, split=True)}
+
+    def test_4cpu_is_judged_at_24_runs_a_half_with_ten_queue_copies_and_a_clean_window_is_ready(self):
+        rows = self.rows(*size_mix_halves(0, 24, self.QUEUE))
+        for name in (G.SHARD_ROW, G.TAIL_ROW):
+            self.assertTrue(size_state(rows[name], "4cpu").judged, rows[name].value)
+            self.assertTrue(size_state(rows[name], "8cpu").judged, rows[name].value)
+            self.assertEqual(rows[name].status, G.PASS)
+        self.assertEqual((rows[RAMP].status, rows[RAMP].note), (G.PASS, ""))
+
+    def test_4cpu_plus_30_percent_with_8cpu_faster_rolls_back_in_at_least_98_of_100_windows(self):
+        caught = 0
+        for seed in range(100):
+            S, B = size_mix_halves(seed, 24, self.QUEUE, r4=1.3, r8=0.905)
+            wall, tail = G.shard_wall_row(S, B, 165.0), G.tail_row(S, B, 165.0)
+            caught += wall.status == G.FAIL or tail.status == G.FAIL
+        self.assertGreaterEqual(caught, 98, f"{caught} of 100")
+
+
 if __name__ == "__main__":
     unittest.main()

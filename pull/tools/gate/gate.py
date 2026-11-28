@@ -92,14 +92,17 @@ WALL_MARGIN = 0.05
 MIN_PAIRED_SHARDS = 8
 SHARD_ROW, CEILING_ROW = "wall (per shard)", "wall p90 (ceiling)"
 # A split is ready to go from its share to the whole job (the ramp rule) when each machine size on superci's half has been judged, by SHARD_ROW and by TAIL_ROW,
-# over MIN_PAIRED_SHARDS shards and MIN_SHARD_RUNS runs a half, and neither row FAILs it. RAMP_ROW says so, and is report-only (in no ROLLBACK_ROWS): the
+# over MIN_PAIRED_SHARDS shards and MIN_SHARD_RUNS runs a half that carry legs of that size, and neither row FAILs it. RAMP_ROW says so, and is report-only (in no ROLLBACK_ROWS): the
 # canary line carries it as `[ramp: ready]` or `[ramp: not ready: ...]`.
 RAMP_ROW = "ramp readiness"
 # Every shard's median is over the legs of the runs of its half, and the legs of one run share the run's weight (a big PR is slow in every shard), so the shard
 # ratios are not independent samples: the fewer runs a half has, the more of them move together, and the test's false-rollback rate drifts above
 # FALSE_ROLLBACK_RATE (the run-permutation test keeps them together; MIN_SHARD_RUNS is what its permutations need to have a spread to draw from). The Nov 28
 # 09:24Z window measured a run-to-run spread of 2% (Blacksmith) to 6% (superci) and a leg-to-leg spread of 7% to 11%; at those, 10 runs a half keeps the
-# rate under 2%, and a real +20% is caught by then. Each half has MIN_SHARD_RUNS runs before the row can FAIL.
+# rate under 2%, and a real +20% is caught by then. Each half has MIN_SHARD_RUNS runs before the row can FAIL, and it is the runs with legs of the size, per size:
+# megpt-mono's unit plan gives 4cpu legs to merge-queue copies and non-PR runs alone (a PR run has 28 legs, all 8cpu), so a window of 12 runs a half with 4 queue
+# copies a half has 8 runs of 4cpu, C(8, 4) = 70 assignments, a least p of 1/70 over the 0.005 the size fails at: a row that can only PASS, and must not count
+# as judged (a size short of runs is not judged, and the ramp rule counts it not ready).
 MIN_SHARD_RUNS = 10
 MAX_SHARD_LINES = 10
 # A split's tail is judged per shard too, because a per-shard median does not see one: 15% of superci's legs on cold machines at 1.5x leave every shard's median
@@ -392,7 +395,8 @@ def size_p(S, B, ceiling, size_of, size, pairs, margin, pct, alpha, row):
 @dataclasses.dataclass(frozen=True)
 class SizeResult:
     """What a split wall row concluded about one machine size, for ramp_row: how many shards it had, whether it judged the size (enough shards, and each half
-    min_runs runs) and, if it did, whether it FAILed it. `short_runs` is (superci runs, Blacksmith runs, min_runs) when the runs, not the shards, were short."""
+    min_runs runs with legs of that size among them) and, if it did, whether it FAILed it. `short_runs` is (superci runs, Blacksmith runs, min_runs) when the
+    size had its shards and the runs of its legs, not the shards, were short."""
     size: str
     shards: int
     judged: bool
@@ -400,18 +404,51 @@ class SizeResult:
     short_runs: "tuple | None" = None
 
 
-def size_results(by_size, judged, per, alpha, ns, nb, min_runs):
+def size_runs(S, B, size_of, by_size):
+    """{size: (superci runs, Blacksmith runs)} of a split wall row's sizes: each half's distinct non-cancelled runs with at least one leg of one of the size's
+    paired shards. A run without a leg of the size is not an observation of it: megpt-mono's PR runs have no 4cpu leg, so a window of 12 runs a half can hold
+    8 runs of 4cpu, which no run permutation can bring under the alpha (C(8, 4) = 70 assignments, a least p of 0.014)."""
+    out = {}
+    for size, ps in by_size.items():
+        keys = {p[0] for p in ps}
+        out[size] = tuple(len({o.run_id for o in h if o.name and not o.cancelled and shard_key(o.name) in keys}) for h in (S, B))
+    return out
+
+
+def judged_sizes(S, B, size_of, by_size, min_runs):
+    """(sizes with MIN_PAIRED_SHARDS shards paired, the runs of each size's shards (size_runs), the sizes of the first that also have min_runs runs on each half:
+    the ones a split wall row judges). Both wall rows read their sizes through here, so one rule holds for the two."""
+    enough = {size: ps for size, ps in sorted(by_size.items()) if len(ps) >= MIN_PAIRED_SHARDS}
+    runs = size_runs(S, B, size_of, enough)
+    return enough, runs, {size: ps for size, ps in enough.items() if min(runs[size]) >= min_runs}
+
+
+def size_note(size, g, k, pv, alpha, runs, min_runs):
+    """One size's text in a split wall row's value: its ratio over its shards, then its p, or why it is not judged."""
+    if pv is not None:
+        return f"{size or 'unsized'} {g:.3f}x over {k} ({p_text(pv, alpha)})"
+    if runs:
+        return f"{size or 'unsized'} {g:.3f}x over {k} ({runs[0]} and {runs[1]} runs with {size or 'unsized'} legs, under {min_runs} a half: not judged)"
+    return f"{size or 'unsized'} {g:.3f}x over {k} (under {MIN_PAIRED_SHARDS}: not judged)"
+
+
+def runs_short(runs, min_runs):
+    """The sizes of a row that had their shards and too few runs, as a phrase: `10 runs a half with its legs (4cpu: 4 and 4)`."""
+    return f"{min_runs} runs a half with its legs (" + ", ".join(f"{size or 'unsized'}: {a} and {b}" for size, (a, b) in runs.items()) + ")"
+
+
+def size_results(by_size, judged, enough, per, alpha, runs, min_runs):
     """A SizeResult for each size of `by_size`, from the p-values `per` the row computed (size -> (ratio, shards, p or None)); nothing is tested again."""
-    enough = min(ns, nb) >= min_runs
-    return tuple(SizeResult(size, len(ps), size in judged and enough, size in judged and enough and per[size][2] <= alpha,
-                            (ns, nb, min_runs) if size in judged and not enough else None) for size, ps in sorted(by_size.items()))
+    return tuple(SizeResult(size, len(ps), size in judged, size in judged and per[size][2] <= alpha,
+                            (*runs[size], min_runs) if size in enough and size not in judged else None) for size, ps in sorted(by_size.items()))
 
 
 def shard_wall_row(S, B, ceiling, min_runs=MIN_SHARD_RUNS):
     """The split's wall row (SHARD_ROW): the per-shard superci/Blacksmith ratios, judged size by size (4cpu shards apart from 8cpu ones: superci's sizes are
     separate sets, and a faster 8cpu set must not hide a slower 4cpu one). It FAILs when, for any size with MIN_PAIRED_SHARDS shards paired, a one-sided
     run-permutation test (permutation_p) says that size's ratios are above 1 + WALL_MARGIN at FALSE_ROLLBACK_RATE divided by the sizes judged (so the row's
-    false-rollback rate stays at FALSE_ROLLBACK_RATE), and is NOISE until some size has MIN_PAIRED_SHARDS shards paired and each half has min_runs runs. The detail is the worst
+    false-rollback rate stays at FALSE_ROLLBACK_RATE), and is NOISE until some size is judged: has MIN_PAIRED_SHARDS shards paired and, on each half, min_runs runs with a leg of those shards (a size short of the
+    runs is "not judged", and cannot FAIL, whatever the half's other sizes have). The detail is the worst
     MAX_SHARD_LINES shards and how many were paired."""
     pairs, only_s, only_b = paired_shards(S, B, ceiling)
     size_of = {}
@@ -430,19 +467,20 @@ def shard_wall_row(S, B, ceiling, min_runs=MIN_SHARD_RUNS):
     if not n:
         return Row(SHARD_ROW, "0 shards paired", th, NOISE, f"not enough shards paired yet: none of {MIN_PAIRED_SHARDS} (a shard needs legs on both halves)", detail)
     gm = math.exp(sum(math.log(p[1]) for p in pairs) / n)
-    judged = {size: ps for size, ps in sorted(by_size.items()) if len(ps) >= MIN_PAIRED_SHARDS}
+    enough, runs, judged = judged_sizes(S, B, size_of, by_size, min_runs)
     alpha = FALSE_ROLLBACK_RATE / max(1, len(judged))
     per = {}
     for size, ps in sorted(by_size.items()):
         per[size] = (math.exp(sum(math.log(x[1]) for x in ps) / len(ps)), len(ps),
                      size_p(S, B, ceiling, size_of, size, ps, WALL_MARGIN, 50, alpha, SHARD_ROW) if size in judged else None)
-    value = f"geometric mean {gm:.3f}x over {n} shards; " + ", ".join(
-        f"{size or 'unsized'} {g:.3f}x over {k}" + (f" ({p_text(pv, alpha)})" if pv is not None else f" (under {MIN_PAIRED_SHARDS}: not judged)") for size, (g, k, pv) in per.items())
-    sizes = size_results(by_size, judged, per, alpha, ns, nb, min_runs)
-    if not judged:
+    value = f"geometric mean {gm:.3f}x over {n} shards; " + ", ".join(size_note(size, g, k, pv, alpha, runs.get(size), min_runs) for size, (g, k, pv) in per.items())
+    sizes = size_results(by_size, judged, enough, per, alpha, runs, min_runs)
+    if not enough:
         return Row(SHARD_ROW, value, th, NOISE, f"not enough shards paired yet: no size has {MIN_PAIRED_SHARDS} (most: {max(len(ps) for ps in by_size.values())})", detail, sizes)
     if min(ns, nb) < min_runs:
         return Row(SHARD_ROW, value, th, NOISE, f"not enough runs yet: the halves have {ns} superci and {nb} Blacksmith runs, under {min_runs} each", detail, sizes)
+    if not judged:
+        return Row(SHARD_ROW, value, th, NOISE, "not enough runs yet: no size has " + runs_short(runs, min_runs), detail, sizes)
     slow = [size for size in judged if per[size][2] <= alpha]
     if slow:
         return Row(SHARD_ROW, value, th, FAIL, "superci is slower than chance allows on " + ", ".join(f"{size or 'unsized'} ({per[size][0]:.3f}x, p = {per[size][2]:.3g})" for size in slow)
@@ -463,7 +501,7 @@ def tail_pairs(S, B, ceiling, min_legs=MIN_TAIL_LEGS):
 def tail_row(S, B, ceiling, min_runs=MIN_SHARD_RUNS):
     """The split's tail row (TAIL_ROW), judged as shard_wall_row judges the median: per size, over the shards with MIN_TAIL_LEGS legs on both halves, FAIL when a
     run-permutation test says superci's p90 / Blacksmith's p90 ratios are above 1 + TAIL_MARGIN at FALSE_ROLLBACK_RATE divided by the sizes judged; NOISE
-    until some size has MIN_PAIRED_SHARDS such shards and each half has min_runs runs. The detail is the worst MAX_SHARD_LINES shards."""
+    until some size is judged (shard_wall_row's rule: MIN_PAIRED_SHARDS such shards and min_runs runs of them on each half). The detail is the worst MAX_SHARD_LINES shards."""
     pairs, short = tail_pairs(S, B, ceiling)
     size_of = {}
     for o in list(S) + list(B):
@@ -480,19 +518,20 @@ def tail_row(S, B, ceiling, min_runs=MIN_SHARD_RUNS):
               *((f"... and {n - MAX_SHARD_LINES} more",) if n > MAX_SHARD_LINES else ()))
     if not n:
         return Row(TAIL_ROW, "0 shards with enough legs", th, NOISE, f"not enough shards yet: none of {MIN_PAIRED_SHARDS} has {MIN_TAIL_LEGS} legs on both halves", detail)
-    judged = {size: ps for size, ps in sorted(by_size.items()) if len(ps) >= MIN_PAIRED_SHARDS}
+    enough, runs, judged = judged_sizes(S, B, size_of, by_size, min_runs)
     alpha = FALSE_ROLLBACK_RATE / max(1, len(judged))
     per = {}
     for size, ps in sorted(by_size.items()):
         per[size] = (math.exp(sum(math.log(x[1]) for x in ps) / len(ps)), len(ps),
                      size_p(S, B, ceiling, size_of, size, ps, TAIL_MARGIN, 90, alpha, TAIL_ROW) if size in judged else None)
-    value = "p90 ratio " + ", ".join(
-        f"{size or 'unsized'} {g:.3f}x over {k}" + (f" ({p_text(pv, alpha)})" if pv is not None else f" (under {MIN_PAIRED_SHARDS}: not judged)") for size, (g, k, pv) in per.items())
-    sizes = size_results(by_size, judged, per, alpha, ns, nb, min_runs)
-    if not judged:
+    value = "p90 ratio " + ", ".join(size_note(size, g, k, pv, alpha, runs.get(size), min_runs) for size, (g, k, pv) in per.items())
+    sizes = size_results(by_size, judged, enough, per, alpha, runs, min_runs)
+    if not enough:
         return Row(TAIL_ROW, value, th, NOISE, f"not enough shards yet: no size has {MIN_PAIRED_SHARDS} with {MIN_TAIL_LEGS} legs on both halves (most: {max(len(ps) for ps in by_size.values())})", detail, sizes)
     if min(ns, nb) < min_runs:
         return Row(TAIL_ROW, value, th, NOISE, f"not enough runs yet: the halves have {ns} superci and {nb} Blacksmith runs, under {min_runs} each", detail, sizes)
+    if not judged:
+        return Row(TAIL_ROW, value, th, NOISE, "not enough runs yet: no size has " + runs_short(runs, min_runs), detail, sizes)
     slow = [size for size in judged if per[size][2] <= alpha]
     if slow:
         return Row(TAIL_ROW, value, th, FAIL, "superci's tail is slower than chance allows on " + ", ".join(f"{size or 'unsized'} ({per[size][0]:.3f}x, p = {per[size][2]:.3g})" for size in slow)
@@ -520,7 +559,7 @@ def ramp_row(S, rows):
                 mine.append((short, "FAIL" if res.failed else "PASS", f"{short} FAIL" if res.failed else ""))
             elif res and res.short_runs:
                 ns, nb, need = res.short_runs
-                mine.append((short, "not judged", f"{short} not judged (halves have {ns} superci and {nb} Blacksmith runs, under {need})"))
+                mine.append((short, "not judged", f"{short} not judged ({ns} superci and {nb} Blacksmith runs with {size} legs, under {need} a half)"))
             else:
                 mine.append((short, "not judged", f"{short} not judged ({res.shards if res else 0} of {MIN_PAIRED_SHARDS} {shard_label[name]})"))
         states.append(f"{size}: " + ", ".join(f"{short} {state}" for short, state, _ in mine))
