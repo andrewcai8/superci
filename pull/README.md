@@ -1010,9 +1010,11 @@ exactly that id, with no fallback. At start the listener checks each region's pi
 the listener logs `image refused` with why, and publishes `ImageRefused` (regions refused), which pages as
 `superci-pull-image-refused` (`deploy/alarms.sh`). It never boots another build. Fix the pin and release.
 
-The checked-in pin is our copies of `runs-on-v2.2-ubuntu24-full-x64-20261120075252`: `ami-0ec23d36a2f286d1f` in us-east-1
-(from RunsOn's `ami-0e27793ea7687e478`) and `ami-00529e5ed16dccb52` in us-east-2 (from `ami-0b6646f1c9e4d3a18`), each
-tagged `superci-pull-image=runs-on-v2.2-ubuntu24-full-x64-20261120075252` and `purpose=superci-pull`. A placeholder
+The checked-in pin is our hibernation-capable copies of `runs-on-v2.2-ubuntu24-full-x64-20261120075252` (`deploy/image.sh`, below):
+`ami-0728db02a64632720` in us-east-1 and `ami-02529511f07cdc8cb` in us-east-2, each tagged
+`superci-pull-image=runs-on-v2.2-ubuntu24-full-x64-20261120075252-hib-9e7cfe5c` and `purpose=superci-pull`. The plain copies they
+replace (`ami-0ec23d36a2f286d1f` in us-east-1, from RunsOn's `ami-0e27793ea7687e478`, and `ami-00529e5ed16dccb52` in us-east-2, from
+`ami-0b6646f1c9e4d3a18`, tagged with the bare build) stay: a rollback to a commit that pins them needs them. A placeholder
 (`ami-REPLACE-<region>`) ships nowhere: `TestNoImagePlaceholderShips` fails `build.sh`'s `go test`, and
 `deploy/parity.sh` refuses the release, while one is there.
 
@@ -1043,6 +1045,31 @@ every machine boots from the listener's restart on. (If the source snapshot is e
 needs `--encrypted --kms-key-id <our key>`; its error says so.) 4. Never deregister a pinned copy, or delete its snapshot,
 while a release references it: a roll back is a release of an older commit, whose pin is the older copy, so keep a copy until
 no commit you may roll back to pins it (`git log -S<ami id> -- pull/config.json` lists them).
+
+**The hibernation-capable image.** The RunsOn build cannot hibernate as shipped (`ec2-hibinit-agent` is installed but disabled, and
+logind answers the sleep key with a suspend an EC2 machine cannot do: the machine sat in `stopping` over 3 minutes). `deploy/image.sh`
+builds the image that can, from the pin in `config.json`, and prints the two ids to pin; `deploy/image-setup.sh` is the whole change:
+`systemctl enable hibinit-agent` and logind's `HandleSuspendKey=hibernate`. The agent asks the metadata service at each boot whether the
+instance was launched with `HibernationOptions.Configured` and exits at once when it was not, so a machine launched as the fleet's are
+makes no swap file, takes no disk and adds only that call (about 70 ms of CPU, off the boot's critical chain). Launched with it, the agent
+makes `/swap-hibinit` (the size of RAM) and writes `resume=` into GRUB within seconds of boot; no reboot and no fstab line is needed, and
+EC2 accepts the hibernate once the instance has run about two minutes (before that it answers `UnsupportedOperation ... not ready to
+hibernate yet`: retry). Hibernation also needs an **encrypted** root of at least RAM plus the set's `disk_gb` (superci-8cpu on
+`m8azn.3xlarge`: 48 GiB + 80 GB = 128 GB; superci-4cpu's largest type, `r8a.xlarge`, needs 32 + 60 = 92 GB) and a launch with
+`HibernationOptions.Configured=true`; the image carries neither, so a machine of the fleet's launch template is not affected.
+
+The build id is the pin's RunsOn build plus the first 8 hex of the setup's sha256 (`<build>-hib-<8 hex>`), so one pin and one setup are
+one build: a second run finds the images by their `superci-pull-image` tag in each region and builds nothing, and an edit to the setup is a
+new build beside the old. `image.sh` never deregisters, deletes or changes an image that exists and never writes `config.json`. It makes a
+builder of the pin, applies the setup, seals it (user, key and cloud-init's record of the boot removed) and makes the candidate, tagged only
+`superci-pull-image-candidate`; then it launches three machines of the largest hibernating type of superci-4cpu and superci-8cpu: one with
+hibernation (hibernated and resumed: the same boot id and the memory it held), one launched as the fleet's are, and one of the pin, and the
+normal machine must have no swap, no swap file, no `resume=`, no failed unit, the pin's disk use, exactly `hibinit-agent` more enabled and a
+boot no slower than the pin's (both measured on a second boot: a snapshot's first boots are cold, a fresh image's took about 2.5 s longer
+whatever it held). Only then is the candidate tagged `superci-pull-image` and `purpose=superci-pull`, as the pin's copies are, and copied
+to the other region. A failed proof leaves the candidate untagged (its delete line is printed, never run), copies nothing and exits 1;
+every instance it made is terminated and confirmed. Put the ids it prints in `config.json`'s `image`, commit, and release: the release's
+parity check boots the new pin, and the old copies stay for any rollback to a commit that pins them.
 
 **Recycle.** A release that changes what a machine runs at boot (boot.sh, the image, the disk) makes a new launch
 template version. Each reconcile pass the listener replaces up to 5 idle machines per set that booted from an older

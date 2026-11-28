@@ -1,0 +1,175 @@
+#!/usr/bin/env -S python3 -I
+"""EC2 as image_test.sh needs it: images, instances and tags kept in $FAKE_AWS/state.json, every call logged to
+$FAKE_AWS/calls.log. `aws __seed__ <build> <east-1 pin> <east-2 pin>` makes the world: the pin's two copies of <build>, ours and
+available. Faults are files in $FAKE_AWS: hib-notready (N: the first N hibernating stops are refused as not ready), hib-refuse
+(always refused), stop-not-hibernate (a hibernate that stops with another reason), stuck-stopping, resume-reboots,
+memory-lost, normal-swap, normal-slow, run-fails."""
+import json, os, re, sys
+
+root = os.environ["FAKE_AWS"]
+import fcntl
+LOCK = open(os.path.join(root, "lock"), "w")  # two machines act at once: one call at a time reads and writes the state
+fcntl.flock(LOCK, fcntl.LOCK_EX)
+args = sys.argv[1:]
+STATE = os.path.join(root, "state.json")
+TYPES = {"m8azn.xlarge": 16384, "m8a.xlarge": 16384, "r8a.xlarge": 32768, "m8azn.3xlarge": 49152, "m8a.2xlarge": 32768, "m8a.large": 8192}
+
+
+def load():
+    return json.load(open(STATE)) if os.path.isfile(STATE) else {"images": {}, "instances": {}, "n": 0}
+
+
+def save(s):
+    json.dump(s, open(STATE, "w"))
+
+
+def knob(name):
+    f = os.path.join(root, name)
+    return open(f).read().strip() if os.path.isfile(f) else None
+
+
+def err(code, msg, rc=254):
+    sys.stderr.write("An error occurred (%s) when calling the operation: %s\n" % (code, msg))
+    sys.exit(rc)
+
+
+if args and args[0] == "__seed__":
+    build, p1, p2 = args[1:4]
+    s = load()
+    for r, ami in (("us-east-1", p1), ("us-east-2", p2)):
+        s["images"].setdefault(r, {})[ami] = {"state": "available", "owner": "243891825325", "name": "superci-pull-" + build, "size": 30,
+                                              "snap": "snap-pin" + r[-1], "tags": {"superci-pull-image": build, "purpose": "superci-pull"}}
+    s["pin"] = p1
+    save(s)
+    sys.exit(0)
+
+with open(os.path.join(root, "calls.log"), "a") as log:
+    log.write(" ".join(args) + "\n")
+if args[:2] == ["--profile", "ci-runners"]:
+    args = args[2:]
+svc, cmd = args[0], args[1]
+opts, name = {}, None
+for a in args[2:]:
+    if a.startswith("--"):
+        name = a[2:]
+        opts[name] = []
+    elif name:
+        opts[name].append(a)
+region = (opts.get("region") or ["us-east-1"])[0]
+query = (opts.get("query") or [""])[0]
+s = load()
+imgs = s["images"].setdefault(region, {})
+
+
+def parse_tags(tokens):
+    out = {}
+    for t in tokens:
+        kv = dict(p.split("=", 1) for p in t.strip("{}").split(",") if "=" in p)
+        if "Key" in kv:
+            out[kv["Key"]] = kv.get("Value")
+    return out
+
+
+def new_id(prefix):
+    s["n"] += 1
+    return "%s%017x" % (prefix, s["n"])
+
+
+if svc == "sts":
+    print(knob("account") or "243891825325")
+elif svc == "ec2" and cmd == "describe-security-groups":
+    print("sg-0listener")
+elif svc == "ec2" and cmd == "describe-instance-types":
+    ts = opts["instance-types"]
+    print(json.dumps({"InstanceTypes": [{"InstanceType": t, "MemoryInfo": {"SizeInMiB": TYPES[t]}, "HibernationSupported": True} for t in ts]}))
+elif svc == "ec2" and cmd == "describe-images":
+    if "image-ids" in opts:
+        ami = opts["image-ids"][0]
+        i = imgs.get(ami)
+        if i is None:
+            err("InvalidAMIID.NotFound", "The image id '[%s]' does not exist" % ami)
+        if "SnapshotId" in query:
+            print(i["snap"])
+        else:
+            print("\t".join([i["owner"], i["state"], ami, i["tags"].get("superci-pull-image", "None"), str(i["size"])]))
+    else:
+        k, v = re.match(r"Name=tag:(.*),Values=(.*)", opts["filters"][0]).groups()
+        hit = [(a, i) for a, i in sorted(imgs.items()) if i["tags"].get(k) == v and i["owner"] == "243891825325"]
+        print("%s\t%s" % (hit[0][0], hit[0][1]["state"]) if hit else "None")
+elif svc == "ec2" and cmd == "wait":
+    sys.exit(0)
+elif svc == "ec2" and cmd == "run-instances":
+    if knob("run-fails"):
+        err("InsufficientInstanceCapacity", "no capacity")
+    ud = opts["user-data"][0]
+    iid = new_id("i-0")
+    open(os.path.join(root, "ud-" + iid), "wb").write(open(ud.partition("://")[2], "rb").read())
+    bdm = opts["block-device-mappings"][0]
+    s["instances"][iid] = {"region": region, "type": opts["instance-type"][0], "ami": opts["image-id"][0], "state": "running", "gb": int(re.search(r"VolumeSize=(\d+)", bdm).group(1)),
+                           "enc": "Encrypted=true" in bdm, "hib": "hibernation-options" in opts, "ip": "10.0.%d.1" % s["n"], "ver": 1, "reason": "", "mark": "",
+                           "booted": "boot-%s-1" % iid}
+    save(s)
+    print(iid)
+elif svc == "ec2" and cmd == "describe-instances":
+    i = s["instances"][opts["instance-ids"][0]]
+    print({"State.Name": i["state"], "PublicIpAddress": i["ip"], "StateReason.Code": i["reason"] or "None"}[next(k for k in ("State.Name", "PublicIpAddress", "StateReason.Code") if k in query)])
+elif svc == "ec2" and cmd == "stop-instances":
+    i = s["instances"][opts["instance-ids"][0]]
+    if "hibernate" in opts:
+        n = int(knob("hib-notready") or 0)
+        if knob("hib-refuse") or n > 0:
+            if n > 0:
+                open(os.path.join(root, "hib-notready"), "w").write(str(n - 1))
+            err("UnsupportedOperation", "Instance %s is not ready to hibernate yet, retry in a few minutes" % opts["instance-ids"][0])
+        i["reason"] = "Client.UserInitiatedShutdown" if knob("stop-not-hibernate") else "Client.UserInitiatedHibernate"
+        i["state"] = "stopping" if knob("stuck-stopping") else "stopped"
+    else:
+        i["reason"] = "Client.UserInitiatedShutdown"
+        i["state"] = "stopped"
+    save(s)
+    print("stopping")
+elif svc == "ec2" and cmd == "start-instances":
+    i = s["instances"][opts["instance-ids"][0]]
+    i["state"], i["ver"] = "running", i["ver"] + 1
+    i["ip"] = "10.0.%d.%d" % (s["n"], i["ver"])
+    if knob("resume-reboots"):
+        i["booted"] = "boot-%s-%d" % (opts["instance-ids"][0], i["ver"])
+    if knob("memory-lost"):
+        i["mark"] = ""
+    save(s)
+    print("pending")
+elif svc == "ec2" and cmd == "terminate-instances":
+    for iid in opts["instance-ids"]:
+        s["instances"][iid]["state"] = "terminated"
+    save(s)
+elif svc == "ec2" and cmd == "create-image":
+    iid = opts["instance-id"][0]
+    ami = new_id("ami-0")
+    tags = {}
+    for t in opts.get("tag-specifications", []):
+        if t.startswith("ResourceType=image"):
+            tags = parse_tags(re.findall(r"\{[^}]*\}", t))
+    imgs[ami] = {"state": "available", "owner": "243891825325", "name": opts["name"][0], "size": 30, "snap": new_id("snap-0"), "tags": tags, "from": iid}
+    save(s)
+    print(ami)
+elif svc == "ec2" and cmd == "modify-image-attribute":
+    pass
+elif svc == "ec2" and cmd == "copy-image":
+    ami = new_id("ami-0")
+    src = s["images"][opts["source-region"][0]][opts["source-image-id"][0]]
+    imgs[ami] = {"state": "available", "owner": "243891825325", "name": opts["name"][0], "size": 30, "snap": new_id("snap-0"), "tags": {}, "copy-of": opts["source-image-id"][0]}
+    save(s)
+    print(ami)
+elif svc == "ec2" and cmd in ("create-tags", "delete-tags"):
+    for ami in opts["resources"]:
+        for t in opts["tags"]:
+            kv = dict(p.split("=", 1) for p in t.split(","))
+            if cmd == "create-tags":
+                imgs[ami]["tags"][kv["Key"]] = kv["Value"]
+            else:
+                imgs[ami]["tags"].pop(kv["Key"], None)
+    save(s)
+elif svc == "ec2" and cmd in ("deregister-image", "delete-snapshot"):
+    pass
+else:
+    err("UnknownFake", " ".join(args))
