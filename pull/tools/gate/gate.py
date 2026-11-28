@@ -60,7 +60,7 @@ SIZES = (2, 4, 8, 16, 32)
 # A canary rolls back on harm to superci's own jobs, judged against Blacksmith over the same window, never on a cause every
 # runner of the organization shares. GitHub's registration cap is the organization's: a job moved from Blacksmith takes one
 # registration on either fleet, so a refusal (superci-pull-registration-refusals) pages and is counted, and moves nothing.
-ROLLBACK_ROWS = ("wall p50", "wall p90", "queue wait p50", "queue wait p90", "failures (superci)")
+ROLLBACK_ROWS = ("wall p50", "wall p90", "wall (per shard)", "wall p90 (ceiling)", "queue wait p50", "queue wait p90", "failures (superci)")
 # listener-down and spend-capped stop every set, so they send back every job listed. A wait or a stall is one set's: a canary
 # reads the alarms of the sets its job ran on (SET_ROLLBACK_ALARMS, one `superci-pull-<alarm>-<size>` each) and no other set's, so a
 # size with a cold machine, or one that is new, cannot send back a job that ran elsewhere. The listener-wide oldest-job-wait and
@@ -77,6 +77,23 @@ ROLLBACK, KEEP = 3, 0
 SPLIT_PERCENTS = (10, 50, 90)
 ROUTING_ROW, RATIO_ROW = "routing faults (runs on both fleets)", "split ratio (superci share of runs)"
 SPLIT_ROWS = (ROUTING_ROW, RATIO_ROW)
+# A split's wall is judged per shard, not pooled. Pooled percentiles of two halves move with each half's mix of legs (a 4cpu leg takes about 100 s, an 8cpu
+# leg about 55 s, and two halves finish different shares of each), so equal fleets read as unequal (Nov 28 09:24Z: unit-tests@50 rolled back on a pooled p50
+# 0.4 s over, while per shard superci was at 1.000x on 4cpu and 0.905x on 8cpu). A shard is one leg name with its fleet label left out; for each shard on
+# both halves the ratio is superci's median wall over Blacksmith's, and the row FAILs when those ratios are beyond chance above 1 + WALL_MARGIN: a one-sided
+# Wilcoxon signed-rank test of their logs against log(1 + WALL_MARGIN) at FALSE_ROLLBACK_RATE. WALL_MARGIN is the slowdown that is not worth a rollback.
+# A one-sided exact signed-rank test can only reach p <= 0.01 from 7 pairs (2^-7 = 0.0078; 6 give 0.0156), so MIN_PAIRED_SHARDS is 8: the first count at which a
+# test can still fail with one pair (the one nearest 1 + WALL_MARGIN) reversed. Fewer shards paired is NOISE ("not enough shards paired yet"), never a verdict.
+WALL_MARGIN = 0.05
+MIN_PAIRED_SHARDS = 8
+SHARD_ROW, CEILING_ROW = "wall (per shard)", "wall p90 (ceiling)"
+# Every shard's median is over the legs of the runs of its half, and the legs of one run share the run's weight (a big PR is slow in every shard), so the shard
+# ratios are not independent samples: the fewer runs a half has, the more of them move together, and the test's false-rollback rate drifts above
+# FALSE_ROLLBACK_RATE. The Nov 28 09:24Z window measured a run-to-run spread of 2% (Blacksmith) to 6% (superci) and a leg-to-leg spread of 7% to 11%; at
+# those, 10 runs a half keeps the rate under 2%, and a real +20% is caught by then. Each half has MIN_SHARD_RUNS runs before the row can FAIL.
+MIN_SHARD_RUNS = 10
+MAX_SHARD_LINES = 10
+EXACT_RANK_TEST_MAX_N = 150  # above this many pairs the signed-rank test is the normal approximation; the exact sum is n x n(n+1)/2 big-int steps
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -98,6 +115,7 @@ class Obs:
     timed_out: bool = False
     attempt: int = 1
     cancelled: bool = False
+    name: str = ""  # the job's name, with its matrix leg: what a split pairs a superci leg with a Blacksmith leg by (shard_key)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -148,7 +166,7 @@ def at_most(name, value, bound, threshold, spread_s=0.0, unit=fmt_s):
 OUTCOMES = ("success", "failure", "timed_out")
 
 
-def is_obs(job, run):
+def is_obs(job, run, record_wall=False):
     """An Obs from a REST job and its run, or None when the job has nothing to count: it never finished, or GitHub skipped it.
     Every attempt of a run is an observation, so a failure a rerun then passed still counts. A rerun attempt keeps its first
     attempt's created_at, so its queue wait is not real and is None; its failure and its wall time (started_at to completed_at)
@@ -172,8 +190,10 @@ def is_obs(job, run):
         queue, wall = (max(0.0, completed - created) if attempt == 1 else None), None  # GitHub's second-granular stamps can put completed_at a second early
     else:
         queue, wall = (started - created if attempt == 1 else None), completed - started
+        if record_wall and job.get("wall_ms"):
+            wall = job["wall_ms"] / 1000
     return Obs(job["id"], job["run_id"], job.get("head_sha") or run.get("head_sha") or "", job.get("head_branch") or run.get("head_branch") or "",
-               fleet_or_label(job), job["conclusion"] == "success", queue, wall, job["conclusion"] == "timed_out", attempt, cancelled)
+               fleet_or_label(job), job["conclusion"] == "success", queue, wall, job["conclusion"] == "timed_out", attempt, cancelled, job.get("name") or "")
 
 
 def fleet_or_label(job):
@@ -212,6 +232,93 @@ def wall_sample(obs, ceiling):
 
 def queue_sample(obs):
     return [o.queue for o in obs if o.queue is not None]
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# A split's wall, shard by shard.
+# ---------------------------------------------------------------------------------------------------------------------
+
+_LEADING_LABEL = re.compile(r"\(\s*(?:superci-[\w-]+|blacksmith-[\w-]+)\s*,\s*")
+_LABEL = re.compile(r"\s*,\s*(?:superci-[\w-]+|blacksmith-[\w-]+)(?=\s*[,)])")
+
+
+def shard_key(name):
+    """A leg's name without its fleet's label, so a superci leg and a Blacksmith leg of one shard have one key: `unit-tests (11, superci-8cpu, 8)` and
+    `unit-tests (11, blacksmith-8vcpu-ubuntu-2404, 8)` are `unit-tests (11, 8)`. A name with no label is its own key."""
+    return _LABEL.sub("", _LEADING_LABEL.sub("(", name or ""))
+
+
+def signed_rank_p(diffs):
+    """The one-sided p-value that the median of `diffs` is above 0: P(W+ >= observed W+) of the Wilcoxon signed-rank statistic when each difference is as
+    likely positive as negative. Zeros are dropped, equal magnitudes take their average rank, and the distribution is the exact one given those ranks:
+    every sign pattern's rank sum counted with a subset-sum table over the ranks doubled to integers (n x n(n+1) big-int steps, a few ms for the 50 shards
+    of unit-tests). Above EXACT_RANK_TEST_MAX_N pairs it is the normal approximation with the tie correction. 1.0 when nothing is left to rank."""
+    d = [x for x in diffs if abs(x) > 1e-12]
+    n = len(d)
+    if n == 0:
+        return 1.0
+    mags = sorted(round(abs(x), 10) for x in d)
+    doubled, i = {}, 0  # magnitude -> its average rank, doubled
+    while i < n:
+        j = i
+        while j < n and mags[j] == mags[i]:
+            j += 1
+        doubled[mags[i]] = i + 1 + j
+        i = j
+    ranks = [doubled[round(abs(x), 10)] for x in d]
+    w = sum(r for r, x in zip(ranks, d) if x > 0)
+    if n > EXACT_RANK_TEST_MAX_N:
+        real = [r / 2 for r in ranks]
+        var = sum(x * x for x in real) / 4  # Var(W+) given the ranks: each rank is in the sum with probability 1/2
+        return 0.5 * math.erfc((w / 2 - sum(real) / 2) / math.sqrt(2 * var))
+    total = sum(ranks)
+    ways = [0] * (total + 1)
+    ways[0] = 1
+    for r in ranks:
+        for k in range(total, r - 1, -1):
+            ways[k] += ways[k - r]
+    return sum(ways[w:]) / 2 ** n
+
+
+def paired_shards(S, B, ceiling):
+    """[(key, ratio, superci median wall, its legs, Blacksmith median wall, its legs)] worst ratio first, for each shard with a wall sample on both
+    halves (wall_sample's rule on each half's legs of the shard: successes, timed-out at the ceiling, cancelled-after-start lower bounds), and the
+    keys seen on one half only: (superci only, Blacksmith only). A median that is 0 pairs nothing."""
+    def walls(obs):
+        by = collections.defaultdict(list)
+        for o in obs:
+            if o.name:
+                by[shard_key(o.name)].append(o)
+        return {k: wall_sample(v, ceiling) for k, v in by.items()}
+    sw, bw = walls(S), walls(B)
+    both = [k for k in sw if k in bw and sw[k] and bw[k] and T.q(sw[k], 50) > 0 and T.q(bw[k], 50) > 0]
+    pairs = sorted(((k, T.q(sw[k], 50) / T.q(bw[k], 50), T.q(sw[k], 50), len(sw[k]), T.q(bw[k], 50), len(bw[k])) for k in both), key=lambda p: (-p[1], p[0]))
+    return pairs, sorted(k for k in sw if sw[k] and k not in set(both)), sorted(k for k in bw if bw[k] and k not in set(both))
+
+
+def shard_wall_row(S, B, ceiling, min_runs=MIN_SHARD_RUNS):
+    """The split's wall row (SHARD_ROW): the geometric mean of the per-shard superci/Blacksmith ratios, FAIL when a one-sided signed-rank test says they
+    are above 1 + WALL_MARGIN at FALSE_ROLLBACK_RATE, NOISE until MIN_PAIRED_SHARDS shards are paired and each half has min_runs runs. The detail is the
+    worst MAX_SHARD_LINES shards and how many were paired."""
+    pairs, only_s, only_b = paired_shards(S, B, ceiling)
+    n = len(pairs)
+    th = f"one-sided Wilcoxon signed-rank p > {FALSE_ROLLBACK_RATE:g} that per-shard median wall ratio (superci / Blacksmith) is over {1 + WALL_MARGIN:g}"
+    ns, nb = (len({o.run_id for o in h if not o.cancelled}) for h in (S, B))
+    detail = (f"{n} shards paired of {n + len(only_s) + len(only_b)} seen ({len(only_s)} on superci only, {len(only_b)} on Blacksmith only); worst ratios first:",
+              *(f"{k}: superci {ms:.1f} s ({cs} legs) / Blacksmith {mb:.1f} s ({cb} legs) = {r:.3f}x" for k, r, ms, cs, mb, cb in pairs[:MAX_SHARD_LINES]),
+              *((f"... and {n - MAX_SHARD_LINES} more",) if n > MAX_SHARD_LINES else ()))
+    if not n:
+        return Row(SHARD_ROW, "0 shards paired", th, NOISE, f"not enough shards paired yet: none of {MIN_PAIRED_SHARDS} (a shard needs legs on both halves)", detail)
+    gm = math.exp(sum(math.log(p[1]) for p in pairs) / n)
+    p = signed_rank_p([math.log(r) - math.log1p(WALL_MARGIN) for _, r, *_ in pairs])
+    value = f"geometric mean {gm:.3f}x over {n} shards (p = {p:.3g})"
+    if n < MIN_PAIRED_SHARDS:
+        return Row(SHARD_ROW, value, th, NOISE, f"not enough shards paired yet: {n} of {MIN_PAIRED_SHARDS}", detail)
+    if min(ns, nb) < min_runs:
+        return Row(SHARD_ROW, value, th, NOISE, f"not enough runs yet: the halves have {ns} superci and {nb} Blacksmith runs, under {min_runs} each", detail)
+    if p <= FALSE_ROLLBACK_RATE:
+        return Row(SHARD_ROW, value, th, FAIL, f"superci is slower than chance allows: its shards are {gm:.3f}x Blacksmith's, over {1 + WALL_MARGIN:g}", detail)
+    return Row(SHARD_ROW, value, th, PASS, "", detail)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -317,8 +424,8 @@ def evaluate_job(S, B, ceiling, unexplained, min_runs=MIN_RUNS, tests=None, spli
     sq, bq = queue_sample(S), queue_sample(B)
     if not sw or not bw:
         why = "no successful, timed-out or cancelled-after-start superci jobs" if not sw else "no Blacksmith runs in the baseline window"
-        for name, th in (("wall p50", "<= Blacksmith p50"), ("wall p90", f"<= min(Blacksmith p90 x {P90_FACTOR}, ceiling)"),
-                         ("queue wait p50", "<= Blacksmith p50"), ("queue wait p90", f"<= Blacksmith p90 + {QUEUE_P90_SLACK_S:g} s")):
+        walls = ((SHARD_ROW, "per-shard superci / Blacksmith median wall"),) if split else (("wall p50", "<= Blacksmith p50"), ("wall p90", f"<= min(Blacksmith p90 x {P90_FACTOR}, ceiling)"))
+        for name, th in walls + (("queue wait p50", "<= Blacksmith p50"), ("queue wait p90", f"<= Blacksmith p90 + {QUEUE_P90_SLACK_S:g} s")):
             rows.append(Row(name, "-", th, FAIL, why))
     else:
         p90_cap = P90_FACTOR * T.q(bw, 90)
@@ -326,8 +433,14 @@ def evaluate_job(S, B, ceiling, unexplained, min_runs=MIN_RUNS, tests=None, spli
         bound90 = p90_cap if ceiling is None else min(p90_cap, ceiling)
         wall_noise = run_spread([o for o in S if o.ok], lambda o: o.wall)
         queue_noise = run_spread([o for o in S if o.queue is not None and not o.cancelled], lambda o: o.queue)
-        rows.append(at_most("wall p50", T.q(sw, 50), T.q(bw, 50), f"<= B p50 {T.q(bw, 50):.1f} s", wall_noise))
-        rows.append(at_most("wall p90", T.q(sw, 90), bound90, f"<= {th90}", wall_noise))
+        if split:
+            # Compared per shard, never pooled (SHARD_ROW). The ceiling is still the job's own: superci's p90 within it, whatever Blacksmith's was.
+            rows.append(shard_wall_row(S, B, ceiling))
+            if ceiling is not None:
+                rows.append(at_most(CEILING_ROW, T.q(sw, 90), ceiling, f"<= ceiling {ceiling:g} s", wall_noise))
+        else:
+            rows.append(at_most("wall p50", T.q(sw, 50), T.q(bw, 50), f"<= B p50 {T.q(bw, 50):.1f} s", wall_noise))
+            rows.append(at_most("wall p90", T.q(sw, 90), bound90, f"<= {th90}", wall_noise))
         rows.append(at_most("queue wait p50", T.q(sq, 50), T.q(bq, 50), f"<= B p50 {T.q(bq, 50):.1f} s", queue_noise))
         rows.append(at_most("queue wait p90", T.q(sq, 90), T.q(bq, 90) + QUEUE_P90_SLACK_S, f"<= B p90 {T.q(bq, 90):.1f} + {QUEUE_P90_SLACK_S:g} s", queue_noise))
         if split:
@@ -422,7 +535,8 @@ def canary_verdict(rows, alarms, sets=()):
     by = {r.name: r for r in rows}
     n = by.get("n (superci runs)")
     runs = int(n.value) if n and n.value.isdigit() else 0
-    need = {"wall p50": MIN_RUNS, "queue wait p50": MIN_RUNS, "wall p90": CANARY_P90_RUNS, "queue wait p90": CANARY_P90_RUNS, "failures (superci)": 0}
+    need = {"wall p50": MIN_RUNS, "queue wait p50": MIN_RUNS, SHARD_ROW: MIN_SHARD_RUNS, "wall p90": CANARY_P90_RUNS, CEILING_ROW: CANARY_P90_RUNS, "queue wait p90": CANARY_P90_RUNS,
+            "failures (superci)": 0}
     harmed = [r for r in (by.get(k) for k in ROLLBACK_ROWS) if r and r.status == FAIL and runs >= need[r.name] and not r.note.startswith("no Blacksmith runs")]
     return ([f"{r.name}: {r.value} vs {r.threshold}" for r in harmed]
             + [f"{a} in ALARM" for a in rollback_alarms(alarms, sets) if alarms.get(a) == "ALARM"])
@@ -939,7 +1053,8 @@ def synth_job(e, group=T.SUPERCI_RUNNER_GROUP):
             "head_branch": record_branch(e), "created_at": e.get("queue_time") or e.get("start_time") or e.get("finish_time"),
             "started_at": e["start_time"] if started else None, "completed_at": e.get("finish_time"), "conclusion": e.get("conclusion"),
             "run_attempt": 1, "runner_name": e.get("runner") if started else None,
-            "runner_group_name": group if started else None, "labels": list(e.get("labels") or []) or [e.get("set") or ""], "set": e.get("set"), "steps": []}
+            "runner_group_name": group if started else None, "labels": list(e.get("labels") or []) or [e.get("set") or ""], "set": e.get("set"), "steps": [],
+            "wall_ms": e.get("wall_ms")}
 
 
 def timeline_job(j):
@@ -993,6 +1108,21 @@ def with_github_created(gh, recs, group=T.SUPERCI_RUNNER_GROUP):
                 j = dict(j, created_at=g["created_at"], arrived_at=j["created_at"], run_attempt=g.get("run_attempt") or 1)
         jobs.append(j)
     return jobs, dispatched, unmatched
+
+
+def with_record_walls(jobs, recs):
+    """`jobs` (REST jobs of superci's runner group) with the listener's `wall_ms` set on each one a record is of: the record of the same run, name and
+    runner that finished nearest the job's completed_at, within MATCH_S. A jobs listing reads a dispatched job as started when its identity accepted it,
+    so its started to completed holds the wait for a machine, which the record's wall does not. A job no record matches keeps GitHub's wall."""
+    by = collections.defaultdict(list)
+    for e in recs:
+        if e.get("wall_ms") and e.get("finish_time"):
+            by[(e.get("run"), e.get("name") or "", e.get("runner") or "")].append(e)
+    out = []
+    for j in jobs:
+        near = [e for e in by.get((j.get("run_id"), j.get("name") or "", j.get("runner_name") or ""), []) if j.get("completed_at") and abs(T.ts(e["finish_time"]) - T.ts(j["completed_at"])) <= MATCH_S]
+        out.append(dict(j, wall_ms=min(near, key=lambda e: abs(T.ts(e["finish_time"]) - T.ts(j["completed_at"])))["wall_ms"]) if near else j)
+    return out
 
 
 def dispatched_row(dispatched, unmatched):
@@ -1416,7 +1546,21 @@ def cmd_job(a):
         S_jobs = [j for j, r in jobs if is_superci(j, a.superci_group) and T.ts(j["created_at"]) >= since]
         B_jobs = [j for j, r in jobs if fleet_or_label(j) == "blacksmith" and b_lo <= T.ts(j["created_at"]) <= b_hi]
     runs_by_job = {j["id"]: r for j, r in jobs}
-    S = [o for o in (is_obs(j, runs_by_job[j["id"]]) for j in S_jobs) if o]
+    wall_from = ""
+    if split is not None:
+        # A split's superci wall is the listener's record, never GitHub's started to completed (which includes a dispatched job's wait for a machine). From the
+        # records (--superci-source events) the jobs already are the records; from GitHub they are matched to the window's records, where there are any.
+        wall_from = "the listener's job.record wall_ms"
+        if not events:
+            try:
+                window_recs = [e for e in job_records(a.profile, since, now + 600) if record_workflow(e) == a.workflow and fnmatch.fnmatch(record_branch(e), a.branch_glob)
+                               and matches(e.get("name") or "", a.job) and e.get("run") in window_ids]
+            except Exception as e:  # a read of the records that fails leaves GitHub's wall, said aloud: the check still runs
+                window_recs, wall_from = [], f"GitHub's started to completed (the listener's records were not read: {type(e).__name__}), which includes a dispatched job's wait for a machine"
+            else:
+                wall_from = (wall_from + ", matched to GitHub's jobs") if window_recs else "GitHub's started to completed (no job.record in the window), which includes a dispatched job's wait for a machine"
+            S_jobs = with_record_walls(S_jobs, window_recs)
+    S = [o for o in (is_obs(j, runs_by_job[j["id"]], record_wall=split is not None) for j in S_jobs) if o]
     B = [o for o in (is_obs(j, runs_by_job[j["id"]]) for j in B_jobs) if o]
     if events and any(not o.ok and not o.cancelled for o in B):
         # A superci failure is excused when Blacksmith failed the same commit; a record has no commit, so its run's head is read, for the failures alone.
@@ -1441,6 +1585,7 @@ def cmd_job(a):
     print(f"gate job {a.job}  workflow {a.workflow}  ({len(listed)} runs listed, {read_from}, {gh.calls} GitHub calls)")
     if split is not None:
         print(f"  split @{split}: one window of runs, each in the half of the fleet its legs ran on, a run on both set aside; no earlier baseline (--baseline-hours is unused)")
+        print(f"  split @{split}: wall is compared per shard (a leg's name without its fleet label), superci's from {wall_from}; queue wait stays pooled")
     reads = (f"GitHub read for every run of the window, to place its legs" if split is not None else "no GitHub call") if not dispatched else f"GitHub read for the created_at of {dispatched} dispatched jobs"
     print(f"  superci: " + (f"{len(S_jobs)} jobs from the listener's job records ({reads}), on branches {a.branch_glob}" if events
                             else f"runner group {a.superci_group}, runs read whole from branches {a.branch_glob}") + f", created {T.iso(since)} to {T.iso(now)}")

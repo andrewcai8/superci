@@ -5,6 +5,7 @@ import io
 import json
 import math
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -3365,10 +3366,11 @@ class SplitWindow(unittest.TestCase):
     def test_a_p90_against_a_blacksmith_half_of_three_runs_is_noise_and_sends_nothing_back(self):
         rows = {r.name: r for r in G.evaluate_job([obs(300.0 if i < 5 else 80.0, 2.0, fleet="superci", run=100 + i) for i in range(25)],
                                                     [obs(80.0, 2.0, fleet="blacksmith", run=900 + i) for i in range(3)], 400.0, [0.5] * 10, split=True)}
-        for name in ("wall p50", "wall p90", "queue wait p50", "queue wait p90"):
+        self.assertEqual(rows[G.SHARD_ROW].status, G.NOISE, "these legs are named for no shard, so none is paired")
+        for name in ("queue wait p50", "queue wait p90"):
             self.assertEqual(rows[name].status, G.NOISE, name)
             self.assertTrue(rows[name].note.startswith("no Blacksmith runs"), rows[name].note)
-        self.assertNotIn("wall p90", " ".join(G.canary_verdict(list(rows.values()), {n: "OK" for n in G.ROLLBACK_ALARMS})))
+        self.assertNotIn("wall", " ".join(G.canary_verdict(list(rows.values()), {n: "OK" for n in G.ROLLBACK_ALARMS})))
 
     # The failures row excuses a superci failure on a test red on Blacksmith's main. In a split the red set is read from the same window's
     # Blacksmith half: the main runs of the window that ran on Blacksmith, not a routing fault's Blacksmith leg and not a run before --since.
@@ -3561,6 +3563,354 @@ class SplitCanary(CanaryTree):
         p = subprocess.run(["bash", os.path.join(HERE, "canary.sh"), "unset"], env=dict(self.env, SUPERCI_APP_TOKEN_CMD=TOKEN_SCOPED), capture_output=True, text=True, timeout=60)
         self.assertEqual(p.returncode, 0, (p.stdout, p.stderr))
         self.assertFalse(os.path.exists(self.env["JOBS_FILE"]))
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# A split's wall row is judged per shard: each shard's superci median against its Blacksmith median, a signed-rank test of the log ratios.
+# ---------------------------------------------------------------------------------------------------------------------
+
+# What the gate names, read with a fallback so that the tests fail at an assertion, not at an AttributeError, against a gate that has no such constant.
+MIN_SHARDS, SHARD_RUNS = getattr(G, "MIN_PAIRED_SHARDS", 8), getattr(G, "MIN_SHARD_RUNS", 10)
+_jids = iter(range(10 ** 7, 10 ** 8))
+
+
+def shard_job(run, shard, cpus, fleet_name, wall, queue=1.0, ok=True, base=1_000_000.0):
+    """A REST job of one shard of a matrix run, named as megpt-mono's unit-tests legs are: `unit-tests (<shard>, <fleet's label>, <cpus>)`."""
+    label = f"superci-{cpus}cpu" if fleet_name == "superci" else f"blacksmith-{cpus}vcpu-ubuntu-2404"
+    at = base + run
+    return gh_job(next(_jids), run, 1, "success" if ok else "failure", at, at + queue, at + queue + wall, fleet=fleet_name, name=f"unit-tests ({shard}, {label}, {cpus})")
+
+
+def split_obs(jobs):
+    return [o for o in (G.is_obs(j, {}) for j in jobs) if o]
+
+
+def simulated_halves(seed, n_runs, regression=1.0, s_slow_share=1.0, b_slow_share=0.55, slow=12, fast=24, run_sigma=0.04, leg_sigma=0.08, shard_sigma=0.03):
+    """(S, B): the two halves of one window of unit-tests runs, `n_runs` a side. Every run has `slow` shards of about 100 s (the 4cpu ones) and `fast` of
+    about 55 s (the 8cpu ones). A slow leg is in the half with the chance `*_slow_share` (the legs not yet finished when the window is read are in
+    neither), so the defaults give superci a third slow legs and Blacksmith a fifth: the leg mixes of the Nov 28 09:24Z check. A run shares a
+    factor across its legs and a fleet one across a shard's. `regression` multiplies every superci wall: 1.0 is the same distribution on both halves."""
+    rng = random.Random(seed)
+    factor = {(f, i): rng.lognormvariate(0, shard_sigma) for f in ("superci", "blacksmith") for i in range(slow + fast)}
+    halves = {}
+    for fleet_name, share, mult, first in (("superci", s_slow_share, regression, 1000), ("blacksmith", b_slow_share, 1.0, 2000)):
+        jobs = []
+        for r in range(n_runs):
+            run_factor = rng.lognormvariate(0, run_sigma)
+            for i in range(slow + fast):
+                is_slow = i < slow
+                if is_slow and rng.random() >= share:
+                    continue
+                wall = (100.0 if is_slow else 55.0) * mult * run_factor * factor[(fleet_name, i)] * rng.lognormvariate(0, leg_sigma)
+                jobs.append(shard_job(first + r, i + 1, 4 if is_slow else 8, fleet_name, wall))
+        halves[fleet_name] = split_obs(jobs)
+    return halves["superci"], halves["blacksmith"]
+
+
+def want(rows, name):
+    """rows[name], or a failed assertion that names the rows there are."""
+    if name not in rows:
+        raise AssertionError(f"no {name!r} row among {list(rows)}")
+    return rows[name]
+
+
+def verdict_of(S, B, ceiling=165.0):
+    rows = G.evaluate_job(S, B, ceiling, [0.5] * 10, split=True)
+    return rows_by_name(rows), G.canary_verdict(rows, {})
+
+
+def run_sim(seeds, n_runs, **kw):
+    """{seed: the canary's reasons}."""
+    return {seed: verdict_of(*simulated_halves(seed, n_runs, **kw))[1] for seed in seeds}
+
+
+def load_split_fixture():
+    """fixtures/split-0924.json as (REST runs for SplitWindow.run_gate, the listener's records, since, now): the `unit-tests@50` canary's window of
+    Nov 28, 09:12:46Z to 09:23:33Z, whose check read GitHub's legs of every run in it and the records of the superci legs. It rolled the split back on
+    `wall p50: 57.4 s vs <= B p50 57.0 s`. Legs are as the rest listing gave them at `now`: a leg still running has no end. head_sha and head_branch are made up."""
+    with open(os.path.join(HERE, "fixtures", "split-0924.json")) as fh:
+        d = json.load(fh)
+    since, now = T.ts(d["since"]), T.ts(d["now"])
+    runs = collections.OrderedDict()
+    for jid, run, name, created, started, completed, conclusion, runner, label in d["legs"]:
+        iso = lambda sec: None if sec is None else T.iso(since + sec)
+        j = {"id": jid, "run_id": run, "run_attempt": 1, "name": name, "conclusion": conclusion, "status": "completed" if completed is not None else "in_progress",
+             "head_sha": f"sha{run}", "head_branch": "pr", "created_at": iso(created), "started_at": iso(started), "completed_at": iso(completed),
+             "runner_name": runner, "labels": [label], "runner_group_name": T.SUPERCI_RUNNER_GROUP if runner.startswith("superci-") else "Default", "steps": []}
+        runs.setdefault(run, []).append(j)
+    rest = [(rid, "pr", "failure" if any(j["conclusion"] == "failure" for j in js) else "success", js) for rid, js in runs.items()]
+    return rest, d["records"], d["since"], now
+
+
+class PerShardKey(unittest.TestCase):
+    def test_the_same_shard_on_both_fleets_has_one_key(self):
+        self.assertTrue(hasattr(G, "shard_key"))
+        key = G.shard_key
+        self.assertEqual(key("unit-tests (11, superci-8cpu, 8)"), key("unit-tests (11, blacksmith-8vcpu-ubuntu-2404, 8)"))
+        self.assertEqual(key("unit-tests (1, superci-4cpu, 4)"), key("unit-tests (1, blacksmith-4vcpu-ubuntu-2404, 4)"))
+        self.assertNotEqual(key("unit-tests (1, superci-8cpu, 8)"), key("unit-tests (2, superci-8cpu, 8)"))
+        self.assertEqual(key("unit-tests (25, superci-8cpu, 1)"), key("unit-tests (25, blacksmith-8vcpu-ubuntu-2404, 1)"))
+        self.assertNotEqual(key("unit-tests (25, superci-8cpu, 1)"), key("unit-tests (25, superci-8cpu, 8)"))
+        self.assertEqual(key("test-go"), "test-go", "a name with no fleet label is its own key")
+
+
+class SignedRank(unittest.TestCase):
+    def test_exact_values_of_the_one_sided_signed_rank_test(self):
+        self.assertTrue(hasattr(G, "signed_rank_p"))
+        p = G.signed_rank_p
+        self.assertAlmostEqual(p([1.0, 2.0, 3.0]), 1 / 8)
+        self.assertAlmostEqual(p([-1.0, -2.0, -3.0]), 1.0)
+        self.assertAlmostEqual(p([1.0, -2.0, 3.0]), 3 / 8, msg="W = 4 of 6: the sums 4, 5, 6 of the 8 sign patterns")
+        self.assertAlmostEqual(p([0.1] * 7), 2 ** -7)
+        self.assertEqual(p([]), 1.0)
+        self.assertEqual(p([0.0, 0.0]), 1.0, "zero differences are left out")
+
+    def test_ties_take_midranks_and_the_test_stays_exact(self):
+        self.assertTrue(hasattr(G, "signed_rank_p"))
+        p = G.signed_rank_p
+        self.assertAlmostEqual(p([1.0, 1.0, 1.0, 1.0]), 1 / 16, msg="four equal positive differences: every rank is 2.5, W the largest of 16")
+        self.assertAlmostEqual(p([1.0, 1.0, -1.0, -1.0]), 11 / 16, msg="W = 5 of the sums 0, 2.5 x k: at least 5 in 11 of 16 patterns")
+
+    def test_the_normal_approximation_above_the_exact_limit_agrees_with_the_exact_test(self):
+        self.assertTrue(hasattr(G, "EXACT_RANK_TEST_MAX_N"))
+        d = [(-1) ** i * (1 + i / 7) + 0.3 for i in range(100)]
+        exact = G.signed_rank_p(d)
+        saved, G.EXACT_RANK_TEST_MAX_N = G.EXACT_RANK_TEST_MAX_N, 10
+        try:
+            approx = G.signed_rank_p(d)
+        finally:
+            G.EXACT_RANK_TEST_MAX_N = saved
+        self.assertNotEqual(exact, approx)
+        self.assertLess(abs(exact - approx), 0.01, (exact, approx))
+
+    def test_the_least_p_value_of_fewer_pairs_than_the_minimum_cannot_reach_the_false_rollback_rate(self):
+        self.assertTrue(hasattr(G, "MIN_PAIRED_SHARDS"))
+        self.assertGreater(G.signed_rank_p([1.0] * (MIN_SHARDS - 2)), G.FALSE_ROLLBACK_RATE, "two pairs under the minimum, even all slower, never fail")
+        self.assertLessEqual(G.signed_rank_p([1.0] * MIN_SHARDS), G.FALSE_ROLLBACK_RATE, "the minimum can fail with a pair to spare")
+
+
+class PerShardWall(unittest.TestCase):
+    def halves(self, ratio, shards=10, runs=None, fast=60.0):
+        """`shards` shards of `runs` runs on each fleet: superci's walls `ratio` times Blacksmith's, every shard alike."""
+        runs = runs or SHARD_RUNS
+        s = [shard_job(1000 + r, i + 1, 8, "superci", fast * ratio) for r in range(runs) for i in range(shards)]
+        b = [shard_job(2000 + r, i + 1, 8, "blacksmith", fast) for r in range(runs) for i in range(shards)]
+        return split_obs(s), split_obs(b)
+
+    def test_a_split_has_one_wall_row_per_shard_and_no_pooled_wall_rows(self):
+        rows, _ = verdict_of(*self.halves(1.0))
+        self.assertIn("wall (per shard)", rows)
+        self.assertNotIn("wall p50", rows)
+        self.assertNotIn("wall p90", rows)
+        self.assertIn("wall (per shard)", G.ROLLBACK_ROWS)
+        self.assertEqual(want(rows, "wall (per shard)").status, G.PASS, want(rows, "wall (per shard)"))
+        self.assertIn("over 10 shards", want(rows, "wall (per shard)").value)
+
+    def test_a_job_that_is_not_split_keeps_its_pooled_rows_and_has_no_shard_row(self):
+        S, B = self.halves(1.0)
+        rows = rows_by_name(G.evaluate_job(S, B, 165.0, [0.5] * 10))
+        self.assertIn("wall p50", rows)
+        self.assertIn("wall p90", rows)
+        self.assertNotIn("wall (per shard)", rows)
+
+    def test_slower_beyond_the_margin_in_every_shard_fails_and_rolls_back(self):
+        rows, reasons = verdict_of(*self.halves(1.20))
+        self.assertEqual(want(rows, "wall (per shard)").status, G.FAIL, want(rows, "wall (per shard)"))
+        self.assertEqual([r.split(":")[0] for r in reasons], ["wall (per shard)"], reasons)
+
+    def test_slower_but_inside_the_margin_is_not_a_failure(self):
+        rows, reasons = verdict_of(*self.halves(1.04))
+        self.assertEqual((want(rows, "wall (per shard)").status, reasons), (G.PASS, []), want(rows, "wall (per shard)"))
+
+    def test_faster_is_never_a_failure(self):
+        rows, reasons = verdict_of(*self.halves(0.7))
+        self.assertEqual((want(rows, "wall (per shard)").status, reasons), (G.PASS, []))
+
+    def test_fewer_shards_paired_than_the_minimum_is_noise_and_sends_nothing_back(self):
+        rows, reasons = verdict_of(*self.halves(1.5, shards=MIN_SHARDS - 1))
+        r = want(rows, "wall (per shard)")
+        self.assertEqual(r.status, G.NOISE, r)
+        self.assertIn("not enough shards paired yet", r.note)
+        self.assertEqual(reasons, [])
+        rows, reasons = verdict_of(*self.halves(1.5, shards=MIN_SHARDS))
+        self.assertEqual(want(rows, "wall (per shard)").status, G.FAIL, "the minimum itself judges")
+
+    def test_a_shard_on_one_half_only_is_not_paired(self):
+        S, B = self.halves(1.5, shards=MIN_SHARDS)
+        extra = split_obs([shard_job(1000 + r, 99, 8, "superci", 500.0) for r in range(8)])
+        rows, _ = verdict_of(S + extra, B)
+        r = want(rows, "wall (per shard)")
+        self.assertIn(f"over {MIN_SHARDS} shards", r.value)
+        self.assertIn("1 on superci only", r.detail[0])
+
+    def test_a_shard_of_one_size_is_not_paired_with_another_size_s_leg(self):
+        s = split_obs([shard_job(1000 + r, i + 1, 4, "superci", 100.0) for r in range(6) for i in range(12)])
+        b = split_obs([shard_job(2000 + r, i + 1, 8, "blacksmith", 50.0) for r in range(6) for i in range(12)])
+        r = want(verdict_of(s, b)[0], "wall (per shard)")
+        self.assertEqual(r.status, G.NOISE, r)
+        self.assertIn("0 shards paired", r.value)
+
+    def test_the_detail_lists_ten_worst_shards_first_and_counts_the_rest(self):
+        S, B = split_obs([shard_job(1000 + r, i + 1, 8, "superci", 120.0 if i == 2 else 60.0) for r in range(SHARD_RUNS) for i in range(14)]), self.halves(1.0, shards=14)[1]
+        r = want(verdict_of(S, B)[0], "wall (per shard)")
+        shards = [l for l in r.detail if l.startswith("unit-tests (")]
+        self.assertEqual(len(shards), 10)
+        self.assertTrue(shards[0].startswith("unit-tests (3, "), shards[0])
+        self.assertRegex(shards[0], r"= 2\.000x$")
+        ratios = [float(re.search(r"= (\d+\.\d+)x$", l).group(1)) for l in shards]
+        self.assertEqual(ratios, sorted(ratios, reverse=True))
+        self.assertIn("... and 4 more", r.detail[-1])
+
+    def test_a_half_under_the_minimum_runs_is_no_comparison_yet(self):
+        S, B = self.halves(1.5, runs=G.MIN_RUNS - 1)
+        r = want(verdict_of(S, B)[0], "wall (per shard)")
+        self.assertEqual(r.status, G.NOISE, r)
+
+    def test_the_verdict_counts_the_shard_row_from_its_minimum_runs_and_the_ceiling_row_from_twenty(self):
+        fail = lambda n: [G.Row("n (superci runs)", str(n), ">= 5", G.PASS), G.Row("wall (per shard)", "x", "y", G.FAIL), G.Row("wall p90 (ceiling)", "x", "y", G.FAIL)]
+        self.assertEqual([r.split(":")[0] for r in G.canary_verdict(fail(SHARD_RUNS - 1), {})], [])
+        self.assertEqual([r.split(":")[0] for r in G.canary_verdict(fail(SHARD_RUNS), {})], ["wall (per shard)"])
+        self.assertEqual([r.split(":")[0] for r in G.canary_verdict(fail(20), {})], ["wall (per shard)", "wall p90 (ceiling)"])
+        noted = [G.Row("n (superci runs)", "9", ">= 5", G.PASS), G.Row("wall (per shard)", "x", "y", G.FAIL, "no Blacksmith runs enough to compare yet: 3, under 5")]
+        self.assertEqual(G.canary_verdict(noted, {}), [])
+
+    def test_the_ceiling_still_judges_superci_s_wall_p90_on_its_own(self):
+        S, B = self.halves(1.0, runs=20)
+        rows, reasons = verdict_of(S, B, ceiling=59.0)
+        self.assertEqual(want(rows, "wall p90 (ceiling)").status, G.FAIL, want(rows, "wall p90 (ceiling)"))
+        self.assertEqual(want(rows, "wall (per shard)").status, G.PASS)
+        self.assertEqual([r.split(":")[0] for r in reasons], ["wall p90 (ceiling)"])
+        rows, reasons = verdict_of(S, B, ceiling=200.0)
+        self.assertEqual((want(rows, "wall p90 (ceiling)").status, reasons), (G.PASS, []))
+        self.assertNotIn("wall p90 (ceiling)", verdict_of(S, B, ceiling=None)[0], "a job with no ceiling has no ceiling row")
+
+    def test_the_queue_rows_stay_pooled_and_the_failures_row_stays(self):
+        rows, _ = verdict_of(*self.halves(1.0))
+        for name in ("queue wait p50", "queue wait p90", "failures (superci)", "n (superci runs)", "unexplained p50 (timeline)"):
+            self.assertIn(name, rows)
+
+
+class FalseRollbackAndPower(unittest.TestCase):
+    SEEDS = range(200)
+
+    def test_the_halves_of_one_distribution_with_different_leg_mixes_almost_never_roll_back(self):
+        S0, B0 = simulated_halves(0, 12)
+        share = lambda obs: sum(1 for o in obs if o.wall > 77.0) / len(obs)
+        self.assertTrue(0.28 <= share(S0) <= 0.38 and 0.17 <= share(B0) <= 0.27, f"the halves have a third and a fifth slow legs: {share(S0):.2f}, {share(B0):.2f}")
+        got = run_sim(self.SEEDS, 12)
+        rolled = sorted(s for s, reasons in got.items() if reasons)
+        self.assertLessEqual(len(rolled) / len(self.SEEDS), 0.02, f"{len(rolled)} of {len(self.SEEDS)} seeds rolled back: {rolled[:10]} {got[rolled[0]] if rolled else ''}")
+
+    def test_a_twenty_percent_regression_on_the_same_shards_rolls_back_on_the_shard_row_within_twenty_runs(self):
+        for seed in range(20):
+            S, B = simulated_halves(seed, 20, regression=1.20)
+            first = None
+            for n in range(G.MIN_RUNS, 21):
+                keep = lambda obs, base: [o for o in obs if o.run_id - base < n]
+                reasons = verdict_of(keep(S, 1000), keep(B, 2000))[1]
+                if reasons:
+                    first = n
+                    break
+            self.assertIsNotNone(first, f"seed {seed}: no rollback by 20 runs a side")
+            self.assertTrue(reasons[0].startswith("wall (per shard)"), (seed, reasons))
+
+    def test_the_old_pooled_p50_row_failed_most_of_those_same_halves(self):
+        over = 0
+        for seed in range(40):
+            S, B = simulated_halves(seed, 12)
+            over += T.q(G.wall_sample(S, 165.0), 50) > T.q(G.wall_sample(B, 165.0), 50)
+        self.assertGreaterEqual(over, 24, "the premise: with a third slow legs against a fifth, superci's pooled p50 is over Blacksmith's in most seeds, and at_most failed any excess")
+
+
+class RealWindowOfNov28(unittest.TestCase):
+    """The `unit-tests@50` canary of Nov 28 09:24Z, replayed from its recorded window through cmd_job."""
+
+    job, workflow = SplitWindow.job, SplitWindow.workflow
+    setUp = SplitWindow.setUp
+    run_gate = SplitWindow.run_gate
+    line = SplitWindow.line
+
+    def replay(self):
+        rest, records, since, now = load_split_fixture()
+        return self.run_gate(rest, records=records, now=now, extra=["--since", since])
+
+    def test_the_window_that_the_pooled_p50_rolled_back_keeps(self):
+        code, out = self.replay()
+        self.assertEqual(code, G.KEEP, out)
+        self.assertTrue(self.line(out, "canary ").startswith("canary unit-tests@50: KEEP"), self.line(out, "canary "))
+        row = self.line(out, "  PASS  wall (per shard)")
+        self.assertRegex(row, r"0\.9\d\dx over 54 shards", out)
+        self.assertRegex(out, r"n \(superci runs\)\s+11\b")
+        self.assertNotIn("wall p50", out.split("criteria", 1)[1], "no pooled p50 row in a split")
+
+    def test_the_pooled_p50_of_this_window_was_over_blacksmith_s_which_is_what_rolled_it_back(self):
+        rest, records, since, now = load_split_fixture()
+        b = [o for o in (G.is_obs(j, {}) for rid, br, c, js in rest for j in js if G.fleet_or_label(j) == "blacksmith") if o]
+        s = [o for o in (G.is_obs(G.synth_job(e), {}) for e in records) if o]
+        self.assertEqual((len(s), len({o.run_id for o in s})), (128, 11))
+        self.assertEqual(T.q(G.wall_sample(b, 165.0), 50), 57.0)
+        self.assertGreater(T.q(G.wall_sample(s, 165.0), 50), 57.0, "superci's pooled p50 over Blacksmith's: the old row failed any excess")
+
+    def test_most_of_the_shards_are_paired_and_the_detail_names_the_worst(self):
+        code, out = self.replay()
+        detail = [l.strip() for l in out.splitlines() if l.strip().startswith("unit-tests (") and "/ Blacksmith" in l]
+        self.assertEqual(len(detail), 10, out)
+        self.assertRegex(detail[0], r"unit-tests \(25, 8\):.* = 1\.9\d\dx$")
+
+
+class RecordsWallNotGitHubs(unittest.TestCase):
+    """A superci leg the identity plane dispatched is `started` at GitHub when its identity accepts it, before the machine is found: GitHub's
+    started to completed holds the wait for the machine. Superci's wall in a split is the listener record's wall_ms."""
+
+    job, workflow = SplitWindow.job, SplitWindow.workflow
+    setUp = SplitWindow.setUp
+    run_gate = SplitWindow.run_gate
+    line = SplitWindow.line
+    WAIT = 30.0
+
+    def window(self, wall_of_superci=60.0):
+        runs, records = [], []
+        shards = range(1, 11)
+        for r in range(SHARD_RUNS):
+            sup = []
+            for i in shards:
+                queued = NOW - 3000 + 40
+                rec = dispatched(record(f"j{r}-{i}", 2.0, wall_of_superci, name=f"unit-tests ({i}, superci-8cpu, 8)", run=100 + r, queued_at=queued, branch="pr"), identity="superci-id-8cpu-0001")
+                records.append(rec)
+                created = queued - self.WAIT
+                j = gh_job(7000 + r * 100 + i, 100 + r, 1, "success", created, created + 1, T.ts(rec["finish_time"]) + 1, fleet="superci", name=rec["name"], sha=f"s{r}", branch="pr")
+                j.update(runner_name="superci-id-8cpu-0001", steps=[])
+                sup.append(j)
+            runs.append((100 + r, "pr", "success", sup))
+            bs = []
+            for i in shards:
+                at = NOW - 3000
+                j = gh_job(8000 + r * 100 + i, 200 + r, 1, "success", at, at + 2, at + 2 + 60.0, fleet="blacksmith", name=f"unit-tests ({i}, blacksmith-8vcpu-ubuntu-2404, 8)", sha=f"b{r}", branch="pr")
+                j["steps"] = []
+                bs.append(j)
+            runs.append((200 + r, "pr", "success", bs))
+        return runs, records
+
+    def test_a_dispatched_legs_wall_is_the_records_so_equal_halves_keep(self):
+        runs, records = self.window()
+        for rid, branch, conclusion, jobs in runs[::2]:
+            leg = jobs[0]
+            github_wall = T.ts(leg["completed_at"]) - T.ts(leg["started_at"])
+            self.assertGreater(github_wall, 60.0 + self.WAIT - 2, "GitHub's started to completed holds the wait for a machine")
+        code, out = self.run_gate(runs, records=records)
+        self.assertRegex(self.line(out, "  PASS  wall (per shard)"), r"geometric mean 1\.000x over 10 shards")
+
+    def test_the_same_window_read_from_github_takes_the_records_wall_for_the_legs_it_matches(self):
+        runs, records = self.window()
+        code, out = self.run_gate(runs, records=records, extra=["--superci-source", "github"])
+        self.assertRegex(self.line(out, "  PASS  wall (per shard)"), r"geometric mean 1\.000x over 10 shards", "the queue rows fail on the wait, as they should; the wall row does not")
+        self.assertIn("superci's from the listener's job.record wall_ms, matched to GitHub's jobs", out)
+
+    def test_a_github_read_with_no_record_in_the_window_says_that_its_superci_wall_holds_the_wait(self):
+        runs, _ = self.window()
+        code, out = self.run_gate(runs, records=None)
+        self.assertIn("includes a dispatched job's wait for a machine", out)
+        self.assertRegex(self.line(out, "  NOISE wall (per shard)") or self.line(out, "  FAIL  wall (per shard)"), r"geometric mean 1\.5\d\dx", "the wait is in the wall it reads")
 
 
 if __name__ == "__main__":
