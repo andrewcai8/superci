@@ -4486,10 +4486,31 @@ class SizeRunFloor(unittest.TestCase):
         self.assertEqual(G.canary_verdict([row], {}), [], "NOISE sends nothing back")
 
     def test_a_size_that_is_not_judged_cannot_fail_even_when_it_is_slow(self):
+        # A guard, not a regression test: base could not FAIL 4cpu in 4 runs a half either (that was the defect, a row that could only PASS).
         S, B = size_mix_halves(0, 12, 4, r4=1.5)
         for build in (G.shard_wall_row, G.tail_row):
             self.assertNotEqual(build(S, B, 165.0).status, G.FAIL)
 
+
+    def test_runs_whose_legs_of_the_size_all_failed_are_not_counted_toward_the_floor(self):
+        # Review of #95: 24 runs a half, 10 queue copies each; in 9 of superci's 10 the 4cpu legs all fail, and the tenth's are 3x slower. The test has 1
+        # superci run of 4cpu to exchange (11 assignments, a least p of 1/11): it cannot FAIL, so 4cpu must not be judged.
+        S, B = size_mix_halves(0, 24, 10)
+        queue = sorted({o.run_id for o in S if G.shard_size(o.name) == "4cpu"})
+        failed, slow = set(queue[:9]), queue[9]
+        S = [dataclasses.replace(o, ok=False) if o.run_id in failed and G.shard_size(o.name) == "4cpu"
+             else dataclasses.replace(o, wall=o.wall * 3) if o.run_id == slow and G.shard_size(o.name) == "4cpu" else o for o in S]
+        row = G.shard_wall_row(S, B, 165.0)
+        self.assertFalse(size_state(row, "4cpu").judged, row.value)
+        self.assertEqual(size_state(row, "4cpu").short_runs, (1, 10, G.MIN_SHARD_RUNS), row.value)
+        self.assertTrue(size_state(row, "8cpu").judged, row.value)
+
+    def test_a_leg_cancelled_after_it_started_is_a_wall_and_its_run_counts(self):
+        # wall_sample counts a job cancelled after it started at the time it ran, so permutation_p exchanges its run: the floor counts it too.
+        S, B = size_mix_halves(0, 12, G.MIN_SHARD_RUNS)
+        S = [dataclasses.replace(o, ok=False, cancelled=True) if G.shard_size(o.name) == "4cpu" else o for o in S]
+        self.assertEqual(G.size_runs(S, B, 165.0, {"4cpu": [(k,) for k in {G.shard_key(o.name) for o in S if G.shard_size(o.name) == "4cpu"}]})["4cpu"],
+                         (G.MIN_SHARD_RUNS, G.MIN_SHARD_RUNS))
 
 class SizeRunFloorMet(unittest.TestCase):
     """The floor met: guards (they pass without the floor too). 24 runs a half with 10 queue copies each judge 4cpu, and a real 4cpu +30% still rolls back."""
