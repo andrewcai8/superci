@@ -59,7 +59,7 @@ alarm spend-capped "A spend cap is reached: the listener launches nothing and ke
 # on_demand_share: a long shortage in both regions puts its machines on demand (m8azn.xlarge 0.41 USD an hour against Blacksmith's 0.48).
 # 4 vCPU alone ran 16% on demand on Nov 26. The share is over those sets alone (superci-2cpu, spot only, would dilute a fleet-wide
 # one), and fewer than 10 of their machines make a share of nothing, so it reads 0.
-math on-demand-share "Over 40% of the machines of the sets that ask m8azn on demand first (superci-4cpu; superci-8cpu asks m8azn spot only) were on demand for 30 minutes, with at least 10 running: m8azn spot is short, and the rule is paying on-demand prices (m8azn.xlarge: 0.41 USD an hour) with nothing but the daily cap behind it" \
+math on-demand-share "Over 40% of the machines of the sets that ask m8azn on demand only when its spot is short (on_demand_first; the on_demand sizes, superci-4cpu and superci-8cpu since Nov 28, ask on demand first by design and are not read) were on demand for 30 minutes, with at least 10 running: m8azn spot is short, and the rule is paying on-demand prices (m8azn.xlarge: 0.41 USD an hour) with nothing but the daily cap behind it" \
   '[{"Id":"machines","MetricStat":{"Metric":{"Namespace":"superci-pull","MetricName":"OnDemandFirstMachines"},"Period":300,"Stat":"Maximum"},"ReturnData":false},
     {"Id":"share","MetricStat":{"Metric":{"Namespace":"superci-pull","MetricName":"OnDemandFirstShare"},"Period":300,"Stat":"Average"},"ReturnData":false},
     {"Id":"od","Expression":"IF(machines >= 10, share, 0)","Label":"On-demand share of the on-demand-first sets machines","ReturnData":true}]' \

@@ -20,20 +20,20 @@
     "superci-4cpu": {
       "cpu": 4,
       "split": 1,
-      "max": 1200,
+      "max": 350,
       "disk_gb": 60,
       "disk_mbps": 1000,
       "disk_iops": 4000,
       "types": ["m8azn.xlarge", "m8a.xlarge", "r8a.xlarge"],
-      "on_demand_first": 1
+      "on_demand": true
     },
     "superci-8cpu": {
       "cpu": 8,
       "split": 1,
-      "max": 600,
+      "max": 580,
       "disk_gb": 80,
       "types": ["m8azn.3xlarge", "m8a.2xlarge"],
-      "spot_first": 1
+      "on_demand": true
     },
     "superci-16cpu": {
       "cpu": 16,
@@ -100,8 +100,8 @@
     "workflow_refs": ["/ci-cache-warm\\.yml@"],
     "jobs": []
   },
-  "daily_usd": 1000,
-  "monthly_usd": 15000,
+  "daily_usd": 3000,
+  "monthly_usd": 45000,
   "on_demand_share": 0.1,
   "job_minutes": 360,
   "margin_minutes": 30,

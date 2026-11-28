@@ -324,10 +324,25 @@ func (sr *setRegion) poolsOf(types []string) []ec2types.FleetLaunchTemplateOverr
 // chunk is the most capacity one CreateFleet asks for; a burst is a handful of these per region.
 const chunk = 250
 
-// Launch starts n machines. The size's leading OnDemandFirst or SpotFirst types go first: spot across every region, then,
-// for OnDemandFirst only, on demand whatever the on-demand share. Then the other types' spot across every region, and only
-// then their on-demand, at most odRoom of them. A region's spot shortfall is asked again of the others. It returns what started.
+// Launch starts n machines. An OnDemand size asks each of its types on demand in turn, in its order and across the
+// regions in theirs, whatever the on-demand share, and then every type's spot for what is left. Otherwise the size's
+// leading OnDemandFirst or SpotFirst types go first: spot across every region, then, for OnDemandFirst only, on demand
+// whatever the on-demand share. Then the other types' spot across every region, and only then their on-demand, at most
+// odRoom of them. A region's spot shortfall is asked again of the others. It returns what started.
 func (sf *SetFleet) Launch(ctx context.Context, round string, n, odRoom int) []*Machine {
+	if sf.spec.OnDemand {
+		// One type an ask: an on-demand fleet over several types would weigh price, not the order. The steps are fast-*,
+		// which on_demand_share does not bound.
+		var got []*Machine
+		for _, t := range sf.spec.Types {
+			got = append(got, sf.onDemand(ctx, round, "fast-", n-len(got), n-len(got), []string{t})...)
+		}
+		got = append(got, sf.spot(ctx, round, "fast-", n-len(got), sf.spec.Types)...)
+		if left := n - len(got); left > 0 {
+			slog.Warn("launch short", "set", sf.spec.Name, "round", round, "asked", n, "short", left)
+		}
+		return got
+	}
 	lead := max(sf.spec.OnDemandFirst, sf.spec.SpotFirst)
 	fast, rest := sf.spec.Types[:lead], sf.spec.Types[lead:]
 	var got []*Machine

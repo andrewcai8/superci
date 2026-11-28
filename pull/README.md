@@ -26,11 +26,14 @@ superci-pull: one process on one c7g.large, an Auto Scaling group of one in us-e
               then m8a and r8a; the others: c8a and m8a, then c8i, m8i, c7a and m7a, then older families) x every zone of us-east-1 that
               offers them (5 of 6: use1-az3 offers none) at weight 2 and of us-east-2 (3 of 3) at weight 1; a
               region's spot shortfall goes to the other, then on-demand, at most 10% of the last half hour's
-              launches. A size's `on_demand_first` leading types (superci-4cpu: m8azn.xlarge) go first, spot then
+              launches. A size with `on_demand` (superci-4cpu and superci-8cpu since Nov 28) asks each of its types on demand in
+              its order, us-east-1 before us-east-2, whatever that share, and spot only for what on demand could not start:
+              in F2 (Nov 27, unit-tests' volume) AWS took back 27 of 28 us-east-1 m8azn.xlarge spot machines in 18 minutes
+              and 31 jobs with them, and the 146 on demand lost none. A size's `on_demand_first` leading types go first, spot then
               on demand outside that 10%, before any slower type: m8azn spot is thin (10 of 11 m8azn-only asks
               failed, Nov 26), on-demand m8azn.xlarge is $0.41/h against Blacksmith's $0.48/h for 4 vCPUs, and
               unit legs ran 12% slower on m8a and r8a (93 s against 83 s). A size's `spot_first` leading types
-              (superci-8cpu: m8azn.3xlarge) go first as spot alone and never on demand, then the others' spot: one
+              (superci-8cpu's mix until Nov 28: m8azn.3xlarge) go first as spot alone and never on demand, then the others' spot: one
               spot ask over all of them is capacity-optimized, and superci-8cpu's jobs ran on r8a.2xlarge 33 times
               and m8a.2xlarge 4 times from one (Nov 26-27). m8azn.3xlarge on demand ($1.2388/h) would cost 2.40x
               Blacksmith per unit-tests leg; a ClientToken on every call

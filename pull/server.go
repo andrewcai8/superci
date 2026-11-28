@@ -237,7 +237,7 @@ func (h *Server) notice(w http.ResponseWriter, r *http.Request) {
 		}
 		if d, ok := h.dispatch.(noticeTaker); ok {
 			if known, err := d.Notice(doc, r.Header.Get(actionHeader), time.Now()); known {
-				h.dispatchNoticed(w, doc, err)
+				h.dispatchNoticed(w, doc, r.Header.Get(actionHeader), err)
 				return
 			}
 		}
@@ -247,8 +247,9 @@ func (h *Server) notice(w http.ResponseWriter, r *http.Request) {
 }
 
 // dispatchNoticed answers a dispatch machine's notice: 204 once the dispatcher took it, 400 for one that is not current,
-// which the machine does not send again.
-func (h *Server) dispatchNoticed(w http.ResponseWriter, doc InstanceDocument, err error) {
+// which the machine does not send again. The log keeps the instance-action IMDS gave the machine, so a notice can be
+// checked against EC2's own record of the interruption afterwards (the spot request's status).
+func (h *Server) dispatchNoticed(w http.ResponseWriter, doc InstanceDocument, action string, err error) {
 	if err != nil {
 		slog.Warn("spot notice refused", "machine", doc.InstanceID, "err", err.Error())
 		http.Error(w, "no current spot notice", http.StatusBadRequest)
@@ -256,7 +257,7 @@ func (h *Server) dispatchNoticed(w http.ResponseWriter, doc InstanceDocument, er
 	}
 	if h.dispatchMachine != nil {
 		if set, m := h.dispatchMachine(doc.InstanceID); m != nil {
-			slog.Warn("spot notice", "set", set, "machine", m.ID, "region", m.Region, "type", m.Type, "az", m.AZ)
+			slog.Warn("spot notice", "set", set, "machine", m.ID, "region", m.Region, "type", m.Type, "az", m.AZ, "action", clip(action, 256))
 			tlNotice(set, m, time.Now())
 		}
 	}
@@ -266,7 +267,7 @@ func (h *Server) dispatchNoticed(w http.ResponseWriter, doc InstanceDocument, er
 // scaleNotice takes in a scale set's machine's notice.
 func (h *Server) scaleNotice(w http.ResponseWriter, r *http.Request, s *Set, m *Machine) {
 	job := s.state.Noticed(m.ID)
-	slog.Warn("spot notice", "set", s.spec.Name, "machine", m.ID, "region", m.Region, "type", m.Type, "az", m.AZ)
+	slog.Warn("spot notice", "set", s.spec.Name, "machine", m.ID, "region", m.Region, "type", m.Type, "az", m.AZ, "action", clip(r.Header.Get(actionHeader), 256))
 	tlNotice(s.spec.Name, m, time.Now())
 	w.WriteHeader(http.StatusNoContent)
 	if job != nil && h.notices != nil {

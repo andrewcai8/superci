@@ -359,6 +359,19 @@ def judge_scale(**kw):
     return rows_by_name(G.evaluate_scale(scale(**kw)))
 
 
+class Cost(unittest.TestCase):
+    def test_aws_spend_a_job_beside_blacksmiths_for_the_same_vcpus(self):
+        recs = [{"set": "superci-8cpu", "usd": 0.04, "wall_ms": 50000}, {"set": "superci-8cpu", "usd": 0.06, "wall_ms": 50000},
+                {"set": "superci-4cpu", "usd": 0.05, "wall_ms": 90000}, {"set": "superci-8cpu", "usd": None, "wall_ms": 1}, {"set": "superci-8cpu", "usd": 1.0}]
+        bs = [{"labels": ["blacksmith-8vcpu-ubuntu-2404"], "started_at": "2026-11-27T10:00:00Z", "completed_at": "2026-11-27T10:00:59Z"},
+              {"labels": ["blacksmith-8vcpu-ubuntu-2404"], "started_at": "2026-11-27T10:00:00Z", "completed_at": "2026-11-27T10:01:01Z"},
+              {"labels": ["ubuntu-latest"], "started_at": "2026-11-27T10:00:00Z", "completed_at": "2026-11-27T10:09:00Z"}]
+        lines = G.cost_lines(recs, bs)
+        # 8 vCPU: one started minute ($0.016) and two ($0.032): $0.024 a job; AWS $0.05 a job, 2.08x
+        self.assertEqual(lines, ["cost superci-4cpu: AWS $0.0500 a job (n=1), Blacksmith 4vcpu: no job",
+                                 "cost superci-8cpu: AWS $0.0500 a job (n=2), Blacksmith 8vcpu $0.0240 (n=2): AWS 2.08x"])
+
+
 class Gate2(unittest.TestCase):
     def test_a_clean_replay_passes_every_row(self):
         rows = judge_scale()

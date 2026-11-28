@@ -73,6 +73,11 @@ type SizeConfig struct {
 	// types is capacity-optimized and ranks priority last: superci-8cpu's jobs ran on r8a.2xlarge 33 times and on
 	// m8a.2xlarge 4 times from one such ask (Nov 26-27). A size sets at most one of the two.
 	SpotFirst int `json:"spot_first"`
+	// OnDemand asks every type on demand first, in its order, whatever on_demand_share, and spot only for what on demand
+	// could not start: a size whose spot loses the jobs it carries. On Nov 27 23:57Z (F2, unit-tests' volume) AWS took 27
+	// of 28 us-east-1 m8azn.xlarge spot machines within 18 minutes, and 31 jobs with them; the 146 on demand lost none. A
+	// size sets at most one of on_demand, on_demand_first and spot_first.
+	OnDemand bool `json:"on_demand"`
 	// Dispatch serves the size from the identity plane (dispatch.go): no scale set and no registration, and each machine
 	// takes its one job from the dispatcher.
 	Dispatch bool `json:"dispatch"`
@@ -257,6 +262,9 @@ func (c Config) validate() error {
 		if s.SpotFirst < 0 || s.SpotFirst > len(s.Types) || (s.SpotFirst > 0 && s.OnDemandFirst > 0) {
 			return fmt.Errorf("config: size %s: spot_first %d is not between 0 and its %d types, or on_demand_first is set too", label, s.SpotFirst, len(s.Types))
 		}
+		if s.OnDemand && (s.OnDemandFirst > 0 || s.SpotFirst > 0) {
+			return fmt.Errorf("config: size %s: on_demand asks every type on demand first, so on_demand_first and spot_first are 0", label)
+		}
 		if s.Dispatch && s.Split != 1 {
 			return fmt.Errorf("config: size %s: a dispatch size is one set (split 1): its identities name the size, not a set of it", label)
 		}
@@ -318,9 +326,10 @@ type SetSpec struct {
 	// DiskMBps and DiskIOPS are SizeConfig's (0 for the defaults: RootVolume says what a machine gets).
 	DiskMBps, DiskIOPS int
 	Types              []string
-	// OnDemandFirst, SpotFirst and Dispatch are SizeConfig's.
+	// OnDemandFirst, SpotFirst, OnDemand and Dispatch are SizeConfig's.
 	OnDemandFirst int
 	SpotFirst     int
+	OnDemand      bool
 	Dispatch      bool
 }
 
@@ -377,7 +386,7 @@ func (c Config) Sets() []SetSpec {
 				name = l + "-" + strconv.Itoa(k+1)
 			}
 			out = append(out, SetSpec{Name: name, Label: l, Index: k, Split: s.Split, CPU: s.CPU,
-				Max: int(math.Ceil(float64(s.Max) / float64(s.Split))), DiskGB: s.DiskGB, DiskMBps: s.DiskMBps, DiskIOPS: s.DiskIOPS, Types: s.Types, OnDemandFirst: s.OnDemandFirst, SpotFirst: s.SpotFirst, Dispatch: s.Dispatch})
+				Max: int(math.Ceil(float64(s.Max) / float64(s.Split))), DiskGB: s.DiskGB, DiskMBps: s.DiskMBps, DiskIOPS: s.DiskIOPS, Types: s.Types, OnDemandFirst: s.OnDemandFirst, SpotFirst: s.SpotFirst, OnDemand: s.OnDemand, Dispatch: s.Dispatch})
 		}
 	}
 	return out
