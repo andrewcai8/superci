@@ -168,7 +168,8 @@ import gzip, re, sys
 src, out, pub = sys.argv[1], sys.argv[2], open(sys.argv[3]).read().strip()
 boot = open(f"{src}/boot.sh").read()
 for k, v in {"@MODE@": "dispatch", "@LISTENER@": "https://203.0.113.1:8443", "@PIN@": "sha256//parity", "@LIFE_SECONDS@": "1800",
-             "@LABEL@": "superci-4cpu", "@WARM_CAP_SECONDS@": "300", "@HYDRATE_STOP@": open(f"{src}/hydrate-stop.sh").read().strip()}.items():
+             "@LABEL@": "superci-4cpu", "@WARM_CAP_SECONDS@": "300", "@HYDRATE_STOP@": open(f"{src}/hydrate-stop.sh").read().strip(),
+             "@IMAGE_ROOT_BYTES@": ""}.items():  # empty, as the set's own template has it (only a hibernated pool's fills it in)
     boot = boot.replace(k, v)
 marker = "# Dispatch mode (pull/agent.py)"
 if marker not in boot:

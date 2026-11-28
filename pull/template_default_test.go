@@ -54,11 +54,15 @@ func (m *templates) DescribeLaunchTemplateVersions(_ context.Context, in *ec2.De
 // responseOf is what EC2 keeps of a request's data (the fields sameData reads).
 func responseOf(r *ec2types.RequestLaunchTemplateData) *ec2types.ResponseLaunchTemplateData {
 	d := r.BlockDeviceMappings[0]
-	return &ec2types.ResponseLaunchTemplateData{ImageId: r.ImageId, UserData: r.UserData, SecurityGroupIds: r.SecurityGroupIds,
+	var hib *ec2types.LaunchTemplateHibernationOptions
+	if r.HibernationOptions != nil {
+		hib = &ec2types.LaunchTemplateHibernationOptions{Configured: r.HibernationOptions.Configured}
+	}
+	return &ec2types.ResponseLaunchTemplateData{ImageId: r.ImageId, UserData: r.UserData, SecurityGroupIds: r.SecurityGroupIds, HibernationOptions: hib,
 		IamInstanceProfile: &ec2types.LaunchTemplateIamInstanceProfileSpecification{Arn: aws.String("arn:aws:iam::243891825325:instance-profile/" + aws.ToString(r.IamInstanceProfile.Name))},
 		MetadataOptions:    &ec2types.LaunchTemplateInstanceMetadataOptions{HttpTokens: ec2types.LaunchTemplateHttpTokensState(r.MetadataOptions.HttpTokens), HttpPutResponseHopLimit: r.MetadataOptions.HttpPutResponseHopLimit},
 		BlockDeviceMappings: []ec2types.LaunchTemplateBlockDeviceMapping{{DeviceName: d.DeviceName,
-			Ebs: &ec2types.LaunchTemplateEbsBlockDevice{VolumeSize: d.Ebs.VolumeSize, Throughput: d.Ebs.Throughput, Iops: d.Ebs.Iops}}}}
+			Ebs: &ec2types.LaunchTemplateEbsBlockDevice{VolumeSize: d.Ebs.VolumeSize, Throughput: d.Ebs.Throughput, Iops: d.Ebs.Iops, Encrypted: d.Ebs.Encrypted}}}}
 }
 
 func (m *templates) CreateLaunchTemplate(_ context.Context, in *ec2.CreateLaunchTemplateInput, _ ...func(*ec2.Options)) (*ec2.CreateLaunchTemplateOutput, error) {

@@ -87,6 +87,11 @@ type SizeConfig struct {
 	// Dispatch serves the size from the identity plane (dispatch.go): no scale set and no registration, and each machine
 	// takes its one job from the dispatcher.
 	Dispatch bool `json:"dispatch"`
+	// Hibernated is how many booted, hydrated and pinned machines a dispatch size keeps hibernated behind its running
+	// pool (hib.go): each hand-off resumes one in about 10 s instead of a cold boot's 47 s, and one hibernated costs only
+	// its volume. They are on demand (EC2 stops no one-time spot machine), launched with an encrypted root of the type's
+	// memory plus disk_gb at 4,000 IOPS and 1,000 MiB/s. 0, the default, keeps none: the size runs as it did before.
+	Hibernated int `json:"hibernated"`
 }
 
 // PoolConfig bounds one size's hot pool by the hour of the day (UTC): never fewer idle runners than floor, never more
@@ -286,6 +291,9 @@ func (c Config) validate() error {
 		if s.Dispatch && s.Split != 1 {
 			return fmt.Errorf("config: size %s: a dispatch size is one set (split 1): its identities name the size, not a set of it", label)
 		}
+		if s.Hibernated < 0 || (s.Hibernated > 0 && !s.Dispatch) {
+			return fmt.Errorf("config: size %s: hibernated %d is 0 or more, and only a dispatch size keeps machines hibernated", label, s.Hibernated)
+		}
 	}
 	for label, p := range c.Pools {
 		if _, ok := c.Sizes[label]; !ok {
@@ -349,6 +357,7 @@ type SetSpec struct {
 	SpotFirst     int
 	OnDemand      bool
 	Dispatch      bool
+	Hibernated    int // SizeConfig's: the machines the set keeps hibernated behind its running pool
 }
 
 // The root volume's defaults, and the range the config takes: 125 to 1,000 MiB/s, 3,000 to 16,000 IOPS, within gp3's ratios (0.25 MiB/s for each IOPS, 500 IOPS for each GiB).
@@ -404,7 +413,7 @@ func (c Config) Sets() []SetSpec {
 				name = l + "-" + strconv.Itoa(k+1)
 			}
 			out = append(out, SetSpec{Name: name, Label: l, Index: k, Split: s.Split, CPU: s.CPU,
-				Max: int(math.Ceil(float64(s.Max) / float64(s.Split))), DiskGB: s.DiskGB, DiskMBps: s.DiskMBps, DiskIOPS: s.DiskIOPS, Types: s.Types, OnDemandFirst: s.OnDemandFirst, SpotFirst: s.SpotFirst, OnDemand: s.OnDemand, Dispatch: s.Dispatch})
+				Max: int(math.Ceil(float64(s.Max) / float64(s.Split))), DiskGB: s.DiskGB, DiskMBps: s.DiskMBps, DiskIOPS: s.DiskIOPS, Types: s.Types, OnDemandFirst: s.OnDemandFirst, SpotFirst: s.SpotFirst, OnDemand: s.OnDemand, Dispatch: s.Dispatch, Hibernated: s.Hibernated})
 		}
 	}
 	return out

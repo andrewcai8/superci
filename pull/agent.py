@@ -62,6 +62,8 @@ class Config:
     exit_settle: float = 10  # an EXIT sent and not answered by a reset or a close in this long is taken as delivered
     hydrate_timeout: float = 10
     first_message_wait: float = 60  # how long after JOB the listener's job message may take to arrive whole
+    wake_every: float = 0.25  # how often the agent looks whether the machine slept (hibernated), and so woke
+    wake_gap: float = 2  # seconds asleep past which it takes a look to be a wake
     renew_context: ssl.SSLContext | None = None  # the TLS settings of the renewal; None is the system's trust (tests)
 
     @property
@@ -75,6 +77,12 @@ class Config:
     @property
     def hydrate_stop(self):
         return os.path.join(self.home, "superci-hydrate-stop.sh")
+
+
+def asleep():
+    """Seconds the machine has been suspended since it booted: CLOCK_BOOTTIME counts them and CLOCK_MONOTONIC does not,
+    so a hibernate and resume grows this by the time asleep."""
+    return time.clock_gettime(time.CLOCK_BOOTTIME) - time.clock_gettime(time.CLOCK_MONOTONIC)
 
 
 def log(msg):
@@ -267,8 +275,11 @@ class Agent:
         self.finished = threading.Event()  # nothing more to ask of the dispatcher
         self.delivered = False
         self.job_taken = threading.Event()
+        self.woke = threading.Event()  # the machine woke: a reconnect's wait ends
+        self.wakes = 0
+        self.asleep = asleep
         self.clock = time.monotonic  # the clock, wait and draw of the reconnect loop, replaced by the tests
-        self.sleep = time.sleep
+        self.sleep = self.nap
         self.jitter = random.random
 
     def mark(self, name, value=None):
@@ -473,6 +484,34 @@ class Agent:
             if self.worker_done.wait(min(left, 0.05)):
                 return
 
+    def nap(self, seconds):
+        """The reconnect loop's wait, which a wake ends."""
+        if self.woke.wait(seconds):
+            self.woke.clear()
+
+    def wake_watch(self):
+        """A machine of a hibernated pool (pull/hib.go) sleeps while it waits for a job and is resumed for one. It wakes
+        with its connection dead: its public address changed and the listener closed its side while it slept, so the
+        connection would show as broken only at the next ping or past the silence. On waking the agent drops it and asks
+        /work at once, as a new outage; the listener then puts the machine in its idle queue. A machine that never sleeps
+        is never woken."""
+        last = self.asleep()
+        while not self.finished.wait(self.cfg.wake_every):
+            now = self.asleep()
+            if now - last > self.cfg.wake_gap:
+                log(f"woke after {now - last:.0f} s asleep")
+                self.mark("hib.wake")
+                self.wakes += 1
+                with self.wlock:
+                    s = self.sock
+                if s is not None:
+                    try:
+                        s.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                self.woke.set()
+            last = now
+
     def ping_loop(self):
         while not self.finished.wait(self.cfg.ping_every):
             self.send(PING)
@@ -521,6 +560,7 @@ class Agent:
     def connect_loop(self):
         outage = self.clock()
         attempt = 0
+        wakes = self.wakes
         while not self.finished.is_set():
             asked = 0  # the Retry-After of a refusal, a floor under the wait
             resume = f"{self.instance}.{self.token}" if self.token else None
@@ -549,6 +589,9 @@ class Agent:
                 if progressed:
                     outage = self.clock()
                     attempt = 0
+            if self.wakes != wakes:  # it slept: ask again now, as a new outage
+                wakes, attempt, outage = self.wakes, 0, self.clock()
+                continue
             limit = self.cfg.window if self.token else self.cfg.wait_window
             left = limit - (self.clock() - outage)
             if left <= 0:
@@ -570,6 +613,7 @@ class Agent:
             log("no identity document")
             return 1
         threading.Thread(target=self.ping_loop, daemon=True).start()
+        threading.Thread(target=self.wake_watch, daemon=True).start()
         conn = threading.Thread(target=self.connect_loop, daemon=True)
         conn.start()
         while not self.job_taken.wait(0.1):

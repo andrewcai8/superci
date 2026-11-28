@@ -48,6 +48,13 @@ type DispatchSet struct {
 	over         func(job string)     // marks a job over beside its claim, for a resume after a restart
 	stranded     []JobRef             // jobs stranded before their handed point since the reconciler last took them
 	reclaims     []JobRef             // handed jobs lost to a spot reclaim since the reconciler last took them
+	// The hibernated pool (hib.go): its size (0: none), the capacity asked of EC2 for it per round and not yet seen,
+	// the machines that came to /work to be hibernated, and the seconds from each resume to its /work.
+	hibernated   int
+	backReserved map[string]int
+	toPark       []*dmachine
+	resumeWaits  []float64
+	owed         int // failed or late resumes not yet launched cold for: Draw leaves them to Deficit
 }
 
 // A dmachine is one machine of a dispatch set: EC2's facts, and where it is in its one job's life.
@@ -59,6 +66,12 @@ type dmachine struct {
 	since     time.Time // when it last had no connection: launched, adopted after a start, or its connection lost
 	firstWork time.Time // its first /work, which ends its launch's time
 	reclaimed bool      // AWS takes it back: its spot notice came, or EC2 lists it leaving for a spot interruption
+	back      bool      // of the hibernated pool and not yet drawn from it: no supply of the running pool (hib.go)
+	resumed   time.Time // when it was drawn from the hibernated pool and started
+	why       string    // why it ends, once it does
+	parkAfter time.Time // of the hibernated pool: no hibernation is asked before this (a not-ready refusal)
+	parkTries int       // not-ready refusals of its hibernation so far
+	parkedAt  time.Time // when EC2 took its hibernation
 }
 
 type machinePhase int
@@ -71,6 +84,13 @@ const (
 	mEnding                      // spent, done or past a bound: it is terminated
 )
 
+// The phases of a hibernated pool's machine (hib.go).
+const (
+	mHibernating machinePhase = mEnding + 1 + iota // of the hibernated pool, put to hibernate: never in the idle queue
+	mHibernated                                    // of the hibernated pool, asleep (EC2 lists it stopped): it may be resumed
+	mResuming                                      // drawn from the hibernated pool and started: supply, until it asks /work or is late
+)
+
 // DispatchCounts is what a dispatch set did, for the metrics.
 type DispatchCounts struct {
 	Handoffs int // jobs handed to a machine
@@ -78,12 +98,20 @@ type DispatchCounts struct {
 	Resumes  int // connections that rejoined their job after a break
 	Lost     int // handed jobs whose machine did not come back within the window, or that ran past their bounds
 	Dropped  int // frames over a job's budgets, dropped
+	// The hibernated pool's (hib.go): machines EC2 took to hibernate, hibernations refused or not done in time, resumed
+	// machines that asked /work, resumes EC2 refused, and resumes that did not ask /work in time. A refused or late
+	// resume is a fallback: the running pool's next Deficit launches cold for it.
+	Parked       int
+	ParkFailed   int
+	Resumed      int
+	ResumeFailed int
+	ResumeLate   int
 }
 
 func NewDispatchSet(spec SetSpec, fleet *SetFleet, regions []string, now time.Time) *DispatchSet {
 	st := &DispatchSet{spec: spec, fleet: fleet, wake: make(chan struct{}, 1), started: now, boot: fmt.Sprintf("%x", now.UnixNano()),
 		max: spec.Max, listings: map[string]time.Time{}, machines: map[string]*dmachine{}, reserved: map[string]int{},
-		pairs: map[string]*session{}, byJob: map[string]*session{}, ended: map[string]time.Time{}}
+		pairs: map[string]*session{}, byJob: map[string]*session{}, ended: map[string]time.Time{}, hibernated: spec.Hibernated, backReserved: map[string]int{}}
 	for _, r := range regions {
 		st.listings[r] = time.Time{}
 	}
@@ -112,14 +140,15 @@ func (st *DispatchSet) desired() int {
 	return max(0, min(st.max, len(st.queue)+len(st.pairs)+pool))
 }
 
-// live is the machines that are or will be supply: every machine not ending, and the capacity asked of EC2.
+// live is the machines that are or will be supply: every machine not ending, and the capacity asked of EC2. A machine
+// of the hibernated pool is not, until it is drawn from it (hib.go).
 func (st *DispatchSet) live() int {
 	n := 0
 	for _, k := range st.reserved {
 		n += k
 	}
 	for _, m := range st.machines {
-		if m.phase != mEnding {
+		if m.phase != mEnding && !m.back {
 			n++
 		}
 	}
@@ -180,11 +209,22 @@ func (st *DispatchSet) Seen(region string, listed []*Machine, began, now time.Ti
 		in[l.ID] = true
 		m := st.machines[l.ID]
 		if m == nil {
-			st.machines[l.ID] = &dmachine{Machine: l, since: now}
-			if st.reserved[l.Round] > 0 {
+			m = &dmachine{Machine: l, since: now}
+			if l.Hib {
+				m = adoptParked(l, now)
+			}
+			st.machines[l.ID] = m
+			switch {
+			case st.reserved[l.Round] > 0:
 				st.reserved[l.Round]--
+			case st.backReserved[l.Round] > 0:
+				st.backReserved[l.Round]--
+				m.back = true
 			}
 			continue
+		}
+		if l.Hib {
+			st.listedParked(m, l.State)
 		}
 		m.IP, m.Type, m.AZ, m.Lifecycle, m.Seen = l.IP, l.Type, l.AZ, l.Lifecycle, now
 		if l.Template != "" {
@@ -230,26 +270,42 @@ func (st *DispatchSet) machine(id string) *dmachine {
 func (st *DispatchSet) mayWait(m *dmachine) bool {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	return m.phase == mBooting || m.phase == mWaiting
+	return m.phase == mBooting || m.phase == mWaiting || m.phase == mResuming
 }
 
 // waiting puts a machine on mw in the idle queue, or gives a machine already there its new connection in its place.
+// A machine of the hibernated pool is put to hibernate instead, unless a job waits for it; one resumed from it joins
+// the idle queue (hib.go).
 func (st *DispatchSet) waiting(m *dmachine, mw *wire, now time.Time) bool {
 	st.mu.Lock()
-	if m.phase != mBooting && m.phase != mWaiting {
+	if m.phase != mBooting && m.phase != mWaiting && m.phase != mResuming {
+		st.mu.Unlock()
+		return false
+	}
+	if m.back && st.stopped {
+		st.end(m, "past the spend's hard stop")
 		st.mu.Unlock()
 		return false
 	}
 	old := m.wire
-	m.wire = mw
-	if m.phase == mBooting {
-		m.phase = mWaiting
-		st.idle = append(st.idle, m)
-	}
 	if m.firstWork.IsZero() {
 		m.firstWork = now
 		if !m.Ordered.IsZero() {
 			st.sample(now.Sub(m.Ordered))
+		}
+	}
+	switch {
+	case m.back && !st.wanted(now):
+		st.park(m, mw, now)
+	case m.phase == mResuming:
+		st.resumeWaits = append(st.resumeWaits, now.Sub(m.resumed).Seconds())
+		st.counts.Resumed++
+		fallthrough
+	default:
+		m.wire, m.back = mw, false
+		if m.phase != mWaiting {
+			m.phase = mWaiting
+			st.idle = append(st.idle, m)
 		}
 	}
 	st.mu.Unlock()
@@ -328,7 +384,7 @@ func (st *DispatchSet) end(m *dmachine, why string) {
 	if m.phase == mEnding {
 		return
 	}
-	m.phase, m.Ending, m.session = mEnding, true, nil
+	m.phase, m.Ending, m.session, m.why = mEnding, true, nil, why
 	st.idle = slices.DeleteFunc(st.idle, func(o *dmachine) bool { return o == m })
 	if m.wire != nil {
 		go m.wire.end()
@@ -765,12 +821,15 @@ func (st *DispatchSet) Reconcile(now time.Time, b dispatchBounds) (end []*Machin
 	if !st.ready() {
 		return nil, lost
 	}
+	st.expire(now)
 	for _, m := range st.machines {
 		age := now.Sub(m.Launched)
 		switch {
 		case m.phase == mEnding, m.session != nil:
 		case age > b.life:
 			st.end(m, "past its life")
+		// A hibernated machine ends only past its life here; the bound on its age asleep (PR 3, 8 h) goes in this switch.
+		case m.phase == mHibernating, m.phase == mHibernated, m.phase == mResuming:
 		case m.phase == mWaiting && age > b.maxAge:
 			st.end(m, "waited past its age")
 		case m.phase == mBooting && age > bootGrace && now.Sub(m.since) > b.window:
@@ -778,6 +837,7 @@ func (st *DispatchSet) Reconcile(now time.Time, b dispatchBounds) (end []*Machin
 		}
 	}
 	st.surplus(now, b.warmup)
+	st.backSurplus()
 	for _, m := range st.machines {
 		if m.phase == mEnding && now.Sub(m.Ended) > time.Minute {
 			m.Ended = now
@@ -841,7 +901,7 @@ func (st *DispatchSet) surplus(now time.Time, warmup time.Duration) {
 	}
 	var free []*dmachine
 	for _, m := range st.machines {
-		if m.phase == mBooting || m.phase == mWaiting {
+		if (m.phase == mBooting || m.phase == mWaiting) && !m.back {
 			free = append(free, m)
 		}
 	}
@@ -908,7 +968,9 @@ func (st *DispatchSet) Running() []Machine {
 	defer st.mu.Unlock()
 	out := make([]Machine, 0, len(st.machines))
 	for _, m := range st.machines {
-		out = append(out, *m.Machine)
+		c := *m.Machine
+		c.Parked = m.phase == mHibernated // asleep: it costs its volume only
+		out = append(out, c)
 	}
 	return out
 }
@@ -950,6 +1012,13 @@ type DispatchSnapshot struct {
 	JobsWaiting int     `json:"jobs_waiting"`
 	OldestJobS  float64 `json:"oldest_job_s"`
 	LaunchS     float64 `json:"launch_s"`
+	// The hibernated pool (hib.go), absent from a set that keeps none: its size, and its machines booting for it,
+	// put to hibernate, asleep, and drawn from it and resuming.
+	Hibernated  int `json:"hibernated,omitempty"`
+	BackBooting int `json:"back_booting,omitempty"`
+	Parking     int `json:"parking,omitempty"`
+	Asleep      int `json:"asleep,omitempty"`
+	Resuming    int `json:"resuming,omitempty"`
 }
 
 func (st *DispatchSet) Snapshot(now time.Time) DispatchSnapshot {
@@ -961,12 +1030,22 @@ func (st *DispatchSet) Snapshot(now time.Time) DispatchSnapshot {
 	for _, k := range st.reserved {
 		out.Inflight += k
 	}
+	out.Hibernated = st.hibernated
 	for _, m := range st.machines {
 		switch m.phase {
 		case mBooting:
 			out.Booting++
+			if m.back {
+				out.BackBooting++
+			}
 		case mEnding:
 			out.Ending++
+		case mHibernating:
+			out.Parking++
+		case mHibernated:
+			out.Asleep++
+		case mResuming:
+			out.Resuming++
 		}
 		if m.Lifecycle == "on-demand" {
 			out.OnDemand++
