@@ -60,7 +60,7 @@ SIZES = (2, 4, 8, 16, 32)
 # A canary rolls back on harm to superci's own jobs, judged against Blacksmith over the same window, never on a cause every
 # runner of the organization shares. GitHub's registration cap is the organization's: a job moved from Blacksmith takes one
 # registration on either fleet, so a refusal (superci-pull-registration-refusals) pages and is counted, and moves nothing.
-ROLLBACK_ROWS = ("wall p50", "wall p90", "wall (per shard)", "wall p90 (ceiling)", "queue wait p50", "queue wait p90", "failures (superci)")
+ROLLBACK_ROWS = ("wall p50", "wall p90", "wall (per shard)", "wall tail (per shard)", "wall p90 (ceiling)", "queue wait p50", "queue wait p90", "failures (superci)")
 # listener-down and spend-capped stop every set, so they send back every job listed. A wait or a stall is one set's: a canary
 # reads the alarms of the sets its job ran on (SET_ROLLBACK_ALARMS, one `superci-pull-<alarm>-<size>` each) and no other set's, so a
 # size with a cold machine, or one that is new, cannot send back a job that ran elsewhere. The listener-wide oldest-job-wait and
@@ -93,6 +93,17 @@ SHARD_ROW, CEILING_ROW = "wall (per shard)", "wall p90 (ceiling)"
 # those, 10 runs a half keeps the rate under 2%, and a real +20% is caught by then. Each half has MIN_SHARD_RUNS runs before the row can FAIL.
 MIN_SHARD_RUNS = 10
 MAX_SHARD_LINES = 10
+# A split's tail is judged per shard too, because a per-shard median does not see one: 15% of superci's legs on cold machines at 1.5x leave every shard's median
+# where it was, and the non-split rows had `wall p90 <= min(B p90 x P90_FACTOR, ceiling)` for exactly that. For each shard with MIN_TAIL_LEGS legs on both halves
+# the ratio is superci's p90 wall over Blacksmith's, and TAIL_ROW FAILs, size by size and at SHARD_ROW's alpha, when those ratios are beyond chance above
+# 1 + TAIL_MARGIN: a one-sided signed-rank test of their logs against log(1 + TAIL_MARGIN), over the same MIN_PAIRED_SHARDS and MIN_SHARD_RUNS as SHARD_ROW.
+# MIN_TAIL_LEGS is 10: a p90 of fewer legs is its one or two largest, and one cold machine would be a tail. TAIL_MARGIN is P90_FACTOR's 10%, not WALL_MARGIN's 5%,
+# because a shard's p90 of 10 to 20 legs is the mean of its two largest and moves more than its median does: on equal halves at the 09:24Z window's spreads
+# (run 6%, leg 11%) a margin of 0.05 rolled back 1.7% of 300 seeds at 10 runs a half, and 0.10 none of 1800 (10, 12 and 24 runs, clean and noisy). The legs
+# of one run share its weight, so the shards' ratios are not independent samples, which is why the margin keeps that cushion over the 1% rate.
+TAIL_ROW = "wall tail (per shard)"
+TAIL_MARGIN = 0.10
+MIN_TAIL_LEGS = 10
 EXACT_RANK_TEST_MAX_N = 150  # above this many pairs the signed-rank test is the normal approximation; the exact sum is n x n(n+1)/2 big-int steps
 
 
@@ -280,17 +291,20 @@ def signed_rank_p(diffs):
     return sum(ways[w:]) / 2 ** n
 
 
+def shard_walls(obs, ceiling):
+    """{shard key: its wall sample (wall_sample's rule on the half's legs of the shard)} of one half, the legs that carry a name."""
+    by = collections.defaultdict(list)
+    for o in obs:
+        if o.name:
+            by[shard_key(o.name)].append(o)
+    return {k: wall_sample(v, ceiling) for k, v in by.items()}
+
+
 def paired_shards(S, B, ceiling):
     """[(key, ratio, superci median wall, its legs, Blacksmith median wall, its legs)] worst ratio first, for each shard with a wall sample on both
     halves (wall_sample's rule on each half's legs of the shard: successes, timed-out at the ceiling, cancelled-after-start lower bounds), and the
     keys seen on one half only: (superci only, Blacksmith only). A median that is 0 pairs nothing."""
-    def walls(obs):
-        by = collections.defaultdict(list)
-        for o in obs:
-            if o.name:
-                by[shard_key(o.name)].append(o)
-        return {k: wall_sample(v, ceiling) for k, v in by.items()}
-    sw, bw = walls(S), walls(B)
+    sw, bw = shard_walls(S, ceiling), shard_walls(B, ceiling)
     both = [k for k in sw if k in bw and sw[k] and bw[k] and T.q(sw[k], 50) > 0 and T.q(bw[k], 50) > 0]
     pairs = sorted(((k, T.q(sw[k], 50) / T.q(bw[k], 50), T.q(sw[k], 50), len(sw[k]), T.q(bw[k], 50), len(bw[k])) for k in both), key=lambda p: (-p[1], p[0]))
     return pairs, sorted(k for k in sw if sw[k] and k not in set(both)), sorted(k for k in bw if bw[k] and k not in set(both))
@@ -345,6 +359,55 @@ def shard_wall_row(S, B, ceiling, min_runs=MIN_SHARD_RUNS):
         return Row(SHARD_ROW, value, th, FAIL, "superci is slower than chance allows on " + ", ".join(f"{size or 'unsized'} ({per[size][0]:.3f}x, p = {per[size][2]:.3g})" for size in slow)
                    + f": over {1 + WALL_MARGIN:g} at {alpha:g} ({FALSE_ROLLBACK_RATE:g} over {len(judged)} size{'s' if len(judged) != 1 else ''})", detail)
     return Row(SHARD_ROW, value, th, PASS, "", detail)
+
+
+def tail_pairs(S, B, ceiling, min_legs=MIN_TAIL_LEGS):
+    """[(key, ratio, superci p90 wall, its legs, Blacksmith p90 wall, its legs)] worst ratio first, for each shard with at least `min_legs` wall samples on both
+    halves (a p90 of fewer is one or two legs), and the number of shards paired by their medians that were left out for having fewer."""
+    sw, bw = shard_walls(S, ceiling), shard_walls(B, ceiling)
+    both = [k for k in sw if k in bw and sw[k] and bw[k] and T.q(sw[k], 50) > 0 and T.q(bw[k], 50) > 0]
+    keep = [k for k in both if len(sw[k]) >= min_legs and len(bw[k]) >= min_legs and T.q(bw[k], 90) > 0]
+    pairs = sorted(((k, T.q(sw[k], 90) / T.q(bw[k], 90), T.q(sw[k], 90), len(sw[k]), T.q(bw[k], 90), len(bw[k])) for k in keep), key=lambda p: (-p[1], p[0]))
+    return pairs, len(both) - len(keep)
+
+
+def tail_row(S, B, ceiling, min_runs=MIN_SHARD_RUNS):
+    """The split's tail row (TAIL_ROW), judged as shard_wall_row judges the median: per size, over the shards with MIN_TAIL_LEGS legs on both halves, FAIL when a
+    one-sided signed-rank test says superci's p90 / Blacksmith's p90 ratios are above 1 + TAIL_MARGIN at FALSE_ROLLBACK_RATE divided by the sizes judged; NOISE
+    until some size has MIN_PAIRED_SHARDS such shards and each half has min_runs runs. The detail is the worst MAX_SHARD_LINES shards."""
+    pairs, short = tail_pairs(S, B, ceiling)
+    size_of = {}
+    for o in list(S) + list(B):
+        if o.name:
+            size_of.setdefault(shard_key(o.name), shard_size(o.name))
+    by_size = collections.defaultdict(list)
+    for pr in pairs:
+        by_size[size_of.get(pr[0], "")].append(pr)
+    n = len(pairs)
+    th = f"one-sided Wilcoxon signed-rank p > {FALSE_ROLLBACK_RATE:g} that per-shard p90 wall ratio (superci / Blacksmith) is over {1 + TAIL_MARGIN:g}"
+    ns, nb = (len({o.run_id for o in h if not o.cancelled}) for h in (S, B))
+    detail = (f"{n} shards judged on their p90 ({short} paired shards left out for under {MIN_TAIL_LEGS} legs on a half); worst ratios first:",
+              *(f"{k}: superci p90 {ms:.1f} s ({cs} legs) / Blacksmith p90 {mb:.1f} s ({cb} legs) = {r:.3f}x" for k, r, ms, cs, mb, cb in pairs[:MAX_SHARD_LINES]),
+              *((f"... and {n - MAX_SHARD_LINES} more",) if n > MAX_SHARD_LINES else ()))
+    if not n:
+        return Row(TAIL_ROW, "0 shards with enough legs", th, NOISE, f"not enough shards yet: none of {MIN_PAIRED_SHARDS} has {MIN_TAIL_LEGS} legs on both halves", detail)
+    judged = {size: ps for size, ps in sorted(by_size.items()) if len(ps) >= MIN_PAIRED_SHARDS}
+    alpha = FALSE_ROLLBACK_RATE / max(1, len(judged))
+    per = {}
+    for size, ps in sorted(by_size.items()):
+        per[size] = (math.exp(sum(math.log(x[1]) for x in ps) / len(ps)), len(ps),
+                     signed_rank_p([math.log(r) - math.log1p(TAIL_MARGIN) for _, r, *_ in ps]) if size in judged else None)
+    value = "p90 ratio " + ", ".join(
+        f"{size or 'unsized'} {g:.3f}x over {k}" + (f" (p = {pv:.3g})" if pv is not None else f" (under {MIN_PAIRED_SHARDS}: not judged)") for size, (g, k, pv) in per.items())
+    if not judged:
+        return Row(TAIL_ROW, value, th, NOISE, f"not enough shards yet: no size has {MIN_PAIRED_SHARDS} with {MIN_TAIL_LEGS} legs on both halves (most: {max(len(ps) for ps in by_size.values())})", detail)
+    if min(ns, nb) < min_runs:
+        return Row(TAIL_ROW, value, th, NOISE, f"not enough runs yet: the halves have {ns} superci and {nb} Blacksmith runs, under {min_runs} each", detail)
+    slow = [size for size in judged if per[size][2] <= alpha]
+    if slow:
+        return Row(TAIL_ROW, value, th, FAIL, "superci's tail is slower than chance allows on " + ", ".join(f"{size or 'unsized'} ({per[size][0]:.3f}x, p = {per[size][2]:.3g})" for size in slow)
+                   + f": p90 over {1 + TAIL_MARGIN:g} at {alpha:g} ({FALSE_ROLLBACK_RATE:g} over {len(judged)} size{'s' if len(judged) != 1 else ''})", detail)
+    return Row(TAIL_ROW, value, th, PASS, "", detail)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -450,7 +513,7 @@ def evaluate_job(S, B, ceiling, unexplained, min_runs=MIN_RUNS, tests=None, spli
     sq, bq = queue_sample(S), queue_sample(B)
     if not sw or not bw:
         why = "no successful, timed-out or cancelled-after-start superci jobs" if not sw else "no Blacksmith runs in the baseline window"
-        walls = ((SHARD_ROW, "per-shard superci / Blacksmith median wall"),) if split else (("wall p50", "<= Blacksmith p50"), ("wall p90", f"<= min(Blacksmith p90 x {P90_FACTOR}, ceiling)"))
+        walls = ((SHARD_ROW, "per-shard superci / Blacksmith median wall"), (TAIL_ROW, "per-shard superci / Blacksmith p90 wall")) if split else (("wall p50", "<= Blacksmith p50"), ("wall p90", f"<= min(Blacksmith p90 x {P90_FACTOR}, ceiling)"))
         for name, th in walls + (("queue wait p50", "<= Blacksmith p50"), ("queue wait p90", f"<= Blacksmith p90 + {QUEUE_P90_SLACK_S:g} s")):
             rows.append(Row(name, "-", th, FAIL, why))
     else:
@@ -462,6 +525,7 @@ def evaluate_job(S, B, ceiling, unexplained, min_runs=MIN_RUNS, tests=None, spli
         if split:
             # Compared per shard, never pooled (SHARD_ROW). The ceiling is still the job's own: superci's p90 within it, whatever Blacksmith's was.
             rows.append(shard_wall_row(S, B, ceiling))
+            rows.append(tail_row(S, B, ceiling))
             if ceiling is not None:
                 rows.append(at_most(CEILING_ROW, T.q(sw, 90), ceiling, f"<= ceiling {ceiling:g} s", wall_noise))
         else:
@@ -561,7 +625,7 @@ def canary_verdict(rows, alarms, sets=()):
     by = {r.name: r for r in rows}
     n = by.get("n (superci runs)")
     runs = int(n.value) if n and n.value.isdigit() else 0
-    need = {"wall p50": MIN_RUNS, "queue wait p50": MIN_RUNS, SHARD_ROW: MIN_SHARD_RUNS, "wall p90": CANARY_P90_RUNS, CEILING_ROW: CANARY_P90_RUNS, "queue wait p90": CANARY_P90_RUNS,
+    need = {"wall p50": MIN_RUNS, "queue wait p50": MIN_RUNS, SHARD_ROW: MIN_SHARD_RUNS, TAIL_ROW: MIN_SHARD_RUNS, "wall p90": CANARY_P90_RUNS, CEILING_ROW: CANARY_P90_RUNS, "queue wait p90": CANARY_P90_RUNS,
             "failures (superci)": 0}
     harmed = [r for r in (by.get(k) for k in ROLLBACK_ROWS) if r and r.status == FAIL and runs >= need[r.name] and not r.note.startswith("no Blacksmith runs")]
     return ([f"{r.name}: {r.value} vs {r.threshold}" for r in harmed]

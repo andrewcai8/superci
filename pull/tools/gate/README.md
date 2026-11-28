@@ -186,6 +186,13 @@ Blacksmith's earlier hours, which had another mix of PRs (that is how the Nov 28
   at 10 runs a half and a real +20% is caught by then. The detail lines under the row give the shards paired and the worst 10 ratios. The row's rollback is `canary_verdict`'s from
   `MIN_SHARD_RUNS` runs. **`wall p90 (ceiling)`** stays as `wall p90` had it: superci's own p90 within the job's ceiling in `ci-limits.tsv` (no row without a ceiling),
   counted from 20 runs.
+- **`wall tail (per shard)`** (a split only) is the tail check the pooled `wall p90` gave: a per-shard median does not see 15% of superci's legs on cold machines at 1.5x.
+  For each shard with at least `MIN_TAIL_LEGS` (10) legs on both halves (a p90 of fewer is its one or two largest legs) the ratio is superci's p90 wall over Blacksmith's;
+  per size, exactly as the median row, the row FAILs when a one-sided signed-rank test says those ratios are above `log(1 + TAIL_MARGIN)` at `FALSE_ROLLBACK_RATE` divided by
+  the sizes judged. `TAIL_MARGIN` is 0.10, the `P90_FACTOR` of the pooled rows: a shard's p90 of 10 to 20 legs is noisier than its median, and at 0.05 equal halves rolled
+  back 1.7% of 300 seeds at 10 runs a half (0.10: none of 1800). It is NOISE until a size has `MIN_PAIRED_SHARDS` shards with enough legs and each half has `MIN_SHARD_RUNS`
+  runs, and counts toward a rollback from `MIN_SHARD_RUNS` runs. A cold tail of 15% at 1.5x on every shard rolls back in 84% of simulated windows at 24 runs a half and 31% at 12,
+  with the median row passing throughout. The shards of a window of 10 to 15 runs have few legs on one half, so the row is often NOISE early in a canary.
 - **Superci's wall is the listener's `wall_ms`**, never GitHub's started to completed: GitHub marks a dispatched job started when its identity accepts it, so that
   interval holds the wait for a machine (up to 24 s on a size short of identities). With `--superci-source events` (the canary's) the superci jobs are the records,
   whose start and finish are `wall_ms`; with `github` the window's records are read as well and matched to the GitHub legs (run, name, runner, finish within 2 min), and the output
@@ -202,7 +209,7 @@ Blacksmith's earlier hours, which had another mix of PRs (that is how the Nov 28
 `gate job <job> --canary` prints the rows, then `canary <job>: KEEP` (exit 0) or `ROLL BACK (reasons)` (exit 3) (`canary <job>@N` with `--split`). A canary rolls
 back on harm to superci's own jobs, judged against Blacksmith over the same window, and on nothing else:
 
-- a FAIL of wall p50, wall p90 (a split: wall (per shard) and wall p90 (ceiling)), queue wait p50, queue wait p90 or failures. A p50 row counts once n passes (5 runs; a split's wall (per shard) at 10) and a
+- a FAIL of wall p50, wall p90 (a split: wall (per shard), wall tail (per shard) and wall p90 (ceiling)), queue wait p50, queue wait p90 or failures. A p50 row counts once n passes (5 runs; a split's two per-shard rows at 10) and a
   p90 row at 20 runs, since a p90 of six runs is one job; the failures row counts from the first run. NOISE asks for runs
   and a row with no Blacksmith runs to compare has no verdict: neither rolls anything back;
 - `superci-pull-listener-down` or `superci-pull-spend-capped` in ALARM: each stops every set, so it sends back every job listed;

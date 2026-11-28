@@ -3585,11 +3585,13 @@ def split_obs(jobs):
     return [o for o in (G.is_obs(j, {}) for j in jobs) if o]
 
 
-def simulated_halves(seed, n_runs, regression=1.0, s_slow_share=1.0, b_slow_share=0.55, slow=12, fast=24, run_sigma=0.04, leg_sigma=0.08, shard_sigma=0.03):
+def simulated_halves(seed, n_runs, regression=1.0, s_slow_share=1.0, b_slow_share=0.55, slow=12, fast=24, run_sigma=0.04, leg_sigma=0.08, shard_sigma=0.03,
+                     tail_share=0.0, tail_mult=1.5, tail_sizes=(4, 8)):
     """(S, B): the two halves of one window of unit-tests runs, `n_runs` a side. Every run has `slow` shards of about 100 s (the 4cpu ones) and `fast` of
     about 55 s (the 8cpu ones). A slow leg is in the half with the chance `*_slow_share` (the legs not yet finished when the window is read are in
     neither), so the defaults give superci a third slow legs and Blacksmith a fifth: the leg mixes of the Nov 28 09:24Z check. A run shares a
-    factor across its legs and a fleet one across a shard's. `regression` multiplies every superci wall: 1.0 is the same distribution on both halves."""
+    factor across its legs and a fleet one across a shard's. `regression` multiplies every superci wall: 1.0 is the same distribution on both halves.
+    `tail_share` of superci's legs of the `tail_sizes` (cpus) are `tail_mult` times slower, the rest as they were: a cold-machine tail, with every median in place."""
     rng = random.Random(seed)
     factor = {(f, i): rng.lognormvariate(0, shard_sigma) for f in ("superci", "blacksmith") for i in range(slow + fast)}
     halves = {}
@@ -3602,7 +3604,10 @@ def simulated_halves(seed, n_runs, regression=1.0, s_slow_share=1.0, b_slow_shar
                 if is_slow and rng.random() >= share:
                     continue
                 wall = (100.0 if is_slow else 55.0) * mult * run_factor * factor[(fleet_name, i)] * rng.lognormvariate(0, leg_sigma)
-                jobs.append(shard_job(first + r, i + 1, 4 if is_slow else 8, fleet_name, wall))
+                cpus = 4 if is_slow else 8
+                if tail_share and fleet_name == "superci" and cpus in tail_sizes and rng.random() < tail_share:
+                    wall *= tail_mult
+                jobs.append(shard_job(first + r, i + 1, cpus, fleet_name, wall))
         halves[fleet_name] = split_obs(jobs)
     return halves["superci"], halves["blacksmith"]
 
@@ -3716,7 +3721,7 @@ class PerShardWall(unittest.TestCase):
     def test_slower_beyond_the_margin_in_every_shard_fails_and_rolls_back(self):
         rows, reasons = verdict_of(*self.halves(1.20))
         self.assertEqual(want(rows, "wall (per shard)").status, G.FAIL, want(rows, "wall (per shard)"))
-        self.assertEqual([r.split(":")[0] for r in reasons], ["wall (per shard)"], reasons)
+        self.assertEqual([r.split(":")[0] for r in reasons], ["wall (per shard)", "wall tail (per shard)"], "+20% everywhere is a slower tail too: " + str(reasons))
 
     def test_slower_but_inside_the_margin_is_not_a_failure(self):
         rows, reasons = verdict_of(*self.halves(1.04))
@@ -3733,7 +3738,7 @@ class PerShardWall(unittest.TestCase):
         self.assertEqual(r.status, G.FAIL, r)
         self.assertIn("slower than chance allows on 4cpu", r.note)
         self.assertNotIn("8cpu (", r.note)
-        self.assertEqual([x.split(":")[0] for x in reasons], ["wall (per shard)"], reasons)
+        self.assertEqual([x.split(":")[0] for x in reasons], ["wall (per shard)", "wall tail (per shard)"], "the slower size's tail is over its margin too: " + str(reasons))
 
     def test_a_size_with_too_few_shards_is_not_judged_but_the_others_are(self):
         s = split_obs([shard_job(1000 + r, i + 1, 4, "superci", 300.0) for r in range(SHARD_RUNS) for i in range(3)]
@@ -3842,6 +3847,150 @@ class FalseRollbackAndPower(unittest.TestCase):
             S, B = simulated_halves(seed, 12)
             over += T.q(G.wall_sample(S, 165.0), 50) > T.q(G.wall_sample(B, 165.0), 50)
         self.assertGreaterEqual(over, 24, "the premise: with a third slow legs against a fifth, superci's pooled p50 is over Blacksmith's in most seeds, and at_most failed any excess")
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# A split's tail: a per-shard median does not see 15% of the legs on cold machines, so the p90 of each shard is judged too (TAIL_ROW).
+# ---------------------------------------------------------------------------------------------------------------------
+
+TAIL_LEGS = getattr(G, "MIN_TAIL_LEGS", 10)
+
+
+class TailPerShard(unittest.TestCase):
+    def halves(self, cold_runs, legs=TAIL_LEGS, shards=10, cold=1.5, base=60.0):
+        """`shards` shards of `legs` runs on each fleet at `base` s, except that superci's first `cold_runs` runs of every shard are `cold` times slower: every
+        median is `base`, and the p90 is `cold` times it from two cold runs of ten."""
+        s = [shard_job(1000 + r, i + 1, 8, "superci", base * (cold if r < cold_runs else 1.0)) for r in range(legs) for i in range(shards)]
+        b = [shard_job(2000 + r, i + 1, 8, "blacksmith", base) for r in range(legs) for i in range(shards)]
+        return split_obs(s), split_obs(b)
+
+    def test_a_split_has_a_tail_row_that_rolls_back_and_a_job_that_is_not_split_has_none(self):
+        self.assertIn("wall tail (per shard)", G.ROLLBACK_ROWS)
+        S, B = self.halves(0)
+        rows, reasons = verdict_of(S, B)
+        r = want(rows, "wall tail (per shard)")
+        self.assertEqual((r.status, reasons), (G.PASS, []), r)
+        self.assertIn("8cpu 1.000x over 10", r.value)
+        self.assertNotIn("wall tail (per shard)", rows_by_name(G.evaluate_job(S, B, 165.0, [0.5] * 10)), "a job that is not split keeps wall p90 and has no tail row")
+
+    def test_two_cold_legs_of_ten_in_every_shard_fail_the_tail_and_leave_the_median_row_passing(self):
+        rows, reasons = verdict_of(*self.halves(2))
+        self.assertEqual(want(rows, "wall (per shard)").status, G.PASS, "every shard's median is where it was")
+        r = want(rows, "wall tail (per shard)")
+        self.assertEqual(r.status, G.FAIL, r)
+        self.assertIn("slower than chance allows on 8cpu (1.500x", r.note)
+        self.assertEqual([x.split(":")[0] for x in reasons], ["wall tail (per shard)"], reasons)
+        self.assertRegex(r.detail[1], r"= 1\.500x$")
+
+    def test_one_cold_leg_of_ten_is_not_a_tail(self):
+        rows, reasons = verdict_of(*self.halves(1))
+        self.assertEqual((want(rows, "wall tail (per shard)").status, reasons), (G.PASS, []), "a p90 of ten legs reads one of them at a tenth of its distance")
+
+    def test_a_tail_inside_the_margin_is_not_a_failure(self):
+        rows, reasons = verdict_of(*self.halves(2, cold=1.0 + getattr(G, "TAIL_MARGIN", 0.10) / 2))
+        self.assertEqual((want(rows, "wall tail (per shard)").status, reasons), (G.PASS, []))
+
+    def test_a_shard_with_under_the_minimum_legs_on_a_half_has_no_p90(self):
+        S, B = self.halves(2, legs=TAIL_LEGS - 1)
+        r = want(verdict_of(S, B)[0], "wall tail (per shard)")
+        self.assertEqual(r.status, G.NOISE, r)
+        self.assertIn("0 shards with enough legs", r.value)
+        S, B = self.halves(2)
+        short = split_obs([shard_job(2000 + r, 11, 8, "blacksmith", 60.0) for r in range(TAIL_LEGS - 1)] + [shard_job(1000 + r, 11, 8, "superci", 600.0) for r in range(TAIL_LEGS)])
+        r = want(verdict_of(S + [o for o in short if o.fleet == "superci"], B + [o for o in short if o.fleet == "blacksmith"])[0], "wall tail (per shard)")
+        self.assertIn("1 paired shards left out", r.detail[0], "the eleventh shard has nine Blacksmith legs: not judged, and said so")
+        self.assertIn("8cpu 1.500x over 10 ", r.value, "the ten shards of ten legs are judged, the eleventh is not")
+
+    def test_fewer_shards_than_the_minimum_and_fewer_runs_than_the_shard_row_needs_are_noise(self):
+        rows, reasons = verdict_of(*self.halves(2, shards=MIN_SHARDS - 1))
+        r = want(rows, "wall tail (per shard)")
+        self.assertEqual((r.status, reasons), (G.NOISE, []), r)
+        self.assertIn("not enough shards yet", r.note)
+        rows, reasons = verdict_of(*self.halves(2, shards=MIN_SHARDS))
+        self.assertEqual(want(rows, "wall tail (per shard)").status, G.FAIL, "the minimum itself judges")
+        S, B = self.halves(2)
+        keep = lambda obs, base: [o for o in obs if o.run_id - base < SHARD_RUNS - 1]
+        r = want(verdict_of(keep(S, 1000), keep(B, 2000))[0], "wall tail (per shard)")
+        self.assertEqual(r.status, G.NOISE, r)
+
+    def test_a_size_is_judged_apart_and_the_row_names_it(self):
+        cold = lambda cpus, shard_ids: split_obs([shard_job(1000 + r, i + 1, cpus, "superci", 60.0 * (1.5 if r < 2 and cpus == 4 else 1.0)) for r in range(TAIL_LEGS) for i in shard_ids])
+        flat = lambda cpus, shard_ids: split_obs([shard_job(2000 + r, i + 1, cpus, "blacksmith", 60.0) for r in range(TAIL_LEGS) for i in shard_ids])
+        s4, s8 = cold(4, range(10)), cold(8, range(10, 20))
+        rows, reasons = verdict_of(s4 + s8, flat(4, range(10)) + flat(8, range(10, 20)))
+        r = want(rows, "wall tail (per shard)")
+        self.assertEqual(r.status, G.FAIL, r)
+        self.assertIn("on 4cpu (", r.note)
+        self.assertNotIn("8cpu (", r.note)
+        self.assertEqual(want(rows, "wall (per shard)").status, G.PASS)
+
+    def test_the_verdict_counts_the_tail_row_from_the_shard_row_s_minimum_runs(self):
+        fail = lambda n: [G.Row("n (superci runs)", str(n), ">= 5", G.PASS), G.Row("wall tail (per shard)", "x", "y", G.FAIL)]
+        self.assertEqual(G.canary_verdict(fail(SHARD_RUNS - 1), {}), [])
+        self.assertEqual([r.split(":")[0] for r in G.canary_verdict(fail(SHARD_RUNS), {})], ["wall tail (per shard)"])
+
+    def test_the_halves_with_no_wall_at_all_fail_the_tail_row_as_they_fail_the_shard_row(self):
+        rows = rows_by_name(G.evaluate_job([], [], 165.0, [0.5] * 10, split=True))
+        self.assertEqual(want(rows, "wall tail (per shard)").status, G.FAIL)
+
+
+class TailFalseRollbackAndPower(unittest.TestCase):
+    SEEDS = range(200)
+
+    def test_equal_halves_with_no_tail_almost_never_roll_back_at_twelve_and_twenty_four_runs(self):
+        self.assertIn("wall tail (per shard)", verdict_of(*simulated_halves(0, 12))[0])
+        for runs in (12, 24):
+            got = run_sim(self.SEEDS, runs)
+            rolled = sorted(s for s, reasons in got.items() if reasons)
+            self.assertLessEqual(len(rolled) / len(self.SEEDS), 0.02, f"{runs} runs: {len(rolled)} of {len(self.SEEDS)} seeds rolled back: {rolled[:10]} {got[rolled[0]] if rolled else ''}")
+
+    def test_equal_halves_with_a_tail_row_that_is_judged_pass_it(self):
+        judged = sum(verdict_of(*simulated_halves(seed, 24))[0][G.TAIL_ROW].status == G.PASS for seed in range(20)) if hasattr(G, "TAIL_ROW") else 0
+        self.assertEqual(judged, 20, "at 24 runs a half the equal halves are judged, and pass")
+
+    def test_a_cold_tail_on_15_percent_of_superci_s_legs_rolls_back_by_24_runs_and_the_median_row_never_fails(self):
+        seeds = range(100)
+        rolled = failed_median = 0
+        for seed in seeds:
+            rows, reasons = verdict_of(*simulated_halves(seed, 24, tail_share=0.15))
+            failed_median += want(rows, "wall (per shard)").status == G.FAIL
+            if reasons:
+                rolled += 1
+                self.assertTrue(all(r.startswith("wall tail (per shard)") for r in reasons), reasons)
+        self.assertEqual(failed_median, 0, "a tail leaves the median row where it was")
+        self.assertGreaterEqual(rolled / len(seeds), 0.80, f"{rolled} of {len(seeds)} seeds rolled back at 24 runs a half")
+
+    def test_a_cold_tail_is_mostly_not_yet_caught_at_twelve_runs_but_never_by_the_median_row(self):
+        rolled = sum(bool(verdict_of(*simulated_halves(seed, 12, tail_share=0.15))[1]) for seed in range(100))
+        self.assertGreaterEqual(rolled, 20, "power at 12 runs: the shards have a dozen legs, and a tail of 15% is under two of them")
+        self.assertEqual(want(verdict_of(*simulated_halves(0, 12, tail_share=0.15))[0], "wall (per shard)").status, G.PASS)
+
+    def test_a_cold_tail_on_4cpu_only_rolls_back_and_names_4cpu(self):
+        for seed in range(30):
+            rows, reasons = verdict_of(*simulated_halves(seed, 30, tail_share=0.25, tail_sizes=(4,)))
+            r = want(rows, "wall tail (per shard)")
+            self.assertEqual(r.status, G.FAIL, (seed, r))
+            self.assertIn("on 4cpu (", r.note)
+            self.assertNotIn("8cpu (", r.note, "the clean size is not named")
+            self.assertEqual([x.split(":")[0] for x in reasons], ["wall tail (per shard)"], (seed, reasons))
+
+
+class TailOnTheRealWindow(unittest.TestCase):
+    job, workflow = SplitWindow.job, SplitWindow.workflow
+    setUp = SplitWindow.setUp
+    run_gate = SplitWindow.run_gate
+    line = SplitWindow.line
+
+    def test_the_09_24z_window_keeps_and_its_tail_row_does_not_fail(self):
+        rest, records, since, now = load_split_fixture()
+        code, out = self.run_gate(rest, records=records, now=now, extra=["--since", since])
+        self.assertEqual(code, G.KEEP, out)
+        self.assertTrue(self.line(out, "canary ").startswith("canary unit-tests@50: KEEP"), self.line(out, "canary "))
+        self.assertRegex(out, r"\n  (PASS|NOISE) wall tail \(per shard\)", "the row is there, and not FAIL")
+        s = [o for o in (G.is_obs(G.synth_job(e), {}) for e in records) if o]
+        b = [o for o in (G.is_obs(j, {}) for rid, br, c, js in rest for j in js if G.fleet_or_label(j) == "blacksmith") if o]
+        pairs, _ = G.tail_pairs(s, b, 165.0, min_legs=4)
+        self.assertTrue(pairs and all(r < 1 + G.TAIL_MARGIN for _, r, *_ in pairs), "even the shards of four legs a half, whose p90 is noisiest, have no tail over the margin")
 
 
 class RealWindowOfNov28(unittest.TestCase):
