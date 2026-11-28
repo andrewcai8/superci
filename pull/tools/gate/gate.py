@@ -69,6 +69,14 @@ ROLLBACK_ALARMS = ("superci-pull-listener-down", "superci-pull-spend-capped")
 SET_ROLLBACK_ALARMS = ("superci-pull-oldest-job-wait", "superci-pull-jobs-stalled")
 CANARY_P90_RUNS = 20  # a p90 of fewer runs is one job: one outlier must not send a job back
 ROLLBACK, KEEP = 3, 0
+# A split key of megpt-mono's SUPERCI_JOBS ("<job>@50") sends a run to superci by the last digit of its run id (@10: 0; @50: 0-4; @90: 0-8), every leg
+# and rerun of the run alike. `gate job --split N` reads one window of the job's runs and holds the superci half against the Blacksmith half of it:
+# both ran in the same hours on the same mix of PRs, so no earlier baseline is read. Two rows are about the split itself, and are report-only (never in
+# ROLLBACK_ROWS): a run with legs on both fleets and a superci share far from N% are routing faults of megpt-mono, not harm to superci's jobs, and no rollback
+# of the job would mend them; the canary line carries them when they fail.
+SPLIT_PERCENTS = (10, 50, 90)
+ROUTING_ROW, RATIO_ROW = "routing faults (runs on both fleets)", "split ratio (superci share of runs)"
+SPLIT_ROWS = (ROUTING_ROW, RATIO_ROW)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -239,10 +247,69 @@ def run_failure_allowance(n, p, alpha=FALSE_ROLLBACK_RATE):
     return min(MIN_ALLOWED_FAILED_RUNS, n)
 
 
-def evaluate_job(S, B, ceiling, unexplained, min_runs=MIN_RUNS, tests=None):
+def binomial_two_sided_p(k, n, p):
+    """The exact two-sided p-value of k successes in n trials of probability p: the sum of every outcome no likelier than k's (1e-7 relative slack for
+    float noise). Each term in log space (lgamma), as run_failure_allowance's. 1.0 for n <= 0."""
+    if n <= 0:
+        return 1.0
+    p = min(max(p, 0.0), 1.0)
+    if p in (0.0, 1.0):
+        return 1.0 if k == round(n * p) else 0.0
+    log_p, log_q, log_n = math.log(p), math.log1p(-p), math.lgamma(n + 1)
+    pmf = lambda i: math.exp(log_n - math.lgamma(i + 1) - math.lgamma(n - i + 1) + i * log_p + (n - i) * log_q)
+    at_k = pmf(k)
+    return min(1.0, sum(x for x in map(pmf, range(n + 1)) if x <= at_k * (1 + 1e-7)))
+
+
+def run_fleets(jobs):
+    """{run id: the set of fleets (superci, blacksmith) its legs ran on}, over the legs given (every attempt). A leg on neither (another runner, or none
+    known) and a leg with no run id are in no run's set. Pure."""
+    out = collections.defaultdict(set)
+    for j in jobs:
+        f = fleet_or_label(j)
+        if j.get("run_id") and f in ("superci", "blacksmith"):
+            out[j["run_id"]].add(f)
+    return out
+
+
+def split_rows(percent, by_run):
+    """The two report-only rows of a split (SPLIT_ROWS) from run_fleets' answer. A run whose legs ran on both fleets is a routing fault: it is in neither
+    half, and the row lists it. The ratio is superci's share of the runs in the halves against `percent`, an exact two-sided binomial test at
+    FALSE_ROLLBACK_RATE. Neither rolls a canary back (they are not ROLLBACK_ROWS): the failures row cannot see a skewed split, and a job sent back to
+    Blacksmith does not repair megpt-mono's routing. Pure."""
+    both = sorted(r for r, f in by_run.items() if len(f) > 1)
+    s = sum(1 for f in by_run.values() if f == {"superci"})
+    b = sum(1 for f in by_run.values() if f == {"blacksmith"})
+    rows = [Row(ROUTING_ROW, f"{len(both)} of {s + b + len(both)} runs", "0", PASS if not both else FAIL,
+                "" if not both else f"run {', '.join(map(str, both[:5]))}{' ...' if len(both) > 5 else ''}: legs on both fleets, so in neither half. The routing of SUPERCI_JOBS is broken, "
+                f"which is not harm to superci's jobs: report-only, no rollback; the first thing to fix")]
+    n = s + b
+    if not n:
+        return rows + [Row(RATIO_ROW, "0 of 0 runs", f"{percent}% to superci", NOISE, "no run in either half: add runs")]
+    pv = binomial_two_sided_p(s, n, percent / 100)
+    th = f"{percent}% to superci (two-sided binomial p >= {FALSE_ROLLBACK_RATE:g})"
+    return rows + [Row(RATIO_ROW, f"{s} of {n} runs = {100 * s / n:.1f}% (p = {pv:.3g})", th, PASS if pv >= FALSE_ROLLBACK_RATE else FAIL,
+                       "" if pv >= FALSE_ROLLBACK_RATE else f"the split is not {percent}%: megpt-mono's routing, report-only, no rollback (the failures row cannot see it)")]
+
+
+def split_excess_p(s_failed, s_runs, b_failed, b_runs):
+    """Fisher's exact one-sided p-value that the superci half's failed runs are this many or more by chance, given both halves' runs and their
+    failed runs together (Hypergeometric: of s_runs + b_runs runs, s_failed + b_failed failed, the s_runs superci drew). A split's two halves ran in
+    the same window on the same mix of PRs, so the question is whether superci's half fails more than Blacksmith's; unlike a binomial bound at the
+    Blacksmith half's rate, it weighs how little a small half knows on both sides (a 1-of-4 Blacksmith half is not a 25% rate)."""
+    n, k = s_runs + b_runs, s_failed + b_failed
+    if s_runs <= 0 or s_failed <= 0:
+        return 1.0
+    total = math.comb(n, s_runs)
+    return sum(math.comb(k, i) * math.comb(n - k, s_runs - i) for i in range(s_failed, min(k, s_runs) + 1)) / total
+
+
+def evaluate_job(S, B, ceiling, unexplained, min_runs=MIN_RUNS, tests=None, split=False):
     """Gate 1's rows from the superci runs S and Blacksmith's B of one job, the job's ceiling in seconds (None when it has no
     row in ci-limits.tsv), the unexplained seconds of each superci job and `tests` (Tests, or None for a job with no test-name
-    source: the failures row then counts a failed job as one failure). Pure."""
+    source: the failures row then counts a failed job as one failure). `split`: S and B are the two halves of one window (gate job --split), so the
+    failures row is Fisher's exact test of the halves, and a row whose Blacksmith half is too small to compare with (under MIN_RUNS runs for a p50,
+    CANARY_P90_RUNS for a p90) is NOISE and sends nothing back: one slow Blacksmith run of three is no p90. Pure."""
     rows = []
     runs = len({o.run_id for o in S if not o.cancelled})
     rows.append(Row("n (superci runs)", str(runs), f">= {min_runs}", PASS if runs >= min_runs else FAIL, "counts runs, not shards"))
@@ -263,6 +330,12 @@ def evaluate_job(S, B, ceiling, unexplained, min_runs=MIN_RUNS, tests=None):
         rows.append(at_most("wall p90", T.q(sw, 90), bound90, f"<= {th90}", wall_noise))
         rows.append(at_most("queue wait p50", T.q(sq, 50), T.q(bq, 50), f"<= B p50 {T.q(bq, 50):.1f} s", queue_noise))
         rows.append(at_most("queue wait p90", T.q(sq, 90), T.q(bq, 90) + QUEUE_P90_SLACK_S, f"<= B p90 {T.q(bq, 90):.1f} + {QUEUE_P90_SLACK_S:g} s", queue_noise))
+        if split:
+            nb = len({o.run_id for o in B if not o.cancelled})
+            for i, r in enumerate(rows):
+                need = CANARY_P90_RUNS if r.name.endswith("p90") else min_runs if r.name.endswith("p50") else None
+                if need is not None and nb < need:
+                    rows[i] = dataclasses.replace(r, status=NOISE, note=f"no Blacksmith runs enough to compare yet: the split's Blacksmith half has {nb}, under {need}")
     everything = list(S) + list(B)
     S_done, B_done = [o for o in S if not o.cancelled], [o for o in B if not o.cancelled]
     counted = [o for o in S_done if not o.ok and not excused(o, everything)]
@@ -281,11 +354,22 @@ def evaluate_job(S, B, ceiling, unexplained, min_runs=MIN_RUNS, tests=None):
     failed_runs = collections.Counter(o.run_id for o in counted)  # run -> its counted failed legs
     b_failed_runs, b_counted_runs = {o.run_id for o in b_failed}, {o.run_id for o in b_counted}
     b_rate = len(b_counted_runs) / len(b_runs) if b_runs else 0.0
-    allowed = run_failure_allowance(len(s_runs), b_rate)
     legs_of = ", ".join(f"{r} ({c})" for r, c in failed_runs.most_common(10)) + (" ..." if len(failed_runs) > 10 else "")
-    rows.append(Row("failures (superci)", f"{len(failed_runs)} of {len(s_runs)} ({len(counted)} legs)",
-                    f"<= {allowed} at a {100 * FALSE_ROLLBACK_RATE:g}% false-rollback bound (Blacksmith {len(b_counted_runs)}/{len(b_runs)} runs = {100 * b_rate:.1f}%)",
-                    PASS if len(failed_runs) <= allowed else FAIL, "; ".join(notes), tuple(detail) + (
+    if not split:
+        allowed = run_failure_allowance(len(s_runs), b_rate)
+        ok = len(failed_runs) <= allowed
+        threshold = f"<= {allowed} at a {100 * FALSE_ROLLBACK_RATE:g}% false-rollback bound (Blacksmith {len(b_counted_runs)}/{len(b_runs)} runs = {100 * b_rate:.1f}%)"
+    elif len(b_runs) < min_runs:  # a Blacksmith half of a few runs knows no rate: the floor, as against a clean baseline
+        ok = len(failed_runs) <= min(MIN_ALLOWED_FAILED_RUNS, len(s_runs))
+        threshold = (f"<= {min(MIN_ALLOWED_FAILED_RUNS, len(s_runs))}: the split's Blacksmith half has {len(b_runs)} runs, under {min_runs}, so the floor "
+                     f"(Blacksmith {len(b_counted_runs)}/{len(b_runs)} runs = {100 * b_rate:.1f}%)")
+    else:
+        pv = split_excess_p(len(failed_runs), len(s_runs), len(b_counted_runs), len(b_runs))
+        ok = len(failed_runs) <= MIN_ALLOWED_FAILED_RUNS or pv > FALSE_ROLLBACK_RATE
+        threshold = (f"Fisher's exact p {pv:.3g} > {FALSE_ROLLBACK_RATE:g} that superci's half fails more than Blacksmith's "
+                     f"(Blacksmith {len(b_counted_runs)}/{len(b_runs)} runs = {100 * b_rate:.1f}%)")
+    rows.append(Row("failures (superci)", f"{len(failed_runs)} of {len(s_runs)} ({len(counted)} legs)", threshold,
+                    PASS if ok else FAIL, "; ".join(notes), tuple(detail) + (
                         (f"failed superci runs (counted legs): {legs_of}",) if failed_runs else ()) + (
                         (f"Blacksmith failure rate: {100 * len(b_failed_runs) / len(b_runs) if b_runs else 0.0:.1f}% ({len(b_failed_runs)} of {len(b_runs)} runs) before, {100 * b_rate:.1f}% ({len(b_counted_runs)} of {len(b_runs)} runs) "
                          f"after excluding {len(b_failed) - len(b_counted)} failed main job{'' if len(b_failed) - len(b_counted) == 1 else 's'} whose every failing test excused a superci failure; the bound uses the rate after",) if tests is not None else ())))
@@ -395,16 +479,17 @@ WINDOW_FLOORS = {
 }
 
 
-def clamp_window(job, since, b_lo, b_hi, floors=None):
+def clamp_window(job, since, b_lo, b_hi, floors=None, split=False):
     """(since, b_lo, lines): the parity window of `job` held to its floor, and a line for each clamp. A Blacksmith window that ends at
-    or before the floor holds nothing of the job after it, so it is refused (SystemExit), never read as empty."""
+    or before the floor holds nothing of the job after it, so it is refused (SystemExit), never read as empty. A split's one window
+    is passed as both (b_lo = since): only --since is reported."""
     f = (WINDOW_FLOORS if floors is None else floors).get(job)
     if f is None:
         return since, b_lo, []
     at, name = T.ts(f.at), f"window floor ({job}): {f.commit[:7]} at {f.at}, {f.why}"
     if b_hi <= at:
         raise SystemExit(f"refusing: Blacksmith's window for {job} ends at {T.iso(b_hi)}, before {name}: no run in it is a parity sample")
-    lines = [f"{what} {T.iso(t)} clamped to {f.at}" for what, t in (("--since", since), ("Blacksmith baseline start", b_lo)) if t < at]
+    lines = [f"{what} {T.iso(t)} clamped to {f.at}" for what, t in (("--since", since), ("Blacksmith baseline start", b_lo))[:1 if split else 2] if t < at]
     return max(since, at), max(b_lo, at), [f"{name}; " + "; ".join(lines)] if lines else [f"{name}; the window starts after it, nothing clamped"]
 
 
@@ -702,13 +787,13 @@ def main_red_runs(listed, job_window):
             and r.get("conclusion") in ("failure", "timed_out", "cancelled")]
 
 
-def gather_tests(gh, cache, source, name, candidates, s_jobs, events, listed, window, limit=MAX_TEST_READS):
+def gather_tests(gh, cache, source, name, candidates, s_jobs, events, listed, window, limit=MAX_TEST_READS, only_runs=None):
     """Tests for the failures row. `candidates` are the superci failures the job-level rule would count, `s_jobs` the REST-shaped jobs
     of S by id. Superci's side comes first in the read budget. A record has no GitHub job id, so each failed record is matched to its
     REST job in its run's listing (one call a run, cached, as with_github_created does), which also gives the job's steps.
     Blacksmith's side is every failed `name` job of the ordinary main runs listed in `window` that ended red (not only the sample the
     rates are drawn from; no census leg, no manual run), read once and then cached. Only test-level names are red: a file or target
-    named for failing with no test is not."""
+    named for failing with no test is not. `only_runs` (a split's Blacksmith half: its run ids) keeps the main runs read to those."""
     src, reader, reads = NAME_SOURCES[name], NameReader(gh, cache, NAME_SOURCES[name], limit), {}
     listing = jobs_of(gh, [{"id": r} for r in sorted({s_jobs[o.job_id]["run_id"] for o in candidates})], attempts="all") if events and candidates else {}
     for o in candidates:
@@ -720,6 +805,8 @@ def gather_tests(gh, cache, source, name, candidates, s_jobs, events, listed, wi
                 continue
         reads[o.job_id] = reader.read(j)
     runs = main_red_runs(listed, window)
+    if only_runs is not None:
+        runs = [r for r in runs if r["id"] in only_runs]
     by_run = jobs_of(gh, runs, attempts="all") if runs else {}
     t = Tests(source, reads, {}, main_runs=len(runs))
     red, red_jobs = collections.defaultdict(set), collections.Counter()
@@ -1279,33 +1366,55 @@ def show_spread(label, obs, ceiling=None):
 
 def cmd_job(a):
     now = time.time()
+    split = a.split  # None, or the percent of runs megpt-mono's key sends to superci: one window, both halves of it, no earlier baseline
+    if split is not None and a.baseline_until:
+        raise SystemExit("refusing: --baseline-until with --split: a split reads one window, both halves of it, and has no earlier baseline")
+    if split is not None and a.max_runs:
+        raise SystemExit("refusing: --max-runs with --split: every run of the window is read, since a sample would skew the halves and their ratio")
     gh = T.GitHub(a.repo, T.Cache(a.cache))
     since = T.ts(a.since) if a.since else now - 86400
     b_hi = T.ts(a.baseline_until) if a.baseline_until else now
     b_lo = b_hi - 3600 * a.baseline_hours
-    since, b_lo, floor_lines = clamp_window(a.job, since, b_lo, b_hi)
+    if split is not None:
+        b_lo, b_hi = since, now
+    since, b_lo, floor_lines = clamp_window(a.job, since, b_lo, b_hi, split=split is not None)
     limits = parse_limits(open(a.limits).read() if a.limits else gh_raw(LIMITS_PATH))
     ceiling = limits.get((a.workflow, a.job))
     events = resolve_source(a, since, now) == "events"
     # With the listener's job records the superci window needs no GitHub call: only Blacksmith's side is listed and read.
     listed = runs_of(gh, a.workflow, b_lo if events else min(since, b_lo), now)
     # The branch only picks which runs are read whole, to bound GitHub calls; which jobs are superci's is decided by the job's own fleet and group below.
-    s_runs = [] if events else [r for r in listed if T.ts(r["created_at"]) >= since and fnmatch.fnmatch(r.get("head_branch") or "", a.branch_glob)]
-    b_runs = [r for r in listed if b_lo <= T.ts(r["created_at"]) <= b_hi and r["id"] not in {x["id"] for x in s_runs}]
-    b_runs = sample(b_runs, a.max_runs or (EVENTS_BASELINE_RUNS if events else 300))
+    if split is not None:
+        # One window of runs, whatever fleet each ran on, every one read: the branch glob bounds both halves alike.
+        s_runs, b_runs = [], [r for r in listed if since <= T.ts(r["created_at"]) <= now and fnmatch.fnmatch(r.get("head_branch") or "", a.branch_glob)]
+        window_ids = {r["id"] for r in b_runs}
+    else:
+        s_runs = [] if events else [r for r in listed if T.ts(r["created_at"]) >= since and fnmatch.fnmatch(r.get("head_branch") or "", a.branch_glob)]
+        b_runs = [r for r in listed if b_lo <= T.ts(r["created_at"]) <= b_hi and r["id"] not in {x["id"] for x in s_runs}]
+        b_runs = sample(b_runs, a.max_runs or (EVENTS_BASELINE_RUNS if events else 300))
     runs = s_runs + b_runs
     by_run = {r["id"]: r for r in runs}
     jobs = [(j, by_run[rid]) for rid, js in jobs_of(gh, runs, attempts="all").items() for j in js if matches(j["name"], a.job)]
     dispatched, unmatched = 0, []
+    listed_legs, record_legs = [j for j, r in jobs], []  # a split places each run by every leg of it: GitHub's, superci's included, and the records'
     if events:
         jobs = [(j, r) for j, r in jobs if not is_superci(j, a.superci_group)]  # a sampled baseline run can hold superci jobs too: they come from the records alone
         recs = [e for e in job_records(a.profile, since, now + 600) if record_workflow(e) == a.workflow and fnmatch.fnmatch(record_branch(e), a.branch_glob)
                 and matches(e.get("name") or "", a.job) and (T.ts(e.get("queue_time") or e.get("finish_time")) or 0) >= since]
+        if split is not None:
+            recs = [e for e in recs if e.get("run") in window_ids]  # a record of a run the window does not hold is not in its halves
         records, dispatched, unmatched = with_github_created(gh, recs, a.superci_group)
+        record_legs = records
         jobs += [(j, {"head_branch": j["head_branch"], "head_sha": ""}) for j in records]
     jobs_all = [j for j, r in jobs]
-    S_jobs = [j for j, r in jobs if is_superci(j, a.superci_group) and T.ts(j["created_at"]) >= since]
-    B_jobs = [j for j, r in jobs if fleet_or_label(j) == "blacksmith" and b_lo <= T.ts(j["created_at"]) <= b_hi]
+    if split is not None:
+        by_fleets = run_fleets(listed_legs + record_legs)
+        faults = {rid for rid, f in by_fleets.items() if len(f) > 1}  # a run with legs on both fleets is in neither half
+        S_jobs = [j for j, r in jobs if is_superci(j, a.superci_group) and j["run_id"] not in faults]
+        B_jobs = [j for j, r in jobs if fleet_or_label(j) == "blacksmith" and j["run_id"] not in faults]
+    else:
+        S_jobs = [j for j, r in jobs if is_superci(j, a.superci_group) and T.ts(j["created_at"]) >= since]
+        B_jobs = [j for j, r in jobs if fleet_or_label(j) == "blacksmith" and b_lo <= T.ts(j["created_at"]) <= b_hi]
     runs_by_job = {j["id"]: r for j, r in jobs}
     S = [o for o in (is_obs(j, runs_by_job[j["id"]]) for j in S_jobs) if o]
     B = [o for o in (is_obs(j, runs_by_job[j["id"]]) for j in B_jobs) if o]
@@ -1319,7 +1428,8 @@ def cmd_job(a):
     tests = None
     if source is not None:
         candidates = [o for o in S if not o.ok and not o.cancelled and not excused(o, list(S) + list(B))]
-        tests = gather_tests(gh, T.Cache(a.cache), source, a.job, candidates, {j["id"]: j for j in S_jobs}, events, listed, (b_lo, b_hi), a.max_test_reads)
+        tests = gather_tests(gh, T.Cache(a.cache), source, a.job, candidates, {j["id"]: j for j in S_jobs}, events, listed, (b_lo, b_hi), a.max_test_reads,
+                             only_runs={j["run_id"] for j in B_jobs} if split is not None else None)  # a split: red on main from the window's Blacksmith half
     unexplained = []
     finished = [j for j in S_jobs if j.get("completed_at") and (j.get("run_attempt") or 1) == 1 and j.get("conclusion") in OUTCOMES]  # a rerun's created_at is its first attempt's: no timeline
     if events:
@@ -1327,19 +1437,24 @@ def cmd_job(a):
     if finished:
         ev = T.gather(a.profile, finished, before=3 * 3600, legacy=a.legacy)
         unexplained = [t.unexplained for t in (T.build(j, ev) for j in finished) if t.wall is not None]
-    print(f"gate job {a.job}  workflow {a.workflow}  ({len(listed)} runs listed, jobs read from {len(s_runs)} superci-window and {len(b_runs)} baseline runs, {gh.calls} GitHub calls)")
-    print(f"  superci: " + (f"{len(S_jobs)} jobs from the listener's job records ({'no GitHub call' if not dispatched else f'GitHub read for the created_at of {dispatched} dispatched jobs'}), on branches {a.branch_glob}" if events
+    read_from = f"jobs read from {len(runs)} runs of the split window" if split is not None else f"jobs read from {len(s_runs)} superci-window and {len(b_runs)} baseline runs"
+    print(f"gate job {a.job}  workflow {a.workflow}  ({len(listed)} runs listed, {read_from}, {gh.calls} GitHub calls)")
+    if split is not None:
+        print(f"  split @{split}: one window of runs, each in the half of the fleet its legs ran on, a run on both set aside; no earlier baseline (--baseline-hours is unused)")
+    reads = (f"GitHub read for every run of the window, to place its legs" if split is not None else "no GitHub call") if not dispatched else f"GitHub read for the created_at of {dispatched} dispatched jobs"
+    print(f"  superci: " + (f"{len(S_jobs)} jobs from the listener's job records ({reads}), on branches {a.branch_glob}" if events
                             else f"runner group {a.superci_group}, runs read whole from branches {a.branch_glob}") + f", created {T.iso(since)} to {T.iso(now)}")
-    print(f"  blacksmith: created {T.iso(b_lo)} to {T.iso(b_hi)}; ceiling " + (f"{ceiling:g} s ({LIMITS_PATH})" if ceiling is not None else f"none (no {a.workflow} / {a.job} row)"))
+    print(f"  blacksmith: " + ("the same window, " if split is not None else "") + f"created {T.iso(b_lo)} to {T.iso(b_hi)}; ceiling " + (f"{ceiling:g} s ({LIMITS_PATH})" if ceiling is not None else f"none (no {a.workflow} / {a.job} row)"))
     for line in floor_lines:
         print(f"  {line}")
     if tests is None:
         print(f"  failing tests: no test-name source for {a.job} (only {', '.join(NAME_SOURCES)} have one): the failures row counts a superci failed job as one failure, as before")
     else:
         print(f"  failing tests: {source.what}, {tests.logs} log read{'' if tests.logs == 1 else 's'} from GitHub this check (the rest cached); a superci failure counts when a failing test is in no failed "
-              f"Blacksmith main job of the baseline window ({tests.main_runs} main run{'' if tests.main_runs == 1 else 's'} ended red, {tests.main_failed} failed job{'' if tests.main_failed == 1 else 's'} read, {len(tests.red)} test{'' if len(tests.red) == 1 else 's'} red there)")
+              f"Blacksmith main job of {'the window' + chr(39) + 's Blacksmith half' if split is not None else 'the baseline window'} ({tests.main_runs} main run{'' if tests.main_runs == 1 else 's'} ended red, {tests.main_failed} failed job{'' if tests.main_failed == 1 else 's'} read, {len(tests.red)} test{'' if len(tests.red) == 1 else 's'} red there)")
     print(f"  rerun attempts: {sum(1 for j in S_jobs + B_jobs if (j.get('run_attempt') or 1) > 1)} counted for failures and wall time, not for queue wait (a rerun keeps its first attempt's created_at, so its queue wait is not real)")
-    cancelled = cancelled_by_fleet([j for j in jobs_all if (fleet_or_label(j) == "superci" and T.ts(j["created_at"]) >= since) or (fleet_or_label(j) == "blacksmith" and b_lo <= T.ts(j["created_at"]) <= b_hi)])
+    cancelled = cancelled_by_fleet(S_jobs + B_jobs if split is not None else
+                                   [j for j in jobs_all if (fleet_or_label(j) == "superci" and T.ts(j["created_at"]) >= since) or (fleet_or_label(j) == "blacksmith" and b_lo <= T.ts(j["created_at"]) <= b_hi)])
     print("  cancelled (no outcome; counted in wall and queue wait as lower bounds, never as runs or failures): " + ", ".join(f"{f} {cancelled.get(f, (0, 0))[0]} run{'' if cancelled.get(f, (0, 0))[0] == 1 else 's'} ({cancelled.get(f, (0, 0))[1]} job{'' if cancelled.get(f, (0, 0))[1] == 1 else 's'})" for f in ("superci", "blacksmith")))
     print("  quantiles are interpolated (wall over successful runs and timed-out ones at the ceiling, queue wait over every first attempt):")
     show_spread("superci", S, ceiling)
@@ -1352,7 +1467,8 @@ def cmd_job(a):
     except Exception as e:  # the spend is information: a CloudWatch failure never stops a check
         print(f"  cost of the window: not read ({type(e).__name__})")
     print()
-    rows = evaluate_job(S, B, ceiling, unexplained, tests=tests) + dispatched_row(dispatched, unmatched) + unread(gh, a.allow_unread)
+    rows = (evaluate_job(S, B, ceiling, unexplained, tests=tests, split=split is not None) + (split_rows(split, by_fleets) if split is not None else [])
+            + dispatched_row(dispatched, unmatched) + unread(gh, a.allow_unread))
     code = print_rows("criteria", rows, f"gate 1 for {a.job}")
     if not a.canary:
         return code
@@ -1361,7 +1477,9 @@ def cmd_job(a):
     reasons = canary_verdict(rows, alarms, sets)
     paging = sorted(n for n, st in alarms.items() if st == "ALARM" and n not in rollback_alarms(alarms, sets))
     print(f"\njudged on: {judged_on(alarms, sets)}")
-    print(f"canary {a.job}: " + (f"ROLL BACK ({'; '.join(reasons)})" if reasons else "KEEP") + (f"   [paging, no rollback: {paging}]" if paging else ""))
+    broken = [f"{r.name}: {r.value}" + (f" (run {', '.join(map(str, sorted(faults)[:5]))})" if r.name == ROUTING_ROW else "") for r in rows if r.name in SPLIT_ROWS and r.status == FAIL] if split is not None else []
+    print(f"canary {a.job}{'' if split is None else f'@{split}'}: " + (f"ROLL BACK ({'; '.join(reasons)})" if reasons else "KEEP") + (f"   [paging, no rollback: {paging}]" if paging else "")
+          + (f"   [split, no rollback: {'; '.join(broken)}]" if broken else ""))
     return ROLLBACK if reasons else KEEP
 
 
@@ -1435,6 +1553,17 @@ def cmd_replay_trace(a):
     return 0
 
 
+def split_percent(text):
+    """argparse type of --split: one of SPLIT_PERCENTS, megpt-mono's split keys."""
+    try:
+        n = int(text)
+    except ValueError:
+        n = None
+    if n not in SPLIT_PERCENTS:
+        raise argparse.ArgumentTypeError(f"--split is one of {', '.join(map(str, SPLIT_PERCENTS[:-1]))} or {SPLIT_PERCENTS[-1]}, megpt-mono's split keys, not {text!r}")
+    return n
+
+
 def build_parser():
     p = argparse.ArgumentParser(prog="gate", description=__doc__.split("\n")[0])
     p.add_argument("--profile", default=os.environ.get("AWS_PROFILE", "ci-runners"), help="AWS profile of the superci account")
@@ -1451,7 +1580,10 @@ def build_parser():
     j.add_argument("--branch-glob", required=True, help="read whole the runs since --since from branches matching this glob ('main' for a canary on main, 'ci/superci-load-pull-*' for load branches); "
                    "a job counts as superci's by its own runner group, so this bounds the GitHub calls and nothing else. Required: with no glob every run would be read whole and --max-runs would bound nothing")
     j.add_argument("--baseline-hours", type=float, default=BASELINE_HOURS, help="Blacksmith's window, ending now")
-    j.add_argument("--baseline-until", help="end Blacksmith's window here instead of now")
+    j.add_argument("--baseline-until", help="end Blacksmith's window here instead of now (refused with --split)")
+    j.add_argument("--split", type=split_percent, help=f"judge a split key (SUPERCI_JOBS \"<job>@N\", N one of {', '.join(map(str, SPLIT_PERCENTS))}): read ONE window, --since to now, every run of the job on --branch-glob, "
+                   "and hold the runs on superci (the superci half) against the runs on Blacksmith (the other half) of that same window, with no earlier baseline. A run with legs on both fleets "
+                   "is a routing fault: reported, in neither half. Report-only rows check the faults and the superci share of runs against N%%")
     j.add_argument("--max-runs", type=int, default=None, help=f"read the baseline's jobs from at most this many runs, spread evenly (GitHub's rate limit is 5,000 an hour; default {EVENTS_BASELINE_RUNS} with the listener's job records, 300 reading superci's side from GitHub); the superci window is always read whole")
     j.add_argument("--superci-source", choices=("auto", "events", "github"), default="auto", help="where superci's jobs are read from: the listener's job.record events (no GitHub call for superci's side), "
                    "GitHub's REST API, or auto (default): events when the window starts after the first record, GitHub before")

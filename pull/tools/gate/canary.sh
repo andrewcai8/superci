@@ -7,7 +7,15 @@
 #   pull/tools/gate/canary.sh SINCE UNTIL JOB...      # SINCE: when SUPERCI_JOBS listed the jobs; UNTIL: the end of the watch
 #   EVERY=900 WORKFLOW=lint-test-backend.yml LIMITS=ci-limits.tsv LOG=dir pull/tools/gate/canary.sh ...
 #
-# Blacksmith's side is the 24 h before SINCE, when the jobs still ran there.
+# A JOB is a SUPERCI_JOBS entry: a plain job (`test-go`: every run of it is on superci) or a split (`unit-tests@50`: megpt-mono sends a run to superci by the
+# last digit of its run id, @10 digit 0, @50 digits 0-4, @90 digits 0-8, every leg and rerun of a run alike; the other runs stay on Blacksmith). Only @10,
+# @50 and @90 are splits; any other JOB with an @ is refused. The entries are matched by KEY, the part before the @: a JOB is still listed while
+# SUPERCI_JOBS holds its key at any percent, and its rollback takes out every entry of that key (the plain one and each percent) and no other key's.
+#
+# A plain JOB's Blacksmith side is the 24 h before SINCE, when the job still ran there (`gate job JOB --baseline-until SINCE`). A split JOB has no
+# earlier baseline: the gate is called `gate job KEY --split N --since SINCE` and holds the superci runs against the Blacksmith runs of the SAME window, SINCE
+# to now, which saw the same PRs. A run with legs on both fleets, or a split far from N%, is a routing fault of megpt-mono: the gate reports it on its canary
+# line (so on this log) and rolls nothing back.
 #
 # Every read is on the superci GitHub App's installation budget (timeline/apptoken.py asks the listener for a token), and
 # the floor reads that token's own budget. With no App token the watch refuses to start, and a check that cannot get one is
@@ -41,7 +49,7 @@
 #                           SUPERCI_JOBS still lists. A rollback that could not be written does not stop the watch: the next tick tries again.
 #                           A job already gone from SUPERCI_JOBS when the rollback read it (another watch, a `set`) is not a rollback of this watch.
 # A re-route by hand uses the same token and the same fallback, with no watch, no aws and no actions token:
-#   pull/tools/gate/canary.sh set '["test-go","verify-tools"]'     # SUPERCI_JOBS := that JSON array of job names
+#   pull/tools/gate/canary.sh set '["test-go","unit-tests@50"]'    # SUPERCI_JOBS := that JSON array of entries: a job, or a job@10, job@50 or job@90 (any other @ is refused)
 #   pull/tools/gate/canary.sh unset                                # delete SUPERCI_JOBS: every job back to Blacksmith
 set -uo pipefail
 R=Authentic-Intelligence/megpt-mono
@@ -175,8 +183,9 @@ jobs_write() { # [delete | set JSON]: one write of SUPERCI_JOBS, as the rollback
   if [ "$1" = delete ]; then vwrite variable delete SUPERCI_JOBS -R $R; else vwrite variable set SUPERCI_JOBS -R $R --body "$2"; fi && return 0
   rollback_failed "$fail_cause"
 }
-remove() { # job: drop it from SUPERCI_JOBS, and delete the variable when it was the last; retried while GitHub does not answer
-  local now="" left code try after # now stays empty when no read answers, so the delete below sends every job back
+key_listed='any(.[]; type == "string" and split("@")[0] == $k)' # SUPERCI_JOBS lists a job by its key, the part of an entry before the @ (a plain job, or a split at any percent)
+remove() { # job: drop its key (every entry of it: plain and each percent) from SUPERCI_JOBS, and delete the variable when it was the last; retried while GitHub does not answer
+  local now="" left code try after k=${1%%@*} # now stays empty when no read answers, so the delete below sends every job back
   rb_state=""; rb_before=""; rb_after="" # for the notice: unset (nothing to roll back), or done with SUPERCI_JOBS before and after
   get_vt 3 || [ "$personal_ok" = 1 ] || { rollback_failed "the listener would not give a variables token to remove $1 with ($(vt_why))"; return 1; }
   for try in 1 2 3 4 5; do
@@ -192,19 +201,21 @@ remove() { # job: drop it from SUPERCI_JOBS, and delete the variable when it was
     rb_state=done; rb_before="$listed (the rollback could not re-read it)"; rb_after=unset
     return
   fi
-  if ! jq -e --arg j "$1" 'index($j) != null' <<<"$now" > /dev/null; then # another watch or a `set` took it out between the tick's read and this one: nothing was rolled back here
+  if ! jq -e --arg k "$k" "$key_listed" <<<"$now" > /dev/null; then # another watch or a `set` took it out between the tick's read and this one: nothing was rolled back here
     echo "$1 is no longer in SUPERCI_JOBS ($now): removed by another watch or by hand, nothing to write"; rb_state=gone; return 0
   fi
-  left=$(jq -c --arg j "$1" 'map(select(. != $j))' <<<"$now")
+  left=$(jq -c --arg k "$k" 'map(select((type == "string" and split("@")[0] == $k) | not))' <<<"$now")
   if [ "$left" = "[]" ]; then jobs_write delete; else jobs_write set "$left"; fi || return 1
   read_jobs 1 && after=$jobs_val || after=unset
   echo "SUPERCI_JOBS was $now, now $after"
   rb_state=done; rb_before=$now; rb_after=$after
 }
 jobs_helper() { # set JSON | unset: the operator's re-route, on the same token and fallback as the rollback
-  local usage="usage: $0 set '[\"job\",...]' | $0 unset" now after rc
+  local usage="usage: $0 set '[\"job\",\"job@50\",...]' | $0 unset" now after rc bad
   case "${1:-}" in
-    set) [ $# -eq 2 ] && jq -e 'type == "array" and all(type == "string")' <<<"$2" > /dev/null 2>&1 || { echo "$usage" >&2; return 2; } ;;
+    set) [ $# -eq 2 ] && jq -e 'type == "array" and all(type == "string")' <<<"$2" > /dev/null 2>&1 || { echo "$usage" >&2; return 2; }
+      bad=$(jq -r '.[] | select(test("^([^@*]+(@(10|50|90))?|[*])$") | not)' <<<"$2" | head -1) # an entry is "*", a job, or a job then @10, @50 or @90: megpt-mono reads no "*@50" or bare "@50"
+      [ -z "$bad" ] || { echo "refusing: SUPERCI_JOBS entry \"$bad\": an entry is \"*\", a job, or a job then @10, @50 or @90, and nothing else" >&2; return 2; } ;;
     unset) [ $# -eq 1 ] || { echo "$usage" >&2; return 2; } ;;
   esac
   get_vt 3 || [ "$personal_ok" = 1 ] || { rollback_failed "the listener would not give a variables token ($(vt_why))"; return 1; }
@@ -217,6 +228,9 @@ jobs_helper() { # set JSON | unset: the operator's re-route, on the same token a
 }
 case "${1:-}" in set | unset) jobs_helper "$@"; exit $? ;; esac
 since=$1 until=$2; shift 2
+for job in "$@"; do # a JOB with an @ is a split, and a split is the job's name then @10, @50 or @90
+  [[ $job != *@* ]] || [[ $job =~ ^[^@]+@(10|50|90)$ ]] || { echo "refusing: JOB $job: a split job is its name then @10, @50 or @90" >&2; exit 2; }
+done
 every=${EVERY:-900}
 log=${LOG:-.}
 [ "$every" -ge 600 ] || { echo "refusing: EVERY under 600 s spends the shared GitHub read budget" >&2; exit 2; }
@@ -244,13 +258,14 @@ while [ "$(date -u +%s)" -lt "$until_s" ]; do
       *) nocheck "$job" "SUPERCI_JOBS unread, no check"; continue ;; # 2: GitHub did not answer, 3: no token
     esac
     listed=$jobs_val
-    jq -e --arg j "$job" 'index($j) != null' <<<"$listed" >/dev/null || { checked "$job"; continue; } # off the list: nothing to check, the run of no-checks ends
+    jq -e --arg k "${job%%@*}" "$key_listed" <<<"$listed" >/dev/null || { checked "$job"; continue; } # off the list (its key at no percent): nothing to check, the run of no-checks ends
     refresh_token || { nocheck "$job" "no GitHub App token, no check ($(head -c 300 "$apperr" | tr '\n' ' '))"; continue; }
     left=$(ghr api rate_limit --jq .resources.core.remaining) # the budget of the token the check reads with
     [ "$left" -ge 1500 ] || { nocheck "$job" "skipped, $left GitHub reads left"; continue; }
     out="$log/canary-${job//[^A-Za-z0-9._-]/_}-$(date -u +%H%M).txt"
-    python3 -B "$here/gate.py" --profile ci-runners ${pt[@]+"${pt[@]}"} job "$job" --workflow "${WORKFLOW:-lint-test-backend.yml}" --branch-glob '*' --since "$since" \
-      --baseline-until "$since" --canary ${LIMITS:+--limits "$LIMITS"} >"$out" 2>&1
+    gargs=(job "${job%%@*}" --workflow "${WORKFLOW:-lint-test-backend.yml}" --branch-glob '*' --since "$since")
+    if [ "${job%%@*}" = "$job" ]; then gargs+=(--baseline-until "$since"); else gargs+=(--split "${job#*@}"); fi # a split has one window and no earlier baseline
+    python3 -B "$here/gate.py" --profile ci-runners ${pt[@]+"${pt[@]}"} "${gargs[@]}" --canary ${LIMITS:+--limits "$LIMITS"} >"$out" 2>&1
     code=$?
     if [ $code -eq 2 ]; then # a refusal (a token the gate was refused, say), not a verdict: it keeps no job and says so
       nocheck "$job" "NO CHECK (the gate refused: $( (grep -m1 '^refusing' "$out" || tail -1 "$out") | head -c 250 | scrub)) (exit 2, $out)"
