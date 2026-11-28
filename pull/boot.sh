@@ -37,8 +37,10 @@ send() {
 mark boot.start "$(cut -d' ' -f1 /proc/uptime)"
 ( sleep @LIFE_SECONDS@; poweroff ) > /dev/null 2>&1 &
 # vm.dirty_ratio: a job's cache restore untars 1.5 to 2 GB (node_modules, Go's modules and build), which at the default
-# 20% waited on the volume's 250 MB/s; nothing on a one-job machine needs its writes on disk soon.
-printf '%s\n' kernel.apparmor_restrict_unprivileged_userns=0 kernel.apparmor_restrict_unprivileged_unconfined=0 net.ipv4.ip_local_reserved_ports=50000-59999 vm.dirty_ratio=50 > /etc/sysctl.d/99-superci.conf
+# 20% waited on the volume's 250 MB/s; nothing on a one-job machine needs its writes on disk soon. vm.max_map_count: the
+# pinner (hydrate()) maps each of the checkout's files (53,600 maps on megpt-mono's, Nov 28): the image's 262,144 is headroom for
+# a tree five times that, this for one twenty times it.
+printf '%s\n' kernel.apparmor_restrict_unprivileged_userns=0 kernel.apparmor_restrict_unprivileged_unconfined=0 net.ipv4.ip_local_reserved_ports=50000-59999 vm.dirty_ratio=50 vm.max_map_count=1048576 > /etc/sysctl.d/99-superci.conf
 sysctl -eqp /etc/sysctl.d/99-superci.conf || :
 # The image's cloud-init leaves out growpart, so its root stays the 29 GB it was built at (7 GB free) on any volume: a
 # hydrated machine ran out of space restoring the Swift toolchain. It grows to the volume in the background (about 1 s).
@@ -88,7 +90,7 @@ HOOK
 chmod 755 /home/runner/superci-hydrate-stop.sh
 printf '\nSUPERCI_HYDRATED=%s\nACTIONS_RUNNER_HOOK_JOB_STARTED=%s\n' "$HR" /home/runner/superci-hydrate-stop.sh >> /home/runner/.env
 hydrate() {
-  local sp=/run/superci-marks t0 out val rs
+  local sp=/run/superci-marks t0 out val rs tree
   us() { local n=${EPOCHREALTIME/[.,]/}; echo "$n"; }
   # A mark for the job timeline (the spool of boot.sh's marks, when the listener keeps one): name=epoch=ms since the start[=value].
   mark_hydrate() { local n=$1; [ -w "$sp" ] && printf '%s=%s.%s=%s%s\n' "$2" "${n:0:10}" "${n:10}" "$(( (n - t0) / 1000 ))" "${3:+=$3}" >> "$sp"; return 0; }
@@ -162,6 +164,34 @@ hydrate() {
     }
     mark_hydrate "$(us)" warm.done "$(until_job hot)"
   }
+  # A job that pushes memory out (model-surface.guard.test.ts grows to 6.5 GB on a 16 GB machine) takes the checkout out of
+  # the page cache, which was written once at boot and not read since, and a scan of its 10,000 small files then reads the
+  # volume one 4 KiB block at a time: 4.8 to 5.2 s against a 5 s timeout, 0.34 s from memory (Nov 28). So `pullcache pin`
+  # locks the checkout's files in memory until the machine powers off (0.3 to 1.1 s, 0.8 GB), on a machine with 15 GB or more
+  # (a smaller one cannot spare it). It is its own session (setsid): the job-started hook ends this process group and the
+  # pinner must outlive it. RLIMIT_MEMLOCK is raised for it alone (boot runs as root, whose CAP_IPC_LOCK passes the limit
+  # anyway). Its summary line is waited for up to 5 s, and no longer than it takes: the lab's pins took 0.33 to 1.06 s, and
+  # a 1 s wait marked 3 of 11 late (Nov 28). A pin that fails costs the job nothing it had before.
+  pin() {
+    local pf=/run/superci-pin.out pp line val
+    [ -n "$1" ] && [ -x /usr/local/bin/pullcache ] && [ "$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)" -ge 15000000 ] 2> /dev/null || return 0
+    : > "$pf"
+    ( ulimit -l unlimited 2> /dev/null || ulimit -S -l "$(ulimit -H -l)" 2> /dev/null; exec setsid /usr/local/bin/pullcache pin "$1" > "$pf" 2> /dev/null < /dev/null ) &
+    pp=$!
+    for _ in {1..50}; do
+      line=$(sed -n 's/^pinned //p' "$pf" 2> /dev/null | head -1)
+      [ -n "$line" ] || ! kill -0 "$pp" 2> /dev/null || { sleep 0.1; continue; }
+      break
+    done
+    val=late
+    [ -n "$line" ] || kill -0 "$pp" 2> /dev/null || val=failed
+    if [[ $line =~ files=([0-9]+)\ bytes=([0-9]+)\ .*capped=([a-z]+)\ failed=([0-9]+) ]]; then
+      val="${BASH_REMATCH[1]}:$(( BASH_REMATCH[2] >> 20 ))MB"
+      case ${BASH_REMATCH[3]} in no) ;; yes) val+=:capped ;; *) val+=":${BASH_REMATCH[3]}" ;; esac
+      [ "${BASH_REMATCH[4]}" = 0 ] || val+=":failed${BASH_REMATCH[4]}"
+    fi
+    mark_hydrate "$(us)" pin.done "$val"
+  }
   t0=$(us); mark_hydrate "$t0" hydrate.start
   echo $$ > "$HR/.pid"
   readset && rs=1
@@ -171,6 +201,8 @@ hydrate() {
     echo "$out"
     val=$(printf '%s\n' "$out" | sed -n 's|^hydrated \([0-9]*\)/\([0-9]*\) entries \([0-9]*\) MB$|\1/\2:\3MB|p' | tail -1)
     mark_hydrate "$(us)" hydrate.done "$val"
+    tree=$(printf '%s\n' "$out" | sed -n 's|^checkout \(/.*\)$|\1|p' | tail -1)
+    pin "$tree"
   fi
   [ -n "${rs:-}" ] || preread
   rm -f "$HR/.pid" "$HR/.warming"

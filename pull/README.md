@@ -618,6 +618,20 @@ of that time unpacking main's caches, so the job's setup takes them with a renam
   54 s for the pre-read (n=3 each, Nov 28, with the 3,309-path list the previous image gave). test-go's first cgo compile took 10 to 11 ms with the list, 198 to 201 ms after the
   pre-read and 201 to 255 ms with the unit-tests list alone.
   [tools/readset](tools/readset/README.md) records a list and proves that it holds only the image's files.
+- **Pin.** A job that pushes memory out (megpt-mono's `model-surface.guard.test.ts` grows to 6.5 GB on a 16 GB machine)
+  takes the hydrated checkout out of the page cache: its files were written once at boot and not read since, so they go
+  first, and a later scan of its 10,000 small files reads the volume one 4 KiB block at a time (0.56 ms each). In a replay of
+  unit-tests shard 11 the cache fell from 10.1 to 3.3 GB and `instant-env-premise`'s scan took 4.8 to 5.2 s against its 5 s
+  timeout. Right after `pullcache hydrate` (before the pre-read), a machine with 15 GB or more starts `pullcache pin <the
+  checkout's work tree>`, which `pullcache hydrate` names in its `checkout <dir>` line. The pinner reads every regular file under the
+  tree except `node_modules` and what is in `.git` but its index, maps each and `mlock`s it, and holds the locks until
+  the machine powers off: 53,445 files and 672 MB took 0.64 s and 0.8 GB of memory, and the scan then took 0.34 s or less
+  with no disk read. A cap (`-max-bytes`, 2 GiB of file data, and `-max-files`, 400,000) stops it, and its one summary line
+  says so. It runs as root in its own session (`setsid`), so the job-started hook, which ends the hydration's group, leaves
+  it be, with RLIMIT_MEMLOCK raised for it alone; `vm.max_map_count` is 1,048,576 in `99-superci.conf` for its maps. The machine
+  waits up to a second for the summary and posts `pin.done` with `<files>:<MB>MB` as its value (`:capped`, `:stopped` or
+  `:failedN` when it did not lock everything; `late` with no summary in a second, `failed` when the pinner died). A pin that fails changes
+  nothing for the job. A machine of less than 15 GB pins nothing: it cannot spare the memory.
 - **Burst.** An entry is read in ranges of 64 MiB, three ahead, and each machine waits a random 0 to 3 s before its first
   read: a thousand machines make about 16 requests per GB each to one prefix, not 64.
 - **Where.** `/home/runner/hydrated/<version>/<key>/`, in which that directory stands for `/`: an archive's files are

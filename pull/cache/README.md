@@ -317,3 +317,11 @@ pullcache janitor -bucket B -region R -cap-gb 1000 -dry-run   # with list rights
 `proof/run.sh scope|big|iam` is what produced the numbers (`proof/mint` signs the tokens). It needs a machine of the
 fleet's image with the machines' role, a checkout of `actions/cache`, and the broker pointed at the proof's key set
 (`BROKER_JWKS_URL=<an address of it the function can read> deploy/up.sh`; run `up.sh` again without it afterwards).
+
+## `pullcache pin`
+
+`pullcache pin [-max-bytes n] [-max-files n] DIR` locks the regular files under DIR in the page cache (each is mapped and
+`mlock`ed) and holds the locks until it is killed or the machine powers off. It skips `node_modules` and `.git` but
+`.git/index`, prints one line (`pinned files=N bytes=N seconds=S capped=no|yes|stopped failed=N`) and stops locking at
+either cap or at the first lock the machine refuses (RLIMIT_MEMLOCK), which it reports and never exits non-zero for.
+boot.sh starts it on the checkout `pullcache hydrate` printed (`checkout <dir>`); see [pull/README.md](../README.md), "Pin".

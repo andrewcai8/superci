@@ -15,6 +15,7 @@ import (
 type prereadBox struct {
 	dir, hr, spool string
 	cmd            *exec.Cmd
+	env            []string
 }
 
 func (b *prereadBox) path(name string) string { return filepath.Join(b.dir, name) }
@@ -41,6 +42,16 @@ func startPrereadOn(t *testing.T, fio, rootBytes, pullcache, catSleep, walkSleep
 // startPrereadWith is startPrereadOn for a size whose read set (bin/warm/<label>.list) holds readset, each path's {BOX}
 // standing for the sandbox; nil is a size with none.
 func startPrereadWith(t *testing.T, fio, rootBytes, pullcache, catSleep, walkSleep, memKB string, readset []string) *prereadBox {
+	t.Helper()
+	b := prepPreread(t, fio, rootBytes, pullcache, catSleep, walkSleep, memKB, readset)
+	if err := b.cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// prepPreread is startPrereadWith before the command starts.
+func prepPreread(t *testing.T, fio, rootBytes, pullcache, catSleep, walkSleep, memKB string, readset []string) *prereadBox {
 	t.Helper()
 	cfg, err := LoadConfig("")
 	if err != nil {
@@ -104,12 +115,10 @@ func startPrereadWith(t *testing.T, fio, rootBytes, pullcache, catSleep, walkSle
 	if err := os.WriteFile(b.path("meminfo"), []byte("MemTotal:       "+memKB+" kB\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	fn := strings.NewReplacer("/run/superci-marks", b.spool, "/run/superci-readset.list", b.path("readset.fetched"), "/usr/local/bin/pullcache", filepath.Join(bin, "pullcache"), "/proc/meminfo", b.path("meminfo")).Replace(got[start : start+end+3])
+	fn := strings.NewReplacer("/run/superci-marks", b.spool, "/run/superci-readset.list", b.path("readset.fetched"), "/usr/local/bin/pullcache", filepath.Join(bin, "pullcache"), "/proc/meminfo", b.path("meminfo"), "/run/superci-pin.out", b.path("pin.out")).Replace(got[start : start+end+3])
 	b.cmd = exec.Command("bash", "-c", fn+"\nhydrate")
-	b.cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "HR="+b.hr, "HM="+b.path("m.json"), "PB=b", "CR=r", "ROOT_BYTES="+rootBytes, "BOX="+b.dir, "CAT_SLEEP="+catSleep, "WALK_SLEEP="+walkSleep)
-	if err := b.cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
+	b.env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "HR="+b.hr, "HM="+b.path("m.json"), "PB=b", "CR=r", "ROOT_BYTES="+rootBytes, "BOX="+b.dir, "CAT_SLEEP="+catSleep, "WALK_SLEEP="+walkSleep)
+	b.cmd.Env = b.env
 	return b
 }
 

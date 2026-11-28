@@ -211,6 +211,10 @@ func TestEachMatchedEntryIsHydratedOnceAndOnlyCheckoutEntriesAreCheckedOut(t *te
 	if len(checked) != 1 || !strings.HasSuffix(checked[0], ".tmp-"+entryVersion+"-seed-9"+workspace) {
 		t.Fatalf("want one checkout, in the seed's workspace before it is in place: %v", checked)
 	}
+	// The checkout's work tree, where it is in place, is what `pullcache pin` is given; no other entry names one.
+	if want := filepath.Join(at(root, "seed-9"), workspace); res[0].Tree != want || res[1].Tree != "" || res[2].Tree != "" {
+		t.Fatalf("want the seed's work tree %q and no other: %+v", want, res)
+	}
 }
 
 func TestACheckedOutSeedLeavesAWorkTreeGitFindsClean(t *testing.T) {

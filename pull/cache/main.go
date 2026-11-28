@@ -4,6 +4,7 @@
 //	pullcache wrap D   put it in front of the runner's Node (D: the runner's externals folder)
 //	pullcache janitor  keep the bucket under a size
 //	pullcache hydrate M R   unpack the entries manifest M names under R while the machine waits for its job; SIGTERM stops it
+//	pullcache pin D    lock the files under D in the page cache and hold them until killed (see pin)
 //	pullcache mirror   copy the default branch's entries the peer region lacks (what the mirror function does per save)
 //
 // As `node` (a wrapped Node) it becomes the real Node, with the job's cache service pointed here. As `bootstrap` it
@@ -36,6 +37,7 @@ import (
 	"superci-pull-cache/internal/broker"
 	"superci-pull-cache/internal/cache"
 	"superci-pull-cache/internal/mirror"
+	"superci-pull-cache/internal/pin"
 	"superci-pull-cache/internal/s3store"
 )
 
@@ -64,7 +66,7 @@ func main() {
 	}
 	lg := log.New(os.Stderr, "pullcache: ", log.LstdFlags|log.Lmicroseconds)
 	if len(os.Args) < 2 {
-		lg.Fatal("usage: pullcache serve | wrap <externals> | janitor | hydrate <manifest> <root> | mirror | version")
+		lg.Fatal("usage: pullcache serve | wrap <externals> | janitor | hydrate <manifest> <root> | pin <dir> | mirror | version")
 	}
 	var err error
 	switch os.Args[1] {
@@ -82,6 +84,8 @@ func main() {
 		err = janitor(lg, os.Args[2:])
 	case "hydrate":
 		err = hydrate(lg, os.Args[2:])
+	case "pin":
+		err = pinDir(os.Args[2:])
 	case "mirror":
 		err = mirrorAll(lg, os.Args[2:])
 	default:
@@ -225,6 +229,11 @@ func hydrate(lg *log.Logger, args []string) error {
 		}
 	}
 	fmt.Printf("hydrated %d/%d entries %d MB\n", ok, len(res), mb)
+	for _, r := range res {
+		if r.Tree != "" {
+			fmt.Printf("checkout %s\n", r.Tree)
+		}
+	}
 	b, err := json.MarshalIndent(map[string]any{"seconds": time.Since(began).Seconds(), "stopped": ctx.Err() != nil, "entries": res}, "", "  ")
 	if err != nil {
 		return err
@@ -234,6 +243,36 @@ func hydrate(lg *log.Logger, args []string) error {
 		return err
 	}
 	return os.Rename(at+".new", at)
+}
+
+// pinDir locks the regular files under a directory in memory (boot.sh starts it on the hydrated checkout, under setsid,
+// so the job-started hook that ends the hydration does not end it). It prints one line (files, bytes, seconds, whether
+// a cap stopped it) and then holds the maps until it is killed or the machine powers off. A lock the machine refuses is
+// in the line and never an exit status: a machine that cannot pin runs its job as it did.
+func pinDir(args []string) error {
+	fs := flag.NewFlagSet("pin", flag.ExitOnError)
+	maxBytes := fs.Int64("max-bytes", pin.DefaultMaxBytes, "stop locking after this many bytes of file data")
+	maxFiles := fs.Int("max-files", pin.DefaultMaxFiles, "stop locking after this many files")
+	_ = fs.Parse(args)
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: pullcache pin [-max-bytes n] [-max-files n] <dir>")
+	}
+	res, err := pin.Run(fs.Arg(0), pin.Options{MaxBytes: *maxBytes, MaxFiles: *maxFiles})
+	if err != nil {
+		return err
+	}
+	fmt.Println(res.Line())
+	if res.Capped {
+		fmt.Fprintf(os.Stderr, "pullcache: pin stopped at its cap (%d files, %d bytes; -max-files %d, -max-bytes %d)\n", res.Files, res.Bytes, *maxFiles, *maxBytes)
+	}
+	if res.Files == 0 {
+		return nil
+	}
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGTERM, os.Interrupt)
+	<-stop
+	res.Release()
+	return nil
 }
 
 func mirrorAll(lg *log.Logger, args []string) error {
