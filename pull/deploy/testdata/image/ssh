@@ -1,0 +1,82 @@
+#!/usr/bin/env -S python3 -I
+"""The machines of image_test.sh over ssh: the instance is the one whose address the call names (state.json of the fake aws), the
+command is what image.sh runs there, and a script on stdin is told by its first line (# superci-image: setup, seal, probe)."""
+import json, os, re, sys
+
+root = os.environ["FAKE_AWS"]
+import fcntl
+LOCK = open(os.path.join(root, "lock"), "w")  # two machines act at once: one call at a time reads and writes the state
+fcntl.flock(LOCK, fcntl.LOCK_EX)
+args = sys.argv[1:]
+i = next(k for k, a in enumerate(args) if re.match(r"^[a-z]+@\d+\.\d+\.\d+\.\d+$", a))
+user, ip = args[i].split("@")
+cmd = " ".join(args[i + 1:])
+STATE = os.path.join(root, "state.json")
+s = json.load(open(STATE))
+inst = next((k for k, v in s["instances"].items() if v["ip"] == ip and v["state"] == "running"), None)
+if inst is None:
+    sys.stderr.write("ssh: connect to host %s port 22: Connection refused\n" % ip)
+    sys.exit(255)
+m = s["instances"][inst]
+
+
+def knob(name):
+    return os.path.isfile(os.path.join(root, name))
+
+
+def save():
+    json.dump(s, open(STATE, "w"))
+
+
+with open(os.path.join(root, "ssh.log"), "a") as log:
+    log.write("%s %s@%s %s\n" % (inst, user, ip, cmd))
+if cmd == "true":
+    sys.exit(0)
+if cmd.startswith("sudo dd if=/dev/nvme0n1 of=/dev/null"):
+    sys.exit(0)
+if cmd == "sudo systemctl reboot":
+    m["rebooted"] = m.get("rebooted", 0) + 1
+    m["booted"] = "boot-%s-reboot%d" % (inst, m["rebooted"])
+    save()
+    sys.exit(255)
+if cmd == "sudo bash -s":
+    text = sys.stdin.read()
+    kind = re.search(r"superci-image: (\w+)", text).group(1)
+    open(os.path.join(root, "%s-stdin.%s" % (kind, inst)), "w").write(text)
+    if kind == "setup":
+        if knob("setup-fails"):
+            sys.stderr.write("setup: hibinit-agent is not enabled\n")
+            sys.exit(1)
+        print("setup: hibinit-agent enabled, logind HandleSuspendKey=hibernate")
+    elif kind == "seal":
+        print("seal: done")
+    elif kind == "probe":
+        ref = m["ami"] == s["pin"]
+        agent = "" if ref else "hibinit-agent.service,"
+        out = {"swap_active": 1 if (knob("normal-swap") and not ref) else 0, "swap_file": 0, "grub_resume": 0, "cmdline_resume": 0,
+               "disk_used": 18000000000 + (0 if ref else 1000), "failed_units": 0,
+               "boot_ms": 4400 if ref else (9400 if knob("normal-slow") else 4500), "agent_ms": 0 if ref else (900 if knob("agent-slow") else 120),
+               "agent_chain": 1 if (knob("agent-critical") and not ref) else 0,
+               "enabled": "cloud-init.service,ssh.service," + agent, "builder_user": 0, "builder_sudoers": 0, "builder_key": 0}
+        print("\n".join("%s=%s" % kv for kv in out.items()))
+    sys.exit(0)
+if cmd.startswith("sudo tee /run/superci-image-bkey"):
+    sys.stdin.read()
+    sys.exit(0)
+if cmd.startswith("sudo test -s /etc/default/grub.d/99-set-swap.cfg"):
+    sys.exit(0 if m["hib"] and not knob("no-swap") else 1)
+if cmd.startswith("sudo journalctl -u hibinit-agent"):
+    print("hibinit-agent[1]: Insufficient disk space. Cannot create setup for hibernation. Please allocate a larger root device")
+    sys.exit(0)
+if cmd == "cat /proc/sys/kernel/random/boot_id":
+    print(m["booted"])
+    sys.exit(0)
+if cmd.startswith("echo ") and cmd.endswith("> /dev/shm/superci-image-mark"):
+    m["mark"] = cmd.split()[1]
+    save()
+    sys.exit(0)
+if cmd == "cat /dev/shm/superci-image-mark":
+    print(m["mark"])
+    sys.exit(0)
+sys.stderr.write("fake ssh: unexpected %s\n" % cmd)
+sys.exit(1)

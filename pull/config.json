@@ -10,8 +10,8 @@
     "us-east-2": 1
   },
   "image": {
-    "us-east-1": "ami-0ec23d36a2f286d1f",
-    "us-east-2": "ami-00529e5ed16dccb52"
+    "us-east-1": "ami-0728db02a64632720",
+    "us-east-2": "ami-02529511f07cdc8cb"
   },
   "sizes": {
     "superci-2cpu": {
