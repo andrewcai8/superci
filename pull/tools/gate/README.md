@@ -177,21 +177,25 @@ Blacksmith's earlier hours, which had another mix of PRs (that is how the Nov 28
   rolled back on a pooled p50 0.4 s over, while per shard superci was at 1.000x on 4cpu and 0.905x on 8cpu). So the wall is compared shard by shard. A shard is a
   leg's name with its fleet label left out (`unit-tests (11, superci-8cpu, 8)` and `unit-tests (11, blacksmith-8vcpu-ubuntu-2404, 8)` are `unit-tests (11, 8)`);
   for each shard with legs on both halves the ratio is superci's median wall over Blacksmith's (wall as `wall p50` counts it: successes, timed-out legs at the
-  ceiling, cancelled-after-start lower bounds). The row prints the geometric mean of the ratios and FAILs only when a **one-sided Wilcoxon signed-rank test** (exact,
-  ties at their average rank; the normal approximation above 150 shards) says the log ratios are above `log(1 + WALL_MARGIN)` (`WALL_MARGIN` = 0.05: a slowdown under 5% is
-  not worth a rollback) at `FALSE_ROLLBACK_RATE` (1%). It is NOISE (`not enough shards paired yet`) until `MIN_PAIRED_SHARDS` (8) shards are paired: an exact one-sided
-  test cannot reach p <= 0.01 from fewer than 7 pairs, and at 8 it can still FAIL with the pair nearest the margin reversed. It is also NOISE until each half has
-  `MIN_SHARD_RUNS` (10) runs: the legs of a run share the run's weight, so the shard ratios are not independent and a few runs let them move together. At the
-  spreads Nov 28 09:24Z measured (run to run 2% on Blacksmith, 6% on superci; leg to leg 7% and 11%) and the mix of 33% against 22% 4cpu runs, the false-rollback rate is under 1%
-  at 10 runs a half and a real +20% is caught by then. The detail lines under the row give the shards paired and the worst 10 ratios. The row's rollback is `canary_verdict`'s from
-  `MIN_SHARD_RUNS` runs. **`wall p90 (ceiling)`** stays as `wall p90` had it: superci's own p90 within the job's ceiling in `ci-limits.tsv` (no row without a ceiling),
+  ceiling, cancelled-after-start lower bounds). The row prints the geometric mean of the ratios and FAILs only when a **one-sided run-permutation test**
+  (`permutation_p`) says the mean of their logs is above `log(1 + WALL_MARGIN)` (`WALL_MARGIN` = 0.05: a slowdown under 5% is not worth a rollback) at
+  `FALSE_ROLLBACK_RATE` (1%) divided by the sizes judged. The test permutes whole runs, not shards, because the legs of a run share the run's weight (a big PR is slow in
+  every shard) and the shard ratios therefore move together: a signed-rank test over shards read them as independent samples, and on equal fleets with 10% of runs 1.3x
+  slower it rolled back 2.7% (tail row) to 4.0% (both rows) of windows at 10 runs a half. Per size the window's runs of both halves are pooled (a run is all its legs of
+  that size); superci's walls are divided by `1 + WALL_MARGIN`, so the null is "superci is exactly at the margin"; the statistic is the mean over the paired shards of the
+  log of superci's median over Blacksmith's. `PERMUTATIONS` (2000) random reassignments of whole runs to the halves, each half keeping its run count, give the null
+  distribution, and p = (1 + the assignments at least as slow as the observed) / (1 + draws). The draws are seeded from the window's run ids (and the row and size), so a
+  window read again has the same p. Once enough assignments are as slow for p > alpha to be certain the draws stop (the verdict is the one all 2000 give, and the p printed
+  is the estimate from the draws made); a FAIL always has every draw made, and the two rows of 52 shards at 24 runs a half take under a second. It is NOISE (`not enough shards paired yet`)
+  until `MIN_PAIRED_SHARDS` (8) shards are paired, so that no verdict hangs on one or two shards. It is also NOISE until each half has `MIN_SHARD_RUNS` (10) runs.
+  The detail lines under the row give the shards paired and the worst 10 ratios. The row's rollback is `canary_verdict`'s from `MIN_SHARD_RUNS` runs. **`wall p90 (ceiling)`** stays as `wall p90` had it: superci's own p90 within the job's ceiling in `ci-limits.tsv` (no row without a ceiling),
   counted from 20 runs.
 - **`wall tail (per shard)`** (a split only) is the tail check the pooled `wall p90` gave: a per-shard median does not see 15% of superci's legs on cold machines at 1.5x.
   For each shard with at least `MIN_TAIL_LEGS` (10) legs on both halves (a p90 of fewer is its one or two largest legs) the ratio is superci's p90 wall over Blacksmith's;
-  per size, exactly as the median row, the row FAILs when a one-sided signed-rank test says those ratios are above `log(1 + TAIL_MARGIN)` at `FALSE_ROLLBACK_RATE` divided by
-  the sizes judged. `TAIL_MARGIN` is 0.10, the `P90_FACTOR` of the pooled rows: a shard's p90 of 10 to 20 legs is noisier than its median, and at 0.05 equal halves rolled
+  per size, exactly as the median row (the same run-permutation test, on each shard's p90), the row FAILs when the mean of the logs of those ratios is above
+  `log(1 + TAIL_MARGIN)` at `FALSE_ROLLBACK_RATE` divided by the sizes judged. `TAIL_MARGIN` is 0.10, the `P90_FACTOR` of the pooled rows: a shard's p90 of 10 to 20 legs is noisier than its median, and at 0.05 equal halves rolled
   back 1.7% of 300 seeds at 10 runs a half (0.10: none of 1800). It is NOISE until a size has `MIN_PAIRED_SHARDS` shards with enough legs and each half has `MIN_SHARD_RUNS`
-  runs, and counts toward a rollback from `MIN_SHARD_RUNS` runs. A cold tail of 15% at 1.5x on every shard rolls back in 84% of simulated windows at 24 runs a half and 31% at 12,
+  runs, and counts toward a rollback from `MIN_SHARD_RUNS` runs. A cold tail of 15% at 1.5x on every shard rolls back in 93% of simulated windows at 24 runs a half, 98% at 30 and 40% at 12 (300 seeds each; the signed-rank rows: 84%, 92%, 40%),
   with the median row passing throughout. The shards of a window of 10 to 15 runs have few legs on one half, so the row is often NOISE early in a canary.
 - **Superci's wall is the listener's `wall_ms`**, never GitHub's started to completed: GitHub marks a dispatched job started when its identity accepts it, so that
   interval holds the wait for a machine (up to 24 s on a size short of identities). With `--superci-source events` (the canary's) the superci jobs are the records,

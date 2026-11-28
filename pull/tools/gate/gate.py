@@ -21,6 +21,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import re
 import sys
 import time
@@ -80,31 +81,37 @@ SPLIT_ROWS = (ROUTING_ROW, RATIO_ROW)
 # A split's wall is judged per shard, not pooled. Pooled percentiles of two halves move with each half's mix of legs (a 4cpu leg takes about 100 s, an 8cpu
 # leg about 55 s, and two halves finish different shares of each), so equal fleets read as unequal (Nov 28 09:24Z: unit-tests@50 rolled back on a pooled p50
 # 0.4 s over, while per shard superci was at 1.000x on 4cpu and 0.905x on 8cpu). A shard is one leg name with its fleet label left out; for each shard on
-# both halves the ratio is superci's median wall over Blacksmith's, and the row FAILs when those ratios are beyond chance above 1 + WALL_MARGIN: a one-sided
-# Wilcoxon signed-rank test of their logs against log(1 + WALL_MARGIN) at FALSE_ROLLBACK_RATE. WALL_MARGIN is the slowdown that is not worth a rollback.
-# A one-sided exact signed-rank test can only reach p <= 0.01 from 7 pairs (2^-7 = 0.0078; 6 give 0.0156), so MIN_PAIRED_SHARDS is 8: the first count at which a
-# test can still fail with one pair (the one nearest 1 + WALL_MARGIN) reversed. Fewer shards paired is NOISE ("not enough shards paired yet"), never a verdict.
+# both halves the ratio is superci's median wall over Blacksmith's. The row's statistic is the mean of the logs of those ratios, and it FAILs when that mean
+# is beyond chance above log(1 + WALL_MARGIN): a one-sided run-permutation test (permutation_p) at FALSE_ROLLBACK_RATE. WALL_MARGIN is the slowdown that is
+# not worth a rollback. The test permutes whole runs, not shards, because the legs of a run share the run's weight (a big PR is slow in every shard): a
+# signed-rank test over shards read them as independent samples, and on equal fleets with 10% of runs 1.3x slower the tail row false-rolled back 2.7% of the
+# time at 10 runs a half (4.0% with the median row), about 1% at 24. MIN_PAIRED_SHARDS is the fewest shards a verdict may rest on, so that no verdict hangs on
+# one or two shards (the signed-rank test it was set for could not reach p <= 0.01 from fewer than 7 pairs). Fewer shards paired is NOISE ("not enough shards
+# paired yet"), never a verdict.
 WALL_MARGIN = 0.05
 MIN_PAIRED_SHARDS = 8
 SHARD_ROW, CEILING_ROW = "wall (per shard)", "wall p90 (ceiling)"
 # Every shard's median is over the legs of the runs of its half, and the legs of one run share the run's weight (a big PR is slow in every shard), so the shard
 # ratios are not independent samples: the fewer runs a half has, the more of them move together, and the test's false-rollback rate drifts above
-# FALSE_ROLLBACK_RATE. The Nov 28 09:24Z window measured a run-to-run spread of 2% (Blacksmith) to 6% (superci) and a leg-to-leg spread of 7% to 11%; at
-# those, 10 runs a half keeps the rate under 2%, and a real +20% is caught by then. Each half has MIN_SHARD_RUNS runs before the row can FAIL.
+# FALSE_ROLLBACK_RATE (the run-permutation test keeps them together; MIN_SHARD_RUNS is what its permutations need to have a spread to draw from). The Nov 28
+# 09:24Z window measured a run-to-run spread of 2% (Blacksmith) to 6% (superci) and a leg-to-leg spread of 7% to 11%; at those, 10 runs a half keeps the
+# rate under 2%, and a real +20% is caught by then. Each half has MIN_SHARD_RUNS runs before the row can FAIL.
 MIN_SHARD_RUNS = 10
 MAX_SHARD_LINES = 10
 # A split's tail is judged per shard too, because a per-shard median does not see one: 15% of superci's legs on cold machines at 1.5x leave every shard's median
 # where it was, and the non-split rows had `wall p90 <= min(B p90 x P90_FACTOR, ceiling)` for exactly that. For each shard with MIN_TAIL_LEGS legs on both halves
-# the ratio is superci's p90 wall over Blacksmith's, and TAIL_ROW FAILs, size by size and at SHARD_ROW's alpha, when those ratios are beyond chance above
-# 1 + TAIL_MARGIN: a one-sided signed-rank test of their logs against log(1 + TAIL_MARGIN), over the same MIN_PAIRED_SHARDS and MIN_SHARD_RUNS as SHARD_ROW.
+# the ratio is superci's p90 wall over Blacksmith's, and TAIL_ROW FAILs, size by size and at SHARD_ROW's alpha, when the mean of the logs of those ratios is
+# beyond chance above log(1 + TAIL_MARGIN): the same run-permutation test, over the same MIN_PAIRED_SHARDS and MIN_SHARD_RUNS as SHARD_ROW.
 # MIN_TAIL_LEGS is 10: a p90 of fewer legs is its one or two largest, and one cold machine would be a tail. TAIL_MARGIN is P90_FACTOR's 10%, not WALL_MARGIN's 5%,
 # because a shard's p90 of 10 to 20 legs is the mean of its two largest and moves more than its median does: on equal halves at the 09:24Z window's spreads
-# (run 6%, leg 11%) a margin of 0.05 rolled back 1.7% of 300 seeds at 10 runs a half, and 0.10 none of 1800 (10, 12 and 24 runs, clean and noisy). The legs
-# of one run share its weight, so the shards' ratios are not independent samples, which is why the margin keeps that cushion over the 1% rate.
+# (run 6%, leg 11%) a margin of 0.05 rolled back 1.7% of 300 seeds at 10 runs a half, and 0.10 none of 1800 (10, 12 and 24 runs, clean and noisy).
 TAIL_ROW = "wall tail (per shard)"
 TAIL_MARGIN = 0.10
 MIN_TAIL_LEGS = 10
-EXACT_RANK_TEST_MAX_N = 150  # above this many pairs the signed-rank test is the normal approximation; the exact sum is n x n(n+1)/2 big-int steps
+# The run-permutation test draws PERMUTATIONS assignments of the window's runs to the two halves: its least p-value is 1 / (1 + PERMUTATIONS), a fifth of
+# the alpha (FALSE_ROLLBACK_RATE / sizes judged) of a window with three sizes in it, and a verdict is the same as at any larger number of draws within the
+# draws' own sampling error, which the seed makes the same on every read of a window.
+PERMUTATIONS = 2000
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -259,36 +266,64 @@ def shard_key(name):
     return _LABEL.sub("", _LEADING_LABEL.sub("(", name or ""))
 
 
-def signed_rank_p(diffs):
-    """The one-sided p-value that the median of `diffs` is above 0: P(W+ >= observed W+) of the Wilcoxon signed-rank statistic when each difference is as
-    likely positive as negative. Zeros are dropped, equal magnitudes take their average rank, and the distribution is the exact one given those ranks:
-    every sign pattern's rank sum counted with a subset-sum table over the ranks doubled to integers (n x n(n+1) big-int steps, a few ms for the 50 shards
-    of unit-tests). Above EXACT_RANK_TEST_MAX_N pairs it is the normal approximation with the tie correction. 1.0 when nothing is left to rank."""
-    d = [x for x in diffs if abs(x) > 1e-12]
-    n = len(d)
-    if n == 0:
+def permutation_p(S, B, ceiling, keys, margin, pct, alpha, row, permutations=PERMUTATIONS, stop_early=True):
+    """The one-sided run-permutation p-value that, over the shards `keys`, superci's `pct` wall percentile is above Blacksmith's by more than `margin`, for the
+    legs `S` and `B` of one machine size (the two halves' Obs).
+
+    The statistic is the mean, over the shards of `keys` with legs on both sides, of log(superci's pct wall / Blacksmith's), each wall as wall_sample counts
+    it, and superci's legs are first divided by 1 + margin, so the null is "superci is exactly at the margin". A run is all of its legs of the size on its
+    half: the legs of one run share its weight (a big PR is slow in every shard), so the shards are not independent and the runs are what is exchanged. The
+    null distribution is the statistic over `permutations` random reassignments of whole runs to the two halves, each half keeping its run count; the p-value
+    is (1 + the assignments whose statistic is at least the observed) / (1 + permutations), the exact p-value of a randomisation test. The generator is seeded
+    from the window's run ids and `row`, so a window read again has the same p. A shard with no leg on a side of an assignment drops out of that
+    assignment's statistic.
+
+    `alpha` is the p-value the caller fails at. Once exceedances make p > alpha certain (1 + k > alpha x (1 + permutations)) the draws stop: the verdict
+    p <= alpha is the same as with all of them, and the p returned is the estimate from the draws made. `stop_early=False` draws all of them. A FAIL, whose
+    p is under alpha, always has every draw made. 1.0 when a side has no run or no shard has legs on both."""
+    keys = set(keys)
+    walls = [(half, o.run_id, shard_key(o.name), w[0]) for half, obs in enumerate((S, B)) for o in obs if o.name for w in [wall_sample([o], ceiling)] if w]
+    unit_of = {u: i for i, u in enumerate(sorted({(half, run) for half, run, _, _ in walls}))}  # by half and run id, so the draws do not depend on the listing order
+    legs = collections.defaultdict(list)
+    for half, run, key, w in walls:
+        if key in keys:
+            legs[key].append((unit_of[(half, run)], w / (1 + margin) if half == 0 else w))
+    n = len(unit_of)
+    ns = {i for (half, _), i in unit_of.items() if half == 0}
+    k_s = len(ns)
+    shards = [legs[k] for k in sorted(legs)]
+    if not 0 < k_s < n or not shards:
         return 1.0
-    mags = sorted(round(abs(x), 10) for x in d)
-    doubled, i = {}, 0  # magnitude -> its average rank, doubled
-    while i < n:
-        j = i
-        while j < n and mags[j] == mags[i]:
-            j += 1
-        doubled[mags[i]] = i + 1 + j
-        i = j
-    ranks = [doubled[round(abs(x), 10)] for x in d]
-    w = sum(r for r, x in zip(ranks, d) if x > 0)
-    if n > EXACT_RANK_TEST_MAX_N:
-        real = [r / 2 for r in ranks]
-        var = sum(x * x for x in real) / 4  # Var(W+) given the ranks: each rank is in the sum with probability 1/2
-        return 0.5 * math.erfc((w / 2 - sum(real) / 2) / math.sqrt(2 * var))
-    total = sum(ranks)
-    ways = [0] * (total + 1)
-    ways[0] = 1
-    for r in ranks:
-        for k in range(total, r - 1, -1):
-            ways[k] += ways[k - r]
-    return sum(ways[w:]) / 2 ** n
+
+    def stat(in_s):
+        total = m = 0
+        for pairs in shards:
+            sv = [v for u, v in pairs if in_s[u]]
+            bv = [v for u, v in pairs if not in_s[u]]
+            if sv and bv:
+                a, b = T.q(sv, pct), T.q(bv, pct)
+                if a > 0 and b > 0:
+                    total += math.log(a / b)
+                    m += 1
+        return total / m if m else None
+
+    observed = bytearray(1 if u in ns else 0 for u in range(n))
+    t_obs = stat(observed)
+    if t_obs is None:
+        return 1.0
+    rng = random.Random(int.from_bytes(hashlib.sha256(json.dumps([row, sorted(r for h, r in unit_of if h == 0), sorted(r for h, r in unit_of if h == 1)]).encode()).digest()[:8], "big"))
+    units = range(n)
+    over = done = 0
+    for done in range(1, permutations + 1):
+        in_s = bytearray(n)
+        for u in rng.sample(units, k_s):
+            in_s[u] = 1
+        t = stat(in_s)
+        if t is not None and t >= t_obs - 1e-12:
+            over += 1
+            if stop_early and 1 + over > alpha * (1 + permutations):
+                break
+    return (1 + over) / (1 + done)
 
 
 def shard_walls(obs, ceiling):
@@ -319,11 +354,17 @@ def shard_size(name):
     return f"{m.group(1) or m.group(2)}cpu" if m else ""
 
 
+def size_p(S, B, ceiling, size_of, size, pairs, margin, pct, alpha, row):
+    """permutation_p of the shards `pairs` of one machine size: the runs of that size, the legs of the half that are of that size, and a seed per row and size."""
+    of_size = lambda obs: [o for o in obs if o.name and size_of.get(shard_key(o.name)) == size]
+    return permutation_p(of_size(S), of_size(B), ceiling, [p[0] for p in pairs], margin, pct, alpha, f"{row}/{size}")
+
+
 def shard_wall_row(S, B, ceiling, min_runs=MIN_SHARD_RUNS):
     """The split's wall row (SHARD_ROW): the per-shard superci/Blacksmith ratios, judged size by size (4cpu shards apart from 8cpu ones: superci's sizes are
     separate sets, and a faster 8cpu set must not hide a slower 4cpu one). It FAILs when, for any size with MIN_PAIRED_SHARDS shards paired, a one-sided
-    signed-rank test says that size's ratios are above 1 + WALL_MARGIN at FALSE_ROLLBACK_RATE divided by the sizes judged (so the row's false-rollback rate
-    stays at FALSE_ROLLBACK_RATE), and is NOISE until some size has MIN_PAIRED_SHARDS shards paired and each half has min_runs runs. The detail is the worst
+    run-permutation test (permutation_p) says that size's ratios are above 1 + WALL_MARGIN at FALSE_ROLLBACK_RATE divided by the sizes judged (so the row's
+    false-rollback rate stays at FALSE_ROLLBACK_RATE), and is NOISE until some size has MIN_PAIRED_SHARDS shards paired and each half has min_runs runs. The detail is the worst
     MAX_SHARD_LINES shards and how many were paired."""
     pairs, only_s, only_b = paired_shards(S, B, ceiling)
     size_of = {}
@@ -334,7 +375,7 @@ def shard_wall_row(S, B, ceiling, min_runs=MIN_SHARD_RUNS):
     for pr in pairs:
         by_size[size_of.get(pr[0], "")].append(pr)
     n = len(pairs)
-    th = f"one-sided Wilcoxon signed-rank p > {FALSE_ROLLBACK_RATE:g} that per-shard median wall ratio (superci / Blacksmith) is over {1 + WALL_MARGIN:g}"
+    th = f"run-permutation p > {FALSE_ROLLBACK_RATE:g} that per-shard median wall ratio (superci / Blacksmith) is over {1 + WALL_MARGIN:g}"
     ns, nb = (len({o.run_id for o in h if not o.cancelled}) for h in (S, B))
     detail = (f"{n} shards paired of {n + len(only_s) + len(only_b)} seen ({len(only_s)} on superci only, {len(only_b)} on Blacksmith only); worst ratios first:",
               *(f"{k}: superci {ms:.1f} s ({cs} legs) / Blacksmith {mb:.1f} s ({cb} legs) = {r:.3f}x" for k, r, ms, cs, mb, cb in pairs[:MAX_SHARD_LINES]),
@@ -347,7 +388,7 @@ def shard_wall_row(S, B, ceiling, min_runs=MIN_SHARD_RUNS):
     per = {}
     for size, ps in sorted(by_size.items()):
         per[size] = (math.exp(sum(math.log(x[1]) for x in ps) / len(ps)), len(ps),
-                     signed_rank_p([math.log(r) - math.log1p(WALL_MARGIN) for _, r, *_ in ps]) if size in judged else None)
+                     size_p(S, B, ceiling, size_of, size, ps, WALL_MARGIN, 50, alpha, SHARD_ROW) if size in judged else None)
     value = f"geometric mean {gm:.3f}x over {n} shards; " + ", ".join(
         f"{size or 'unsized'} {g:.3f}x over {k}" + (f" (p = {pv:.3g})" if pv is not None else f" (under {MIN_PAIRED_SHARDS}: not judged)") for size, (g, k, pv) in per.items())
     if not judged:
@@ -373,7 +414,7 @@ def tail_pairs(S, B, ceiling, min_legs=MIN_TAIL_LEGS):
 
 def tail_row(S, B, ceiling, min_runs=MIN_SHARD_RUNS):
     """The split's tail row (TAIL_ROW), judged as shard_wall_row judges the median: per size, over the shards with MIN_TAIL_LEGS legs on both halves, FAIL when a
-    one-sided signed-rank test says superci's p90 / Blacksmith's p90 ratios are above 1 + TAIL_MARGIN at FALSE_ROLLBACK_RATE divided by the sizes judged; NOISE
+    run-permutation test says superci's p90 / Blacksmith's p90 ratios are above 1 + TAIL_MARGIN at FALSE_ROLLBACK_RATE divided by the sizes judged; NOISE
     until some size has MIN_PAIRED_SHARDS such shards and each half has min_runs runs. The detail is the worst MAX_SHARD_LINES shards."""
     pairs, short = tail_pairs(S, B, ceiling)
     size_of = {}
@@ -384,7 +425,7 @@ def tail_row(S, B, ceiling, min_runs=MIN_SHARD_RUNS):
     for pr in pairs:
         by_size[size_of.get(pr[0], "")].append(pr)
     n = len(pairs)
-    th = f"one-sided Wilcoxon signed-rank p > {FALSE_ROLLBACK_RATE:g} that per-shard p90 wall ratio (superci / Blacksmith) is over {1 + TAIL_MARGIN:g}"
+    th = f"run-permutation p > {FALSE_ROLLBACK_RATE:g} that per-shard p90 wall ratio (superci / Blacksmith) is over {1 + TAIL_MARGIN:g}"
     ns, nb = (len({o.run_id for o in h if not o.cancelled}) for h in (S, B))
     detail = (f"{n} shards judged on their p90 ({short} paired shards left out for under {MIN_TAIL_LEGS} legs on a half); worst ratios first:",
               *(f"{k}: superci p90 {ms:.1f} s ({cs} legs) / Blacksmith p90 {mb:.1f} s ({cb} legs) = {r:.3f}x" for k, r, ms, cs, mb, cb in pairs[:MAX_SHARD_LINES]),
@@ -396,7 +437,7 @@ def tail_row(S, B, ceiling, min_runs=MIN_SHARD_RUNS):
     per = {}
     for size, ps in sorted(by_size.items()):
         per[size] = (math.exp(sum(math.log(x[1]) for x in ps) / len(ps)), len(ps),
-                     signed_rank_p([math.log(r) - math.log1p(TAIL_MARGIN) for _, r, *_ in ps]) if size in judged else None)
+                     size_p(S, B, ceiling, size_of, size, ps, TAIL_MARGIN, 90, alpha, TAIL_ROW) if size in judged else None)
     value = "p90 ratio " + ", ".join(
         f"{size or 'unsized'} {g:.3f}x over {k}" + (f" (p = {pv:.3g})" if pv is not None else f" (under {MIN_PAIRED_SHARDS}: not judged)") for size, (g, k, pv) in per.items())
     if not judged:
