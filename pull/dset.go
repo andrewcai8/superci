@@ -28,6 +28,7 @@ type DispatchSet struct {
 	pool     int
 	max      int
 	capped   bool
+	stopped  bool                 // past the hard stop (Spend.Stopped): no launches, and a job with no machine is failed at once
 	listings map[string]time.Time // per region, when its last complete listing began
 	machines map[string]*dmachine
 	reserved map[string]int      // per launch round, capacity asked of EC2 and not yet seen
@@ -101,10 +102,11 @@ func (st *DispatchSet) ready() bool {
 }
 
 // desired is the machines the set's jobs ask for: those waiting for one, those running, and the pool (none while the
-// spend cap holds), at most max.
+// spend cap holds), at most max. At the cap a job superci already holds still gets its machine: the canary's spend-capped
+// rollback sends the jobs after it to Blacksmith, and one left without a machine would wait out its timeout.
 func (st *DispatchSet) desired() int {
 	pool := st.pool
-	if st.capped {
+	if st.capped || st.stopped {
 		pool = 0
 	}
 	return max(0, min(st.max, len(st.queue)+len(st.pairs)+pool))
@@ -128,7 +130,7 @@ func (st *DispatchSet) live() int {
 func (st *DispatchSet) Deficit(now time.Time) (round string, n int) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	if st.capped || !st.ready() {
+	if st.stopped || !st.ready() {
 		return "", 0
 	}
 	if n = st.desired() - st.live(); n <= 0 {
@@ -632,8 +634,11 @@ func (st *DispatchSet) finish(s *session, why jobEnd) bool {
 		if over != nil {
 			over(s.id)
 		}
-		if why == machineLost {
+		switch why {
+		case machineLost:
 			s.lose()
+		case spendStopped:
+			s.refuse()
 		}
 		s.closeAll()
 	}()
@@ -788,6 +793,7 @@ type jobEnd int
 const (
 	exitRelayed       jobEnd = iota // its exit code reached its shim
 	machineLost                     // its machine was away past the window, or it ran past its bound: its shim gets 1
+	spendStopped                    // it had no machine when the spend passed its hard stop: its shim gets 1 at once
 	shimLeftAfterExit               // its shim was away past the window with the exit code held for it
 )
 
@@ -859,6 +865,23 @@ func (st *DispatchSet) SetMax(n int)            { st.mu.Lock(); st.max = n; st.m
 func (st *DispatchSet) SetNoDemand(r BatchRule) { st.mu.Lock(); st.noDemand = r; st.mu.Unlock() }
 func (st *DispatchSet) SetCapped(on bool)       { st.mu.Lock(); st.capped = on; st.mu.Unlock() }
 
+// SetStopped sets the hard stop (Spend.Stopped): the set launches nothing, and each job still waiting for a machine is
+// failed now (its shim exits 1, so its identity's listener fails it at GitHub at once), so none waits out its timeout on
+// superci. A job already on a machine runs to its end. Called each tick, it fails a job that came since the last.
+func (st *DispatchSet) SetStopped(on bool) {
+	st.mu.Lock()
+	st.stopped = on
+	var drop []*session
+	if on {
+		drop, st.queue = st.queue, nil
+	}
+	st.mu.Unlock()
+	for _, s := range drop {
+		slog.Warn("dispatch job refused: past the spend's hard stop", "set", st.spec.Name, "job", s.id)
+		st.finish(s, spendStopped)
+	}
+}
+
 // Carry and Resume keep the set's pool across a restart as State's do (carry.go).
 func (st *DispatchSet) Carry(now time.Time, r PoolRule) Carried {
 	st.mu.Lock()
@@ -914,6 +937,7 @@ type DispatchSnapshot struct {
 	Pool        int     `json:"pool"`
 	Max         int     `json:"max"`
 	Capped      bool    `json:"capped"`
+	Stopped     bool    `json:"stopped"`
 	Desired     int     `json:"desired"`
 	Live        int     `json:"live"`
 	Inflight    int     `json:"inflight"`
@@ -931,7 +955,7 @@ type DispatchSnapshot struct {
 func (st *DispatchSet) Snapshot(now time.Time) DispatchSnapshot {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	out := DispatchSnapshot{Set: st.spec.Name, Ready: st.ready(), Pool: st.pool, Max: st.max, Capped: st.capped, Desired: st.desired(),
+	out := DispatchSnapshot{Set: st.spec.Name, Ready: st.ready(), Pool: st.pool, Max: st.max, Capped: st.capped, Stopped: st.stopped, Desired: st.desired(),
 		Live: st.live(), Machines: len(st.machines), Idle: len(st.idle), JobsWaiting: len(st.queue), Running: len(st.pairs),
 		LaunchS: st.launchTime(0).Seconds()}
 	for _, k := range st.reserved {

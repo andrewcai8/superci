@@ -311,9 +311,11 @@ once it holds no machine it is deleted at GitHub, so no job fails.
   (it holds no runner then). A job can stop those timers; it cannot stop the listener's.
 - Spend is accrued every 10 s from each running machine's price: its pool's spot price (refreshed every 30
   minutes; $0.058 per vCPU-hour for on-demand), its gp3 volume and its public IPv4 address ($0.005/h). Data
-  transfer out is not counted. At `daily_usd` (1,000) or `monthly_usd` (15,000) the listener launches nothing and
-  keeps no pool. Running jobs finish; queued jobs wait until the day or month turns or the cap is raised: CI on
-  superci stops. `superci-pull-spend-daily` alarms at 80% of the cap the listener runs with. To keep CI going,
+  transfer out is not counted. At `daily_usd` (3,000) or `monthly_usd` (45,000) every set keeps no pool. A
+  dispatch set still gives each job it holds a machine, and a canary rolls back to Blacksmith on
+  `superci-pull-spend-capped`, so the jobs after it run there; a scale set launches nothing. At 110% of a cap a
+  dispatch set launches nothing and fails at once each job still waiting for a machine (its shim exits 1), so none
+  waits out its timeout; running jobs finish. `superci-pull-spend-daily` alarms at 80% of the cap the listener runs with. To keep CI going,
   raise the cap (override file) or send the jobs back to Blacksmith: unset megpt-mono's `SUPERCI_JOBS`. The estimate
   bounds the bill; it is not the bill.
 - A job lost to a spot reclaim is re-run once with GitHub's re-run API, only on proof of the reclaim:
@@ -852,7 +854,7 @@ aws --profile ci-runners --region us-east-1 sns subscribe --topic-arn arn:aws:sn
 | superci-pull-identity-none-`<size>` (2cpu to 32cpu) | a dispatch size has no identity online (`IdentitiesOnline` under 1) for 5 minutes: no job of the size can start, and the starved alarm sees no job, since none has reached the dispatcher | no |
 | superci-pull-pool-at-floor | a set's pool at the hour's floor for 5 minutes while more of its jobs waited than it had idle runners | no |
 | superci-pull-spend-daily | today's spend past 80% of the daily cap the listener runs with (`SpendDailyCapUSD`) | no |
-| superci-pull-spend-capped | a spend cap is reached: CI on superci stops | yes, every canary |
+| superci-pull-spend-capped | a spend cap is reached: pools empty, held jobs still get machines, a dispatch set stops at 110% | yes, every canary |
 | superci-pull-launch-shortfall | EC2 started fewer machines than asked for 15 minutes running | no |
 | superci-pull-org-rate-unknown | the organization's rate unmeasured for 15 minutes | no |
 

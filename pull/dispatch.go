@@ -1475,6 +1475,23 @@ func (s *session) lose() {
 	s.toShimFrame(frameExit, binary.LittleEndian.AppendUint32(nil, 1))
 }
 
+// refuse fails a job no machine has: its shim exits 1 at once. A queued job's shim is not live yet (it waits for PAIRED), so
+// the EXIT goes on its connection directly rather than being held for it as lose's would be; the shim takes an EXIT before
+// PAIRED. A shim that is away gets nothing, and starts the job again, which the next refusal fails.
+func (s *session) refuse() {
+	s.mu.Lock()
+	if s.exited {
+		s.mu.Unlock()
+		return
+	}
+	s.exited = true
+	sw := s.shim
+	s.mu.Unlock()
+	if sw != nil {
+		_ = sw.send(frameExit, binary.LittleEndian.AppendUint32(nil, 1))
+	}
+}
+
 // closeAll ends both connections of a job that is over, each after what was sent on it.
 func (s *session) closeAll() {
 	s.mu.Lock()

@@ -53,7 +53,7 @@ math spend-daily "Today's estimated spend passed 80% of the daily cap the listen
     {"Id":"cap","MetricStat":{"Metric":{"Namespace":"superci-pull","MetricName":"SpendDailyCapUSD"},"Period":300,"Stat":"Maximum"},"ReturnData":false},
     {"Id":"share","Expression":"IF(cap > 0, 100 * spent / cap, 0)","Label":"Spend today, % of the daily cap","ReturnData":true}]' \
   GreaterThanThreshold 80 1 1 notBreaching
-alarm spend-capped "A spend cap is reached: the listener launches nothing and keeps no pool until the day or month turns, or the cap is raised" \
+alarm spend-capped "A spend cap is reached: every set keeps no pool; a dispatch set still gives each job it holds a machine, and canaries roll back to Blacksmith on this alarm. At 110% of the cap a dispatch set launches nothing and fails at once a job still waiting for a machine; a scale set launches nothing from the cap. Until the day or month turns, or the cap is raised" \
   SpendCapped Maximum GreaterThanOrEqualToThreshold 1 300 1 1 notBreaching
 # Spot is thin for the m8azn types, and superci-4cpu asks m8azn on demand before a slower spot type (on_demand_first), outside
 # on_demand_share: a long shortage in both regions puts its machines on demand (m8azn.xlarge 0.41 USD an hour against Blacksmith's 0.48).
