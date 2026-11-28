@@ -19,7 +19,9 @@ cat > "$H/python3" << 'STUB'
 echo "python3 $*" >> "$CALLS"
 case "$*" in *version_info*) echo "$PYV" ;; esac
 STUB
-for t in go gofmt; do printf '#!/bin/bash\necho "%s $*" >> "$CALLS"\n' $t > "$H/$t"; done
+# gofmt lists $GOFMT_OUT as unformatted; go vet exits $GO_VET_RC.
+printf '#!/bin/bash\necho "gofmt $*" >> "$CALLS"\n[ -z "${GOFMT_OUT:-}" ] || echo "$GOFMT_OUT"\n' > "$H/gofmt"
+printf '#!/bin/bash\necho "go $*" >> "$CALLS"\n[ "$1" != vet ] || exit "${GO_VET_RC:-0}"\n' > "$H/go"
 chmod +x "$H"/*
 export CALLS=$T/calls
 C() { env PATH="$H:$PATH" PYV="$1" "$here/build-check.sh" "$T/pull" "${2:-$PARITY}"; }
@@ -32,6 +34,14 @@ out=$(C "$WANT" 2>&1); rc=$?
 [ $rc = 0 ] && grep -qF "build-check: python3 $WANT, the machines'" <<< "$out"; check $? "build-check.sh passes under the machines' python3"
 grep -q '^go test -count=1 ./\.\.\.$' "$CALLS" && grep -q '^go vet ./\.\.\.$' "$CALLS" && grep -qx 'python3 -I -m unittest discover -s . -p test_agent.py' "$CALLS"
 check $? "and runs the Go tests and agent.py's tests, from the pull directory, under that python3"
+: > "$CALLS"
+CF() { env GOFMT_OUT=fleet.go PATH="$H:$PATH" PYV="$1" "$here/build-check.sh" "$T/pull" "$PARITY"; }
+CV() { env GO_VET_RC=1 PATH="$H:$PATH" PYV="$1" "$here/build-check.sh" "$T/pull" "$PARITY"; }
+refuses "build-check.sh refuses an unformatted file" "gofmt would change: fleet.go" CF "$WANT"
+! grep -q '^go \|unittest' "$CALLS"; check $? "and runs no vet and no test after it"
+: > "$CALLS"
+refuses "build-check.sh refuses a go vet failure" "go vet failed" CV "$WANT"
+! grep -q '^go test\|unittest' "$CALLS"; check $? "and runs no test after it"
 sed 's/^tool python3 .*/tool python3 3.13/' "$PARITY" > "$T/parity13.txt"
 refuses "build-check.sh takes the machines' python3 from the parity file it is given, not a number of its own" "the machines' is 3.13" C "$WANT" "$T/parity13.txt"
 grep -v '^tool python3 ' "$PARITY" > "$T/parity-none.txt"

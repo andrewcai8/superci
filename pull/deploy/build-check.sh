@@ -20,6 +20,10 @@ have=$(python3 -I -c 'import sys; print("%d.%d" % sys.version_info[:2])')
 [ "$have" = "$w" ] || { echo "refusing: the tests' python3 is $have, the machines' is $w (tool python3 in the parity file)" >&2; exit 1; }
 echo "build-check: python3 $have, the machines'"
 cd "$dir"
-test -z "$(gofmt -l .)" && go vet ./... && go test -count=1 ./...
+# One check a line: under set -e a failure before the last && of a list stops nothing.
+unformatted=$(gofmt -l .) || { echo "refusing: gofmt failed" >&2; exit 1; }
+[ -z "$unformatted" ] || { echo "refusing: gofmt would change: $(echo $unformatted)" >&2; exit 1; }
+go vet ./... || { echo "refusing: go vet failed" >&2; exit 1; }
+go test -count=1 ./... || exit 1
 # agent.py runs on the machines under that python3: its tests (the Go tests do not run them).
 python3 -I -m unittest discover -s . -p test_agent.py
