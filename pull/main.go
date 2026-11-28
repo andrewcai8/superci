@@ -882,7 +882,7 @@ func (l *Listener) reconciler(ctx context.Context, refresh func(context.Context,
 			refresh(ctx, r.Name)
 		}
 		cfg := l.config()
-		capped := l.spend.Over()
+		capped, stopped := l.spend.Over(), l.spend.Stopped()
 		var running []Machine
 		var end []*Machine
 		// Machines launched for registrations GitHub no longer leaves us wait paid for: past twice what the budget
@@ -944,6 +944,7 @@ func (l *Listener) reconciler(ctx context.Context, refresh func(context.Context,
 		}
 		for _, d := range l.dsets {
 			d.SetCapped(capped)
+			d.SetStopped(stopped)
 			ended, lost := d.Reconcile(now, dispatchBounds{maxAge: l.maxAge(), life: cfg.life(), job: cfg.job(), warmup: window, window: resumeWindow})
 			end = append(end, ended...)
 			for _, j := range lost {

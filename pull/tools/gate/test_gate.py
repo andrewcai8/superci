@@ -359,6 +359,19 @@ def judge_scale(**kw):
     return rows_by_name(G.evaluate_scale(scale(**kw)))
 
 
+class Cost(unittest.TestCase):
+    def test_aws_spend_a_job_beside_blacksmiths_for_the_same_vcpus(self):
+        recs = [{"set": "superci-8cpu", "usd": 0.04, "wall_ms": 50000}, {"set": "superci-8cpu", "usd": 0.06, "wall_ms": 50000},
+                {"set": "superci-4cpu", "usd": 0.05, "wall_ms": 90000}, {"set": "superci-8cpu", "usd": None, "wall_ms": 1}, {"set": "superci-8cpu", "usd": 1.0}]
+        bs = [{"labels": ["blacksmith-8vcpu-ubuntu-2404"], "started_at": "2026-11-27T10:00:00Z", "completed_at": "2026-11-27T10:00:59Z"},
+              {"labels": ["blacksmith-8vcpu-ubuntu-2404"], "started_at": "2026-11-27T10:00:00Z", "completed_at": "2026-11-27T10:01:01Z"},
+              {"labels": ["ubuntu-latest"], "started_at": "2026-11-27T10:00:00Z", "completed_at": "2026-11-27T10:09:00Z"}]
+        lines = G.cost_lines(recs, bs)
+        # 8 vCPU: one started minute ($0.016) and two ($0.032): $0.024 a job; AWS $0.05 a job, 2.08x
+        self.assertEqual(lines, ["cost superci-4cpu: AWS $0.0500 a job (n=1), Blacksmith 4vcpu: no job",
+                                 "cost superci-8cpu: AWS $0.0500 a job (n=2), Blacksmith 8vcpu $0.0240 (n=2): AWS 2.08x"])
+
+
 class Gate2(unittest.TestCase):
     def test_a_clean_replay_passes_every_row(self):
         rows = judge_scale()
@@ -460,6 +473,15 @@ class Gate2(unittest.TestCase):
         row = judge_scale(launched=["spot"] * 9 + ["fast"] * 80 + ["on-demand"])["on-demand share"]
         self.assertEqual(row.status, G.PASS, row)
         self.assertEqual(judge_scale(launched=["fast"] * 8 + ["on-demand"] * 2)["on-demand share"].status, G.FAIL)
+
+    def test_the_share_is_of_the_launches_it_bounds(self):
+        # 80 launches of on_demand sizes (fast) do not dilute the others' share: 2 of their 10 is 20%
+        row = judge_scale(launched=["spot"] * 8 + ["fast"] * 80 + ["on-demand"] * 2)["on-demand share"]
+        self.assertEqual(row.status, G.FAIL, row)
+        self.assertIn("2 of 10", row.value)
+        row = judge_scale(launched=["fast"] * 40)["on-demand share"]
+        self.assertEqual(row.status, G.PASS, row)
+        self.assertIn("40 of an on_demand", row.note)
 
     def test_no_alarm_in_alarm_at_the_end(self):
         firing = judge_scale(alarms={"superci-pull-orphans": "ALARM", "superci-pull-jobs-stalled": "OK"})["alarms at the end"]

@@ -119,6 +119,21 @@ func (s *Spend) Accrue(now time.Time, ms []Machine) {
 	s.MonthUSD += perHour * hours
 }
 
+// capOverrunPercent is how far past a cap the spend may run while the jobs superci holds finish. At a cap each dispatch set keeps
+// no pool but still gives a held job its machine, and the canary's rollback on spend-capped sends the jobs after it to
+// Blacksmith (canary.sh checks every 10 minutes; on demand, unit-tests' Nov 26 peak hour was about 105 to 205 USD of jobs). At
+// capOverrunPercent of a cap nothing more launches and a job still waiting for a machine is failed at once, never left to
+// wait out its timeout.
+const capOverrunPercent = 110
+
+// Stopped says whether the spend has reached capOverrunPercent of a cap: the hard stop. (In percent: 100 x 1.1 is a hair
+// over 110 in floating point.)
+func (s *Spend) Stopped() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return (s.DailyCap > 0 && 100*s.DayUSD >= capOverrunPercent*s.DailyCap) || (s.MonthlyCap > 0 && 100*s.MonthUSD >= capOverrunPercent*s.MonthlyCap)
+}
+
 // Over says whether a cap is reached.
 func (s *Spend) Over() bool {
 	s.mu.Lock()

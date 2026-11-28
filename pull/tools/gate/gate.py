@@ -973,12 +973,15 @@ def evaluate_scale(s):
         rows.append(Row("orphans 10 min after", f"max {peak:.0f}", "0", PASS if peak == 0 else FAIL))
     else:
         rows.append(Row("orphans 10 min after", "-", "0", FAIL, f"no Orphans datapoint at {T.iso(s.orphans_due)}+: run it after then"))
+    # the share is of the launches on_demand_share bounds: a fast-* launch (an on_demand size, or an on_demand_first type)
+    # is outside it, in neither the count nor the whole
     od = sum(1 for l in s.launched if l not in ("spot", "fast"))
     fast = sum(1 for l in s.launched if l == "fast")
-    share = od / len(s.launched) if s.launched else None
-    rows.append(Row("on-demand share", "-" if share is None else f"{100 * share:.1f}% ({od} of {len(s.launched)})", f"<= {100 * ON_DEMAND_SHARE:.0f}%",
+    bounded = len(s.launched) - fast
+    share = od / bounded if bounded else (0.0 if s.launched else None)
+    rows.append(Row("on-demand share", "-" if share is None else f"{100 * share:.1f}% ({od} of {bounded})", f"<= {100 * ON_DEMAND_SHARE:.0f}%",
                     PASS if share is not None and share <= ON_DEMAND_SHARE else FAIL,
-                    "no machine.launched events" if not s.launched else f"{fast} of an on_demand_first type, outside the share" if fast else ""))
+                    "no machine.launched events" if not s.launched else f"{fast} of an on_demand size or on_demand_first type, outside the share" if fast else ""))
     firing = sorted(n for n, st in s.alarms.items() if st == "ALARM")
     rows.append(Row("alarms at the end", f"{len(firing)} in ALARM of {len(s.alarms)}", "0 in ALARM", PASS if not firing and s.alarms else FAIL,
                     f"firing: {firing}" if firing else "" if s.alarms else "no alarms listed"))
@@ -1153,6 +1156,35 @@ def print_rows(title, rows, verdict_name):
     return 1
 
 
+# Blacksmith's x64 Linux list price, per vCPU-minute, billed by the started minute (tools/cost/cost.py measured it from
+# `blacksmith usage`, Nov 10-26).
+BLACKSMITH_USD_PER_VCPU_MIN = 0.002
+
+
+def cost_lines(records, blacksmith_jobs):
+    """Lines of AWS's spend per job of each superci size (the listener's job.record usd: the machine's whole life, one job a
+    machine) beside Blacksmith's for the same job on the same vCPUs (its billed minutes x vCPUs x list price). Information, not
+    a row: the canary judges speed and failures, the operator judges this. Pure."""
+    aws_by = {}
+    for e in records:
+        if e.get("usd") is not None and e.get("set") and e.get("wall_ms"):
+            aws_by.setdefault(e["set"].removeprefix("superci-").removesuffix("cpu"), []).append(float(e["usd"]))
+    bs_by = {}
+    for j in blacksmith_jobs:
+        m = next((re.match(r"blacksmith-(\d+)vcpu", l) for l in j.get("labels") or [] if re.match(r"blacksmith-(\d+)vcpu", l)), None)
+        st, done = T.ts(j.get("started_at")), T.ts(j.get("completed_at"))
+        if m and st and done and done >= st:
+            bs_by.setdefault(m.group(1), []).append(math.ceil((done - st) / 60) * int(m.group(1)) * BLACKSMITH_USD_PER_VCPU_MIN)
+    lines = []
+    for cpu in sorted(set(aws_by) | set(bs_by), key=lambda c: int(c) if c.isdigit() else 0):
+        a, b = aws_by.get(cpu, []), bs_by.get(cpu, [])
+        aws = f"AWS ${sum(a) / len(a):.4f} a job (n={len(a)})" if a else "AWS: no job.record with a cost"
+        bs = f"Blacksmith {cpu}vcpu ${sum(b) / len(b):.4f} (n={len(b)})" if b else f"Blacksmith {cpu}vcpu: no job"
+        ratio = f": AWS {sum(a) / len(a) / (sum(b) / len(b)):.2f}x" if a and b and sum(b) > 0 else ""
+        lines.append(f"cost superci-{cpu}cpu: {aws}, {bs}{ratio}")
+    return lines
+
+
 def show_spread(label, obs, ceiling=None):
     walls = [o for o in obs if o.ok]
     queued = [o for o in obs if o.queue is not None and not o.cancelled]
@@ -1231,6 +1263,9 @@ def cmd_job(a):
     print("  quantiles are interpolated (wall over successful runs and timed-out ones at the ceiling, queue wait over every first attempt):")
     show_spread("superci", S, ceiling)
     show_spread("blacksmith", B, ceiling)
+    print("  spend per job (not judged; AWS's from the listener's records, Blacksmith's at its list price):")
+    for line in cost_lines(recs if events else [], B_jobs) or ["no superci records or Blacksmith jobs to price"]:
+        print(f"  {line}")
     print()
     rows = evaluate_job(S, B, ceiling, unexplained, tests=tests) + dispatched_row(dispatched, unmatched) + unread(gh, a.allow_unread)
     code = print_rows("criteria", rows, f"gate 1 for {a.job}")
