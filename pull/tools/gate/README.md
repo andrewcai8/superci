@@ -132,7 +132,12 @@ output says so: `failing tests: no test-name source for <job>`).
 **Window floors (`WINDOW_FLOORS`).** A job's parity window may not include runs from before its floor: `--since` and Blacksmith's
 baseline start are clamped to it (the output says so), and a Blacksmith window that ends before it is refused. `integration` starts at
 megpt-mono `4e75d94` (#36944, 2026-11-27T20:33:52Z, its committer time on main), which ended 5-25 minute resets between targets.
-The floor is by run creation time: a run on a branch cut before that commit and created after it is not caught.
+`unit-tests` starts at megpt-mono `bdfa0fe` (#36789, 2026-11-28T05:52:41Z), the last of ci-speed's Nov 28 flake fixes (with #36883
+and #36887). The floor is by run creation time: a run on a branch cut before that commit and created after it is not caught.
+A canary's Blacksmith window ends at its T0 (`canary.sh` passes `--baseline-until` = `--since`), so a canary of a floored job whose
+T0 is at or before the floor gets no check on any tick (the gate's `refusing:` line, exit 1, logged as `NO CHECK`) and is never rolled
+back by it: no Blacksmith run in its window is a parity sample. Route the job
+again after its floor, so T0 is past it, with Blacksmith runs between the floor and T0 for the baseline.
 
 ## A live canary: `gate job --canary` and `canary.sh`
 

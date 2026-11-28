@@ -2982,6 +2982,14 @@ class IntegrationFailingTests(FailingHarness, unittest.TestCase):
             self.run_gate(self.baseline() + self.superci(), extra=["--baseline-until", "2026-11-27T18:00:00Z", "--since", "2026-11-27T18:00:00Z"])
         self.assertIn("before window floor (integration)", str(e.exception))
 
+    def test_unit_tests_parity_starts_at_ci_speeds_last_flake_fix(self):
+        floor = "2026-11-28T05:52:41Z"
+        since, b_lo, lines = G.clamp_window("unit-tests", T.ts("2026-11-28T03:00:00Z"), T.ts("2026-11-27T06:00:00Z"), T.ts("2026-11-28T08:00:00Z"))
+        self.assertEqual((since, b_lo), (T.ts(floor), T.ts(floor)), "a unit-tests window before bdfa0fe counted Blacksmith runs that still had the flakes")
+        self.assertIn(f"window floor (unit-tests): bdfa0fe at {floor}", lines[0])
+        with self.assertRaises(SystemExit):
+            G.clamp_window("unit-tests", T.ts("2026-11-28T03:00:00Z"), T.ts("2026-11-27T06:00:00Z"), T.ts("2026-11-28T05:00:00Z"))
+
 
 class LogParsers(unittest.TestCase):
     def test_unit_names_are_file_and_test_with_the_timing_removed(self):
