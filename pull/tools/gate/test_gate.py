@@ -3566,7 +3566,7 @@ class SplitCanary(CanaryTree):
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# A split's wall row is judged per shard: each shard's superci median against its Blacksmith median, a signed-rank test of the log ratios.
+# A split's wall row is judged per shard: each shard's superci median against its Blacksmith median, a run-permutation test of the mean of the log ratios.
 # ---------------------------------------------------------------------------------------------------------------------
 
 # What the gate names, read with a fallback so that the tests fail at an assertion, not at an AttributeError, against a gate that has no such constant.
@@ -3585,13 +3585,22 @@ def split_obs(jobs):
     return [o for o in (G.is_obs(j, {}) for j in jobs) if o]
 
 
+def rw(r):
+    """The weight of run `r` of a half, the same on both halves (so a ratio of medians over the same runs is the ratio it was built with): a few percent between
+    runs, in steps of 1 s of a 60 s leg (the stamps of a job are whole seconds). A run-permutation test cannot tell a half from the other when every leg of
+    a half has one wall: assignments that swap a few runs then all tie with the observed one."""
+    return 1.0 + (5 if r < 2 else (r * 11) % 17 % 5) / 60
+
+
 def simulated_halves(seed, n_runs, regression=1.0, s_slow_share=1.0, b_slow_share=0.55, slow=12, fast=24, run_sigma=0.04, leg_sigma=0.08, shard_sigma=0.03,
-                     tail_share=0.0, tail_mult=1.5, tail_sizes=(4, 8)):
+                     tail_share=0.0, tail_mult=1.5, tail_sizes=(4, 8), run_tail_share=0.0, run_tail_mult=1.3):
     """(S, B): the two halves of one window of unit-tests runs, `n_runs` a side. Every run has `slow` shards of about 100 s (the 4cpu ones) and `fast` of
     about 55 s (the 8cpu ones). A slow leg is in the half with the chance `*_slow_share` (the legs not yet finished when the window is read are in
     neither), so the defaults give superci a third slow legs and Blacksmith a fifth: the leg mixes of the Nov 28 09:24Z check. A run shares a
     factor across its legs and a fleet one across a shard's. `regression` multiplies every superci wall: 1.0 is the same distribution on both halves.
-    `tail_share` of superci's legs of the `tail_sizes` (cpus) are `tail_mult` times slower, the rest as they were: a cold-machine tail, with every median in place."""
+    `tail_share` of superci's legs of the `tail_sizes` (cpus) are `tail_mult` times slower, the rest as they were: a cold-machine tail, with every median in place.
+    `run_tail_share` of the runs of BOTH halves are `run_tail_mult` times slower in every leg (a big PR): a heavy tail of the run factor, which the halves share
+    and which makes the shards' ratios move together. Drawn only when asked for, so the seeds of the other tests keep their windows."""
     rng = random.Random(seed)
     factor = {(f, i): rng.lognormvariate(0, shard_sigma) for f in ("superci", "blacksmith") for i in range(slow + fast)}
     halves = {}
@@ -3599,6 +3608,8 @@ def simulated_halves(seed, n_runs, regression=1.0, s_slow_share=1.0, b_slow_shar
         jobs = []
         for r in range(n_runs):
             run_factor = rng.lognormvariate(0, run_sigma)
+            if run_tail_share and rng.random() < run_tail_share:
+                run_factor *= run_tail_mult
             for i in range(slow + fast):
                 is_slow = i < slow
                 if is_slow and rng.random() >= share:
@@ -3659,47 +3670,113 @@ class PerShardKey(unittest.TestCase):
         self.assertEqual(key("test-go"), "test-go", "a name with no fleet label is its own key")
 
 
-class SignedRank(unittest.TestCase):
-    def test_exact_values_of_the_one_sided_signed_rank_test(self):
-        self.assertTrue(hasattr(G, "signed_rank_p"))
-        p = G.signed_rank_p
-        self.assertAlmostEqual(p([1.0, 2.0, 3.0]), 1 / 8)
-        self.assertAlmostEqual(p([-1.0, -2.0, -3.0]), 1.0)
-        self.assertAlmostEqual(p([1.0, -2.0, 3.0]), 3 / 8, msg="W = 4 of 6: the sums 4, 5, 6 of the 8 sign patterns")
-        self.assertAlmostEqual(p([0.1] * 7), 2 ** -7)
-        self.assertEqual(p([]), 1.0)
-        self.assertEqual(p([0.0, 0.0]), 1.0, "zero differences are left out")
+def run_halves(s_runs, b_runs, shards=10, base=60.0, cpus=8):
+    """(S, B): `shards` shards of one size; run i of a half has the wall `base` x its factor in every shard (a factor per run, the run's weight). Run ids are
+    1000 + i on superci and 2000 + i on Blacksmith."""
+    mk = lambda fleet_name, first, factors: split_obs([shard_job(first + r, i + 1, cpus, fleet_name, base * f) for r, f in enumerate(factors) for i in range(shards)])
+    return mk("superci", 1000, s_runs), mk("blacksmith", 2000, b_runs)
 
-    def test_ties_take_midranks_and_the_test_stays_exact(self):
-        self.assertTrue(hasattr(G, "signed_rank_p"))
-        p = G.signed_rank_p
-        self.assertAlmostEqual(p([1.0, 1.0, 1.0, 1.0]), 1 / 16, msg="four equal positive differences: every rank is 2.5, W the largest of 16")
-        self.assertAlmostEqual(p([1.0, 1.0, -1.0, -1.0]), 11 / 16, msg="W = 5 of the sums 0, 2.5 x k: at least 5 in 11 of 16 patterns")
 
-    def test_the_normal_approximation_above_the_exact_limit_agrees_with_the_exact_test(self):
-        self.assertTrue(hasattr(G, "EXACT_RANK_TEST_MAX_N"))
-        d = [(-1) ** i * (1 + i / 7) + 0.3 for i in range(100)]
-        exact = G.signed_rank_p(d)
-        saved, G.EXACT_RANK_TEST_MAX_N = G.EXACT_RANK_TEST_MAX_N, 10
-        try:
-            approx = G.signed_rank_p(d)
-        finally:
-            G.EXACT_RANK_TEST_MAX_N = saved
-        self.assertNotEqual(exact, approx)
-        self.assertLess(abs(exact - approx), 0.01, (exact, approx))
+def one_size(obs, size="8cpu"):
+    return [o for o in obs if G.shard_size(o.name) == size]
 
-    def test_the_least_p_value_of_fewer_pairs_than_the_minimum_cannot_reach_the_false_rollback_rate(self):
-        self.assertTrue(hasattr(G, "MIN_PAIRED_SHARDS"))
-        self.assertGreater(G.signed_rank_p([1.0] * (MIN_SHARDS - 2)), G.FALSE_ROLLBACK_RATE, "two pairs under the minimum, even all slower, never fail")
-        self.assertLessEqual(G.signed_rank_p([1.0] * MIN_SHARDS), G.FALSE_ROLLBACK_RATE, "the minimum can fail with a pair to spare")
+
+def keys_of(obs):
+    return {G.shard_key(o.name) for o in obs}
+
+
+def power_halves(rnd, fleet, runs, f4, f8, base_run):
+    """One half of #91's round 2 power setup: 24 4cpu shards of about 100 s and 28 8cpu shards of about 55 s (a fixed spread of 0 to 10% over the shards), a run
+    factor of 4% and a leg factor of 9%, and `f4` and `f8` scaling the whole half. superci is the half `f4` and `f8` are given for."""
+    out, jid = [], 0
+    for r in range(runs):
+        run_factor = math.exp(rnd.gauss(0, 0.04))
+        for cpus, count, base, f in ((4, 24, 100, f4), (8, 28, 55, f8)):
+            for s in range(count):
+                label = f"superci-{cpus}cpu" if fleet == "superci" else f"blacksmith-{cpus}vcpu-ubuntu-2404"
+                wall = base * (1 + 0.1 * (s % 5) / 5) * run_factor * f * math.exp(rnd.gauss(0, 0.09))
+                jid += 1
+                out.append(G.Obs(base_run * 10000 + jid, base_run + r, "", "", fleet, True, 1.0, wall, name=f"unit-tests ({s}, {label}, {cpus})"))
+    return out
+
+
+class RunPermutation(unittest.TestCase):
+    def p(self, S, B, margin=0.0, pct=50, alpha=0.01, **kw):
+        self.assertTrue(hasattr(G, "permutation_p"))
+        return G.permutation_p(one_size(S), one_size(B), 165.0, keys_of(one_size(S)), margin, pct, alpha, "test", **kw)
+
+    def test_two_runs_a_side_one_in_six_assignments_are_as_slow_as_the_observed(self):
+        self.assertTrue(hasattr(G, "permutation_p"))
+        p = self.p(*run_halves([2.0, 2.0], [1.0, 1.0]), stop_early=False)
+        self.assertAlmostEqual(p, 1 / 6, delta=0.03, msg="C(4, 2) = 6 assignments of the four runs, and only the observed one has both superci runs on the slow side")
+        self.assertAlmostEqual(self.p(*run_halves([1.0, 1.0], [2.0, 2.0]), stop_early=False), 1.0, delta=0.01, msg="every other assignment is at least as slow")
+
+    def test_a_slowdown_in_every_run_has_a_p_value_under_the_false_rollback_rate_and_over_one_in_the_draws(self):
+        self.assertTrue(hasattr(G, "PERMUTATIONS"))
+        S, B = run_halves([1.2 + 0.01 * i for i in range(10)], [1.0 + 0.01 * i for i in range(10)])
+        p = self.p(S, B, margin=0.05, stop_early=False)
+        self.assertTrue(1 / (1 + G.PERMUTATIONS) <= p <= 0.01, p)
+        self.assertGreaterEqual(self.p(S, B, margin=0.05, permutations=99), 1 / 100, "a p-value of n draws is at least 1 / (1 + n)")
+
+    def test_the_legs_of_a_run_move_together(self):
+        # Five of ten superci runs and two of ten Blacksmith runs are 1.3x slower in every one of 10 shards: every shard's median ratio is 1.15x, and a
+        # signed-rank test of the ten shards reads that as ten independent samples (p = 2^-10). The slow runs are seven of twenty, and five or more of
+        # them fall on one side with chance (C(7,5) C(13,5) + C(7,6) C(13,4) + C(7,7) C(13,3)) / C(20,10) = 0.175.
+        S, B = run_halves([1.3] * 5 + [1.0] * 5, [1.3] * 2 + [1.0] * 8)
+        self.assertAlmostEqual(self.p(S, B, margin=0.05, stop_early=False), 0.175, delta=0.03)
+        rows, reasons = verdict_of(S, B)
+        self.assertEqual((want(rows, G.SHARD_ROW).status, want(rows, G.TAIL_ROW).status, reasons), (G.PASS, G.PASS, []), "a window whose slow runs landed on one half is not a regression")
+
+    def test_the_same_window_has_the_same_p_however_it_is_listed_and_a_different_one_has_another(self):
+        self.assertTrue(hasattr(G, "permutation_p"))
+        S, B = simulated_halves(3, 12, regression=1.04)
+        S8, B8 = one_size(S), one_size(B)
+        keys = keys_of(S8)
+        p = lambda s, b, row="x": G.permutation_p(s, b, 165.0, keys, G.WALL_MARGIN, 50, 0.005, row, stop_early=False)
+        first = p(S8, B8)
+        self.assertEqual(first, p(S8, B8), "a rerun of the window")
+        self.assertEqual(first, p(S8[::-1], B8[::-1]), "the same legs in another order")
+        self.assertNotEqual(first, p(S8, B8, row="another row"), "the draws are seeded from the row and the window: not one stream for every row")
+        S2, B2 = simulated_halves(4, 12, regression=1.04)
+        self.assertNotEqual(first, G.permutation_p(one_size(S2), one_size(B2), 165.0, keys, G.WALL_MARGIN, 50, 0.005, "x", stop_early=False))
+
+    def test_stopping_the_draws_at_a_pass_changes_no_verdict(self):
+        for seed in range(30):
+            S, B = simulated_halves(seed, 12, regression=1.09)
+            for pct, margin in ((50, G.WALL_MARGIN), (90, G.TAIL_MARGIN)):
+                full = self.p(S, B, margin=margin, pct=pct, alpha=0.005, stop_early=False)
+                early = self.p(S, B, margin=margin, pct=pct, alpha=0.005)
+                self.assertEqual(full <= 0.005, early <= 0.005, (seed, pct, full, early))
+                if full <= 0.005:
+                    self.assertEqual(full, early, "a failing p has every draw made")
+
+    def test_a_side_with_no_run_or_no_paired_shard_has_nothing_to_permute(self):
+        S, B = run_halves([1.0] * 3, [1.0] * 3)
+        self.assertEqual(self.p(S, []), 1.0)
+        self.assertEqual(self.p([], B), 1.0)
+        self.assertEqual(G.permutation_p(S, B, 165.0, set(), 0.0, 50, 0.01, "x"), 1.0)
+
+    def test_the_rows_name_the_test_in_their_threshold_and_print_its_p(self):
+        S, B = simulated_halves(0, 12, regression=1.2)
+        rows, _ = verdict_of(S, B)
+        for name, shard in (("wall (per shard)", "median"), ("wall tail (per shard)", "p90")):
+            r = want(rows, name)
+            self.assertTrue(r.threshold.startswith("run-permutation p > 0.01 that per-shard " + shard), r.threshold)
+            self.assertNotIn("Wilcoxon", r.threshold)
+            self.assertRegex(r.value, r"\(p = [0-9.e-]+\)")
+
+    def test_a_window_read_again_has_the_same_rows(self):
+        S, B = simulated_halves(5, 24, tail_share=0.15)
+        a, b = verdict_of(S, B)[0], verdict_of(list(S), list(B))[0]
+        self.assertEqual({k: (r.value, r.status, r.note, r.detail) for k, r in a.items()}, {k: (r.value, r.status, r.note, r.detail) for k, r in b.items()})
 
 
 class PerShardWall(unittest.TestCase):
     def halves(self, ratio, shards=10, runs=None, fast=60.0):
         """`shards` shards of `runs` runs on each fleet: superci's walls `ratio` times Blacksmith's, every shard alike."""
         runs = runs or SHARD_RUNS
-        s = [shard_job(1000 + r, i + 1, 8, "superci", fast * ratio) for r in range(runs) for i in range(shards)]
-        b = [shard_job(2000 + r, i + 1, 8, "blacksmith", fast) for r in range(runs) for i in range(shards)]
+        s = [shard_job(1000 + r, i + 1, 8, "superci", fast * ratio * rw(r)) for r in range(runs) for i in range(shards)]
+        b = [shard_job(2000 + r, i + 1, 8, "blacksmith", fast * rw(r)) for r in range(runs) for i in range(shards)]
         return split_obs(s), split_obs(b)
 
     def test_a_split_has_one_wall_row_per_shard_and_no_pooled_wall_rows(self):
@@ -3729,10 +3806,10 @@ class PerShardWall(unittest.TestCase):
 
     # Review of #91: one test over every shard let a faster 8cpu set hide a slower 4cpu one (4cpu +30%, 8cpu at 0.905: 15 of 100 caught at 12 runs a half).
     def test_a_slower_size_is_not_hidden_by_a_faster_one(self):
-        s = split_obs([shard_job(1000 + r, i + 1, 4, "superci", 130.0) for r in range(SHARD_RUNS) for i in range(12)]
-                      + [shard_job(1000 + r, i + 1, 8, "superci", 50.0) for r in range(SHARD_RUNS) for i in range(12, 40)])
-        b = split_obs([shard_job(2000 + r, i + 1, 4, "blacksmith", 100.0) for r in range(SHARD_RUNS) for i in range(12)]
-                      + [shard_job(2000 + r, i + 1, 8, "blacksmith", 55.25) for r in range(SHARD_RUNS) for i in range(12, 40)])
+        s = split_obs([shard_job(1000 + r, i + 1, 4, "superci", 130.0 * rw(r)) for r in range(SHARD_RUNS) for i in range(12)]
+                      + [shard_job(1000 + r, i + 1, 8, "superci", 50.0 * rw(r)) for r in range(SHARD_RUNS) for i in range(12, 40)])
+        b = split_obs([shard_job(2000 + r, i + 1, 4, "blacksmith", 100.0 * rw(r)) for r in range(SHARD_RUNS) for i in range(12)]
+                      + [shard_job(2000 + r, i + 1, 8, "blacksmith", 55.25 * rw(r)) for r in range(SHARD_RUNS) for i in range(12, 40)])
         rows, reasons = verdict_of(s, b)
         r = want(rows, "wall (per shard)")
         self.assertEqual(r.status, G.FAIL, r)
@@ -3778,7 +3855,7 @@ class PerShardWall(unittest.TestCase):
         self.assertIn("0 shards paired", r.value)
 
     def test_the_detail_lists_ten_worst_shards_first_and_counts_the_rest(self):
-        S, B = split_obs([shard_job(1000 + r, i + 1, 8, "superci", 120.0 if i == 2 else 60.0) for r in range(SHARD_RUNS) for i in range(14)]), self.halves(1.0, shards=14)[1]
+        S, B = split_obs([shard_job(1000 + r, i + 1, 8, "superci", (120.0 if i == 2 else 60.0) * rw(r)) for r in range(SHARD_RUNS) for i in range(14)]), self.halves(1.0, shards=14)[1]
         r = want(verdict_of(S, B)[0], "wall (per shard)")
         shards = [l for l in r.detail if l.startswith("unit-tests (")]
         self.assertEqual(len(shards), 10)
@@ -3858,9 +3935,10 @@ TAIL_LEGS = getattr(G, "MIN_TAIL_LEGS", 10)
 
 class TailPerShard(unittest.TestCase):
     def halves(self, cold_runs, legs=TAIL_LEGS, shards=10, cold=1.5, base=60.0):
-        """`shards` shards of `legs` runs on each fleet at `base` s, except that superci's first `cold_runs` runs of every shard are `cold` times slower: every
-        median is `base`, and the p90 is `cold` times it from two cold runs of ten."""
-        s = [shard_job(1000 + r, i + 1, 8, "superci", base * (cold if r < cold_runs else 1.0)) for r in range(legs) for i in range(shards)]
+        """`shards` shards of `legs` runs on each fleet at `base` s, except that in superci's every shard `cold_runs` of the runs are `cold` times slower, a
+        different pair of runs in each shard (a cold machine is a leg's, not a run's): every median is `base`, and the p90 is `cold` times it from two cold runs
+        of ten."""
+        s = [shard_job(1000 + r, i + 1, 8, "superci", base * (cold if (r - i) % legs < cold_runs else 1.0)) for r in range(legs) for i in range(shards)]
         b = [shard_job(2000 + r, i + 1, 8, "blacksmith", base) for r in range(legs) for i in range(shards)]
         return split_obs(s), split_obs(b)
 
@@ -3914,7 +3992,7 @@ class TailPerShard(unittest.TestCase):
         self.assertEqual(r.status, G.NOISE, r)
 
     def test_a_size_is_judged_apart_and_the_row_names_it(self):
-        cold = lambda cpus, shard_ids: split_obs([shard_job(1000 + r, i + 1, cpus, "superci", 60.0 * (1.5 if r < 2 and cpus == 4 else 1.0)) for r in range(TAIL_LEGS) for i in shard_ids])
+        cold = lambda cpus, shard_ids: split_obs([shard_job(1000 + r, i + 1, cpus, "superci", 60.0 * (1.5 if (r - i) % TAIL_LEGS < 2 and cpus == 4 else 1.0)) for r in range(TAIL_LEGS) for i in shard_ids])
         flat = lambda cpus, shard_ids: split_obs([shard_job(2000 + r, i + 1, cpus, "blacksmith", 60.0) for r in range(TAIL_LEGS) for i in shard_ids])
         s4, s8 = cold(4, range(10)), cold(8, range(10, 20))
         rows, reasons = verdict_of(s4 + s8, flat(4, range(10)) + flat(8, range(10, 20)))
@@ -3973,6 +4051,82 @@ class TailFalseRollbackAndPower(unittest.TestCase):
             self.assertIn("on 4cpu (", r.note)
             self.assertNotIn("8cpu (", r.note, "the clean size is not named")
             self.assertEqual([x.split(":")[0] for x in reasons], ["wall tail (per shard)"], (seed, reasons))
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# The legs of a run share its weight, so the shards' ratios move together: the walls are judged by permuting whole runs (permutation_p).
+# ---------------------------------------------------------------------------------------------------------------------
+
+class RunLevelTail(unittest.TestCase):
+    """Equal fleets, with 10% of the runs of both 1.3x slower in every leg (a big PR): chance clusters the slow runs into one half. Review of #92 measured the
+    signed-rank rows rolling that back 2.7% (tail row) and 4.0% (both rows) of the time at 10 runs a half, and about 1% at 24."""
+    SEEDS = range(300)
+
+    def rates(self, runs):
+        both = wall = tail = 0
+        for seed in self.SEEDS:
+            rows = verdict_of(*simulated_halves(seed, runs, run_tail_share=0.10))[0]
+            w, t = want(rows, G.SHARD_ROW).status == G.FAIL, want(rows, G.TAIL_ROW).status == G.FAIL
+            wall, tail, both = wall + w, tail + t, both + (w or t)
+        return {"both rows": both, "wall (per shard)": wall, "wall tail (per shard)": tail}
+
+    def test_equal_halves_with_a_run_level_tail_almost_never_roll_back_at_ten_twelve_and_twenty_four_runs(self):
+        for runs in (10, 12, 24):
+            for row, n in self.rates(runs).items():
+                self.assertLessEqual(n / len(self.SEEDS), 0.02, f"{runs} runs a half, {row}: {n} of {len(self.SEEDS)} seeds rolled back")
+
+    def test_the_halves_of_the_run_level_tail_are_judged_not_noise(self):
+        rows = verdict_of(*simulated_halves(0, 10, run_tail_share=0.10))[0]
+        self.assertEqual((want(rows, G.SHARD_ROW).status, want(rows, G.TAIL_ROW).status), (G.PASS, G.PASS), "ten runs a half is enough to judge, and they pass")
+
+    def test_superci_exactly_at_the_wall_margin_is_a_false_rollback_about_as_often_as_the_rate_says(self):
+        # `all +5%` of #91's round 2: the null the test is exact for. FALSE_ROLLBACK_RATE is 1%; 200 seeds and a bound of 4% leave room for sampling.
+        rolled = 0
+        for seed in range(200):
+            rnd = random.Random(seed)
+            S, B = power_halves(rnd, "superci", 12, 1 + G.WALL_MARGIN, 1 + G.WALL_MARGIN, 1000), power_halves(rnd, "blacksmith", 12, 1, 1, 5000)
+            rolled += want(rows_by_name(G.evaluate_job(S, B, 165.0, [0.5] * 10, split=True)), G.SHARD_ROW).status == G.FAIL
+        self.assertLessEqual(rolled / 200, 0.04, f"{rolled} of 200")
+
+
+class RunPermutationPower(unittest.TestCase):
+    """What #91's round 2 measured for the signed-rank row, on its setup (24 4cpu and 28 8cpu shards, run noise 4%, leg noise 9%): a regression on one size
+    is caught by 12 runs a half whatever the other size does, 100 of 100."""
+    SEEDS = range(30)
+
+    def rolled(self, runs, f4, f8):
+        got = []
+        for seed in self.SEEDS:
+            rnd = random.Random(seed)
+            S, B = power_halves(rnd, "superci", runs, f4, f8, 1000), power_halves(rnd, "blacksmith", runs, 1, 1, 5000)
+            rows = rows_by_name(G.evaluate_job(S, B, 165.0, [0.5] * 10, split=True))
+            got.append((G.canary_verdict(list(rows.values()), {}), want(rows, G.SHARD_ROW).status))
+        return got
+
+    def test_4cpu_plus_30_percent_with_8cpu_faster_is_caught_at_12_and_24_runs_a_half(self):
+        for runs in (12, 24):
+            got = self.rolled(runs, 1.3, 0.905)
+            self.assertTrue(all(r and status == G.FAIL for r, status in got), f"{runs} runs: {sum(bool(r) for r, _ in got)} of {len(got)} rolled back")
+
+    def test_8cpu_plus_30_percent_with_4cpu_equal_is_caught_at_12_and_24_runs_a_half(self):
+        for runs in (12, 24):
+            got = self.rolled(runs, 1.0, 1.3)
+            self.assertTrue(all(r and status == G.FAIL for r, status in got), f"{runs} runs: {sum(bool(r) for r, _ in got)} of {len(got)} rolled back")
+
+    def test_the_fail_names_the_size_that_is_slow(self):
+        rnd = random.Random(0)
+        S, B = power_halves(rnd, "superci", 12, 1.3, 0.905, 1000), power_halves(rnd, "blacksmith", 12, 1, 1, 5000)
+        r = want(rows_by_name(G.evaluate_job(S, B, 165.0, [0.5] * 10, split=True)), G.SHARD_ROW)
+        self.assertIn("on 4cpu (", r.note)
+        self.assertNotIn("8cpu (", r.note)
+
+
+class ColdTailPowerAtThirtyRuns(unittest.TestCase):
+    def test_a_cold_tail_on_15_percent_of_superci_s_legs_is_caught_by_thirty_runs_a_half(self):
+        # #92: 84% at 24 runs a half. The permutation rows catch it as often at 24 (TailFalseRollbackAndPower) and, at 30, in 98% of 300 seeds.
+        seeds = range(60)
+        rolled = sum(bool(verdict_of(*simulated_halves(seed, 30, tail_share=0.15))[1]) for seed in seeds)
+        self.assertGreaterEqual(rolled / len(seeds), 0.90, f"{rolled} of {len(seeds)}")
 
 
 class TailOnTheRealWindow(unittest.TestCase):
@@ -4046,7 +4200,7 @@ class RecordsWallNotGitHubs(unittest.TestCase):
             sup = []
             for i in shards:
                 queued = NOW - 3000 + 40
-                rec = dispatched(record(f"j{r}-{i}", 2.0, wall_of_superci, name=f"unit-tests ({i}, superci-8cpu, 8)", run=100 + r, queued_at=queued, branch="pr"), identity="superci-id-8cpu-0001")
+                rec = dispatched(record(f"j{r}-{i}", 2.0, wall_of_superci + (r * 3) % 7, name=f"unit-tests ({i}, superci-8cpu, 8)", run=100 + r, queued_at=queued, branch="pr"), identity="superci-id-8cpu-0001")
                 records.append(rec)
                 created = queued - self.WAIT
                 j = gh_job(7000 + r * 100 + i, 100 + r, 1, "success", created, created + 1, T.ts(rec["finish_time"]) + 1, fleet="superci", name=rec["name"], sha=f"s{r}", branch="pr")
@@ -4056,7 +4210,7 @@ class RecordsWallNotGitHubs(unittest.TestCase):
             bs = []
             for i in shards:
                 at = NOW - 3000
-                j = gh_job(8000 + r * 100 + i, 200 + r, 1, "success", at, at + 2, at + 2 + 60.0, fleet="blacksmith", name=f"unit-tests ({i}, blacksmith-8vcpu-ubuntu-2404, 8)", sha=f"b{r}", branch="pr")
+                j = gh_job(8000 + r * 100 + i, 200 + r, 1, "success", at, at + 2, at + 2 + 60.0 + (r * 3) % 7, fleet="blacksmith", name=f"unit-tests ({i}, blacksmith-8vcpu-ubuntu-2404, 8)", sha=f"b{r}", branch="pr")
                 j["steps"] = []
                 bs.append(j)
             runs.append((200 + r, "pr", "success", bs))
