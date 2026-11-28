@@ -639,7 +639,11 @@ for r in json.load(sys.stdin)["runners"]:
         print(r["id"])' "$size" "$from")
   [ -n "$ids" ] || { echo "nothing to relabel: no superci-id-$size-* carries $from"; return 0; }
   echo "relabelling $(wc -l <<< "$ids") identities of $size: $from -> $to"
-  # One SSH to the listener for each 50. The listener answers GitHub's 403 and 429 as 429 with the Retry-After.
+  # One SSH to the listener for each 50. The listener answers GitHub's 403 and 429 as 429 with the Retry-After. ssh reads
+  # its stdin, which here is the list of chunks, so the call gets /dev/null: given the loop's stdin it took every chunk after
+  # the first, and a relabel of 410 moved 50 and said "relabelled all" (Nov 28).
+  local total moved=0 left
+  total=$(wc -l <<< "$ids")
   while read -r -a chunk; do
     out=$($SSH "h=\$(mktemp); for id in ${chunk[*]}; do
       code=\$(curl -s -o /dev/null -D \"\$h\" -w '%{http_code}' -X POST \"localhost:8080/identities/labels?id=\$id&labels=$to\")
@@ -647,9 +651,10 @@ for r in json.load(sys.stdin)["runners"]:
       elif [ \"\$code\" = 403 ] || [ \"\$code\" = 429 ]; then echo \"stop \$id \$code \$(sed -n 's/^[Rr]etry-[Aa]fter: *\\([0-9]*\\).*/\\1/p' \"\$h\")\"; break
       else echo fail \$id \$code; fi
       sleep 1
-    done; rm -f \"\$h\"") || out=""
+    done; rm -f \"\$h\"" < /dev/null) || out=""
     ok=$(grep -c '^ok' <<< "$out" || true)
-    echo "  relabelled $ok"
+    moved=$((moved + ok))
+    echo "  relabelled $ok ($moved of $total)"
     stopline=$(grep '^stop ' <<< "$out" || true)
     if [ -n "$stopline" ]; then
       read -r _ id code pause <<< "$stopline"
@@ -660,7 +665,11 @@ for r in json.load(sys.stdin)["runners"]:
     bad=$((bad + ${#chunk[@]} - ok))
   done < <(xargs -n 50 <<< "$ids")
   [ "$bad" = 0 ] || die "$bad identities were not relabelled; run the same command again"
-  echo "relabelled all"
+  # What GitHub lists afterwards decides, not the count of answers: an identity still under the old label is reported.
+  left=$(at_github | python3 -I -c 'import json,sys
+print(sum(1 for r in json.load(sys.stdin)["runners"] if r["name"].startswith("superci-id-%s-" % sys.argv[1]) and sys.argv[2] in r["labels"]))' "$size" "$from")
+  [ "$left" = 0 ] || die "relabelled $moved of $total, and GitHub still lists $left of superci-id-$size-* under $from; run the same command again"
+  echo "relabelled all $moved of $total"
 }
 
 # ---- down ----
