@@ -58,16 +58,16 @@ machine() {
   step "waiting for $ID to run"
   $A ec2 wait instance-running --region $R --instance-ids "$ID"
   read -r IP ZONE < <($A ec2 describe-instances --region $R --instance-ids "$ID" --query 'Reservations[0].Instances[0].[PublicIpAddress,Placement.AvailabilityZone]' --output text)
-  push() { $A ec2-instance-connect send-ssh-public-key --region $R --instance-id "$ID" --availability-zone "$ZONE" --instance-os-user ubuntu --ssh-public-key "file://$tmp/key.pub" > /dev/null; }
-  S="ssh -i $tmp/key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o LogLevel=ERROR ubuntu@$IP"
-  if [ "${SUPERCI_TEST:-}" = 1 ] && [ -n "${PARITY_SSH:-}" ]; then S=$PARITY_SSH; push() { :; }; fi
+  # The machine's own user data puts this run's key on a user of its own (parity), as the lab did: the image's sshd does
+  # not take an EC2 Instance Connect key (Nov 28: the push answered true, ssh "Permission denied (publickey)").
+  S="ssh -i $tmp/key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o LogLevel=ERROR parity@$IP"
+  if [ "${SUPERCI_TEST:-}" = 1 ] && [ -n "${PARITY_SSH:-}" ]; then S=$PARITY_SSH; fi
   step "waiting for $ID ($IP) to reach its probe"
-  until push && $S test -d /run/superci-parity 2> /dev/null; do sleep 5; done
-  push
+  until $S test -d /run/superci-parity 2> /dev/null; do sleep 5; done
   step "putting the probe on $ID"
   tar -C "$tmp/put" -cf - agent.py probe.sh | $S 'sudo tar -C /run/superci-parity -xf - --no-same-owner && sudo touch /run/superci-parity/go'
   step "waiting for the probe on $ID to finish"
-  until $S test -e /run/superci-parity/rc 2> /dev/null; do sleep 2; push; done
+  until $S test -e /run/superci-parity/rc 2> /dev/null; do sleep 2; done
   step "reading the probe's output from $ID"
   $S 'cat /run/superci-parity/out' > "$tmp/probe.txt"
   [ "$($S 'cat /run/superci-parity/rc')" = 0 ] || { echo "parity: the probe failed: $($S 'tail -5 /run/superci-parity/err')"; exit 1; }
@@ -162,9 +162,10 @@ fi
 TYPE=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["sizes"]["superci-4cpu"]["types"][0])' "$OVERRIDE")
 # The commit's boot.sh as the listener renders it for superci-4cpu, up to the job's branch, then the probe; gzipped as
 # the listener's launch template holds it (encodeUserData in fleet.go): EC2 takes 16 KiB before its base64.
-python3 -I - "$rev" "$tmp/user-data" << 'PY'
+ssh-keygen -q -t ed25519 -N '' -f "$tmp/key"
+python3 -I - "$rev" "$tmp/user-data" "$tmp/key.pub" << 'PY'
 import gzip, re, sys
-src, out = sys.argv[1], sys.argv[2]
+src, out, pub = sys.argv[1], sys.argv[2], open(sys.argv[3]).read().strip()
 boot = open(f"{src}/boot.sh").read()
 for k, v in {"@MODE@": "dispatch", "@LISTENER@": "https://203.0.113.1:8443", "@PIN@": "sha256//parity", "@LIFE_SECONDS@": "1800",
              "@LABEL@": "superci-4cpu", "@WARM_CAP_SECONDS@": "300", "@HYDRATE_STOP@": open(f"{src}/hydrate-stop.sh").read().strip()}.items():
@@ -175,7 +176,14 @@ if marker not in boot:
 left = sorted(set(re.findall(r"@[A-Z_]+@", boot)))
 if left:
     sys.exit(f"parity: FAIL: boot.sh has placeholders this check does not render: {', '.join(left)}")
-text = boot[:boot.index(marker)] + """# pull/deploy/parity.sh: boot's shell runs the probe as the agent runs a job, once the check has put them in place.
+text = boot[:boot.index(marker)] + """# pull/deploy/parity.sh: a user of the check's own, with this run's key, that the check reaches over ssh (the image's
+# sshd does not take an EC2 Instance Connect key). The probe looks at the runner user, which this does not touch.
+useradd -m -s /bin/bash parity
+install -d -m 700 -o parity -g parity /home/parity/.ssh
+printf '%s\\n' '""" + pub + """' > /home/parity/.ssh/authorized_keys
+chown parity:parity /home/parity/.ssh/authorized_keys; chmod 600 /home/parity/.ssh/authorized_keys
+printf 'parity ALL=(ALL) NOPASSWD:ALL\\n' > /etc/sudoers.d/90-parity; chmod 440 /etc/sudoers.d/90-parity
+# boot's shell runs the probe as the agent runs a job, once the check has put them in place.
 P=/run/superci-parity
 install -d -m 755 $P
 until [ -e $P/go ]; do sleep 1; done
@@ -190,7 +198,6 @@ PY
 mkdir "$tmp/put"
 install -m 755 "$AGENT" "$tmp/put/agent.py"
 install -m 755 "$here/parity/probe.sh" "$tmp/put/probe.sh"
-ssh-keygen -q -t ed25519 -N '' -f "$tmp/key"
 echo "parity: booting $AMI ($WHAT) as $TYPE in $R"
 SG=$($A ec2 describe-security-groups --region $R --filters Name=group-name,Values=superci-pull-listener --query 'SecurityGroups[0].GroupId' --output text)
 ID=$($A ec2 run-instances --region $R --image-id "$AMI" --instance-type "$TYPE" --security-group-ids "$SG" \
