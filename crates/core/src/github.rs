@@ -374,6 +374,12 @@ pub async fn runner_state(http: &dyn Http, api: &str, token: &str, owner: &Owner
     }
 }
 
+/// Whether an organization's runner group lets public repositories' jobs onto its runners.
+pub async fn group_allows_public(http: &dyn Http, api: &str, token: &str, org: &str, group: u64) -> Result<bool> {
+    let v = gh(http, api, "GET", &format!("/orgs/{org}/actions/runner-groups/{group}"), token, None).await?;
+    v["allows_public_repositories"].as_bool().ok_or_else(|| "GitHub said nothing of the runner group's public repositories".into())
+}
+
 pub async fn delete_runner(http: &dyn Http, api: &str, token: &str, owner: &Owner, repo: &str, runner_id: u64) -> Result<()> {
     let path = if owner.org { format!("/orgs/{}/actions/runners/{runner_id}", owner.login) } else { format!("/repos/{repo}/actions/runners/{runner_id}") };
     gh(http, api, "DELETE", &path, token, None).await.map(|_| ())

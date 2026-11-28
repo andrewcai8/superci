@@ -41,9 +41,9 @@ pub struct Conflict { pub path: Vec<String>, pub now: Value }
 fn present<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> { Value::deserialize(d).map(Some) }
 
 /// The field its items are kept by, for a list kept by key: the order's providers and the launchers, by their cloud;
-/// further accounts and runners, by their word.
+/// further accounts and runners, by their word; the labels kept warm, by their label.
 pub fn keyed(path: &[String]) -> Option<&'static str> {
-    match path { [a, b] if a == "routing" && b == "order" => Some("cloud"), [a] if a == "launchers" => Some("cloud"), [a] if a == "accounts" || a == "runners" => Some("name"), _ => None }
+    match path { [a, b] if a == "routing" && b == "order" => Some("cloud"), [a, b] if a == "routing" && b == "warm" => Some("label"), [a] if a == "launchers" => Some("cloud"), [a] if a == "accounts" || a == "runners" => Some("name"), _ => None }
 }
 
 fn key_of<'a>(item: &'a Value, by: &str) -> Option<&'a str> { item[by].as_str() }

@@ -3061,3 +3061,28 @@ fn an_image_of_ones_own_moves_to_a_new_tag_in_one_write_and_an_unknown_name_is_r
     assert!(served.aws.unanswered.lock().unwrap().is_empty(), "{:?}", served.aws.unanswered.lock().unwrap());
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn a_label_kept_warm_is_set_in_place_listed_and_deleted_and_one_the_control_plane_does_not_answer_to_is_refused() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    let ok = |args: &[&str]| { let (code, v) = json(&home, args); assert_eq!(code, 0, "{args:?}: {v}"); v };
+    let kept = || serde_json::from_str::<serde_json::Value>(served.store.0.lock().unwrap().get("settings").map_or("{}", String::as_str)).unwrap();
+    let warm = || kept()["routing"]["warm"].clone();
+
+    assert_eq!(ok(&["warm", "list"])["warm"], serde_json::json!([]));
+    let said = ok(&["warm", "set", "superci/cpu=4", "--count=2"]);
+    assert_eq!(said["said"], "2 runners are kept idle for `runs-on: superci/cpu=4`; one idle 30 minutes is replaced.");
+    assert_eq!(warm(), serde_json::json!([{ "label": "superci/cpu=4", "count": 2, "idle_minutes": 30 }]));
+    // The same label again: changed where it is, not kept twice.
+    ok(&["warm", "set", "superci/cpu=4", "--count=3", "--idle-minutes=10"]);
+    assert_eq!(warm(), serde_json::json!([{ "label": "superci/cpu=4", "count": 3, "idle_minutes": 10 }]));
+    assert_eq!(ok(&["warm", "list"])["warm"], serde_json::json!([{ "label": "superci/cpu=4", "count": 3, "idle_minutes": 10, "idle": 0 }]));
+    // A label this control plane does not answer to: refused, and nothing written.
+    let (code, refused) = json(&home, &["warm", "set", "other/cpu=4", "--count=1"]);
+    assert!(code == 1 && refused["error"].as_str().is_some_and(|e| e.contains("other/cpu=4 is not a label this control plane answers to")), "{refused}");
+    assert_eq!(warm()[0]["count"], 3);
+    let said = ok(&["warm", "delete", "superci/cpu=4"]);
+    assert_eq!((said["said"].as_str(), warm()), (Some("No runner is kept idle for superci/cpu=4 now: those there are ended at the next sweep."), serde_json::Value::Null));
+    let _ = std::fs::remove_dir_all(&home);
+}
