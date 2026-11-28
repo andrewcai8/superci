@@ -7,7 +7,7 @@ file it writes.
 ```
 readset.py resident OUT                       on a lab machine that has just run one job: the page cache's files
 readset.py build --image MNT OUT RESIDENT...  the union, kept only where the image has the file at the same size
-readset.py check --image MNT LIST             exit 1 unless every path of LIST is a regular file of the image
+readset.py check --image MNT LIST             exit 1 unless every path of LIST is a regular file of the image; prints "N of M"
 python3 -m unittest pull/tools/readset/test_readset.py
 ```
 
@@ -21,12 +21,21 @@ host. Terminate every instance at the end.
 2. Run one real job of the size on it, through a repository runner on a lab label from a load branch, and nothing else.
 3. `readset.py resident` after the job. Repeat on fresh machines for other legs of the job and the other jobs of the
    size. Each run adds the files its leg reads, and the Nov 27 list for superci-8cpu took ten (two solo legs, eight
-   packed legs).
-4. Make a volume from the image's root snapshot (a copy in the account: EBS direct APIs refuse a public snapshot). Attach
+   packed legs). The Nov 28 list for superci-4cpu took all 24 packed 4 vCPU unit-tests legs of the queue fleet, one on a machine alone first, then
+   the rest in batches of six, and then leg 3 again, because the first recording of leg 3 held only 62,643 resident files. Built against
+   the current image (3,002 image files after leg 1, 3,012 after two legs, 3,073 after ten and 3,095 after all 24), the legs' union is
+   3,108 image files with the second leg 3. It then took four runs of test-go (one job, four fresh machines, on main 30cc3a4): the first added 198 image files
+   (cgo's gcc, as and ld, and the C headers they read), the second and third none, and the fourth, on the current image, 66 (Chrome's files, which
+   the current image has at another size, and kernel 7.0.0-1018's modules). The list holds 3,372. Twenty-three legs and three test-go runs were recorded
+   on RunsOn 20261117081256, which RunsOn has since deleted; leg 3 and the fourth test-go run were recorded on 20261120075252,
+   the build the listener now boots, and `build` and `check` ran against its snapshot. A file the newer image changed (libpq, Chrome) is in the list
+   only where a machine of the newer image read it.
+4. Make a volume from the image's root snapshot (`create-volume --snapshot-id` takes the image's public snapshot; the EBS direct APIs refuse it). Attach
    it to a lab machine and mount it read-only (`-o ro,noload`).
 5. `readset.py build --image MNT readsets/<label>.list` on the resident files, then `readset.py check` on the result.
    Commit the list. `readsets_test.go` holds every committed list to sorted, absolute paths outside the trees jobs and
-   boot write.
+   boot write. Run both as an ordinary user, not root: a path the user cannot reach (docker's state under /var/lib/docker,
+   sudoers.d, 353 paths on Nov 28) is not a job's read, and root's `build` kept all of them.
 
 ## Why a list holds only image files
 
