@@ -133,12 +133,12 @@ class Gate1(unittest.TestCase):
         fails = [obs(30, ok=False, sha=f"s{i}") for i in range(3)]
         bad_b = B + [obs(30, ok=False, sha="s0", fleet="blacksmith"), obs(30, ok=False, sha="s1", fleet="blacksmith")]
         row = judge(self.good() + fails, base=bad_b)["failures (superci)"]
-        self.assertEqual(row.value, "1 of 13")
+        self.assertEqual(row.value, "1 of 13 (1 legs)")
         self.assertEqual(row.status, G.PASS)
         self.assertIn("2 more", row.note)
         main_on_blacksmith = obs(30, ok=False, sha="s2", fleet="blacksmith", branch="main")
         row = judge(self.good() + fails, base=B + [main_on_blacksmith])["failures (superci)"]
-        self.assertEqual(row.value, "2 of 13", "main's run on Blacksmith failed the same commit")
+        self.assertEqual(row.value, "2 of 13 (2 legs)", "main's run on Blacksmith failed the same commit")
 
     def test_unexplained_time_must_be_under_two_seconds_at_p50(self):
         self.assertEqual(judge(self.good(), unexplained=[1.0] * 9)["unexplained p50 (timeline)"].status, G.PASS)
@@ -194,6 +194,84 @@ class Sources(unittest.TestCase):
         legs = [obs(w, run=r) for r, ws in enumerate(([10, 100, 200], [11, 101, 201], [9, 99, 199], [10, 100, 200]), 1) for w in ws]
         self.assertLess(G.run_spread(legs, lambda o: o.wall), 2.0)
         self.assertGreater(G.iqr([o.wall for o in legs]), 80)
+
+
+class FailedRunsBound(unittest.TestCase):
+    """Nov 28 07:36Z: unit-tests rolled back on 22 failed legs of 491 against `B rate 1.9% x 491 + 1 = 10.2`, though 15 of them were one PR's run
+    and none was superci's. The failures row counts runs, not legs, and the allowance is the binomial bound at FALSE_ROLLBACK_RATE."""
+    QUIET = {n: "OK" for n in G.ROLLBACK_ALARMS}
+
+    @staticmethod
+    def runs(fleet_name, n, failed=(), legs=1, first=1, tag="s"):
+        """n runs of `legs` legs, run ids first..first+n-1; every leg of a run whose index is in `failed` is red, on a commit of its own."""
+        out = []
+        for i in range(n):
+            for leg in range(legs):
+                red = i in failed
+                out.append(obs(100.0 if fleet_name == "blacksmith" else 80.0, 2.0, ok=not red, fleet=fleet_name, run=first + i, sha=f"{tag}{first + i}-{leg}" if red else tag))
+        return out
+
+    def blacksmith(self, n=238, failed=36):
+        return self.runs("blacksmith", n, set(range(failed)), first=500_000, tag="b")
+
+    def rows(self, S, B):
+        return rows_by_name(G.evaluate_job(S, B, 200.0, [0.5] * 10))
+
+    def test_one_run_that_fails_fifteen_legs_is_one_failed_run(self):
+        S = self.runs("superci", 1, {0}, legs=15, first=9000) + self.runs("superci", 28, legs=2, first=9001)
+        row = self.rows(S, self.blacksmith())["failures (superci)"]
+        self.assertEqual(row.value, "1 of 29 (15 legs)")
+        self.assertEqual(row.status, G.PASS)
+        self.assertEqual(G.canary_verdict(list(self.rows(S, self.blacksmith()).values()), self.QUIET), [])
+
+    def rollback(self, S):
+        """The failures row's reason, if the canary rolls back on it (a run of nothing but failures has no wall time to compare, which is not this row's)."""
+        return [r for r in G.canary_verdict(list(self.rows(S, self.blacksmith()).values()), self.QUIET) if r.startswith("failures")]
+
+    def test_a_fault_in_every_run_rolls_back_by_ten_runs_and_the_line_carries_the_bound(self):
+        reasons = self.rollback(self.runs("superci", 10, set(range(10))))
+        self.assertEqual(len(reasons), 1, reasons)
+        self.assertIn("failures (superci): 10 of 10 (10 legs) vs <= 5 at a 1% false-rollback bound (Blacksmith 36/238 runs = 15.1%)", reasons[0])
+        first = next(n for n in range(1, 11) if self.rollback(self.runs("superci", n, set(range(n)))))
+        self.assertLessEqual(first, 10)
+
+    def test_a_fault_in_half_the_runs_rolls_back_by_twenty_runs_and_the_line_carries_the_bound(self):
+        reasons = self.rollback(self.runs("superci", 20, set(range(0, 20, 2))))
+        self.assertEqual(len(reasons), 1, reasons)
+        self.assertIn("failures (superci): 10 of 20 (10 legs) vs <= 7 at a 1% false-rollback bound (Blacksmith 36/238 runs = 15.1%)", reasons[0])
+        first = next(n for n in range(1, 21) if self.rollback(self.runs("superci", n, set(range(0, n, 2)))))
+        self.assertLessEqual(first, 20)
+
+    def test_seven_failed_runs_of_twenty_nine_against_blacksmith_s_thirty_six_of_two_hundred_thirty_eight_is_noise(self):
+        S = self.runs("superci", 29, set(range(7)), first=9000)
+        rows = self.rows(S, self.blacksmith())
+        row = rows["failures (superci)"]
+        self.assertEqual((row.value, row.status), ("7 of 29 (7 legs)", G.PASS))
+        self.assertEqual(row.threshold, "<= 9 at a 1% false-rollback bound (Blacksmith 36/238 runs = 15.1%)")
+        self.assertEqual(G.canary_verdict(list(rows.values()), self.QUIET), [])
+
+    def test_a_blacksmith_run_counts_failed_once_however_many_of_its_legs_failed(self):
+        B = self.runs("blacksmith", 238, set(range(12)), legs=3, first=500_000, tag="b")  # 12 of 238 runs, 36 of 714 legs
+        self.assertEqual(self.rows(self.runs("superci", 5), B)["failures (superci)"].threshold,
+                         "<= 2 at a 1% false-rollback bound (Blacksmith 12/238 runs = 5.0%)")
+
+    def test_the_bound_is_the_smallest_k_whose_tail_is_at_most_the_false_rollback_rate(self):
+        self.assertTrue(hasattr(G, "run_failure_allowance"), "the bound is a function of its own")
+        p = 36 / 238
+        self.assertEqual([G.run_failure_allowance(29, p, a) for a in (0.05, 0.01, 0.001)], [8, 9, 11])
+        self.assertEqual([G.run_failure_allowance(n, p, 0.01) for n in (10, 20, 29)], [5, 7, 9])
+        self.assertEqual(G.FALSE_ROLLBACK_RATE, 0.01)
+        self.assertEqual(G.run_failure_allowance(29, p), 9, "the default is the module's rate")
+
+    def test_the_bound_at_its_edges(self):
+        self.assertTrue(hasattr(G, "run_failure_allowance"))
+        self.assertEqual(G.run_failure_allowance(29, 0.0), 1, "a clean baseline still lets one run fail: one red run is not evidence")
+        self.assertEqual(G.run_failure_allowance(1, 0.0), 1)
+        self.assertEqual(G.run_failure_allowance(29, 1.0), 29, "every Blacksmith run fails: nothing exceeds it")
+        self.assertEqual(G.run_failure_allowance(0, 0.15), 0, "no runs")
+        verdict = lambda failed: G.canary_verdict(list(self.rows(self.runs("superci", 10, failed), self.runs("blacksmith", 40)).values()), self.QUIET)
+        one, two = verdict({0}), verdict({0, 1})
+        self.assertEqual((one, len(two)), ([], 1), "against a clean baseline one failed run keeps, two roll back")
 
 
 class RecordedCanary(unittest.TestCase):
@@ -605,7 +683,7 @@ class Excuses(unittest.TestCase):
         B20 = fleet(spread_around(100, 10, 20), spread_around(3, 1, 20), fleet="blacksmith")
         rows = G.evaluate_job(S, B20, 200.0, [0.5] * 10)
         by = rows_by_name(rows)
-        self.assertEqual(by["failures (superci)"].value, "3 of 10")
+        self.assertEqual(by["failures (superci)"].value, "2 of 5 (3 legs)")
         self.assertEqual(by["failures (superci)"].status, G.FAIL)
         self.assertEqual({n: r.status for n, r in by.items() if n != "failures (superci)"}, {n: G.PASS for n in by if n != "failures (superci)"}, "only the failures row is red")
         self.assertEqual(printed(rows, "gate 1"), 1)
@@ -613,7 +691,7 @@ class Excuses(unittest.TestCase):
     def test_a_failed_superci_run_on_the_same_commit_in_another_branch_does_not_excuse_either(self):
         a, b = obs(30, ok=False, sha="s9", branch="ci/a"), obs(30, ok=False, sha="s9", branch="ci/b")
         row = judge(self.good_runs() + [a, b])["failures (superci)"]
-        self.assertEqual(row.value, "2 of 12")
+        self.assertEqual(row.value, "2 of 12 (2 legs)")
 
     def good_runs(self):
         return fleet(spread_around(80, 2, 10), spread_around(1, 0.2, 10))
@@ -698,7 +776,7 @@ class GateJobEndToEnd(unittest.TestCase):
     def test_a_failure_that_a_rerun_then_passed_is_counted(self):
         rerun_run = [gh_job(901, 0, 1, "failure", 1_000_000.0, 1_000_001.0, 1_000_031.0), gh_job(902, 0, 2, "success", 1_000_000.0, 1_000_400.0, 1_000_480.0)]
         code, out = self.run_gate(self.superci(5) + [rerun_run], self.blacksmith(8))
-        self.assertRegex(out, r"failures \(superci\)\s+1 of 7")
+        self.assertRegex(out, r"failures \(superci\)\s+1 of 6 \(1 legs\)")
 
     def test_the_jobs_of_every_attempt_are_read(self):
         seen = []
@@ -748,13 +826,13 @@ class TimedOutAndCancelled(unittest.TestCase):
         self.assertEqual((o.ok, o.timed_out), (False, True))
 
     def test_a_timed_out_leg_pushes_wall_p90_over_the_ceiling_and_counts_as_a_failure(self):
-        timed = [G.is_obs(gh_job(1, 1, 1, "timed_out", self.T0, self.T0 + 2, self.T0 + 52), {}) for _ in range(2)]
+        timed = [G.is_obs(gh_job(i, i, 1, "timed_out", self.T0, self.T0 + 2, self.T0 + 52), {}) for i in (1, 2)]  # two runs: the failures row counts runs, and one failed run alone never fails it
         self.assertTrue(all(timed))
         S = fleet(spread_around(80, 2, 10), spread_around(1, 0.2, 10)) + timed
         by = judge(S, ceiling=200.0)
         self.assertEqual(by["wall p90"].status, G.FAIL)
         self.assertGreater(float(by["wall p90"].value.split()[0]), 150.0, "a 50 s timed-out leg counts at the 200 s ceiling, not at 50 s")
-        self.assertEqual(by["failures (superci)"].value, "2 of 12")
+        self.assertEqual(by["failures (superci)"].value, "2 of 12 (2 legs)")
         self.assertEqual(by["failures (superci)"].status, G.FAIL)
 
     def test_without_a_ceiling_a_timed_out_leg_keeps_the_wall_time_it_ran(self):
@@ -843,7 +921,7 @@ class CancelledJobsAreLowerBounds(unittest.TestCase):
         cancelled_b = obs(300.0, 1.0, cancelled=True, fleet="blacksmith", sha=sha)
         self.assertFalse(G.excused(failed, [failed, cancelled_b]))
         by = judge(self.good() + [failed], base=B + [cancelled_b])
-        self.assertEqual(by["failures (superci)"].value, "1 of 11")
+        self.assertEqual(by["failures (superci)"].value, "1 of 11 (1 legs)")
 
     def test_a_blacksmith_cancel_does_not_raise_its_failure_rate(self):
         base = B + [obs(300.0, 1.0, cancelled=True, fleet="blacksmith") for _ in range(40)]
@@ -2755,22 +2833,22 @@ class FailingTests(FailingHarness, unittest.TestCase):
         red = unit_log("suite > stampDoubles")
         failed = [red, red, unit_log("suite > newlyBroken"), unit_log("suite > alsoBroken")]
         code, out = self.run_gate(self.baseline(red=[red, red, red]) + self.superci(failed=failed))
-        self.assertRegex(out, r"FAIL\s+failures \(superci\)\s+2 of 9\s+<= B rate 0\.0% x 9 \+ 1 = 1\.0")
-        self.assertIn("Blacksmith failure rate: 27.3% (3 of 11) before, 0.0% (0 of 11) after excluding 3 failed main jobs whose every failing test excused a superci failure", out)
+        self.assertRegex(out, r"FAIL\s+failures \(superci\)\s+2 of 9 \(2 legs\)\s+<= 1 at a 1% false-rollback bound \(Blacksmith 0/11 runs = 0\.0%\)")
+        self.assertIn("Blacksmith failure rate: 27.3% (3 of 11 runs) before, 0.0% (0 of 11 runs) after excluding 3 failed main jobs whose every failing test excused a superci failure", out)
 
     def test_scattered_blacksmith_flakes_on_other_tests_still_count_toward_the_allowance(self):
-        """Main 6 of 20 failing on six different flaky tests, superci 3 of 10 on three others: 30% x 10 + 1 = 4, so 3 pass."""
+        """Main 6 of 20 failing on six different flaky tests, superci 3 of 10 on three others: the 1% bound at 30% over 10 runs is 7, so 3 pass."""
         main = [unit_log(f"suite > mainFlake{i}") for i in range(6)]
         sup = [unit_log(f"suite > superciFlake{i}") for i in range(3)]
         code, out = self.run_gate(self.baseline(red=main, n=14) + self.superci(n=7, failed=sup))
-        self.assertRegex(out, r"PASS\s+failures \(superci\)\s+3 of 10\s+<= B rate 30\.0% x 10 \+ 1 = 4\.0")
-        self.assertIn("30.0% (6 of 20) before, 30.0% (6 of 20) after excluding 0 failed main jobs", out)
+        self.assertRegex(out, r"PASS\s+failures \(superci\)\s+3 of 10 \(3 legs\)\s+<= 7 at a 1% false-rollback bound \(Blacksmith 6/20 runs = 30\.0%\)")
+        self.assertIn("30.0% (6 of 20 runs) before, 30.0% (6 of 20 runs) after excluding 0 failed main jobs", out)
 
     def test_a_blacksmith_main_failure_that_cannot_be_read_still_counts_toward_the_rate(self):
         red = unit_log("suite > stampDoubles")
         code, out = self.run_gate(self.baseline(red=[red, None]) + self.superci(failed=[red]))
-        self.assertIn("20.0% (2 of 10) before, 10.0% (1 of 10) after excluding 1 failed main job", out)
-        self.assertIn("B rate 10.0% x 6 + 1 = 1.6", out)
+        self.assertIn("20.0% (2 of 10 runs) before, 10.0% (1 of 10 runs) after excluding 1 failed main job", out)
+        self.assertIn("<= 3 at a 1% false-rollback bound (Blacksmith 1/10 runs = 10.0%)", out)
 
     def test_a_blacksmith_failure_off_main_or_with_no_test_named_still_counts_toward_the_rate(self):
         red = unit_log("suite > stampDoubles")
@@ -2778,14 +2856,14 @@ class FailingTests(FailingHarness, unittest.TestCase):
         feature["head_branch"] = "ci/feature"
         setup = tj(6300, 0, "failure", "blacksmith", f"{self.job} (2)", steps=[{"name": "Run tests", "conclusion": "success"}, {"name": "Install", "conclusion": "failure"}])
         code, out = self.run_gate(self.baseline(red=[red]) + [(6200, "ci/feature", "failure", [feature]), (6300, "main", "failure", [setup])] + self.superci(failed=[red]))
-        self.assertIn("27.3% (3 of 11) before, 18.2% (2 of 11) after excluding 1 failed main job", out)
+        self.assertIn("27.3% (3 of 11 runs) before, 18.2% (2 of 11 runs) after excluding 1 failed main job", out)
 
     def test_a_blacksmith_failure_with_a_hard_reason_or_a_second_test_outside_the_excused_ones_counts_toward_the_rate(self):
         red = unit_log("suite > stampDoubles")
         both = unit_log("suite > stampDoubles", "suite > other")
         stopped = unit_log("suite > stampDoubles", stopped="the 180 s a test file may run")
         code, out = self.run_gate(self.baseline(red=[red, both, stopped]) + self.superci(failed=[red]))
-        self.assertIn("27.3% (3 of 11) before, 18.2% (2 of 11) after excluding 1 failed main job", out)
+        self.assertIn("27.3% (3 of 11 runs) before, 18.2% (2 of 11 runs) after excluding 1 failed main job", out)
 
     def test_an_exclusion_resting_on_one_blacksmith_failure_is_tagged_and_one_resting_on_two_is_not(self):
         once, twice = unit_log("suite > once"), unit_log("suite > twice")
