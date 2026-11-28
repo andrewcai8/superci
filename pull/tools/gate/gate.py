@@ -1165,51 +1165,68 @@ def cost_lines(records, blacksmith_jobs):
     """Lines of AWS's spend per job of each superci size beside Blacksmith's for the same job on the same vCPUs. AWS's is the
     listener's job.record: busy_usd, the machine while it ran the job, and usd, the machine's whole life (one job a machine,
     so a pool machine's idle wait is in it, and at low traffic it is most of it). Blacksmith's is its billed minutes x vCPUs x
-    list price, over the jobs it billed: one that ran, not one skipped or cancelled before it started (0 s, no minute billed).
-    The ratio is of the busy cost. Information, not a row: the canary judges speed and failures, the operator judges this. Pure."""
+    list price, over the jobs it billed: one that ran (a cancelled job that ran is billed), not one skipped or cancelled before
+    it started (0 s, no minute billed). A record from before busy_usd was written counts in the whole-life mean only. The ratio
+    is of the busy cost. Information, not a row: the canary judges speed and failures, the operator judges this. Pure."""
     busy_by, life_by = {}, {}
     for e in records:
         if e.get("usd") is not None and e.get("set") and e.get("wall_ms"):
             cpu = e["set"].removeprefix("superci-").removesuffix("cpu")
             life_by.setdefault(cpu, []).append(float(e["usd"]))
-            busy_by.setdefault(cpu, []).append(float(e.get("busy_usd") or 0))
+            if e.get("busy_usd") is not None:
+                busy_by.setdefault(cpu, []).append(float(e["busy_usd"]))
     bs_by = {}
     for j in blacksmith_jobs:
         m = next((re.match(r"blacksmith-(\d+)vcpu", l) for l in j.get("labels") or [] if re.match(r"blacksmith-(\d+)vcpu", l)), None)
         st, done = T.ts(j.get("started_at")), T.ts(j.get("completed_at"))
-        if m and st and done and done > st and j.get("conclusion") not in ("skipped", "cancelled"):
+        if m and st and done and done > st and j.get("conclusion") != "skipped":
             bs_by.setdefault(m.group(1), []).append(math.ceil((done - st) / 60) * int(m.group(1)) * BLACKSMITH_USD_PER_VCPU_MIN)
     mean = lambda xs: sum(xs) / len(xs)
     lines = []
     for cpu in sorted(set(life_by) | set(bs_by), key=lambda c: int(c) if c.isdigit() else 0):
         busy, life, b = busy_by.get(cpu, []), life_by.get(cpu, []), bs_by.get(cpu, [])
-        aws = f"AWS busy ${mean(busy):.4f} a job, whole life ${mean(life):.4f} (n={len(life)})" if life else "AWS: no job.record with a cost"
+        busy_s = f"busy ${mean(busy):.4f} a job (n={len(busy)})" if busy else "busy: no record with busy_usd"
+        aws = f"AWS {busy_s}, whole life ${mean(life):.4f} (n={len(life)})" if life else "AWS: no job.record with a cost"
         bs = f"Blacksmith {cpu}vcpu ${mean(b):.4f} (n={len(b)})" if b else f"Blacksmith {cpu}vcpu: no billed job"
-        ratio = f": AWS busy {mean(busy) / mean(b):.2f}x, whole life {mean(life) / mean(b):.2f}x" if life and b and mean(b) > 0 else ""
+        ratio = ""
+        if life and b and mean(b) > 0:
+            ratios = ([f"busy {mean(busy) / mean(b):.2f}x"] if busy else []) + [f"whole life {mean(life) / mean(b):.2f}x"]
+            ratio = f": AWS {', '.join(ratios)}"
         lines.append(f"cost superci-{cpu}cpu: {aws}, {bs}{ratio}")
     return lines
 
 
-def window_cost_line(spend_usd, hours, records):
+def window_cost_line(spend, hours, records):
     """The line that decides the move: superci's whole spend over a window (every machine-second, idle pools included, from
     the listener's SpendPerHourUSD) over the jobs it served in it (every set's job.records with a wall), beside what Blacksmith
     bills for the same jobs (each one's billed minutes x its size's vCPUs x list price). Pure."""
     served = [e for e in records if e.get("wall_ms") and e.get("set")]
-    if spend_usd is None or not served:
-        return f"cost of the window: no {'spend metric' if spend_usd is None else 'job served'} over its {hours:.2f} h"
+    if spend is None or not served:
+        return f"cost of the window: no {'spend metric' if spend is None else 'job served'} over its {hours:.2f} h"
+    spend_usd, found, expected = spend
     def vcpus(set_name):
         m = re.match(r"superci-(\d+)cpu", set_name)
         return int(m.group(1)) if m else 0
     bs = sum(math.ceil(e["wall_ms"] / 60000) * vcpus(e["set"]) * BLACKSMITH_USD_PER_VCPU_MIN for e in served)
     ratio = f": AWS {spend_usd / bs:.2f}x" if bs > 0 else ""
+    gaps = f" [{found} of {expected} five-minute spend points: the rest read as the mean]" if found < expected else ""
     return (f"cost of the window ({hours:.2f} h): superci ${spend_usd:.2f} for {len(served)} jobs, ${spend_usd / len(served):.4f} a job;"
-            f" Blacksmith ${bs:.2f} for the same jobs, ${bs / len(served):.4f} a job{ratio}")
+            f" Blacksmith ${bs:.2f} for the same jobs, ${bs / len(served):.4f} a job{ratio}{gaps}")
+
+
+def spend_over(points, lo, hi):
+    """(USD, points found, points expected) over [lo, hi] from the listener's SpendPerHourUSD five-minute averages (it publishes
+    a point a minute, so an average is the bucket's mean rate): the mean rate x the window's hours, so partial buckets at the
+    edges count for the time they cover, not five minutes each. None with no point. Pure."""
+    if not points:
+        return None
+    rate = sum(v for _, v in points) / len(points)
+    return rate * (hi - lo) / 3600, len(points), max(1, math.ceil((hi - lo) / 300))
 
 
 def window_spend(profile, lo, hi):
-    """superci's spend over [lo, hi] in USD, from the listener's SpendPerHourUSD (five-minute averages x their hours), or None."""
-    points = metric(profile, "SpendPerHourUSD", lo, hi, "Average", 300)
-    return sum(v for _, v in points) * 300 / 3600 if points else None
+    """spend_over of the listener's SpendPerHourUSD over [lo, hi]."""
+    return spend_over(metric(profile, "SpendPerHourUSD", lo, hi, "Average", 300), lo, hi)
 
 
 def show_spread(label, obs, ceiling=None):
