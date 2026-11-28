@@ -296,11 +296,29 @@ def paired_shards(S, B, ceiling):
     return pairs, sorted(k for k in sw if sw[k] and k not in set(both)), sorted(k for k in bw if bw[k] and k not in set(both))
 
 
+_SIZE = re.compile(r"(?:superci-(\d+)cpu|blacksmith-(\d+)vcpu)\b")
+
+
+def shard_size(name):
+    """The machine size a leg's name carries in its fleet's label (`superci-8cpu` and `blacksmith-8vcpu-ubuntu-2404` are both `8cpu`), or "" for none."""
+    m = _SIZE.search(name or "")
+    return f"{m.group(1) or m.group(2)}cpu" if m else ""
+
+
 def shard_wall_row(S, B, ceiling, min_runs=MIN_SHARD_RUNS):
-    """The split's wall row (SHARD_ROW): the geometric mean of the per-shard superci/Blacksmith ratios, FAIL when a one-sided signed-rank test says they
-    are above 1 + WALL_MARGIN at FALSE_ROLLBACK_RATE, NOISE until MIN_PAIRED_SHARDS shards are paired and each half has min_runs runs. The detail is the
-    worst MAX_SHARD_LINES shards and how many were paired."""
+    """The split's wall row (SHARD_ROW): the per-shard superci/Blacksmith ratios, judged size by size (4cpu shards apart from 8cpu ones: superci's sizes are
+    separate sets, and a faster 8cpu set must not hide a slower 4cpu one). It FAILs when, for any size with MIN_PAIRED_SHARDS shards paired, a one-sided
+    signed-rank test says that size's ratios are above 1 + WALL_MARGIN at FALSE_ROLLBACK_RATE divided by the sizes judged (so the row's false-rollback rate
+    stays at FALSE_ROLLBACK_RATE), and is NOISE until some size has MIN_PAIRED_SHARDS shards paired and each half has min_runs runs. The detail is the worst
+    MAX_SHARD_LINES shards and how many were paired."""
     pairs, only_s, only_b = paired_shards(S, B, ceiling)
+    size_of = {}
+    for o in list(S) + list(B):
+        if o.name:
+            size_of.setdefault(shard_key(o.name), shard_size(o.name))
+    by_size = collections.defaultdict(list)
+    for pr in pairs:
+        by_size[size_of.get(pr[0], "")].append(pr)
     n = len(pairs)
     th = f"one-sided Wilcoxon signed-rank p > {FALSE_ROLLBACK_RATE:g} that per-shard median wall ratio (superci / Blacksmith) is over {1 + WALL_MARGIN:g}"
     ns, nb = (len({o.run_id for o in h if not o.cancelled}) for h in (S, B))
@@ -310,14 +328,22 @@ def shard_wall_row(S, B, ceiling, min_runs=MIN_SHARD_RUNS):
     if not n:
         return Row(SHARD_ROW, "0 shards paired", th, NOISE, f"not enough shards paired yet: none of {MIN_PAIRED_SHARDS} (a shard needs legs on both halves)", detail)
     gm = math.exp(sum(math.log(p[1]) for p in pairs) / n)
-    p = signed_rank_p([math.log(r) - math.log1p(WALL_MARGIN) for _, r, *_ in pairs])
-    value = f"geometric mean {gm:.3f}x over {n} shards (p = {p:.3g})"
-    if n < MIN_PAIRED_SHARDS:
-        return Row(SHARD_ROW, value, th, NOISE, f"not enough shards paired yet: {n} of {MIN_PAIRED_SHARDS}", detail)
+    judged = {size: ps for size, ps in sorted(by_size.items()) if len(ps) >= MIN_PAIRED_SHARDS}
+    alpha = FALSE_ROLLBACK_RATE / max(1, len(judged))
+    per = {}
+    for size, ps in sorted(by_size.items()):
+        per[size] = (math.exp(sum(math.log(x[1]) for x in ps) / len(ps)), len(ps),
+                     signed_rank_p([math.log(r) - math.log1p(WALL_MARGIN) for _, r, *_ in ps]) if size in judged else None)
+    value = f"geometric mean {gm:.3f}x over {n} shards; " + ", ".join(
+        f"{size or 'unsized'} {g:.3f}x over {k}" + (f" (p = {pv:.3g})" if pv is not None else f" (under {MIN_PAIRED_SHARDS}: not judged)") for size, (g, k, pv) in per.items())
+    if not judged:
+        return Row(SHARD_ROW, value, th, NOISE, f"not enough shards paired yet: no size has {MIN_PAIRED_SHARDS} (most: {max(len(ps) for ps in by_size.values())})", detail)
     if min(ns, nb) < min_runs:
         return Row(SHARD_ROW, value, th, NOISE, f"not enough runs yet: the halves have {ns} superci and {nb} Blacksmith runs, under {min_runs} each", detail)
-    if p <= FALSE_ROLLBACK_RATE:
-        return Row(SHARD_ROW, value, th, FAIL, f"superci is slower than chance allows: its shards are {gm:.3f}x Blacksmith's, over {1 + WALL_MARGIN:g}", detail)
+    slow = [size for size in judged if per[size][2] <= alpha]
+    if slow:
+        return Row(SHARD_ROW, value, th, FAIL, "superci is slower than chance allows on " + ", ".join(f"{size or 'unsized'} ({per[size][0]:.3f}x, p = {per[size][2]:.3g})" for size in slow)
+                   + f": over {1 + WALL_MARGIN:g} at {alpha:g} ({FALSE_ROLLBACK_RATE:g} over {len(judged)} size{'s' if len(judged) != 1 else ''})", detail)
     return Row(SHARD_ROW, value, th, PASS, "", detail)
 
 
@@ -1558,8 +1584,13 @@ def cmd_job(a):
             except Exception as e:  # a read of the records that fails leaves GitHub's wall, said aloud: the check still runs
                 window_recs, wall_from = [], f"GitHub's started to completed (the listener's records were not read: {type(e).__name__}), which includes a dispatched job's wait for a machine"
             else:
-                wall_from = (wall_from + ", matched to GitHub's jobs") if window_recs else "GitHub's started to completed (no job.record in the window), which includes a dispatched job's wait for a machine"
+                wall_from = "GitHub's started to completed (no job.record in the window), which includes a dispatched job's wait for a machine"
             S_jobs = with_record_walls(S_jobs, window_recs)
+            matched = sum(1 for j in S_jobs if j.get("wall_ms"))
+            if window_recs:
+                wall_from = (f"the listener's job.record wall_ms, matched to {matched} of {len(S_jobs)} of GitHub's superci jobs (the rest keep GitHub's started to "
+                             "completed, which includes a dispatched job's wait for a machine)") if matched else (
+                             "GitHub's started to completed (no job.record matched a job in the window), which includes a dispatched job's wait for a machine")
     S = [o for o in (is_obs(j, runs_by_job[j["id"]], record_wall=split is not None) for j in S_jobs) if o]
     B = [o for o in (is_obs(j, runs_by_job[j["id"]]) for j in B_jobs) if o]
     if events and any(not o.ok and not o.cancelled for o in B):

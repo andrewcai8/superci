@@ -3722,6 +3722,28 @@ class PerShardWall(unittest.TestCase):
         rows, reasons = verdict_of(*self.halves(1.04))
         self.assertEqual((want(rows, "wall (per shard)").status, reasons), (G.PASS, []), want(rows, "wall (per shard)"))
 
+    # Review of #91: one test over every shard let a faster 8cpu set hide a slower 4cpu one (4cpu +30%, 8cpu at 0.905: 15 of 100 caught at 12 runs a half).
+    def test_a_slower_size_is_not_hidden_by_a_faster_one(self):
+        s = split_obs([shard_job(1000 + r, i + 1, 4, "superci", 130.0) for r in range(SHARD_RUNS) for i in range(12)]
+                      + [shard_job(1000 + r, i + 1, 8, "superci", 50.0) for r in range(SHARD_RUNS) for i in range(12, 40)])
+        b = split_obs([shard_job(2000 + r, i + 1, 4, "blacksmith", 100.0) for r in range(SHARD_RUNS) for i in range(12)]
+                      + [shard_job(2000 + r, i + 1, 8, "blacksmith", 55.25) for r in range(SHARD_RUNS) for i in range(12, 40)])
+        rows, reasons = verdict_of(s, b)
+        r = want(rows, "wall (per shard)")
+        self.assertEqual(r.status, G.FAIL, r)
+        self.assertIn("slower than chance allows on 4cpu", r.note)
+        self.assertNotIn("8cpu (", r.note)
+        self.assertEqual([x.split(":")[0] for x in reasons], ["wall (per shard)"], reasons)
+
+    def test_a_size_with_too_few_shards_is_not_judged_but_the_others_are(self):
+        s = split_obs([shard_job(1000 + r, i + 1, 4, "superci", 300.0) for r in range(SHARD_RUNS) for i in range(3)]
+                      + [shard_job(1000 + r, i + 1, 8, "superci", 55.0) for r in range(SHARD_RUNS) for i in range(3, 13)])
+        b = split_obs([shard_job(2000 + r, i + 1, 4, "blacksmith", 100.0) for r in range(SHARD_RUNS) for i in range(3)]
+                      + [shard_job(2000 + r, i + 1, 8, "blacksmith", 55.0) for r in range(SHARD_RUNS) for i in range(3, 13)])
+        r = want(verdict_of(s, b)[0], "wall (per shard)")
+        self.assertEqual(r.status, G.PASS, r)
+        self.assertIn("4cpu 3.000x over 3 (under 8: not judged)", r.value)
+
     def test_faster_is_never_a_failure(self):
         rows, reasons = verdict_of(*self.halves(0.7))
         self.assertEqual((want(rows, "wall (per shard)").status, reasons), (G.PASS, []))
@@ -3904,7 +3926,7 @@ class RecordsWallNotGitHubs(unittest.TestCase):
         runs, records = self.window()
         code, out = self.run_gate(runs, records=records, extra=["--superci-source", "github"])
         self.assertRegex(self.line(out, "  PASS  wall (per shard)"), r"geometric mean 1\.000x over 10 shards", "the queue rows fail on the wait, as they should; the wall row does not")
-        self.assertIn("superci's from the listener's job.record wall_ms, matched to GitHub's jobs", out)
+        self.assertRegex(out, r"superci's from the listener's job.record wall_ms, matched to (\d+) of \1 of GitHub's superci jobs")
 
     def test_a_github_read_with_no_record_in_the_window_says_that_its_superci_wall_holds_the_wait(self):
         runs, _ = self.window()
