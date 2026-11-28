@@ -151,10 +151,13 @@ type Platform struct{ OS, Version, Arch string }
 
 // Hydrated is what became of one entry of the manifest.
 type Hydrated struct {
-	Pattern string  `json:"pattern"`
-	Version string  `json:"version,omitempty"`
-	Key     string  `json:"key,omitempty"`
-	MB      int64   `json:"mb,omitempty"`
+	Pattern string `json:"pattern"`
+	Version string `json:"version,omitempty"`
+	Key     string `json:"key,omitempty"`
+	MB      int64  `json:"mb,omitempty"`
+	// Tree is the work tree of a checkout entry that was hydrated: where the job's workspace path is under the entry's
+	// directory (`pullcache pin` locks it in memory).
+	Tree    string  `json:"tree,omitempty"`
 	Seconds float64 `json:"seconds"`
 	Error   string  `json:"error,omitempty"`
 }
@@ -229,6 +232,8 @@ func (h *Hydrator) Run(ctx context.Context, m Manifest) []Hydrated {
 				began := time.Now()
 				if err := h.one(ctx, m.Workspace, f.obj, out[i].Version, f.key, e.Checkout); err != nil {
 					out[i].Error = err.Error()
+				} else if e.Checkout {
+					out[i].Tree = filepath.Join(h.Root, out[i].Version, esc(f.key), m.Workspace)
 				}
 				out[i].Seconds = time.Since(began).Seconds()
 			}()

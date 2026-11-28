@@ -498,6 +498,17 @@
       ],
       "what": "after the pre-read, the walk of the hydrated and image trees ended: full, or stopped by the job"
     },
+    "pin.done": {
+      "src": "machine",
+      "fields": [
+        "inst",
+        "set",
+        "offset_ms",
+        "dur_ms",
+        "val"
+      ],
+      "what": "the hydrated checkout's files were locked in memory (pullcache pin), so a job's memory pressure cannot push them out of the page cache; val is files:MB, with :capped when a cap stopped it, :stopped when the machine refused a lock and :failedN for N files it could not lock, or late (no summary within a second) or failed (the pinner died)"
+    },
     "warm.done": {
       "src": "machine",
       "fields": [
