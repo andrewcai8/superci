@@ -169,6 +169,29 @@ removes a job that gets ROLL BACK from SUPERCI_JOBS, and leaves the other jobs l
 token and says so). `canary.sh set '["test-go"]'` and `canary.sh unset` re-route by hand the same way, with no watch. `WORKFLOW` names the jobs' workflow
 file (lint-test-backend.yml by default). A check that crashes exits 1 and rolls nothing back: read its output file.
 
+**Telling the operator.** A rollback is a line in a log unless something reads it (Nov 28 00:57:56Z: test-go was rolled back on its queue
+wait p90 and nobody noticed for 59 minutes). Two switches make it reach a person:
+
+- `ON_ROLLBACK=<command>` runs once after every rollback the watch makes, with one more argument, a one-line summary: the UTC time, the
+  job, the reason line the gate printed, and SUPERCI_JOBS before and after. It also runs when the rollback's write fails (the job is
+  still on superci, the line says so and names the cause), on each failed tick, and once when a job has had no check for 3 ticks running
+  (no App token, SUPERCI_JOBS unreadable, under the 1,500-read floor, a gate that refused or crashed), with why. The command line runs
+  under `bash -c` with the summary appended as its last argument, under `env -i` with only `PATH`, `HOME`, `LANG` and the `NOTIFY_*`
+  variables (the watch's `GH_TOKEN`, `GITHUB_TOKEN` and AWS credentials never reach it). `NOTIFY_TIMEOUT` seconds (60) is a hard bound:
+  TERM, then 5 s later KILL, to the notifier's whole process group, so a notifier that traps TERM or leaves a background child behind ends
+  within `NOTIFY_TIMEOUT` + 6 s, and what it leaves running is killed. Its output goes to a file capped at 256 KiB and only the first 250
+  bytes are read, scrubbed of GitHub tokens (`gh*_`, `github_pat_`), JWTs and AWS access key ids. Its failure is logged
+  (`ON_ROLLBACK failed (exit N)`) and never stops the watch or undoes the rollback.
+- `STOP_ON_ROLLBACK=1` exits 3 at the end of the tick that made a rollback, once ON_ROLLBACK has run, so a wrapper that runs the watch as a
+  background task is woken. The tick's remaining jobs are checked first (and rolled back if the gate says so), so none goes unchecked in
+  that tick; but the watch is then over, and **a wrapper must restart it** (with the same SINCE and UNTIL) for the jobs SUPERCI_JOBS still
+  lists. A rollback that could not be written does not stop the watch (the next tick tries again). An unset SUPERCI_JOBS (someone else sent
+  every job back), and a job another watch or a `set` had already taken out of the value this watch re-read, are not rollbacks of this
+  watch: no notice, no exit 3. A watch that reaches UNTIL exits 0.
+- An unset SUPERCI_JOBS (after a rollback, or `canary.sh unset`) is not a failure to check: each tick logs `SUPERCI_JOBS unset, nothing to
+  check` and the no-check streak starts over, as it does for a job that is off the list. Only an unreadable variable (GitHub did not answer,
+  no token), a gate that refused or crashed, a missing App token or the read floor count toward the 3 ticks.
+
 ## gate 2: `gate scale`
 
 Reads the replay's runs (every run in the window whose workflow file is `--workflow` and whose branch matches `--branch-glob`; a load workflow that exists only on its branch has no name GitHub resolves), the listener's timeline events and CloudWatch, and lists the claims
