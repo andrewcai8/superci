@@ -10,7 +10,8 @@
 #   cache/bin/warm/<label>.list  each size's read set (readsets/<label>.list), the image files a machine reads while it waits
 # Each Go binary carries the commit (-X main.revision; -trimpath keeps it out of `go version -m`): `superci-pull
 # -version` and `pullcache version` print it. release.sh and cache/deploy/release.sh release it. The instance is
-# reached with a key made for the run (EC2 Instance Connect): no key pair.
+# reached with a key made for the run (EC2 Instance Connect): no key pair. The tests run under the machines' python3
+# (3.12: build-check.sh), installed beside the host's own 3.9.
 #
 #   pull/deploy/build.sh <new release directory> [commit]
 set -euo pipefail
@@ -29,6 +30,11 @@ src=$tmp/src/pull
 GO=$(cat "$src/go.mod" "$src/cache/go.mod" | sed -n 's/^go //p' | sort -V | tail -1)
 AMI=$($A ssm get-parameter --region $R --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64 --query Parameter.Value --output text)
 SG=$($A ec2 describe-security-groups --region $R --filters Name=group-name,Values=superci-pull-listener --query 'SecurityGroups[0].GroupId' --output text)
+# The Go and agent tests run under the machines' python3, the parity file's (this checkout's for a commit from before it):
+# the host installs that version, and build-check.sh refuses any other.
+PARITY=$src/parity/blacksmith-ubuntu-2404.txt
+[ -f "$PARITY" ] || PARITY=$here/parity/blacksmith-ubuntu-2404.txt
+PYWANT=$("$here/deploy/build-check.sh" --want "$PARITY")
 ssh-keygen -q -t ed25519 -N '' -f "$tmp/key"
 ID=$($A ec2 run-instances --region $R --image-id "$AMI" --instance-type c7g.2xlarge --security-group-ids "$SG" \
   --associate-public-ip-address --instance-initiated-shutdown-behavior terminate --metadata-options HttpTokens=required \
@@ -36,7 +42,7 @@ ID=$($A ec2 run-instances --region $R --image-id "$AMI" --instance-type c7g.2xla
   --tag-specifications "ResourceType=instance,Tags=[{Key=purpose,Value=superci-pull},{Key=Name,Value=superci-pull-build}]" "ResourceType=volume,Tags=[{Key=purpose,Value=superci-pull}]" \
   --user-data "#!/bin/bash
 ( sleep 3600; poweroff ) &
-dnf install -y -q git && curl -sfL https://go.dev/dl/go$GO.linux-arm64.tar.gz | tar -C /usr/local -xz && touch /tmp/go-ready" --query 'Instances[0].InstanceId' --output text)
+dnf install -y -q git python$PYWANT && mkdir /opt/py && ln -s /usr/bin/python$PYWANT /opt/py/python3 && curl -sfL https://go.dev/dl/go$GO.linux-arm64.tar.gz | tar -C /usr/local -xz && touch /tmp/go-ready" --query 'Instances[0].InstanceId' --output text)
 trap '$A ec2 terminate-instances --region $R --instance-ids $ID >/dev/null; echo "terminated $ID"; rm -rf "$tmp"' EXIT
 $A ec2 wait instance-running --region $R --instance-ids "$ID"
 read -r IP ZONE < <($A ec2 describe-instances --region $R --instance-ids "$ID" --query 'Reservations[0].Instances[0].[PublicIpAddress,Placement.AvailabilityZone]' --output text)
@@ -45,8 +51,10 @@ S="ssh -i $tmp/key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o 
 until push && $S test -f /tmp/go-ready 2>/dev/null; do sleep 5; done
 push
 tar -C "$tmp/src" -czf - pull | $S 'mkdir -p src && tar -C src -xzf -'
+$S 'cat > build-check.sh' < "$here/deploy/build-check.sh"
+$S 'cat > parity.txt' < "$PARITY"
 $S "set -e; export PATH=/usr/local/go/bin:\$PATH GOFLAGS=-buildvcs=false CGO_ENABLED=0 GOOS=linux; X='-X main.revision=$REV'; mkdir /tmp/out
-cd ~/src/pull && test -z \"\$(gofmt -l .)\" && go vet ./... && go test -count=1 ./...
+cd ~/src/pull && PATH=/opt/py:\$PATH bash ~/build-check.sh . ~/parity.txt
 go build -trimpath -ldflags=\"\$X\" -o /tmp/out/superci-pull .
 GOARCH=amd64 go build -trimpath -ldflags=\"-s -w \$X\" -o /tmp/out/superci-shim ./shim
 cd cache && for a in amd64 arm64; do GOARCH=\$a go build -trimpath -ldflags=\"-s -w \$X\" -o /tmp/out/pullcache-linux-\$a .; done

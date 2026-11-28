@@ -129,6 +129,104 @@ sed -i "s/$P1/ami-REPLACE-us-east-1/" "$W/pull/config.json"; git -C "$W" -c user
 : > "$FAKE_AWS/calls.log"
 refuses "parity.sh refuses a commit whose config.json still pins a placeholder image" "ami-REPLACE-us-east-1" "$D/parity.sh" "$PH"
 ! grep -q 'run-instances\|describe-images' "$FAKE_AWS/calls.log"; check $? "and asked EC2 nothing"
+# The launch templates (templates.sh): a machine that is lost must be replaceable, so every template names an image EC2
+# has (Nov 28: both identity hosts' templates named a deleted RunsOn image). The world is templates-<region>.json of the fake aws.
+cat > "$T/world.py" << 'PY2'
+import json, os, sys
+root, p1, p2, mode = os.environ["FAKE_AWS"], sys.argv[1], sys.argv[2], sys.argv[3]
+AL, GONE = "ami-0358f644d7299878d", "ami-0178d4ab7f659a2cc"
+def tags(*extra):
+    return dict({"purpose": "superci-pull"}, **dict(extra))
+def lt(name, pin, *tg, versions=None, default=1):
+    v = versions or {"1": pin}
+    return {"id": "lt-" + name, "name": name, "tags": tags(*tg), "default": default, "latest": max(int(n) for n in v), "versions": v}
+if mode == "clean":
+    w = {"us-east-1": {"templates": [
+            lt("superci-pull-identity-us-east-1a", p1, ("superci-pull-role", "identity")),
+            lt("superci-pull-identity-us-east-1b", p1, ("superci-pull-role", "identity")),
+            lt("superci-pull-listener", AL, ("superci-pull-role", "listener"), versions={"1": AL, "2": AL}, default=2),
+            lt("superci-pull-superci-2cpu", p1, ("superci-pull-deployment", "superci-pull"), versions={"1": p1, "2": p1}, default=2)],
+          "asg": {"template": "lt-superci-pull-listener", "version": "$Default"},
+          "images": {AL: {"OwnerId": "137112412989", "State": "available", "DeprecationTime": "2027-02-01T00:00:00.000Z"}}},
+         "us-east-2": {"templates": [
+            lt("superci-pull-identity-us-east-2a", p2, ("superci-pull-role", "identity")),
+            lt("superci-pull-superci-2cpu", p2, ("superci-pull-deployment", "superci-pull"), versions={"1": p2, "2": p2}, default=2)]}}
+    for r, x in w.items():
+        json.dump(x, open(os.path.join(root, "templates-" + r + ".json"), "w"))
+else:  # a statement over the worlds: w["us-east-1"] ...
+    w = {r: json.load(open(os.path.join(root, "templates-" + r + ".json"))) for r in ("us-east-1", "us-east-2")}
+    T = lambda r, name: next(t for t in w[r]["templates"] if t["name"] == name)
+    exec(mode)
+    for r, x in w.items():
+        json.dump(x, open(os.path.join(root, "templates-" + r + ".json"), "w"))
+PY2
+W() { python3 -I "$T/world.py" "$P1" "$P2" "$1"; }
+TC() { "$D/templates.sh" check "$@"; }
+W clean
+ok "templates.sh passes a clean set: identities, dispatch and the listener on images EC2 has" TC
+out=$(TC 2>&1); grep -qF "ok    us-east-1 superci-pull-identity-us-east-1a v1 (\$Default): image $P1" <<< "$out" && grep -qF "ok    us-east-1 superci-pull-superci-2cpu v2 (\$Latest): image $P1" <<< "$out" &&
+  grep -qF "ok    us-east-1 superci-pull-listener v2 (its group's \$Default): image ami-0358f644d7299878d" <<< "$out" && grep -qF "note  us-east-1 superci-pull-listener v2 (its group's \$Default): image ami-0358f644d7299878d DeprecationTime 2027-02-01T00:00:00.000Z" <<< "$out"
+check $? "and says which version and image each check read, and the listener image's DeprecationTime"
+W 'w["us-east-1"]["templates"].append({"id": "lt-plane", "name": "superci-82flwf4vz2os-138733726419-1795550317020", "tags": {"purpose": "superci-pull"}, "default": 1, "latest": 1, "versions": {"1": "ami-0gone"}}); w["us-east-1"]["templates"].append({"id": "lt-dev", "name": "superci-pull-timeline-superci-2cpu", "tags": {"purpose": "superci-pull", "superci-pull-deployment": "superci-pull-timeline"}, "default": 1, "latest": 1, "versions": {"1": "ami-0gone"}})'
+ok "templates.sh leaves superci's own plane's template and another deployment's alone" TC
+W clean
+# Each rule, on the identity templates (the ones release.sh checks before any upload).
+rule() { # name, the world's change, what templates.sh says; release.sh refuses with the same and uploads nothing
+  local name=$1 change=$2 want=$3
+  W clean; W "$change"; : > "$FAKE_AWS/calls.log"
+  refuses "templates.sh refuses $name" "$want" TC
+  refuses "release.sh refuses $name" "$want" "$D/release.sh" "$R" "$here/testdata/ssh"
+  [ ! -e "$FAKE_AWS/s3/superci-pull-243891825325/bin/RELEASE.json" ] && ! grep -q 's3 cp .*s3://superci-pull-243891825325' "$FAKE_AWS/calls.log"; check $? "and uploaded nothing"
+}
+rule "an identity template whose default names an image EC2 no longer lists (RunsOn deregistered it)" \
+  'T("us-east-1", "superci-pull-identity-us-east-1a")["versions"]["1"] = "ami-0178d4ab7f659a2cc"; w["us-east-1"]["images"]["ami-0178d4ab7f659a2cc"] = None' \
+  "us-east-1 superci-pull-identity-us-east-1a v1 (\$Default): names ami-0178d4ab7f659a2cc, not $P1"
+rule "an identity template that names the pin, which EC2 no longer lists" \
+  'w["us-east-1"]["images"]["'$P1'"] = None' \
+  "us-east-1 superci-pull-identity-us-east-1a v1 (\$Default): image $P1 does not exist (EC2 does not list it)"
+rule "an identity template whose image is another account's" \
+  'w["us-east-2"]["images"] = {"'$P2'": {"OwnerId": "135269210855", "State": "available"}}' \
+  "us-east-2 superci-pull-identity-us-east-2a v1 (\$Default): image $P2 is owned by 135269210855, not 243891825325"
+rule "an identity template whose image is not available" \
+  'w["us-east-1"]["images"]["'$P1'"] = {"OwnerId": "243891825325", "State": "pending"}' \
+  "image $P1 is pending, not available"
+rule "an identity template on an image that is not the pin" \
+  'T("us-east-1", "superci-pull-identity-us-east-1b")["versions"]["1"] = "ami-0bbbb5555cccc6666"' \
+  "us-east-1 superci-pull-identity-us-east-1b v1 (\$Default): names ami-0bbbb5555cccc6666, not $P1"
+rule "an identity template whose old version is the pin but whose default is not" \
+  'T("us-east-1", "superci-pull-identity-us-east-1a")["versions"] = {"1": "'$P1'", "2": "ami-0178d4ab7f659a2cc"}; T("us-east-1", "superci-pull-identity-us-east-1a")["latest"] = 2; T("us-east-1", "superci-pull-identity-us-east-1a")["default"] = 2' \
+  "us-east-1 superci-pull-identity-us-east-1a v2 (\$Default): names ami-0178d4ab7f659a2cc, not $P1"
+rule "a listener whose group launches an image EC2 no longer lists" \
+  'w["us-east-1"]["images"]["ami-0358f644d7299878d"] = None' \
+  "us-east-1 superci-pull-listener v2 (its group's \$Default): image ami-0358f644d7299878d does not exist"
+rule "a listener whose group launches a version on a deprecated-and-gone image while \$Latest is fine" \
+  'T("us-east-1", "superci-pull-listener")["versions"] = {"1": "ami-0old", "2": "ami-0358f644d7299878d"}; w["us-east-1"]["asg"]["version"] = "1"; w["us-east-1"]["images"]["ami-0old"] = None' \
+  "us-east-1 superci-pull-listener v1 (its group's 1): image ami-0old does not exist"
+# The dispatch templates: the listener launches $Latest and the version it makes is now the default, so both name the pin.
+W clean; W 'T("us-east-1", "superci-pull-superci-2cpu")["versions"] = {"1": "ami-0178d4ab7f659a2cc", "2": "'$P1'"}; T("us-east-1", "superci-pull-superci-2cpu")["default"] = 1'
+refuses "templates.sh refuses a dispatch template whose \$Default is not the pin" "us-east-1 superci-pull-superci-2cpu v1 (\$Default): names ami-0178d4ab7f659a2cc, not $P1" TC
+ok "but not before an upload: --pre-upload leaves the dispatch templates to the listener this release starts" TC --pre-upload
+W 'T("us-east-1", "superci-pull-superci-2cpu")["default"] = 2; T("us-east-2", "superci-pull-superci-2cpu")["versions"]["2"] = "ami-0bbbb5555cccc6666"'
+refuses "templates.sh refuses a dispatch template whose \$Latest is not the pin" "us-east-2 superci-pull-superci-2cpu v2 (\$Latest): names ami-0bbbb5555cccc6666, not $P2" TC
+W 'T("us-east-2", "superci-pull-superci-2cpu")["versions"]["2"] = "'$P2'"; w["us-east-2"]["images"] = {"'$P2'": None}'
+refuses "templates.sh refuses a dispatch template on a pin EC2 does not list" "us-east-2 superci-pull-superci-2cpu v2 (\$Default): image $P2 does not exist" TC
+# A retired template fails, with the line that deletes it, and is never deleted.
+W clean; W 'w["us-east-1"]["templates"].append({"id": "lt-old96", "name": "superci-pull-superci-96cpu", "tags": {"purpose": "superci-pull"}, "default": 1, "latest": 1, "versions": {"1": "ami-0178d4ab7f659a2cc"}}); w["us-east-2"]["templates"].append({"id": "lt-odd", "name": "odd-name", "tags": {"purpose": "superci-pull"}, "default": 1, "latest": 1, "versions": {"1": "ami-0178d4ab7f659a2cc"}})'
+: > "$FAKE_AWS/calls.log"
+refuses "templates.sh fails a template no size, identity host or listener names, and prints its delete line" "aws --profile ci-runners ec2 delete-launch-template --region us-east-1 --launch-template-id lt-old96" TC
+refuses "(by its tag too, when its name is another's)" "us-east-2 odd-name (lt-odd, default v1, latest v1) is retired" TC
+! grep -q 'delete-launch-template' "$FAKE_AWS/calls.log"; check $? "and deleted nothing"
+ok "a retired template is not checked before an upload: the release this check guards does not delete or wait on it" TC --pre-upload
+W clean
+
+# The dispatch templates are the listener's to make: a release whose pin is new finds them on the old image, uploads, and
+# its restart makes them (the fake aws has no listener, so verify-release.sh's last check fails here, after the upload).
+W 'T("us-east-1", "superci-pull-superci-2cpu")["versions"] = {"1": "ami-0178d4ab7f659a2cc", "2": "'$P1'"}; T("us-east-1", "superci-pull-superci-2cpu")["default"] = 1'
+rm -rf "$T/r2"; cp -r "$R" "$T/r2"; rm -f "$T/r2/listener/bin/RELEASE.json"
+out=$(env TEMPLATES_TRIES=1 SSH="$here/testdata/ssh" "$D/release.sh" "$T/r2" "$here/testdata/ssh" 2>&1); rc=$?
+[ $rc != 0 ] && [ -e "$FAKE_AWS/s3/superci-pull-243891825325/bin/RELEASE.json" ] && grep -qF "FAIL  launch templates (templates.sh)" <<< "$out" && ! grep -qF "refusing: a launch template" <<< "$out"
+check $? "release.sh uploads past a dispatch template that is not on the pin yet, and verify-release.sh after the restart fails on it"
+rm -rf "$T/r2"; W clean
 ok "release.sh releases the listener" env SSH="$here/testdata/ssh" "$D/release.sh" "$R" "$here/testdata/ssh"
 [ "$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["parity"])' "$FAKE_AWS/s3/superci-pull-243891825325/bin/RELEASE.json")" = passed ]
 check $? "and its RELEASE.json records that the parity check passed"
@@ -139,6 +237,11 @@ check $? "the functions run the released zip"
 cmp -s "$R/cache/bin/warm/superci-8cpu.list" "$FAKE_AWS/s3/superci-pull-cache-243891825325-us-east-2/bin/warm/superci-8cpu.list"
 check $? "the cache buckets hold superci-8cpu's read set, as RELEASE.json names it"
 ok "verify-release.sh passes on the release" env SSH="$here/testdata/ssh" "$D/verify-release.sh" all
+W 'T("us-east-1", "superci-pull-superci-2cpu")["default"] = 1; T("us-east-1", "superci-pull-superci-2cpu")["versions"]["1"] = "ami-0178d4ab7f659a2cc"'
+out=$(env TEMPLATES_TRIES=1 SSH="$here/testdata/ssh" "$D/verify-release.sh" all 2>&1); rc=$?
+[ $rc != 0 ] && grep -qF "us-east-1 superci-pull-superci-2cpu v1 (\$Default): names ami-0178d4ab7f659a2cc, not $P1" <<< "$out" && grep -qF "FAIL  launch templates (templates.sh)" <<< "$out" && grep -qF "release NOT verified: all" <<< "$out"
+check $? "verify-release.sh fails a release whose dispatch template still has a default that is not the pin"
+W clean
 ok "deploy/up.sh moves the template once a release is in place" "$D/up.sh" 203.0.113.7/32
 grep -q create-launch-template-version "$FAKE_AWS/calls.log"; check $? "and wrote a template version"
 

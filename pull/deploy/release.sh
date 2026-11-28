@@ -25,6 +25,10 @@ $A s3api get-bucket-policy --bucket superci-pull-claims-243891825325 --query Pol
 # releases without the check, for an emergency rollback; the reason goes into the release's bin/RELEASE.json as its
 # "parity", which is "passed" otherwise.
 "$here/parity.sh" "$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["commit"])' "$DIR/REVISION")" || { echo "refusing: the job environment differs from Blacksmith's (pull/deploy/parity.sh)" >&2; exit 1; }
+# A machine that is lost must be replaceable: the identity hosts' templates and the listener's group name images that
+# exist (templates.sh; no PARITY_SKIP skips it). The dispatch templates are not checked here: the listener this release
+# starts makes their next version on the pin, and verify-release.sh checks them after the restart.
+"$here/templates.sh" check --pre-upload --commit "$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["commit"])' "$DIR/REVISION")" || { echo "refusing: a launch template names an image EC2 does not have, or not the pin (pull/deploy/templates.sh)" >&2; exit 1; }
 if [ -n "${PARITY_SKIP:-}" ]; then
   parity="skipped: $PARITY_SKIP"
   echo "release: WARNING: the parity check was skipped (PARITY_SKIP: $PARITY_SKIP); bin/RELEASE.json records it" >&2

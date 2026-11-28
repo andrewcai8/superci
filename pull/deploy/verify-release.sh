@@ -3,7 +3,7 @@
 # andrewcai8/superci main, every file it lists is in the bucket with its sha256, the bucket holds nothing else under
 # the release's prefixes but operator files (OPERATOR_KEYS in release-lib.sh), the running listener's binary has the
 # listener manifest's sha256 and prints its commit, and each cache function's code in each region is the cache
-# manifest's zip. Prints a line per check and exits 1 when any fails.
+# manifest's zip, and every launch template names an image that exists (templates.sh). Prints a line per check and exits 1 when any fails.
 #
 #   pull/deploy/verify-release.sh [listener|cache|all]      SSH=<command> reaches the listener (pull/deploy/ssh.sh by default)
 set -uo pipefail
@@ -55,6 +55,19 @@ if [ "$PART" = listener ] || [ "$PART" = all ]; then
       if [ "$got" = "$want" ] && [ "$rev" = "$commit" ]; then ok "listener runs $commit ($got)"; else fail "listener runs sha256 $got, -version ${rev:-none}; RELEASE.json says $want, $commit"; fi
     fi
   fi
+fi
+if [ "$PART" = listener ] || [ "$PART" = all ]; then
+  # Every launch template names an image that exists: the dispatch templates' $Default and $Latest are the pin, a retired
+  # one is deleted by hand (templates.sh prints the line). A restarted listener makes its dispatch versions in the first
+  # seconds of its start, so a failure is checked again for TEMPLATES_TRIES (18) times, 5 s apart, before it counts.
+  tries=${TEMPLATES_TRIES:-18}
+  for ((i = 1; i <= tries; i++)); do
+    out=$("$here/templates.sh" check 2>&1) && rc=0 || rc=$?
+    [ $rc = 0 ] || [ $i = "$tries" ] || sleep 5
+    [ $rc != 0 ] || break
+  done
+  echo "$out" | sed 's/^/      /'
+  if [ $rc = 0 ]; then ok "launch templates"; else fail "launch templates (templates.sh)"; fi
 fi
 if [ "$PART" = cache ] || [ "$PART" = all ]; then
   for r in $CACHE_REGIONS; do

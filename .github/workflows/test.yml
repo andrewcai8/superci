@@ -187,6 +187,36 @@ jobs:
       - name: Slice ${{ matrix.part }} of every sweep's faults
         run: cargo nextest run --archive-file tests.tar.zst --workspace-remap . --extract-to "$GITHUB_WORKSPACE" --extract-overwrite --no-fail-fast -E 'binary(~sweep_) | test(~holds_with_each_call_and_store_operation_failing) | (package(superci-core) & binary(=plane) & test(every_test_here))'
 
+  # The listener (pull/): its Go tests and agent.py's tests, under the Python the machines have (the parity file's `tool
+  # python3`: 3.12), as the release's build host runs them (pull/deploy/build-check.sh, which refuses another Python).
+  # Neither ran here before, and the release of 0d60192 failed on the build host's 3.9 under code this job's newer
+  # Python had taken. About 5 minutes.
+  pull:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CGO_ENABLED: "0"
+      GOFLAGS: -buildvcs=false
+    steps:
+      - uses: actions/checkout@v6
+      - id: python
+        run: echo "version=$(pull/deploy/build-check.sh --want pull/parity/blacksmith-ubuntu-2404.txt)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ steps.python.outputs.version }}
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: pull/go.mod
+          cache-dependency-path: pull/go.sum
+      - name: gofmt, go vet, the Go tests and test_agent.py
+        run: pull/deploy/build-check.sh pull pull/parity/blacksmith-ubuntu-2404.txt
+      # One job failed: the rest of the run is cancelled, so a failure is known at once.
+      - name: Stop the run
+        if: failure()
+        run: gh run cancel ${{ github.run_id }} --repo ${{ github.repository }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+
   # superci-layers against containerd's own conformance suites for snapshotters and content stores (as root: the
   # snapshotter suite mounts overlays), directly and through containerd's metadata layer.
   layers:

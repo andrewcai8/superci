@@ -182,7 +182,7 @@ func (f *Fleet) AddSet(ctx context.Context, spec SetSpec, userData string, group
 			continue
 		}
 		sr := &setRegion{}
-		if err := sr.ensureTemplate(ctx, r, "superci-pull-"+spec.Name, userData, groups[r.Name], spec.DiskGB, spec, sf.tags); err != nil {
+		if err := sr.ensureTemplate(ctx, r.ec2, r, templateName(f.deployment, spec.Name), userData, groups[r.Name], spec.DiskGB, spec, sf.tags); err != nil {
 			return nil, fmt.Errorf("%s %s template: %w", spec.Name, r.Name, err)
 		}
 		if err := sr.findPools(ctx, r, spec.Types); err != nil {
@@ -262,31 +262,63 @@ func userDataScript(encoded string) (string, bool) {
 	return string(out), true
 }
 
-func (sr *setRegion) ensureTemplate(ctx context.Context, r *Region, name, userData, group string, diskGB int, spec SetSpec, tags []ec2types.Tag) error {
+// templateName is a set's launch template in a deployment: "<deployment>-<set>", so production's (deployment
+// superci-pull) stay superci-pull-<set> and a dev listener's own deployment makes templates of its own. They were
+// named superci-pull-<set> for every deployment, and a dev listener's start (Nov 28: superci-pull-timeline and
+// superci-pull-v4d) wrote versions, and now the default, of the templates production launches from.
+func templateName(deployment, set string) string { return deployment + "-" + set }
+
+// templateAPI is the launch template calls ensureTemplate makes, so a test can stand in for EC2.
+type templateAPI interface {
+	DescribeLaunchTemplates(ctx context.Context, in *ec2.DescribeLaunchTemplatesInput, opts ...func(*ec2.Options)) (*ec2.DescribeLaunchTemplatesOutput, error)
+	DescribeLaunchTemplateVersions(ctx context.Context, in *ec2.DescribeLaunchTemplateVersionsInput, opts ...func(*ec2.Options)) (*ec2.DescribeLaunchTemplateVersionsOutput, error)
+	CreateLaunchTemplate(ctx context.Context, in *ec2.CreateLaunchTemplateInput, opts ...func(*ec2.Options)) (*ec2.CreateLaunchTemplateOutput, error)
+	CreateLaunchTemplateVersion(ctx context.Context, in *ec2.CreateLaunchTemplateVersionInput, opts ...func(*ec2.Options)) (*ec2.CreateLaunchTemplateVersionOutput, error)
+	ModifyLaunchTemplate(ctx context.Context, in *ec2.ModifyLaunchTemplateInput, opts ...func(*ec2.Options)) (*ec2.ModifyLaunchTemplateOutput, error)
+}
+
+// ensureTemplate leaves the set's template with a version that holds the machines' data, and sets sr.template and
+// sr.version to it. That version is also the template's default: the fleet launches the exact version, but a machine
+// made from $Default (an operator's run-instances, the checks of deploy/templates.sh) must be the machines' too, and a
+// default left on version 1 named an image RunsOn deleted (Nov 28).
+func (sr *setRegion) ensureTemplate(ctx context.Context, api templateAPI, r *Region, name, userData, group string, diskGB int, spec SetSpec, tags []ec2types.Tag) error {
 	data := templateData(r, userData, group, diskGB, spec, tags)
-	got, err := r.ec2.DescribeLaunchTemplates(ctx, &ec2.DescribeLaunchTemplatesInput{LaunchTemplateNames: []string{name}})
+	got, err := api.DescribeLaunchTemplates(ctx, &ec2.DescribeLaunchTemplatesInput{LaunchTemplateNames: []string{name}})
 	if err == nil && len(got.LaunchTemplates) == 1 {
 		sr.template = aws.ToString(got.LaunchTemplates[0].LaunchTemplateId)
 		// A start makes a version only when the machines' data changed (a template keeps at most 10,000).
-		latest, err := r.ec2.DescribeLaunchTemplateVersions(ctx, &ec2.DescribeLaunchTemplateVersionsInput{LaunchTemplateId: aws.String(sr.template), Versions: []string{"$Latest"}})
+		latest, err := api.DescribeLaunchTemplateVersions(ctx, &ec2.DescribeLaunchTemplateVersionsInput{LaunchTemplateId: aws.String(sr.template), Versions: []string{"$Latest"}})
 		if err == nil && len(latest.LaunchTemplateVersions) == 1 && sameData(latest.LaunchTemplateVersions[0].LaunchTemplateData, data) {
 			sr.version = fmt.Sprint(aws.ToInt64(latest.LaunchTemplateVersions[0].VersionNumber))
-			return nil
+		} else {
+			v, err := api.CreateLaunchTemplateVersion(ctx, &ec2.CreateLaunchTemplateVersionInput{LaunchTemplateId: aws.String(sr.template), LaunchTemplateData: data})
+			if err != nil {
+				return err
+			}
+			sr.version = fmt.Sprint(aws.ToInt64(v.LaunchTemplateVersion.VersionNumber))
 		}
-		v, err := r.ec2.CreateLaunchTemplateVersion(ctx, &ec2.CreateLaunchTemplateVersionInput{LaunchTemplateId: aws.String(sr.template), LaunchTemplateData: data})
-		if err != nil {
-			return err
-		}
-		sr.version = fmt.Sprint(aws.ToInt64(v.LaunchTemplateVersion.VersionNumber))
-		return nil
+		return sr.makeDefault(ctx, api, name, aws.ToInt64(got.LaunchTemplates[0].DefaultVersionNumber))
 	}
-	made, err := r.ec2.CreateLaunchTemplate(ctx, &ec2.CreateLaunchTemplateInput{LaunchTemplateName: aws.String(name), LaunchTemplateData: data,
+	made, err := api.CreateLaunchTemplate(ctx, &ec2.CreateLaunchTemplateInput{LaunchTemplateName: aws.String(name), LaunchTemplateData: data,
 		TagSpecifications: []ec2types.TagSpecification{{ResourceType: ec2types.ResourceTypeLaunchTemplate, Tags: tags}}})
 	if err != nil {
 		return err
 	}
 	sr.template = aws.ToString(made.LaunchTemplate.LaunchTemplateId)
-	sr.version = fmt.Sprint(aws.ToInt64(made.LaunchTemplate.LatestVersionNumber))
+	sr.version = fmt.Sprint(aws.ToInt64(made.LaunchTemplate.LatestVersionNumber)) // a new template's first version is its default
+	return nil
+}
+
+// makeDefault makes sr.version the template's default version when it is not. A failure is logged, not returned: the
+// fleet launches sr.version itself, so the set works, and deploy/templates.sh (verify-release.sh) names the template
+// whose default is another version.
+func (sr *setRegion) makeDefault(ctx context.Context, api templateAPI, name string, current int64) error {
+	if fmt.Sprint(current) == sr.version {
+		return nil
+	}
+	if _, err := api.ModifyLaunchTemplate(ctx, &ec2.ModifyLaunchTemplateInput{LaunchTemplateId: aws.String(sr.template), DefaultVersion: aws.String(sr.version)}); err != nil {
+		slog.Error("template default version not moved", "template", name, "default", current, "version", sr.version, "err", err.Error())
+	}
 	return nil
 }
 

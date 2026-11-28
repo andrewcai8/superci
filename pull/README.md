@@ -915,6 +915,11 @@ pull/deploy/verify-release.sh                             # read-only: what prod
 ```
 
 `build.sh` writes a private release directory: the files at the S3 keys they go to, and the commit (`REVISION`).
+Its tests run through `deploy/build-check.sh` under the machines' python3: the build host (Amazon Linux 2023) has 3.9
+and the machines' image 3.12 (`tool python3` in `parity/blacksmith-ubuntu-2404.txt`), so the host installs the parity
+file's version beside its own, and the check refuses a python3 of another major.minor before any test runs. It runs
+`gofmt`, `go vet`, `go test ./...` and `agent.py`'s `test_agent.py`; the `pull` job of `.github/workflows/test.yml` runs the
+same check under `actions/setup-python` with the same version.
 Each release script writes its tree's `bin/RELEASE.json` (commit, build time, the sha256 of every file) with
 `manifest.sh`, which refuses a commit not on andrewcai8/superci main (fetched exactly, from that remote only), a
 script or config that is not the commit's, and a binary that does not carry the commit. It uploads from that
@@ -937,7 +942,14 @@ machine's `bin/up.sh`, run as the bucket holds them, and `verify-release.sh` fin
 `verify-release.sh [listener|cache|all]` checks each bucket's manifest commit is on main, every file it lists is in
 the bucket with its sha256, the bucket holds nothing else under the release's prefixes but an operator's files
 (`bin/issuer`, `bin/hydrate/*.json`, `bin/dev-*/`), the running listener's sha256 and `-version`, and each cache
-function's `CodeSha256` in both regions.
+function's `CodeSha256` in both regions, and runs `deploy/templates.sh check`, which `release.sh` also runs before any
+upload (`--pre-upload`: the identity templates and the listener's group only): every launch template tagged
+`purpose=superci-pull` or named `superci-pull-*` names an image EC2 lists. An identity template's `$Default` is the
+region's pin, ours and available; a dispatch set's `<deployment>-<size>` has both `$Default` and `$Latest` on the pin (the
+listener launches the version it makes, and makes it the default); the listener's template names, at the version its group
+launches, an image that exists and is available (Amazon's AL2023; its `DeprecationTime` is printed); another template of
+the namespace is retired, fails, and prints the `delete-launch-template` line, which the operator runs. A set's template
+is named `<deployment>-<set>`, so a dev listener's start never writes into production's.
 
 **Parity.** A job on superci runs in the environment a job on Blacksmith does: the runner user, its uid, gid, groups
 and HOME, the file mode mask 022, its sudo rules (NOPASSWD), its ulimits, the commands on PATH and the key tools'
