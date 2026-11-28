@@ -942,14 +942,23 @@ machine's `bin/up.sh`, run as the bucket holds them, and `verify-release.sh` fin
 `verify-release.sh [listener|cache|all]` checks each bucket's manifest commit is on main, every file it lists is in
 the bucket with its sha256, the bucket holds nothing else under the release's prefixes but an operator's files
 (`bin/issuer`, `bin/hydrate/*.json`, `bin/dev-*/`), the running listener's sha256 and `-version`, and each cache
-function's `CodeSha256` in both regions, and runs `deploy/templates.sh check`, which `release.sh` also runs before any
-upload (`--pre-upload`: the identity templates and the listener's group only): every launch template tagged
-`purpose=superci-pull` or named `superci-pull-*` names an image EC2 lists. An identity template's `$Default` is the
-region's pin, ours and available; a dispatch set's `<deployment>-<size>` has both `$Default` and `$Latest` on the pin (the
-listener launches the version it makes, and makes it the default); the listener's template names, at the version its group
-launches, an image that exists and is available (Amazon's AL2023; its `DeprecationTime` is printed); another template of
-the namespace is retired, fails, and prints the `delete-launch-template` line, which the operator runs. A set's template
-is named `<deployment>-<set>`, so a dev listener's start never writes into production's.
+function's `CodeSha256` in both regions, and runs `deploy/templates.sh check --commit <the commit its manifest names>`,
+which `release.sh` also runs before any upload (`--pre-upload`: the commit's pin, the identity templates and the listener's
+group only): every launch template tagged `purpose=superci-pull` or named `superci-pull-*` names an image EC2 lists. The
+commit's own pin for each region exists, is ours and is available (a release that would boot another image is refused,
+naming the region, the AMI and why). An identity template's `$Default` names an image that exists, is ours and is available;
+it need not be the commit's pin, so a rollback to a commit that pins another copy of the image is not refused (a `note`
+line says the host is not on the pin). A dispatch set's `<deployment>-<size>` has both `$Default` and `$Latest` on the
+released commit's pin (the listener launches the version it makes, and makes it the default; after a rollback they are
+that older commit's pin, which is why `verify-release.sh` reads the commit from the bucket's manifest, not this checkout's
+`config.json`); the listener's template names, at the version its group launches, an image that exists and is available
+(Amazon's AL2023; its `DeprecationTime` is printed); another template of the namespace is retired, fails, and prints the
+`delete-launch-template` line, which the operator runs. A commit from before the pin (no `image` in its `config.json`) has
+no pin to check: its dispatch templates need only an image that exists and is available. A set's template is named
+`<deployment>-<set>`, so a dev listener's start never writes into production's. For an emergency the check cannot
+pass, `TEMPLATES_SKIP=<reason> pull/deploy/release.sh ...` skips the pre-upload check, prints that it did and why, and
+records the reason as the release's `"templates"` in `bin/RELEASE.json` (`"passed"` otherwise), as `PARITY_SKIP` does for
+`"parity"`; an empty reason is refused. The check after the restart still runs, and reports any image that is not there.
 
 **Parity.** A job on superci runs in the environment a job on Blacksmith does: the runner user, its uid, gid, groups
 and HOME, the file mode mask 022, its sudo rules (NOPASSWD), its ulimits, the commands on PATH and the key tools'

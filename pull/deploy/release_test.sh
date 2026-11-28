@@ -180,7 +180,7 @@ rule() { # name, the world's change, what templates.sh says; release.sh refuses 
 }
 rule "an identity template whose default names an image EC2 no longer lists (RunsOn deregistered it)" \
   'T("us-east-1", "superci-pull-identity-us-east-1a")["versions"]["1"] = "ami-0178d4ab7f659a2cc"; w["us-east-1"]["images"]["ami-0178d4ab7f659a2cc"] = None' \
-  "us-east-1 superci-pull-identity-us-east-1a v1 (\$Default): names ami-0178d4ab7f659a2cc, not $P1"
+  "us-east-1 superci-pull-identity-us-east-1a v1 (\$Default): image ami-0178d4ab7f659a2cc does not exist (EC2 does not list it)"
 rule "an identity template that names the pin, which EC2 no longer lists" \
   'w["us-east-1"]["images"]["'$P1'"] = None' \
   "us-east-1 superci-pull-identity-us-east-1a v1 (\$Default): image $P1 does not exist (EC2 does not list it)"
@@ -190,12 +190,12 @@ rule "an identity template whose image is another account's" \
 rule "an identity template whose image is not available" \
   'w["us-east-1"]["images"]["'$P1'"] = {"OwnerId": "243891825325", "State": "pending"}' \
   "image $P1 is pending, not available"
-rule "an identity template on an image that is not the pin" \
-  'T("us-east-1", "superci-pull-identity-us-east-1b")["versions"]["1"] = "ami-0bbbb5555cccc6666"' \
-  "us-east-1 superci-pull-identity-us-east-1b v1 (\$Default): names ami-0bbbb5555cccc6666, not $P1"
-rule "an identity template whose old version is the pin but whose default is not" \
-  'T("us-east-1", "superci-pull-identity-us-east-1a")["versions"] = {"1": "'$P1'", "2": "ami-0178d4ab7f659a2cc"}; T("us-east-1", "superci-pull-identity-us-east-1a")["latest"] = 2; T("us-east-1", "superci-pull-identity-us-east-1a")["default"] = 2' \
-  "us-east-1 superci-pull-identity-us-east-1a v2 (\$Default): names ami-0178d4ab7f659a2cc, not $P1"
+rule "an identity template on an image that is another account's, not the pin" \
+  'T("us-east-1", "superci-pull-identity-us-east-1b")["versions"]["1"] = "ami-0bbbb5555cccc6666"; w["us-east-1"]["images"]["ami-0bbbb5555cccc6666"] = {"OwnerId": "135269210855", "State": "available"}' \
+  "us-east-1 superci-pull-identity-us-east-1b v1 (\$Default): image ami-0bbbb5555cccc6666 is owned by 135269210855, not 243891825325"
+rule "an identity template whose old version is usable but whose default is an image EC2 no longer lists" \
+  'T("us-east-1", "superci-pull-identity-us-east-1a")["versions"] = {"1": "'$P1'", "2": "ami-0178d4ab7f659a2cc"}; T("us-east-1", "superci-pull-identity-us-east-1a")["latest"] = 2; T("us-east-1", "superci-pull-identity-us-east-1a")["default"] = 2; w["us-east-1"]["images"]["ami-0178d4ab7f659a2cc"] = None' \
+  "us-east-1 superci-pull-identity-us-east-1a v2 (\$Default): image ami-0178d4ab7f659a2cc does not exist (EC2 does not list it)"
 rule "a listener whose group launches an image EC2 no longer lists" \
   'w["us-east-1"]["images"]["ami-0358f644d7299878d"] = None' \
   "us-east-1 superci-pull-listener v2 (its group's \$Default): image ami-0358f644d7299878d does not exist"
@@ -331,4 +331,78 @@ out=$(PARITY_SKIP="incident 12: roll back now" SSH="$here/testdata/ssh" "$D/rele
 [ $rc = 0 ] && grep -qF "parity: SKIPPED for $OLD by PARITY_SKIP: incident 12: roll back now" <<< "$out" && ! grep -q run-instances "$FAKE_AWS/calls.log" &&
   [ "$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["parity"])' "$FAKE_AWS/s3/superci-pull-243891825325/bin/RELEASE.json")" = "skipped: incident 12: roll back now" ]
 check $? "release.sh with PARITY_SKIP releases without the check, prints the reason and records it in RELEASE.json"; [ $rc = 0 ] || echo "$out" | tail -5 | sed 's/^/      /'
+# A commit from before the pin has none: its pin is not checked, and its dispatch templates need only an image that is available.
+out=$(TC --commit "$OLD" 2>&1); rc=$?
+[ $rc = 0 ] && grep -qF "note  us-east-1: the commit names no image pin (it is from before the pin): its pin is not checked" <<< "$out"
+check $? "templates.sh --commit of a commit from before the pin notes that it has none, and passes"
+
+# A rollback releases a commit whose pin is not the one the templates name (Nov 28: a release of an older commit, whose
+# "image" is our other copy of the machine image, was refused before any upload because the identity templates name
+# today's pin). The released commit's own pin must be usable; the identity and listener templates need only an image
+# that exists (and is ours, for an identity host); the dispatch templates are the commit's pin once its listener runs.
+# A commit that pins PB for us-east-1, our other available copy, on main beside the commits above.
+PB=ami-0eeee5555ffff6666
+cp "$here/testdata/parity-probe.txt" "$T/probe.txt"
+sed -i "s/$P1/$PB/" "$W/pull/config.json"; git -C "$W" -c user.name=t -c user.email=t@t commit -q -am "pin B"; CB=$(git -C "$W" rev-parse HEAD); git -C "$W" reset -q --hard "$C"
+git -C "$W" push -q -f "$T/origin.git" "$CB:refs/heads/main"
+rm -rf "$T/rb"; cp -r "$R" "$T/rb"; rm -f "$T/rb/listener/bin/RELEASE.json"
+printf '{"commit":"%s","built":"2026-11-25T00:00:00Z"}\n' "$CB" > "$T/rb/REVISION"
+printf '#!/bin/sh\n# %s\ncase "$1" in -version) echo %s ;; -validate) cat > /dev/null; echo valid ;; esac\n' "$CB" "$CB" > "$T/rb/listener/bin/superci-pull"
+(cd "$here/.." && CGO_ENABLED=0 GOFLAGS=-buildvcs=false go build -trimpath -ldflags="-s -w -X main.revision=$CB" -o "$T/rb/listener/bin/superci-shim" ./shim)
+RB() { rm -f "$T/rb/listener/bin/RELEASE.json" "$T/rb/listener.RELEASE.json"; env TEMPLATES_TRIES=1 SSH="$here/testdata/ssh" "$@" "$D/release.sh" "$T/rb" "$here/testdata/ssh"; }
+RELEASED=$FAKE_AWS/s3/superci-pull-243891825325/bin/RELEASE.json
+json() { python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2], "none"))' "$@"; }
+# The identity templates name pin A (P1); the dispatch templates are on B, as the listener of the rolled-back release makes them.
+W clean; W 'T("us-east-1", "superci-pull-superci-2cpu")["versions"] = {"1": "'$P1'", "2": "'$PB'"}'
+out=$(TC --pre-upload --commit "$CB" 2>&1); rc=$?
+[ $rc = 0 ] && grep -qF "ok    us-east-1: the commit's pin $PB" <<< "$out" && grep -qF "note  us-east-1 superci-pull-identity-us-east-1a v1 (\$Default): image $P1 is not the commit's pin $PB" <<< "$out" &&
+  grep -qF "launch templates ok: pre" <<< "$out"
+check $? "templates.sh --pre-upload --commit passes identity templates on our other copy of the image, with a note"; [ $rc = 0 ] || echo "$out" | tail -5 | sed 's/^/      /'
+out=$(RB 2>&1); rc=$?
+[ $rc = 0 ] && grep -qF "image $P1 is not the commit's pin $PB" <<< "$out" && ! grep -qF "refusing: the commit's pin" <<< "$out" && [ "$(json "$RELEASED" commit)" = "$CB" ] && [ "$(json "$RELEASED" templates)" = passed ]
+check $? "release.sh of that commit goes past the template check, uploads, and its RELEASE.json records templates: passed"; [ $rc = 0 ] || echo "$out" | tail -8 | sed 's/^/      /'
+# The full check after the restart reads the commit the release is, not this checkout's config.json.
+ok "verify-release.sh passes the release: dispatch templates on the released commit's pin, identity templates on our other copy" V listener
+out=$(V listener 2>&1); grep -qF "note  us-east-1 superci-pull-identity-us-east-1a v1 (\$Default): image $P1 is not the commit's pin $PB" <<< "$out"
+check $? "and notes the identity templates that are not the commit's pin"
+ok "templates.sh --commit passes dispatch templates on the commit's pin, identity templates on our other copy" TC --commit "$CB"
+W 'T("us-east-1", "superci-pull-superci-2cpu")["versions"]["2"] = "'$P1'"'
+out=$(TC --commit "$CB" 2>&1); rc=$?
+[ $rc != 0 ] && grep -qF "us-east-1 superci-pull-superci-2cpu v2 (\$Latest): names $P1, not $PB, config.json's pin for us-east-1" <<< "$out"
+check $? "templates.sh --commit fails a dispatch template on another image than the commit's pin, though ours and available"
+refuses "verify-release.sh fails it too" "us-east-1 superci-pull-superci-2cpu v2 (\$Latest): names $P1, not $PB" V listener
+W 'T("us-east-1", "superci-pull-superci-2cpu")["versions"]["2"] = "'$PB'"'
+
+# The released commit's own pin must be usable: refused, naming the region, the AMI and why, and nothing uploaded. (The
+# parity check boots the pin too and refuses first, in its own words, so these releases skip it to reach the template check.)
+cp "$RELEASED" "$T/released.before"
+pin_refused() { # name, the change to the world, what is said
+  local name=$1 change=$2 want=$3
+  W clean; W "$change"; : > "$FAKE_AWS/calls.log"
+  refuses "templates.sh --pre-upload --commit refuses $name" "$want" TC --pre-upload --commit "$CB"
+  refuses "release.sh refuses $name" "$want" RB env PARITY_SKIP="parity is not under test"
+  cmp -s "$RELEASED" "$T/released.before" && ! grep -q 's3 cp .*s3://superci-pull-243891825325' "$FAKE_AWS/calls.log"; check $? "and uploaded nothing"
+}
+pin_refused "a commit whose pin EC2 does not list" 'w["us-east-1"]["images"]["'$PB'"] = None' \
+  "us-east-1: the commit's pin $PB does not exist (EC2 does not list it)"
+pin_refused "a commit whose pin is another account's" 'w["us-east-1"]["images"]["'$PB'"] = {"OwnerId": "135269210855", "State": "available"}' \
+  "us-east-1: the commit's pin $PB is owned by 135269210855, not 243891825325"
+pin_refused "a commit whose pin is not available" 'w["us-east-1"]["images"]["'$PB'"] = {"OwnerId": "243891825325", "State": "pending"}' \
+  "us-east-1: the commit's pin $PB is pending, not available"
+# An identity template on an image EC2 does not list is still refused: the rollback relaxes the pin, not the image.
+pin_refused "an identity template on an image EC2 does not list, though the commit's pin is fine" 'w["us-east-1"]["images"]["'$P1'"] = None' \
+  "us-east-1 superci-pull-identity-us-east-1a v1 (\$Default): image $P1 does not exist (EC2 does not list it)"
+
+# TEMPLATES_SKIP=<reason>: an emergency release past the template check, printed and recorded as PARITY_SKIP is; an empty one is refused.
+W clean; W 'w["us-east-1"]["images"]["'$PB'"] = None'; : > "$FAKE_AWS/calls.log"
+out=$(RB env PARITY_SKIP="parity is not under test" TEMPLATES_SKIP="incident 13: roll back now" 2>&1)
+grep -qF "templates: SKIPPED for $CB by TEMPLATES_SKIP: incident 13: roll back now" <<< "$out" && ! grep -qF "refusing: the commit's pin" <<< "$out" &&
+  [ "$(json "$RELEASED" templates)" = "skipped: incident 13: roll back now" ] && [ "$(json "$RELEASED" commit)" = "$CB" ] && [ "$(json "$RELEASED" parity)" = "skipped: parity is not under test" ]
+check $? "release.sh with TEMPLATES_SKIP releases past the template check, prints the reason and records it in RELEASE.json"
+grep -qF "release NOT verified: listener" <<< "$out"; check $? "and the verification after the restart still reports the pin EC2 does not list"
+cp "$RELEASED" "$T/released.before"; : > "$FAKE_AWS/calls.log"
+refuses "release.sh refuses an empty TEMPLATES_SKIP" "TEMPLATES_SKIP needs a reason" RB env PARITY_SKIP="parity is not under test" TEMPLATES_SKIP=
+refuses "and a TEMPLATES_SKIP of spaces" "TEMPLATES_SKIP needs a reason" RB env PARITY_SKIP="parity is not under test" TEMPLATES_SKIP="  "
+cmp -s "$RELEASED" "$T/released.before" && ! grep -q 's3 cp .*s3://superci-pull-243891825325\|run-instances' "$FAKE_AWS/calls.log"; check $? "and uploaded nothing"
+W clean
 exit $failed
