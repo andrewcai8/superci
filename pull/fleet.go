@@ -33,6 +33,7 @@ type Region struct {
 	fleets  fleetAPI
 	image   string
 	root    string
+	refused string            // why the pinned image cannot be used here, when it cannot: the region launches nothing
 	subnets map[string]string // zone -> default subnet
 }
 
@@ -59,11 +60,21 @@ const (
 	tagRole       = "superci-pull-role"    // "identity" on an identity host
 )
 
-type ImageConfig struct {
-	Owner, Name, Pin string
+// imageAPI is the call findImage makes, so a test can stand in for EC2's images.
+type imageAPI interface {
+	DescribeImages(ctx context.Context, in *ec2.DescribeImagesInput, opts ...func(*ec2.Options)) (*ec2.DescribeImagesOutput, error)
 }
 
-func NewFleet(ctx context.Context, deployment string, weights map[string]int, img ImageConfig) (*Fleet, error) {
+// An imageRefusal is the reason a region's pinned image cannot be booted: the image is gone, not available or not ours.
+// The listener then launches nothing in that region and pages (the ImageRefused metric); it never boots another build.
+type imageRefusal struct{ ID, Why string }
+
+func (e *imageRefusal) Error() string { return fmt.Sprintf("pinned image %q refused: %s", e.ID, e.Why) }
+
+// NewFleet makes the regions. images is the AMI id each region boots (Config.Image), account the one that must own it.
+// A region whose pinned image is refused (findImage) stays in the fleet, so its machines are still listed and ended, but
+// launches nothing.
+func NewFleet(ctx context.Context, deployment, account string, weights map[string]int, images map[string]string) (*Fleet, error) {
 	names := make([]string, 0, len(weights))
 	for name := range weights {
 		names = append(names, name)
@@ -77,7 +88,13 @@ func NewFleet(ctx context.Context, deployment string, weights map[string]int, im
 		}
 		client := ec2.NewFromConfig(cfg)
 		r := &Region{Name: name, Weight: weights[name], ec2: client, fleets: client, subnets: map[string]string{}}
-		if r.image, r.root, err = r.findImage(ctx, img); err != nil {
+		r.image, r.root, err = findImage(ctx, client, account, images[name])
+		var refusal *imageRefusal
+		switch {
+		case errors.As(err, &refusal):
+			r.refused = refusal.Error()
+			slog.Error("image refused: this region launches nothing until a release pins an image it can boot", "region", name, "image", images[name], "why", refusal.Why)
+		case err != nil:
 			return nil, fmt.Errorf("%s: %w", name, err)
 		}
 		subnets, err := r.ec2.DescribeSubnets(ctx, &ec2.DescribeSubnetsInput{Filters: []ec2types.Filter{{Name: aws.String("default-for-az"), Values: []string{"true"}}}})
@@ -92,28 +109,51 @@ func NewFleet(ctx context.Context, deployment string, weights map[string]int, im
 	return f, nil
 }
 
-// findImage is the image jobs boot, as superci picks it: the pinned build, or once its maker has deleted it the oldest
-// newer build (out the longest), or with none newer the newest.
-func (r *Region) findImage(ctx context.Context, img ImageConfig) (id, root string, err error) {
-	out, err := r.ec2.DescribeImages(ctx, &ec2.DescribeImagesInput{Owners: []string{img.Owner, "self"},
-		Filters: []ec2types.Filter{{Name: aws.String("name"), Values: []string{img.Name}}, {Name: aws.String("state"), Values: []string{"available"}}}})
-	if err != nil {
-		return "", "", err
+// Refused is how many regions launch nothing because their pinned image was refused: the ImageRefused metric, which
+// deploy/alarms.sh pages on.
+func (f *Fleet) Refused() int {
+	if f == nil {
+		return 0
 	}
-	build := func(i ec2types.Image) string { n := aws.ToString(i.Name); return n[strings.LastIndexByte(n, '-')+1:] }
-	imgs := out.Images
-	if len(imgs) == 0 {
-		return "", "", fmt.Errorf("no image %s/%s", img.Owner, img.Name)
-	}
-	slices.SortFunc(imgs, func(a, b ec2types.Image) int { return strings.Compare(build(a), build(b)) })
-	pick := imgs[len(imgs)-1]
-	for _, i := range imgs {
-		if build(i) >= img.Pin {
-			pick = i
-			break
+	n := 0
+	for _, r := range f.regions {
+		if r.refused != "" {
+			n++
 		}
 	}
-	return aws.ToString(pick.ImageId), aws.ToString(pick.RootDeviceName), nil
+	return n
+}
+
+// findImage is the image jobs boot: exactly the pinned id, and nothing else. A pin that EC2 does not know, that is not
+// available, or that another account owns is an imageRefusal: no fallback to another build, so the machines never move to an
+// image no release's parity check (deploy/parity.sh) passed. The pin is a copy in our account of a RunsOn build, so RunsOn
+// deleting its own cannot take it away. Any other error from EC2 is returned as it is, and the listener does not start.
+func findImage(ctx context.Context, api imageAPI, account, pin string) (id, root string, err error) {
+	if pin == "" {
+		return "", "", &imageRefusal{ID: pin, Why: "no image is pinned for this region"}
+	}
+	out, err := api.DescribeImages(ctx, &ec2.DescribeImagesInput{ImageIds: []string{pin}})
+	if err != nil {
+		var api smithy.APIError
+		if errors.As(err, &api) {
+			switch api.ErrorCode() {
+			case "InvalidAMIID.NotFound", "InvalidAMIID.Malformed", "InvalidAMIID.Unavailable":
+				return "", "", &imageRefusal{ID: pin, Why: api.ErrorCode() + ": " + api.ErrorMessage()}
+			}
+		}
+		return "", "", err
+	}
+	if len(out.Images) != 1 || aws.ToString(out.Images[0].ImageId) != pin {
+		return "", "", &imageRefusal{ID: pin, Why: "EC2 lists no such image"}
+	}
+	img := out.Images[0]
+	if owner := aws.ToString(img.OwnerId); owner != account {
+		return "", "", &imageRefusal{ID: pin, Why: fmt.Sprintf("owned by %s, not by %s: only our own copy is pinned", owner, account)}
+	}
+	if img.State != ec2types.ImageStateAvailable {
+		return "", "", &imageRefusal{ID: pin, Why: fmt.Sprintf("its state is %q, not available", img.State)}
+	}
+	return pin, aws.ToString(img.RootDeviceName), nil
 }
 
 // SetFleet launches one scale set's machines: its launch template and its (type, subnet) pools in each region.
@@ -137,6 +177,10 @@ func (f *Fleet) AddSet(ctx context.Context, spec SetSpec, userData string, group
 		sf.tags = append(sf.tags, ec2types.Tag{Key: aws.String(tagMode), Value: aws.String("dispatch")})
 	}
 	for _, r := range f.regions {
+		if r.refused != "" {
+			slog.Error("set region skipped: its image was refused", "set", spec.Name, "region", r.Name, "why", r.refused)
+			continue
+		}
 		sr := &setRegion{}
 		if err := sr.ensureTemplate(ctx, r, "superci-pull-"+spec.Name, userData, groups[r.Name], spec.DiskGB, spec, sf.tags); err != nil {
 			return nil, fmt.Errorf("%s %s template: %w", spec.Name, r.Name, err)
@@ -435,6 +479,9 @@ func (f *Fleet) split(n int) map[string]int {
 // ask makes the CreateFleet calls for n machines in one region, at most chunk each, all at once. Each call carries a
 // ClientToken unique to this process, round and part, so a call retried after a lost answer starts nothing twice.
 func (sf *SetFleet) ask(ctx context.Context, r *Region, n int, kind ec2types.DefaultTargetCapacityType, round, step string, types []string) []*Machine {
+	if r.refused != "" { // its image was refused: nothing is launched here, and what it was to start the other regions are asked for
+		return nil
+	}
 	pools := sf.regions[r.Name].poolsOf(types)
 	if n <= 0 || len(pools) == 0 {
 		return nil

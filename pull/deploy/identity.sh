@@ -58,10 +58,9 @@ IDENTITY_AZS=${IDENTITY_AZS:-us-east-1a us-east-1b}
 read -ra AZS <<< "$IDENTITY_AZS"
 KEY_ALIAS=alias/superci-pull-identities
 SSH_USER=${IDENTITY_SSH_USER:-ubuntu}
-# The machines' image, as fleet.go picks it (ImageConfig in main.go): the pinned build, or the oldest newer, or the newest.
-IMAGE_OWNER=135269210855
-IMAGE_NAME='runs-on-v2.2-ubuntu24-full-x64-*'
-IMAGE_PIN=20261102081424
+# The machines' image, exactly as fleet.go boots it: the "image" pin of config.json for this region (an AMI id of a copy in
+# our account), with no fallback. A placeholder or an unpinned region refuses.
+IMAGE_CONFIG=${IMAGE_CONFIG:-$(cd "$(dirname "$0")/.." && pwd)/config.json}
 
 die() { echo "$*" >&2; exit 1; }
 cmd=${1:-}
@@ -230,12 +229,10 @@ ensure_sg() { # prints the id of the hosts' security group: SSH from the admin a
 }
 
 image() {
-  $A ec2 describe-images --owners $IMAGE_OWNER self --filters "Name=name,Values=$IMAGE_NAME" Name=state,Values=available \
-    --query 'Images[].[ImageId,Name]' --output text | python3 -I -c 'import sys
-rows = sorted((l.split() for l in sys.stdin if l.strip()), key=lambda r: r[1].rsplit("-", 1)[1])
-if not rows:
-    sys.exit("no image")
-print(next((r for r in rows if r[1].rsplit("-", 1)[1] >= sys.argv[1]), rows[-1])[0])' "$IMAGE_PIN"
+  local ami
+  ami=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("image", {}).get(sys.argv[2], ""))' "$IMAGE_CONFIG" "$R")
+  [[ $ami =~ ^ami-[0-9a-f]{8}([0-9a-f]{9})?$ ]] || die "refusing: $IMAGE_CONFIG pins '${ami:-nothing}' for $R, not an AMI id (a placeholder ami-REPLACE-<region> ships nowhere)"
+  echo "$ami"
 }
 
 # tls_pin: the pin of the listener's public key, the only half of /superci-pull/tls that leaves the pipe.
@@ -388,7 +385,7 @@ up() {
   ami=$(image); subnet=$($A ec2 describe-subnets --filters Name=default-for-az,Values=true Name=availability-zone,Values="$az" --query 'Subnets[0].SubnetId' --output text)
   [ "$subnet" != None ] || die "refusing: no default subnet in $az"
   # The root volume is encrypted: its device is the image's own, or the mapping would add a second volume instead.
-  rootdev=$($A ec2 describe-images --image-ids "$ami" --query 'Images[0].RootDeviceName' --output text)
+  rootdev=$($A ec2 describe-images --image-ids "$ami" --owners self --query 'Images[0].RootDeviceName' --output text)
   [[ $rootdev =~ ^/dev/[a-z0-9]+$ ]] || die "refusing: $ami names no root device ($rootdev)"
   ud=$(userdata "https://$eip:8443" "$pin")
   [ ${#ud} -le 16000 ] || die "refusing: user data is ${#ud} bytes, over EC2's 16 KB"

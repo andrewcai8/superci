@@ -1,0 +1,11 @@
+#!/bin/bash
+# The parity machine over SSH as release_test.sh needs it (parity.sh, with SUPERCI_TEST=1): the probe it prints is
+# $PARITY_PROBE. With $PARITY_SSH_HANG set, a call never returns, as an ssh to a machine that stopped answering.
+[ -z "${PARITY_SSH_HANG:-}" ] || exec sleep 3600
+case "$*" in
+  'test -d /run/superci-parity' | 'test -e /run/superci-parity/rc') exit 0 ;;
+  'sudo tar '*) cat > /dev/null ;;
+  'cat /run/superci-parity/out') cat "$PARITY_PROBE" ;;
+  'cat /run/superci-parity/rc') echo 0 ;;
+  *) echo "parity-ssh: unexpected $*" >&2; exit 1 ;;
+esac

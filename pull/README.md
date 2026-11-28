@@ -49,7 +49,7 @@ superci-pull: one process on one c7g.large, an Auto Scaling group of one in us-e
      |
 EC2 machines tagged purpose=superci-pull, superci-pull-deployment=superci-pull, superci-pull-set=<set>, and once
 issued its runner superci-pull-issued=<when>
-  RunsOn ubuntu24 x64 image (superci's pinned build rule); boot.sh asks /jit, runs the runner for its one job and
+  our copy of the RunsOn ubuntu24 x64 image, the AMI id `config.json` pins for the region (`findImage`); boot.sh asks /jit, runs the runner for its one job and
   powers off (or powers off when told it gets none); the listener ends it when its job completes, whatever runs on
   it; metadata hop limit 1, so a job's containers cannot reach it
 ```
@@ -671,7 +671,7 @@ each job to a fresh machine. Its listener runs on an **identity host**, and no j
   (`identity-bucket-policy.json`) blocks public access, refuses a put that is not SSE-KMS or not the role's, refuses a
   read that is not the role's, and refuses a delete that is not the operator's. The host starts a shim only if its
   sha256 is the one `bin/RELEASE.json` names, as the listener does for its own binary.
-- **The image** is the machines' (`runs-on-v2.2-ubuntu24-full-x64`, pinned as `fleet.go` pins it), so the runner is
+- **The image** is the machines' (our copy of a `runs-on-v2.2-ubuntu24-full-x64` build, the AMI id `config.json` pins for the region, as `identity.sh` reads it), so the runner is
   the same version. IMDSv2 only, hop limit 1. Tags: `superci-pull-role=identity`, `superci-pull-deployment`,
   `purpose=superci-pull`, `Name=superci-pull-identity-<az>`. The shim's `/shim` endpoint serves only an instance with
   the first two.
@@ -939,11 +939,75 @@ the bucket with its sha256, the bucket holds nothing else under the release's pr
 (`bin/issuer`, `bin/hydrate/*.json`, `bin/dev-*/`), the running listener's sha256 and `-version`, and each cache
 function's `CodeSha256` in both regions.
 
+**Parity.** A job on superci runs in the environment a job on Blacksmith does: the runner user, its uid, gid, groups
+and HOME, the file mode mask 022, its sudo rules (NOPASSWD), its ulimits, the commands on PATH and the key tools'
+versions. `parity/blacksmith-ubuntu-2404.txt` is that
+environment, as `parity/probe.sh` printed it in a job on `blacksmith-4vcpu-ubuntu-2404` and `blacksmith-8vcpu-ubuntu-2404`,
+with each difference superci accepts written beside it (`allow`, and why). `release.sh` runs `deploy/parity.sh` before
+it uploads anything: it checks each region's pin (below, "Moving the image pin"), boots one machine of superci-4cpu's
+shape from exactly the pinned image with the commit's `boot.sh` up to the job's branch, runs the probe there as the
+agent runs a job (`agent.py --probe`), and refuses the release on any difference (`parity/compare.py`), on a pin it
+cannot use, or when the regions' copies are of two builds. A boot or agent change that alters the job's environment, or
+an image that does, so never reaches a machine that takes a job (Nov 28: a mask of 077 that boot set made dpkg-deb
+refuse a package and four unit tests fail on every superci shard that held them). The image cannot move without a
+release: the listener boots the pin and nothing else. (It used to boot the pinned RunsOn build, or once RunsOn had
+deleted it the oldest newer one, so a listener restart could move every machine to a build no parity check had booted.)
+To re-take the manifest, run the probe as a step of a job on each Blacksmith label and keep the lines it holds.
+The commit's `boot.sh`, `hydrate-stop.sh`, image, regions and machine type are checked with this checkout's probe,
+`compare.py` and manifest (and its `agent.py` when the commit's has no `--probe`), so a rollback to a commit from before
+the check is checked too. A rollback to a commit from before the pin (no `image` in its `config.json`) boots what that
+commit's listener would: the old rule over the `ImageConfig` in its `main.go`; the check's first lines say which part came from where, its last `parity: PASS` or
+`parity: FAIL`. The machine phase is bounded at 15 minutes and the machine is terminated on any exit. For an emergency
+release the check cannot pass, `PARITY_SKIP=<reason> pull/deploy/release.sh ...` boots nothing, prints the reason and
+records it as the release's `"parity"` in `bin/RELEASE.json` (`"passed"` otherwise).
+
 Before the release that moves the pool parameter to `/superci-pull/pool/<deployment>`: apply `deploy/listener-policy.json`
 (`aws --profile ci-runners iam put-role-policy --role-name superci-pull --policy-name superci-pull --policy-document file://pull/deploy/listener-policy.json`)
 so the new listener may read and write it, and run `deploy/alarms.sh` for the alarms. The first start after the
 release finds no saved burst there and starts from 0 once. The policy still grants the old parameter
 `/superci-pull/pool`, which the previous binary uses, so a roll back works; drop it with that binary.
+
+**Moving the image pin.** `config.json`'s `image` is the AMI id each region boots: a copy in our account (243891825325) of
+the RunsOn build the release's parity check passed, so RunsOn deleting its own cannot take it away. Only the built-in
+`config.json` holds it (a release's binary carries it; an override file that changes it is refused), and `findImage` uses
+exactly that id, with no fallback. At start the listener checks each region's pin: if EC2 does not list it, it is not
+`available` or another account owns it, that region launches nothing (what it was to start is asked of the other region),
+the listener logs `image refused` with why, and publishes `ImageRefused` (regions refused), which pages as
+`superci-pull-image-refused` (`deploy/alarms.sh`). It never boots another build. Fix the pin and release.
+
+The checked-in pin is our copies of `runs-on-v2.2-ubuntu24-full-x64-20261120075252`: `ami-0ec23d36a2f286d1f` in us-east-1
+(from RunsOn's `ami-0e27793ea7687e478`) and `ami-00529e5ed16dccb52` in us-east-2 (from `ami-0b6646f1c9e4d3a18`), each
+tagged `superci-pull-image=runs-on-v2.2-ubuntu24-full-x64-20261120075252` and `purpose=superci-pull`. A placeholder
+(`ami-REPLACE-<region>`) ships nowhere: `TestNoImagePlaceholderShips` fails `build.sh`'s `go test`, and
+`deploy/parity.sh` refuses the release, while one is there.
+
+To move the pin to a RunsOn build (the build in use today is `runs-on-v2.2-ubuntu24-full-x64-20261120075252`, which is
+`ami-0e27793ea7687e478` in us-east-1):
+
+```
+eval "$(aws --profile ci-runners configure export-credentials --format env)"
+[ "$(aws sts get-caller-identity --query Account --output text)" = 243891825325 ] || echo "not ci-runners" >&2
+BUILD=runs-on-v2.2-ubuntu24-full-x64-20261120075252   # the RunsOn build to pin
+for r in us-east-1 us-east-2; do
+  # 1. RunsOn's image of that build in the region, copied into our account in the same region
+  SRC=$(aws ec2 describe-images --region $r --owners 135269210855 --filters "Name=name,Values=$BUILD" Name=state,Values=available \
+    --query 'Images[0].ImageId' --output text)
+  [ "$SRC" != None ] || { echo "RunsOn has no $BUILD in $r" >&2; break; }
+  NEW=$(aws ec2 copy-image --region $r --source-region $r --source-image-id "$SRC" --name "superci-pull-$BUILD" \
+    --description "superci-pull's copy of RunsOn $BUILD" --query ImageId --output text)
+  aws ec2 wait image-available --region $r --image-ids "$NEW"
+  # 2. tag the copy with the build it copies, which parity.sh reads to see both regions hold one build
+  aws ec2 create-tags --region $r --resources "$NEW" --tags Key=superci-pull-image,Value=$BUILD Key=purpose,Value=superci-pull
+  echo "$r $NEW"
+done
+```
+
+3. Put the two ids it prints in `pull/config.json`'s `image` (one per region), commit, `build.sh`, and `release.sh`. The
+release's parity check boots the pinned id in us-east-1, and refuses unless it passes; a release that passes pins the image
+every machine boots from the listener's restart on. (If the source snapshot is encrypted with RunsOn's key, `copy-image`
+needs `--encrypted --kms-key-id <our key>`; its error says so.) 4. Never deregister a pinned copy, or delete its snapshot,
+while a release references it: a roll back is a release of an older commit, whose pin is the older copy, so keep a copy until
+no commit you may roll back to pins it (`git log -S<ami id> -- pull/config.json` lists them).
 
 **Recycle.** A release that changes what a machine runs at boot (boot.sh, the image, the disk) makes a new launch
 template version. Each reconcile pass the listener replaces up to 5 idle machines per set that booted from an older

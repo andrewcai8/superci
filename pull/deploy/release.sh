@@ -1,10 +1,11 @@
 #!/bin/bash
 # Releases the listener tree of a release directory (build.sh; see release-lib.sh): writes its bin/RELEASE.json
-# (manifest.sh, which refuses a commit not on andrewcai8/superci main and any file that is not the commit's), checks
-# the override config with the new binary on the listener, uploads the tree to the release bucket from the directory
-# (RELEASE.json last), installs the binary on the listener only if its sha256 is the manifest's, restarts it, and ends
-# with verify-release.sh listener, failing if that fails. The instance fetches the same files at boot, so a
-# replacement runs the same. A rollback is a release of an older commit of main: build.sh <dir> <commit>, then this.
+# (manifest.sh, which refuses a commit not on andrewcai8/superci main and any file that is not the commit's), boots the
+# commit's machine and refuses unless its job environment is Blacksmith's (parity.sh; PARITY_SKIP=<reason> skips it and
+# RELEASE.json records why), checks the override config with the new binary on the listener, uploads the tree to the
+# release bucket from the directory (RELEASE.json last), installs the binary on the listener only if its sha256 is the
+# manifest's, restarts it, and ends with verify-release.sh listener, failing if that fails. The instance fetches the
+# same files at boot, so a replacement runs the same. A rollback is a release of an older commit of main: build.sh <dir> <commit>, then this.
 #
 #   pull/deploy/release.sh <release directory> pull/deploy/ssh.sh
 set -euo pipefail
@@ -19,6 +20,18 @@ T=$DIR/listener
 # The listener refuses to start without its claims bucket (claims.go), so a release before up.sh made it is an outage.
 $A s3api get-bucket-policy --bucket superci-pull-claims-243891825325 --query Policy --output text | grep -q if-none-match || { echo "refusing: the claims bucket or its policy is missing; run pull/deploy/up.sh first" >&2; exit 1; }
 "$here/manifest.sh" "$DIR" listener > "$DIR/listener.RELEASE.json"
+# The listener carries boot.sh and agent.py and picks the image at its start: a release whose machines would give a job
+# another environment than Blacksmith's stops here, before anything is uploaded (parity.sh). PARITY_SKIP=<reason>
+# releases without the check, for an emergency rollback; the reason goes into the release's bin/RELEASE.json as its
+# "parity", which is "passed" otherwise.
+"$here/parity.sh" "$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["commit"])' "$DIR/REVISION")" || { echo "refusing: the job environment differs from Blacksmith's (pull/deploy/parity.sh)" >&2; exit 1; }
+if [ -n "${PARITY_SKIP:-}" ]; then
+  parity="skipped: $PARITY_SKIP"
+  echo "release: WARNING: the parity check was skipped (PARITY_SKIP: $PARITY_SKIP); bin/RELEASE.json records it" >&2
+else
+  parity=passed
+fi
+python3 -I -c 'import json,sys; p=sys.argv[1]; r=json.load(open(p)); r["parity"]=sys.argv[2]; open(p,"w").write(json.dumps(r, separators=(",", ":")) + "\n")' "$DIR/listener.RELEASE.json" "$parity"
 mv "$DIR/listener.RELEASE.json" "$T/bin/RELEASE.json"
 want=$(release_json_sha "$T/bin/RELEASE.json" bin/superci-pull)
 $SSH "cat > /tmp/superci-pull.check && chmod 755 /tmp/superci-pull.check" < "$T/bin/superci-pull"

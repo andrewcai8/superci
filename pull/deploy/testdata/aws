@@ -82,5 +82,33 @@ elif svc == "lambda":
             sys.exit(254)
         if opt("--query") == "CodeSha256":
             print(open(state).read())
+elif svc == "ec2" and cmd == "describe-images" and opt("--image-ids") is not None:
+    # A pin looked up by id: "<owner>\t<state>\t<image id>\t<superci-pull-image tag>" per region in images-<region>; empty,
+    # EC2 does not know the id (the CLI exits 254); with no file, our own available copy of the id asked for, of one RunsOn build.
+    images = os.path.join(root, "images-" + opt("--region", "us-east-1"))
+    if not os.path.isfile(images):
+        print("243891825325\tavailable\t%s\t20261120075252" % opt("--image-ids"))
+    elif not open(images).read().strip():
+        sys.stderr.write("An error occurred (InvalidAMIID.NotFound) when calling the DescribeImages operation\n")
+        sys.exit(254)
+    else:
+        print(open(images).read().strip())
+elif svc == "ec2" and cmd == "describe-images":
+    # Builds listed by name, as a listener from before the pin looks them up: "<name>\t<image id>" lines in builds-<region>
+    # or builds (for all regions); one build of the fleet's image by default.
+    builds = os.path.join(root, "builds-" + opt("--region", "us-east-1"))
+    builds = builds if os.path.isfile(builds) else os.path.join(root, "builds")
+    print(open(builds).read().strip() if os.path.isfile(builds) else "runs-on-v2.2-ubuntu24-full-x64-20261120075252\tami-0parity")
+elif svc == "ec2" and cmd == "run-instances":  # the user data a launch is given, kept as the bytes EC2 would take
+    ud = opt("--user-data", "")
+    scheme, _, f = ud.partition("://")
+    data = open(f, "rb").read() if scheme in ("file", "fileb") else ud.encode()
+    open(os.path.join(root, "user-data"), "wb").write(data)
+    open(os.path.join(root, "user-data.scheme"), "w").write(scheme + "\n")
+    print("i-0parity")
+elif svc == "ec2" and cmd == "terminate-instances" and os.path.exists(os.path.join(root, "fail-terminate-once")):
+    os.remove(os.path.join(root, "fail-terminate-once"))
+    sys.stderr.write("An error occurred (RequestLimitExceeded) when calling the TerminateInstances operation\n")
+    sys.exit(254)
 elif opt("--query") is not None:
     print("1" if opt("--query").startswith("length(") else "stub-id")

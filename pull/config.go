@@ -9,10 +9,12 @@ import (
 	"io"
 	"math"
 	"os"
+	"reflect"
 	"regexp"
 	"slices"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/actions/scaleset"
@@ -27,14 +29,18 @@ var builtinConfig []byte
 // listener rereads the override file when it changes: pools, caps and limits apply at once; sizes, splits, types,
 // disks, regions, the deployment and its repositories apply at the next start.
 type Config struct {
-	Account      string                `json:"account"`
-	Org          string                `json:"org"`
-	Installation int64                 `json:"installation"`
-	AppParam     string                `json:"app_param"`
-	Deployment   string                `json:"deployment"`   // tags its machines and names its runner group: a listener acts only on its own
-	Repositories []string              `json:"repositories"` // the repositories its runner group serves, and whose lost jobs it re-runs
-	Scope        string                `json:"scope"`        // where identities register: "org" (the default) or "repository" (the first of Repositories)
-	Regions      map[string]int        `json:"regions"`
+	Account      string         `json:"account"`
+	Org          string         `json:"org"`
+	Installation int64          `json:"installation"`
+	AppParam     string         `json:"app_param"`
+	Deployment   string         `json:"deployment"`   // tags its machines and names its runner group: a listener acts only on its own
+	Repositories []string       `json:"repositories"` // the repositories its runner group serves, and whose lost jobs it re-runs
+	Scope        string         `json:"scope"`        // where identities register: "org" (the default) or "repository" (the first of Repositories)
+	Regions      map[string]int `json:"regions"`
+	// Image is the machine image each region boots, by AMI id: a copy in our own account of the RunsOn build deploy/parity.sh
+	// passed (see "Moving the image pin" in the README). findImage uses exactly it, with no fallback, and only the built-in
+	// config.json holds it: a release's binary carries it, so the override cannot move it.
+	Image        map[string]string     `json:"image"`
 	Sizes        map[string]SizeConfig `json:"sizes"`
 	Pools        map[string]PoolConfig `json:"pools"`
 	Pool         PoolRule              `json:"pool"`
@@ -192,6 +198,10 @@ func LoadConfig(path string) (Config, error) {
 	if err := decodeStrict(builtinConfig, &c); err != nil {
 		return c, fmt.Errorf("built-in config: %w", err)
 	}
+	pinned := make(map[string]string, len(c.Image))
+	for k, v := range c.Image {
+		pinned[k] = v
+	}
 	if path != "" {
 		raw, err := os.ReadFile(path)
 		switch {
@@ -201,6 +211,9 @@ func LoadConfig(path string) (Config, error) {
 		default:
 			if err := decodeStrict(raw, &c); err != nil {
 				return c, fmt.Errorf("%s: %w", path, err)
+			}
+			if !reflect.DeepEqual(c.Image, pinned) {
+				return c, fmt.Errorf("%s: image is pinned in the built-in config.json, which a release's binary carries; the override may not change it", path)
 			}
 		}
 	}
@@ -247,6 +260,11 @@ func (c Config) validate() error {
 	for r, w := range c.Regions {
 		if w <= 0 {
 			return fmt.Errorf("config: region %s needs a weight above 0", r)
+		}
+	}
+	for r := range c.Regions {
+		if id := c.Image[r]; !strings.HasPrefix(id, "ami-") || strings.ContainsAny(id, " \t\n") {
+			return fmt.Errorf("config: region %s needs an image pin, the id of our copy of the machine image (ami-...), not %q", r, id)
 		}
 	}
 	for label, s := range c.Sizes {
