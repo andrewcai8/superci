@@ -361,15 +361,29 @@ def judge_scale(**kw):
 
 class Cost(unittest.TestCase):
     def test_aws_spend_a_job_beside_blacksmiths_for_the_same_vcpus(self):
-        recs = [{"set": "superci-8cpu", "usd": 0.04, "wall_ms": 50000}, {"set": "superci-8cpu", "usd": 0.06, "wall_ms": 50000},
-                {"set": "superci-4cpu", "usd": 0.05, "wall_ms": 90000}, {"set": "superci-8cpu", "usd": None, "wall_ms": 1}, {"set": "superci-8cpu", "usd": 1.0}]
+        recs = [{"set": "superci-8cpu", "usd": 0.04, "busy_usd": 0.02, "wall_ms": 50000}, {"set": "superci-8cpu", "usd": 0.06, "busy_usd": 0.03, "wall_ms": 50000},
+                {"set": "superci-4cpu", "usd": 0.05, "busy_usd": 0.01, "wall_ms": 90000}, {"set": "superci-8cpu", "usd": None, "wall_ms": 1}, {"set": "superci-8cpu", "usd": 1.0}]
         bs = [{"labels": ["blacksmith-8vcpu-ubuntu-2404"], "started_at": "2026-11-27T10:00:00Z", "completed_at": "2026-11-27T10:00:59Z"},
               {"labels": ["blacksmith-8vcpu-ubuntu-2404"], "started_at": "2026-11-27T10:00:00Z", "completed_at": "2026-11-27T10:01:01Z"},
-              {"labels": ["ubuntu-latest"], "started_at": "2026-11-27T10:00:00Z", "completed_at": "2026-11-27T10:09:00Z"}]
+              {"labels": ["ubuntu-latest"], "started_at": "2026-11-27T10:00:00Z", "completed_at": "2026-11-27T10:09:00Z"},
+              # skipped or cancelled before it ran: 0 s, no minute billed, not a job Blacksmith charged for
+              {"labels": ["blacksmith-8vcpu-ubuntu-2404"], "started_at": "2026-11-27T10:00:00Z", "completed_at": "2026-11-27T10:00:00Z", "conclusion": "skipped"},
+              {"labels": ["blacksmith-8vcpu-ubuntu-2404"], "started_at": "2026-11-27T10:00:00Z", "completed_at": "2026-11-27T10:00:30Z", "conclusion": "cancelled"}]
         lines = G.cost_lines(recs, bs)
-        # 8 vCPU: one started minute ($0.016) and two ($0.032): $0.024 a job; AWS $0.05 a job, 2.08x
-        self.assertEqual(lines, ["cost superci-4cpu: AWS $0.0500 a job (n=1), Blacksmith 4vcpu: no job",
-                                 "cost superci-8cpu: AWS $0.0500 a job (n=2), Blacksmith 8vcpu $0.0240 (n=2): AWS 2.08x"])
+        # 8 vCPU: one started minute ($0.016) and two ($0.032): $0.024 a job; AWS busy $0.025 (1.04x), whole life $0.05 (2.08x)
+        self.assertEqual(lines, ["cost superci-4cpu: AWS busy $0.0100 a job, whole life $0.0500 (n=1), Blacksmith 4vcpu: no billed job",
+                                 "cost superci-8cpu: AWS busy $0.0250 a job, whole life $0.0500 (n=2), Blacksmith 8vcpu $0.0240 (n=2): AWS busy 1.04x, whole life 2.08x"])
+
+
+class WindowCost(unittest.TestCase):
+    def test_the_whole_spend_over_the_jobs_served_beside_blacksmiths_bill_for_them(self):
+        recs = [{"set": "superci-8cpu", "wall_ms": 50_000}, {"set": "superci-8cpu", "wall_ms": 70_000}, {"set": "superci-4cpu", "wall_ms": 30_000},
+                {"set": "superci-8cpu", "wall_ms": 0}, {"wall_ms": 10_000}]
+        # Blacksmith: 1 min x 8 + 2 min x 8 + 1 min x 4 = 28 vCPU-minutes x $0.002 = $0.056
+        self.assertEqual(G.window_cost_line(3.0, 2.0, recs), "cost of the window (2.00 h): superci $3.00 for 3 jobs, $1.0000 a job;"
+                         " Blacksmith $0.06 for the same jobs, $0.0187 a job: AWS 53.57x")
+        self.assertEqual(G.window_cost_line(None, 1.0, recs), "cost of the window: no spend metric over its 1.00 h")
+        self.assertEqual(G.window_cost_line(2.0, 1.0, []), "cost of the window: no job served over its 1.00 h")
 
 
 class Gate2(unittest.TestCase):
