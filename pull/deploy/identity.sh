@@ -27,6 +27,9 @@
 #   down <az>                      sets that AZ's group to 0 and deletes it (so nothing heals the host back), terminates the
 #                                  host; its identities stay registered, and `up <az>` restores them
 #   status                         groups, hosts, identities per host, listeners running, private memory per listener
+#   labels                         "<label> <n>": the idle identities (online, not busy) GitHub lists under each superci-*
+#                                  label, as the listener's /identities shows them (reads only; bench/replay.sh checks a
+#                                  trace against it)
 #
 # Adopting a plain host. Two Runner.Listeners on one identity conflict at GitHub, so a host and its replacement must never
 # restore one share at once. A host that `up` finds with the AZ's name and no group is therefore ATTACHED to a new group
@@ -62,7 +65,7 @@ IMAGE_PIN=20261102081424
 
 die() { echo "$*" >&2; exit 1; }
 cmd=${1:-}
-[ -n "$cmd" ] || die "usage: identity.sh up [--type T] [--replace] <az> | register <size> <n> [first] | relabel <size> <from> <to> | down <az> | status"
+[ -n "$cmd" ] || die "usage: identity.sh up [--type T] [--replace] <az> | register <size> <n> [first] | relabel <size> <from> <to> | down <az> | status | labels"
 shift
 ACCOUNT=$($A sts get-caller-identity --query Account --output text)
 [ "$ACCOUNT" = 243891825325 ] || { echo "refusing: account $ACCOUNT is not ci-runners" >&2; exit 1; }
@@ -731,11 +734,20 @@ print("  memory they need on %d hosts: %.1f GiB" % (int(sys.argv[1]), (len(runne
   echo "budget per listener: 64 MiB private (its unit restarts it at MemoryMax 192M) + 60 MiB shared a host; 1,550 identities are about 97 GiB"
 }
 
+labels() {
+  at_github | python3 -I -c 'import collections,json,sys
+n = collections.Counter(l for r in json.load(sys.stdin)["runners"] if r["name"].startswith("superci-id-") and r["status"] == "online" and not r["busy"]
+                        for l in r["labels"] if l.startswith("superci-"))
+for l, c in sorted(n.items()):
+    print(l, c)'
+}
+
 case "$cmd" in
   up) up "$@" ;;
   register) register "$@" ;;
   relabel) relabel "$@" ;;
   down) down "$@" ;;
   status) status "$@" ;;
-  *) die "usage: identity.sh up [--type T] [--replace] <az> | register <size> <n> [first] | relabel <size> <from> <to> | down <az> | status" ;;
+  labels) labels "$@" ;;
+  *) die "usage: identity.sh up [--type T] [--replace] <az> | register <size> <n> [first] | relabel <size> <from> <to> | down <az> | status | labels" ;;
 esac

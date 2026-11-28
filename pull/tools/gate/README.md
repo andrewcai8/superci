@@ -179,7 +179,7 @@ bucket read-only.
 | completion | the trace's job count (`--trace` is required, so a push that never created a run is a missing job), the jobs GitHub ran and `job lost with its machine` lines | completed equals the trace's count, none stranded, none lost |
 | queue wait p50, p90 | replay jobs on `superci-pull` | at most 6 s and 10 s |
 | org registrations per 5 min | `RegistrationWindowUse` (ours and others) and `OrgRateKnown` | peak at most 1,200 (80% of 1,500), with the rate known throughout and a datapoint for every minute of the replay window (a gap fails the row and names its first minute) |
-| one runner per machine | `issued/` objects, `jit.issued` and `jit.claim` events | claimed set equals registered set, no machine registered or claimed twice. A refused duplicate grant is the fence working and is reported |
+| one runner per machine | `issued/` objects, `jit.issued` and `jit.claim` events, dispatched `job.record`s | claimed set equals the registered set and the dispatched machines (a dispatch size registers no runner: its machine is claimed when it is handed its one job), no machine registered, claimed or handed a job twice. A refused duplicate grant is the fence working and is reported |
 | orphans 10 min after | `Orphans` from `to`+10 min | 0 |
 | on-demand share | `machine.launched` lifecycle and step | at most 10%, not counting a size's `on_demand_first` types (step `fast-*`), which on_demand_share does not bound |
 | alarms at the end | `superci-pull-*` alarm history at `to` | none in ALARM |
@@ -201,6 +201,12 @@ DRY_RUN=1 replay.sh BRANCH trace.json   prints the schedule and each push's work
 
 `replay.sh`'s existing mode (`BRANCH WAVES INTERVAL BURST_AT WORKFLOW`) is unchanged. Pass the same trace to
 `gate scale --trace`: "replayed" is the trace's job count.
+
+Before its first push a trace replay checks the identities labelled per size: `identity.sh labels` (the online identities
+GitHub lists under each label) against `workflow.py --need` (the most of a label's legs at once, each held for its sleep
+and the 10 s of gate 2's queue-wait p90). A short label refuses the replay, which would otherwise measure the wait for an
+identity, not the plane. Every push's tree is origin/main's at the start, so a fetch by another session during the replay
+adds no file of main's to a push (megpt's pre-push hook checks what a push changes). A refused push stops the replay.
 
 ## First exec: `spawn.py`
 

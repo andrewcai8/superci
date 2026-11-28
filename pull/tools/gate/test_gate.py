@@ -365,6 +365,51 @@ class Gate2(unittest.TestCase):
         self.assertEqual({n: r.status for n, r in rows.items()}, {n: G.PASS for n in rows})
         self.assertEqual(len(rows), 9)
 
+    def with_dispatched(self, **kw):
+        """A window of dispatch machines alone: claimed when handed their one job, never registered. The field is set after
+        construction, so this test runs (and fails at its assertion) on a Scale that does not know it."""
+        disp = kw.pop("dispatched_machines")
+        s = scale(**kw)
+        s.dispatched_machines = disp
+        return rows_by_name(G.evaluate_scale(s))["one runner per machine"]
+
+    def test_dispatched_machines_stand_for_registrations(self):
+        ids = {f"i-d{n}" for n in range(8)}
+        row = self.with_dispatched(claims=ids, issued=collections.Counter(), claim_taken=collections.Counter(), dispatched_machines=collections.Counter({i: 1 for i in ids}))
+        self.assertEqual(row.status, G.PASS, row)
+        both = ids | {f"i-{n}" for n in range(10)}
+        row = self.with_dispatched(claims=both, dispatched_machines=collections.Counter({i: 1 for i in ids}))
+        self.assertEqual(row.status, G.PASS, row)
+
+    def test_a_machine_handed_two_jobs_or_handed_one_unclaimed_fails(self):
+        ids = {f"i-d{n}" for n in range(8)}
+        twice = collections.Counter({i: 1 for i in ids}) + collections.Counter({"i-d0": 1})
+        row = self.with_dispatched(claims=ids, issued=collections.Counter(), claim_taken=collections.Counter(), dispatched_machines=twice)
+        self.assertEqual(row.status, G.FAIL)
+        self.assertIn("i-d0", row.note)
+        row = self.with_dispatched(claims=ids - {"i-d1"}, issued=collections.Counter(), claim_taken=collections.Counter(), dispatched_machines=collections.Counter({i: 1 for i in ids}))
+        self.assertEqual(row.status, G.FAIL, "a machine handed a job with no claim")
+        self.assertIn("i-d1", row.note)
+
+    def test_a_dispatch_machine_spent_after_its_claim_is_the_fence_working(self):
+        # the dispatcher claims a machine when it pairs it, and a JOB send that fails or a reclaim before the hand-off spends
+        # it: a claim, no jit.claim (only a grant writes one) and no record
+        ids = {f"i-d{n}" for n in range(8)}
+        row = self.with_dispatched(claims=ids | {"i-spent"}, issued=collections.Counter(), claim_taken=collections.Counter(), dispatched_machines=collections.Counter({i: 1 for i in ids}))
+        self.assertEqual(row.status, G.PASS, row)
+        self.assertIn("1 dispatch machine(s) spent after their claim", row.note)
+        # a grant's claim (jit.claim taken) that registered nothing still fails
+        row = self.with_dispatched(claims=ids | {"i-g"}, issued=collections.Counter(), claim_taken=collections.Counter({"i-g": 1}), dispatched_machines=collections.Counter({i: 1 for i in ids}))
+        self.assertEqual(row.status, G.FAIL)
+        self.assertIn("granted, not registered ['i-g']", row.note)
+
+    def test_handed_machines_counts_dispatched_records_by_their_handed_time(self):
+        rec = lambda inst, start, dispatch=True: {"inst": inst, "dispatch": dispatch, "start_time": start}
+        recs = [rec("i-a", "2026-11-27T23:59:00Z"), rec("i-a", "2026-11-28T00:05:00Z"), rec("i-b", "2026-11-28T00:20:00Z"),
+                rec("i-c", "2026-11-28T00:01:00Z", dispatch=False), {"inst": "i-d", "dispatch": True}, rec("", "2026-11-28T00:01:00Z")]
+        got = G.handed_machines(recs, T.ts("2026-11-27T23:58:00Z"), T.ts("2026-11-28T00:10:00Z"))
+        self.assertEqual(got, collections.Counter({"i-a": 2}), "only dispatched records with a machine, handed inside the window")
+
     def test_completion_needs_every_replayed_job_and_none_lost_with_a_machine(self):
         self.assertEqual(judge_scale(completed=99, stranded=[("j", "failure")])["completion"].status, G.FAIL)
         self.assertEqual(judge_scale(lost=1)["completion"].status, G.FAIL)
@@ -386,8 +431,10 @@ class Gate2(unittest.TestCase):
 
     def test_one_runner_per_machine(self):
         key = "one runner per machine"
-        self.assertEqual(judge_scale(claims={f"i-{n}" for n in range(11)})[key].status, G.FAIL)
-        self.assertIn("claimed not registered ['i-10']", judge_scale(claims={f"i-{n}" for n in range(11)})[key].note)
+        # a claim no grant wrote a jit.claim for is the dispatcher's, of a machine it spent before a hand-off
+        self.assertEqual(judge_scale(claims={f"i-{n}" for n in range(11)})[key].status, G.PASS)
+        self.assertEqual(judge_scale(claims={f"i-{n}" for n in range(11)}, claim_taken=collections.Counter({f"i-{n}": 1 for n in range(11)}))[key].status, G.FAIL)
+        self.assertIn("granted, not registered ['i-10']", judge_scale(claims={f"i-{n}" for n in range(11)}, claim_taken=collections.Counter({f"i-{n}": 1 for n in range(11)}))[key].note)
         self.assertEqual(judge_scale(issued=collections.Counter({**{f"i-{n}": 1 for n in range(9)}}))[key].status, G.FAIL)
         twice = collections.Counter({f"i-{n}": 1 for n in range(10)})
         twice["i-3"] = 2

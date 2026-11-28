@@ -910,6 +910,16 @@ class Scale:
     max_wait_s: float = 0.0
     dispatched: int = 0           # replayed jobs the identity plane ran, whose waits are read from GitHub's created_at
     dispatched_unmatched: list = dataclasses.field(default_factory=list)
+    # instance id -> the dispatched job.records of the window's machines (handed in it). A dispatch size registers no runner:
+    # its machine's claim is taken when the dispatcher pairs it with its one job, so a dispatched record stands where
+    # jit.issued does
+    dispatched_machines: collections.Counter = dataclasses.field(default_factory=collections.Counter)
+
+
+def handed_machines(records, lo, hi):
+    """instance id -> the job.records of dispatched jobs handed to it in [lo, hi], every set's, as the claims are: the handed
+    time (start_time) places a record, not its write at the job's end. Pure."""
+    return collections.Counter(e["inst"] for e in records if e.get("dispatch") and e.get("inst") and lo <= (T.ts(e.get("start_time")) or 0) <= hi)
 
 
 def evaluate_scale(s):
@@ -939,13 +949,25 @@ def evaluate_scale(s):
         rows.append(Row("org registrations per 5 min", f"max {peak:.0f} at {T.iso(t)}", f"<= {limit:.0f} (80% of {ORG_CAP}), a datapoint every minute", PASS if ok else FAIL, "; ".join(notes)))
     else:
         rows.append(Row("org registrations per 5 min", "-", f"<= {limit:.0f} (80% of {ORG_CAP})", FAIL, "no RegistrationWindowUse datapoints"))
-    twice = sorted(i for i, n in s.issued.items() if n > 1) + sorted(i for i, n in s.claim_taken.items() if n > 1 and s.issued.get(i, 0) <= 1)
-    unregistered, unclaimed = sorted(s.claims - set(s.issued)), sorted(set(s.issued) - s.claims)
+    # A scale set's machine is claimed by its grant, which writes jit.claim, and must then register. The dispatcher claims a
+    # machine when it pairs it with a job, and writes no jit.claim: a machine it spends before the hand-off (its JOB send
+    # failed, AWS took it back) keeps a claim and runs nothing, which is the fence working. Neither may run a job unclaimed
+    # or a second job.
+    disp = s.dispatched_machines
+    twice = (sorted(i for i, n in s.issued.items() if n > 1) + sorted(i for i, n in s.claim_taken.items() if n > 1 and s.issued.get(i, 0) <= 1)
+             + sorted(i for i, n in disp.items() if n > 1))
+    ran = set(s.issued) | set(disp)
+    unregistered = sorted((s.claims & set(s.claim_taken)) - set(s.issued))
+    spent = sorted(s.claims - set(s.claim_taken) - ran)
+    unclaimed = sorted(ran - s.claims)
     one = not twice and not unregistered and not unclaimed and bool(s.claims)
-    rows.append(Row("one runner per machine", f"{len(s.claims)} claims, {len(s.issued)} registrations, {len(twice)} claimed twice",
-                    "claims = registrations, 0 twice", PASS if one else FAIL,
-                    f"claimed not registered {unregistered[:3]}, registered not claimed {unclaimed[:3]}, twice {twice[:3]}; fence refused {s.claim_refused}" if not one else
-                    f"the fence refused {s.claim_refused} duplicate grant(s)" if s.claim_refused else ""))
+    notes = [f"the fence refused {s.claim_refused} duplicate grant(s)"] if s.claim_refused else []
+    if spent:
+        notes.append(f"{len(spent)} dispatch machine(s) spent after their claim, with no job: {spent[:3]}")
+    rows.append(Row("one runner per machine", f"{len(s.claims)} claims, {len(s.issued)} registrations, {len(disp)} dispatched, {len(twice)} claimed twice",
+                    "a grant's claims = registrations, every registration and hand-off claimed, 0 twice", PASS if one else FAIL,
+                    f"granted, not registered {unregistered[:3]}, registered or dispatched, not claimed {unclaimed[:3]}, twice {twice[:3]}; fence refused {s.claim_refused}" if not one else
+                    "; ".join(notes)))
     if s.orphans:
         peak = max(v for _, v in s.orphans)
         rows.append(Row("orphans 10 min after", f"max {peak:.0f}", "0", PASS if peak == 0 else FAIL))
@@ -1255,6 +1277,8 @@ def collect_scale(a):
     launched = ["fast" if (e.get("step") or "").startswith("fast-") else e.get("lifecycle") or "on-demand"
                 for e in ev if e["ev"] == "machine.launched" and lo <= e["t"] <= hi]
     grants = [e for e in ev if e["ev"] == "jit.granted" and in_window(e)]
+    # a record is written when its job ends, so the read runs 2 hours past the window
+    handed = handed_machines(job_records(a.profile, lo - tail, hi + 7200), lo - tail, hi + tail)
     due = hi + ORPHAN_WAIT_S
     return Scale(replayed=replayed, completed=sum(1 for j in jobs if j.get("conclusion") == "success"), stranded=stranded, lost=lost_n, waits=waits,
                  window_use=metric(a.profile, "RegistrationWindowUse", lo, hi + tail), org_known=[v for _, v in metric(a.profile, "OrgRateKnown", lo, hi + tail, "Minimum")],
@@ -1263,7 +1287,7 @@ def collect_scale(a):
                  alarms=alarm_states(a.profile, hi, now),
                  queuewait_samples=sum(v for _, v in metric(a.profile, "QueueWait", lo, hi + tail, "SampleCount")),
                  waited_asks=len(grants), max_wait_s=max((e.get("waited_ms") or 0 for e in grants), default=0) / 1000,
-                 dispatched=dispatched, dispatched_unmatched=unmatched), gh
+                 dispatched=dispatched, dispatched_unmatched=unmatched, dispatched_machines=handed), gh
 
 
 def cmd_scale(a):

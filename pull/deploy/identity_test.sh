@@ -37,7 +37,7 @@ flog() { : > "$FAKE/calls.log"; : > "$FAKE/ssh.log"; : > "$FAKE/curl.log"; : > "
 flog
 
 # ---- the account ----
-for c in "up us-east-1a" "register 4cpu 1" "relabel 4cpu a b" "down us-east-1a" "status"; do
+for c in "up us-east-1a" "register 4cpu 1" "relabel 4cpu a b" "down us-east-1a" "status" "labels"; do
   refuses "identity.sh $c refuses another account" "refusing: account 111111111111 is not ci-runners" env FAKE_ACCOUNT=111111111111 "$ID" $c
 done
 [ "$(grep -vc ' sts get-caller-identity' "$FAKE/calls.log")" = 0 ]; check $? "and made no AWS call but the identity check"
@@ -399,6 +399,26 @@ rm -f "$FAKE/labels-sticky"
 python3 -I -c 'import json,sys
 p = sys.argv[1] + "/github.json"
 json.dump([x for x in json.load(open(p)) if not 7000 < x["id"] <= 7120], open(p, "w"))' "$FAKE"
+# labels: the idle identities a label, from GitHub's list through the listener
+python3 -I -c 'import json,sys
+p = sys.argv[1] + "/github.json"
+r = json.load(open(p))
+r += [{"id": 7000 + n, "name": "superci-id-8cpu-%d" % n, "status": "offline" if n == 5 else "online", "busy": n == 4, "labels": ["self-hosted", "superci-8cpu"]} for n in range(1, 6)]
+r += [{"id": 7100, "name": "superci-pull-jit-0a1b", "status": "online", "busy": False, "labels": ["self-hosted", "superci-8cpu"]}]
+json.dump(r, open(p, "w"))' "$FAKE"
+flog
+ok "labels counts the idle identities under each label" "$ID" labels
+want=$(python3 -I -c 'import collections,json,sys
+r = json.load(open(sys.argv[1] + "/github.json"))
+n = collections.Counter(l for x in r if x["name"].startswith("superci-id-") and x["status"] == "online" and not x["busy"] for l in x["labels"] if l.startswith("superci-"))
+print("\n".join("%s %d" % kv for kv in sorted(n.items())))' "$FAKE")
+n8=$(python3 -I -c 'import json,sys
+print(sum(1 for x in json.load(open(sys.argv[1] + "/github.json")) if x["name"].startswith("superci-id-8cpu-") and x["status"] == "online" and not x["busy"] and "superci-8cpu" in x["labels"]))' "$FAKE")
+[ "$out" = "$want" ] && grep -qx "superci-8cpu $n8" <<< "$out" && [ "$n8" -ge 3 ]; check $? "one line a label: superci-8cpu's idle identities (not the busy, the offline or the runner that is not an identity), nothing else printed"
+[ ! -s "$FAKE/config.log" ] && [ "$(count '^labels' "$FAKE/curl.log")" = 0 ]; check $? "and it registers and relabels nothing"
+python3 -I -c 'import json,sys
+p = sys.argv[1] + "/github.json"
+json.dump([x for x in json.load(open(p)) if not 7000 < x["id"] <= 7100], open(p, "w"))' "$FAKE"
 flog; printf '429 30 2\n' > "$FAKE/labels-limit"
 refuses "relabel stops at the first 429" "GitHub answered 429" "$ID" relabel 4cpu superci-park superci-4cpu
 [ "$(count '^labels' "$FAKE/curl.log")" = 3 ]; check $? "after 2 relabels and the one refused: no call after it"

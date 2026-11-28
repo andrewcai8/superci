@@ -12,11 +12,20 @@ run time its real job had (capped at MAX_SLEEP seconds), as matrices of at most 
 
   workflow.py --trace TRACE.json BRANCH BUCKET [MAX_SLEEP] > .github/workflows/superci-load.yml
   workflow.py --schedule TRACE.json                    prints "<bucket> <offset seconds> <legs>" for each non-empty bucket
+  workflow.py --need TRACE.json [MAX_SLEEP]            prints "<label> <identities>": the most legs of the label at once
+  workflow.py --check-need TRACE.json MAX_SLEEP LABELS reads "<label> <idle identities>" lines (identity.sh labels) on
+                                                       stdin, prints the need of each dispatch size LABELS names (comma
+                                                       separated) against them, exits 1 if one is short; a scale set's
+                                                       label has no identities and is not checked
 """
 import json
 import sys
 
 MATRIX_LIMIT = 256
+# A leg holds its identity from its arrival to its end. Its arrival is its bucket's push, which queues the bucket's legs at
+# once. A plane that meets gate 2's queue-wait p90 (10 s) has a leg's machine start it within that, so a leg is counted
+# for its sleep and 10 s more.
+NEED_HOLD_S = 10
 
 
 def trace_buckets(trace):
@@ -44,6 +53,52 @@ def trace_workflow(branch, legs, max_sleep=900):
     return "\n".join(out)
 
 
+def trace_need(trace, max_sleep=900, hold_s=NEED_HOLD_S):
+    """{label: the most of its legs at once}, each leg from its bucket's push (its arrival: a push queues its bucket's legs
+    together) to its (capped) sleep's end and hold_s more. A leg that ends when another arrives is not counted with it."""
+    edges = {}
+    for leg in trace["jobs"]:
+        at = int(leg["t"] // trace["bucket_s"]) * trace["bucket_s"]
+        end = at + min(max_sleep, int(round(leg["duration_s"]))) + hold_s
+        edges.setdefault(leg["label"], []).extend([(at, 1), (end, -1)])
+    out = {}
+    for label, es in edges.items():
+        n = peak = 0
+        for _, d in sorted(es):  # at one instant an end (-1) sorts before an arrival (+1)
+            n += d
+            peak = max(peak, n)
+        out[label] = peak
+    return out
+
+
+def check_need(need, have_lines, dispatch):
+    """(lines to print, every dispatch size has its need) for the trace's need against "<label> <count>" lines. A label that is
+    not a dispatch size is a scale set's, which registers a runner a machine and has no identities to count."""
+    have = {}
+    for line in have_lines:
+        parts = line.split()
+        if len(parts) == 2 and parts[1].isdigit():
+            have[parts[0]] = int(parts[1])
+    lines, ok = [], True
+    for label, n in sorted(need.items()):
+        if label not in dispatch:
+            lines.append(f"identities labelled {label}: a scale set's label, no identities: not checked")
+            continue
+        got = have.get(label, 0)
+        ok = ok and got >= n
+        lines.append(f"identities labelled {label}: {got} idle, the trace's peak holds {n}: {'ok' if got >= n else 'SHORT'}")
+    return lines, ok
+
+
+if sys.argv[1] in ("--need", "--check-need"):
+    need = trace_need(json.load(open(sys.argv[2])), int(sys.argv[3]) if len(sys.argv) > 3 else 900)
+    if sys.argv[1] == "--need":
+        for label, n in sorted(need.items()):
+            print(label, n)
+        sys.exit(0)
+    lines, ok = check_need(need, sys.stdin.read().splitlines(), set(filter(None, (sys.argv[4] if len(sys.argv) > 4 else "").split(","))))
+    print("\n".join(lines))
+    sys.exit(0 if ok else 1)
 if sys.argv[1] == "--schedule":
     trace = json.load(open(sys.argv[2]))
     for idx, legs in sorted(trace_buckets(trace).items()):
