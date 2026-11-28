@@ -551,6 +551,41 @@ size is one set (`split` 1), since an identity names its size, not a set of it.
 - **Limits.** A crash in a hand-off fails that job once (Known limits). A dispatch set's pool is carried across a
   restart as a scale set's is (`Carry`, `Resume`); it starts from the saved burst. Moving a size back to a scale set fails the jobs its machines run.
 
+### Hibernated pool
+
+A dispatch size may keep `hibernated` machines behind its running pool (`hib.go`; 0, the default, keeps none and the
+set runs as it did). They are booted, hydrated and pinned like any machine, then hibernated, so a hand-off's replacement
+is a resume, ready about 10 s later with its page cache and pin, instead of a cold launch's 47 s.
+
+- **Launch.** On demand only (EC2 stops no one-time spot machine), one CreateFleet a type in the size's order over
+  every zone, from a template of each type (`<deployment>-<set>-hib-<type>`): an encrypted gp3 root of the type's
+  memory plus `disk_gb`, 4,000 IOPS and 1,000 MiB/s, and `HibernationOptions.Configured`. The set's own template is
+  unchanged. A zone EC2 refuses for capacity is left out and its share asked of the others. Machines carry
+  `superci-pull-hib=<root GiB>`. At the spend cap the pool launches nothing; past the hard stop its machines end.
+- **Image.** The pin must be the hibernation-capable image (`deploy/image.sh`, "The hibernation-capable image" below). On a machine
+  launched able to hibernate, its `superci-hibinit-prepare` grows the root before `boot.sh` runs. So the pool's templates carry the
+  image's root snapshot size (`IMAGE_ROOT_BYTES`, read once from DescribeImages), and `boot.sh`'s pre-read reads that less the root
+  partition's start: the snapshot's part, not the grown root and its swap file. Every other template leaves it empty, and its
+  machines pre-read as before.
+- **Sleep.** A pool machine that asks `/work` with no job waiting is never put in the idle queue: it is hibernated
+  (StopInstances `Hibernate=true`), and a `/work` from it meanwhile is answered 503. With a job waiting it takes it. EC2's
+  `not ready to hibernate yet` for a fresh machine is asked again after 15, 30 and then 60 s, until 6 minutes after the launch,
+  and only then ends the machine. Any other refusal ends it at once, and one EC2 took but has not listed stopped within 3
+  minutes of the call it took ends it too.
+- **Resume.** Each launcher tick draws the oldest hibernated machines for the running pool's deficit before it launches
+  cold (`Plan`): a resuming machine counts as supply. Starts are batched (50 a call) and a throttle is asked again with
+  backoff, so none is dropped. The agent sees that it slept (`CLOCK_BOOTTIME` past `CLOCK_MONOTONIC`) and asks
+  `/work` at once, which puts the machine in the idle queue. A resume EC2 refuses, or one that has not asked `/work`
+  within 30 s, is ended and launched cold for. The pool's own deficit is refilled in the background.
+- **Cost.** A hibernated machine costs its root only (about $0.069/h for 128 GiB at 1,000 MiB/s); the spend counts it so.
+- **Metrics** (only for a set that keeps a pool): `HibernatedTarget`, `HibernatedMachines`, `HibernatingMachines`,
+  `HibernatedBooting`, `ResumingMachines`, and each minute's `Hibernations`, `HibernationFailures`, `Resumes`,
+  `ResumeFailures`, `ResumeLate`, `ResumeFallbacks` and the `ResumeLatency` histogram.
+- **Off.** Every listing asks for stopped machines too. When a set keeps no pool (`hibernated` 0, or past the hard stop),
+  each stopped pool machine is ended on that tick ("its set keeps no hibernated pool"). A stopped machine without the
+  `superci-pull-hib` tag is left alone and named in the log.
+- **Limits.** A machine's age asleep is bounded only by its life (PR 3 adds 8 h).
+
 ## Hydration
 
 A machine idles in its set's pool until GitHub hands it its one job. With a manifest for its label, it spends part

@@ -596,6 +596,11 @@ func (d *Dispatcher) work(ctx context.Context, w http.ResponseWriter, r *http.Re
 		d.spawn(func() { d.machineReader(st, m, mw) })
 		return
 	}
+	if st.parked(m) { // put to hibernate, or asleep: its agent asks again, and once it is resumed it is taken
+		w.Header().Set("Retry-After", "5")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
 	if !st.mayWait(m) {
 		w.WriteHeader(http.StatusGone)
 		return

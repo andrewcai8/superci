@@ -31,6 +31,7 @@ type Region struct {
 	Weight  int
 	ec2     *ec2.Client
 	fleets  fleetAPI
+	power   powerAPI // StartInstances and StopInstances, for a hibernated pool (hib.go)
 	image   string
 	root    string
 	refused string            // why the pinned image cannot be used here, when it cannot: the region launches nothing
@@ -50,6 +51,7 @@ type fleetAPI interface {
 type Fleet struct {
 	regions    []*Region
 	deployment string
+	powerWait  time.Duration // the first wait after a throttled start or hibernation (powerCall); 0 is 250 ms
 }
 
 const (
@@ -58,6 +60,7 @@ const (
 	tagNoticed    = "superci-pull-noticed" // <owner>/<repo>/<run id> of the job a spot notice found running
 	tagMode       = "superci-pull-mode"    // "dispatch" on a machine of a dispatch set
 	tagRole       = "superci-pull-role"    // "identity" on an identity host
+	tagHib        = "superci-pull-hib"     // the root's GiB on a machine launched for a hibernated pool (hib.go)
 )
 
 // imageAPI is the call findImage makes, so a test can stand in for EC2's images.
@@ -87,7 +90,7 @@ func NewFleet(ctx context.Context, deployment, account string, weights map[strin
 			return nil, err
 		}
 		client := ec2.NewFromConfig(cfg)
-		r := &Region{Name: name, Weight: weights[name], ec2: client, fleets: client, subnets: map[string]string{}}
+		r := &Region{Name: name, Weight: weights[name], ec2: client, fleets: client, power: client, subnets: map[string]string{}}
 		r.image, r.root, err = findImage(ctx, client, account, images[name])
 		var refusal *imageRefusal
 		switch {
@@ -167,6 +170,7 @@ type SetFleet struct {
 type setRegion struct {
 	template, version string
 	pools             []ec2types.FleetLaunchTemplateOverridesRequest
+	hib               map[string]hibTemplate // by type: the template a hibernated pool's machines of it launch from (hib.go)
 }
 
 func (f *Fleet) AddSet(ctx context.Context, spec SetSpec, userData string, groups map[string]string) (*SetFleet, error) {
@@ -192,8 +196,13 @@ func (f *Fleet) AddSet(ctx context.Context, spec SetSpec, userData string, group
 		for _, p := range sr.pools {
 			types[string(p.InstanceType)] = true
 		}
+		if spec.Hibernated > 0 {
+			if err := sr.ensureHibTemplates(ctx, r.ec2, r.ec2, r.ec2, r, f.deployment, userData, groups[r.Name], spec, sf.tags); err != nil {
+				return nil, fmt.Errorf("%s %s hibernated templates: %w", spec.Name, r.Name, err)
+			}
+		}
 		slog.Info("set region ready", "set", spec.Name, "region", r.Name, "image", r.image, "template", sr.template,
-			"version", sr.version, "pools", len(sr.pools), "types", len(types))
+			"version", sr.version, "pools", len(sr.pools), "types", len(types), "hibernated_types", len(sr.hib))
 		sf.regions[r.Name] = sr
 	}
 	return sf, nil
@@ -282,7 +291,11 @@ type templateAPI interface {
 // made from $Default (an operator's run-instances, the checks of deploy/templates.sh) must be the machines' too, and a
 // default left on version 1 named an image RunsOn deleted (Nov 28).
 func (sr *setRegion) ensureTemplate(ctx context.Context, api templateAPI, r *Region, name, userData, group string, diskGB int, spec SetSpec, tags []ec2types.Tag) error {
-	data := templateData(r, userData, group, diskGB, spec, tags)
+	return sr.ensureData(ctx, api, name, templateData(r, userData, group, diskGB, spec, tags), tags)
+}
+
+// ensureData is ensureTemplate for the data given.
+func (sr *setRegion) ensureData(ctx context.Context, api templateAPI, name string, data *ec2types.RequestLaunchTemplateData, tags []ec2types.Tag) error {
 	got, err := api.DescribeLaunchTemplates(ctx, &ec2.DescribeLaunchTemplatesInput{LaunchTemplateNames: []string{name}})
 	if err == nil && len(got.LaunchTemplates) == 1 {
 		sr.template = aws.ToString(got.LaunchTemplates[0].LaunchTemplateId)
@@ -339,9 +352,15 @@ func sameData(have *ec2types.ResponseLaunchTemplateData, want *ec2types.RequestL
 		have.IamInstanceProfile != nil && strings.HasSuffix(aws.ToString(have.IamInstanceProfile.Arn), "/superci-pull-cache-machine") &&
 		aws.ToString(h.DeviceName) == aws.ToString(w.DeviceName) &&
 		aws.ToInt32(h.Ebs.VolumeSize) == aws.ToInt32(w.Ebs.VolumeSize) && aws.ToInt32(h.Ebs.Throughput) == aws.ToInt32(w.Ebs.Throughput) &&
-		aws.ToInt32(h.Ebs.Iops) == aws.ToInt32(w.Ebs.Iops) &&
+		aws.ToInt32(h.Ebs.Iops) == aws.ToInt32(w.Ebs.Iops) && aws.ToBool(h.Ebs.Encrypted) == aws.ToBool(w.Ebs.Encrypted) &&
+		hibernates(have.HibernationOptions) == (want.HibernationOptions != nil && aws.ToBool(want.HibernationOptions.Configured)) &&
 		aws.ToInt32(have.MetadataOptions.HttpPutResponseHopLimit) == aws.ToInt32(want.MetadataOptions.HttpPutResponseHopLimit) &&
 		string(have.MetadataOptions.HttpTokens) == string(want.MetadataOptions.HttpTokens)
+}
+
+// hibernates says whether a template version's machines are launched able to hibernate.
+func hibernates(o *ec2types.LaunchTemplateHibernationOptions) bool {
+	return o != nil && aws.ToBool(o.Configured)
 }
 
 // findPools pairs each machine type with the default subnet of every zone that offers it.
@@ -527,10 +546,9 @@ func (sf *SetFleet) ask(ctx context.Context, r *Region, n int, kind ec2types.Def
 		wg.Add(1)
 		go func(part, k int) {
 			defer wg.Done()
-			sum := sha256.Sum256(fmt.Appendf(nil, "%s/%s/%s/%s/%d", sf.spec.Name, round, step, r.Name, part))
-			token := hex.EncodeToString(sum[:16])
+			token := clientToken(sf.spec.Name, round, step, r.Name, part)
 			started := time.Now()
-			ms, errs, err := sf.createFleet(ctx, r, k, kind, token, round, pools)
+			ms, errs, _, err := sf.createFleet(ctx, r, k, kind, token, round, pools, nil)
 			slog.Info("fleet", "set", sf.spec.Name, "region", r.Name, "step", step, "round", round, "part", part, "asked", k, "got", len(ms),
 				"ms", time.Since(started).Milliseconds(), "errors", errs, "err", errString(err), "token", token)
 			tlLaunched(sf.spec.Name, round, step, started, ms)
@@ -543,10 +561,16 @@ func (sf *SetFleet) ask(ctx context.Context, r *Region, n int, kind ec2types.Def
 	return got
 }
 
+// createFleet makes one instant fleet of n machines from the set's template, or from a hibernated pool's (hib). It
+// returns what started, EC2's error codes, and the subnets of the pools EC2 named in its errors.
 func (sf *SetFleet) createFleet(ctx context.Context, r *Region, n int, kind ec2types.DefaultTargetCapacityType, token, round string,
-	pools []ec2types.FleetLaunchTemplateOverridesRequest) ([]*Machine, map[string]int, error) {
+	pools []ec2types.FleetLaunchTemplateOverridesRequest, hib *hibTemplate) ([]*Machine, map[string]int, []string, error) {
 	sr := sf.regions[r.Name]
-	tags := append([]ec2types.Tag{{Key: aws.String("superci-pull-round"), Value: aws.String(round)}}, sf.tags...)
+	template, version := sr.template, sr.version
+	if hib != nil {
+		template, version = hib.template, hib.version
+	}
+	tags := append(append([]ec2types.Tag{{Key: aws.String("superci-pull-round"), Value: aws.String(round)}}, sf.tags...), hibTags(hib)...)
 	in := &ec2.CreateFleetInput{
 		Type:                        ec2types.FleetTypeInstant,
 		ClientToken:                 aws.String(token),
@@ -554,7 +578,7 @@ func (sf *SetFleet) createFleet(ctx context.Context, r *Region, n int, kind ec2t
 		SpotOptions:                 &ec2types.SpotOptionsRequest{AllocationStrategy: ec2types.SpotAllocationStrategyCapacityOptimizedPrioritized},
 		OnDemandOptions:             &ec2types.OnDemandOptionsRequest{AllocationStrategy: ec2types.FleetOnDemandAllocationStrategyPrioritized},
 		LaunchTemplateConfigs: []ec2types.FleetLaunchTemplateConfigRequest{{
-			LaunchTemplateSpecification: &ec2types.FleetLaunchTemplateSpecificationRequest{LaunchTemplateId: aws.String(sr.template), Version: aws.String(sr.version)},
+			LaunchTemplateSpecification: &ec2types.FleetLaunchTemplateSpecificationRequest{LaunchTemplateId: aws.String(template), Version: aws.String(version)},
 			Overrides:                   pools,
 		}},
 		TagSpecifications: []ec2types.TagSpecification{{ResourceType: ec2types.ResourceTypeInstance, Tags: tags}, {ResourceType: ec2types.ResourceTypeFleet, Tags: sf.tags}},
@@ -569,7 +593,7 @@ func (sf *SetFleet) createFleet(ctx context.Context, r *Region, n int, kind ec2t
 		time.Sleep(time.Duration(500*(try+1)) * time.Millisecond)
 	}
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	now := time.Now()
 	lifecycle := "spot"
@@ -584,14 +608,24 @@ func (sf *SetFleet) createFleet(ctx context.Context, r *Region, n int, kind ec2t
 		}
 		for _, id := range i.InstanceIds {
 			ms = append(ms, &Machine{ID: id, Set: sf.spec.Name, Region: r.Name, Type: string(i.InstanceType), AZ: az, Lifecycle: lifecycle,
-				Launched: now, Asked: now, Round: round, Template: sr.version})
+				Launched: now, Asked: now, Round: round, Template: version})
 		}
 	}
 	errs := map[string]int{}
+	var failed []string
 	for _, e := range out.Errors {
 		errs[aws.ToString(e.ErrorCode)]++
+		if o := e.LaunchTemplateAndOverrides; o != nil && o.Overrides != nil && o.Overrides.SubnetId != nil {
+			failed = append(failed, aws.ToString(o.Overrides.SubnetId))
+		}
 	}
-	return ms, errs, nil
+	return ms, errs, failed, nil
+}
+
+// tokenOf is a ClientToken for a call named key: the first 16 bytes of its SHA-256, in hex.
+func tokenOf(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:16])
 }
 
 func retryable(err error) bool {
@@ -615,7 +649,11 @@ func errString(err error) string {
 // listedStates are the states a listing asks EC2 for: starting and running, and leaving running, which lasts seconds
 // and is how a dispatch set learns of a spot reclaim its machine's notice did not bring (DispatchSet.Leaving). The
 // leaving ones add no call: they are a few more instances on the same pages.
-var listedStates = []string{"pending", "running", "shutting-down", "stopping"}
+//
+// Stopped is listed too, whether or not a set keeps a hibernated pool: a pool machine asleep when its set's pool is turned
+// off, or of a set past the hard stop, is seen and ended rather than left on its volume (DispatchSet.backSurplus). A
+// stopped machine without the pool's tag is no pool's and is left alone (untaggedStopped).
+var listedStates = []string{"pending", "running", "shutting-down", "stopping", "stopped"}
 
 // Describe lists every scale set's machines of this deployment that are starting, running or leaving running in a
 // region (listedStates); live splits off the leaving ones.
@@ -669,6 +707,9 @@ func listedMachine(i ec2types.Instance, region string) *Machine {
 			m.Dispatch = aws.ToString(t.Value) == "dispatch"
 		case "aws:ec2launchtemplate:version":
 			m.Template = aws.ToString(t.Value)
+		case tagHib:
+			m.Hib = true
+			m.RootGB, _ = strconv.Atoi(aws.ToString(t.Value))
 		}
 	}
 	return m

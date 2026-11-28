@@ -594,6 +594,49 @@ class TestReconnectBackoff(AgentCase):
             self.assertEqual(agent.retry_after_seconds(value), want, repr(value))
 
 
+class TestWake(AgentCase):
+    """A machine of a hibernated pool (pull/hib.go) sleeps on its /work connection and wakes with it dead."""
+
+    def wake_case(self, hold):
+        slept = [0.0]
+        up = threading.Event()
+
+        def handler(c):
+            if c.n == 0:
+                c.up()
+                up.set()
+                c.closed_within(hold)  # the listener's side of a connection the machine slept through
+            else:
+                c.status(410)
+        self.dispatcher(handler)
+        self.agent = agent.Agent(self.config(wake_every=0.02, ping_every=30, silence=30, wait_window=60))
+        self.agent.asleep = lambda: slept[0]
+        self.thread = threading.Thread(target=lambda: self.result.update(code=self.agent.run()), daemon=True)
+        self.thread.start()
+        self.assertTrue(up.wait(5))
+        end = time.monotonic() + 5
+        while self.agent.sock is None and time.monotonic() < end:  # the agent holds the connection it sleeps on
+            time.sleep(0.01)
+        return slept
+
+    def test_a_machine_that_woke_drops_its_dead_connection_and_asks_for_work_at_once(self):
+        slept = self.wake_case(hold=20)
+        woke = time.monotonic()
+        slept[0] = 600  # ten minutes hibernated
+        while self.disp.requests_seen < 2 and time.monotonic() - woke < 5:
+            time.sleep(0.01)
+        self.assertEqual(self.disp.requests_seen, 2, "no /work after the wake")
+        self.assertLess(time.monotonic() - woke, 1.0, "the /work after the wake waited for a ping or the silence")
+        self.assertEqual(self.finish(), 0)
+        self.assertIn("hib.wake", open(self.spool).read())
+
+    def test_a_machine_that_never_sleeps_keeps_its_connection(self):
+        self.wake_case(hold=0.5)
+        time.sleep(0.3)
+        self.assertEqual(self.disp.requests_seen, 1, "the agent left a connection the machine never slept through")
+        self.assertEqual(self.finish(), 0)
+
+
 class TestPairing(AgentCase):
     def test_a_second_ask_or_a_gone_machine_gets_410_and_runs_nothing(self):
         self.dispatcher(lambda c: c.status(410))

@@ -37,6 +37,9 @@ type Metrics struct {
 	// Dispatch is the sets the identity plane serves, and DispatchCounts what each did this minute.
 	Dispatch       []DispatchSnapshot
 	DispatchCounts map[string]DispatchCounts
+	// ResumeWaits is the seconds from each resume to its machine's /work this minute, for the sets that keep machines
+	// hibernated (hib.go).
+	ResumeWaits map[string][]float64
 	// Identities is the identities online, busy and labeled at GitHub per dispatch size, from the listener's last listing of the
 	// identities group; empty when that listing is older than identityCountFresh or has not yet been made.
 	Identities []IdentityCount
@@ -111,6 +114,16 @@ func metricData(m Metrics, now time.Time) []cwtypes.MetricDatum {
 			d("DispatchHandoffs", float64(c.Handoffs), cwtypes.StandardUnitCount, set), d("DispatchRetries", float64(c.Retries), cwtypes.StandardUnitCount, set),
 			d("DispatchResumes", float64(c.Resumes), cwtypes.StandardUnitCount, set), d("DispatchLostJobs", float64(c.Lost), cwtypes.StandardUnitCount, set),
 			d("DispatchDroppedFrames", float64(c.Dropped), cwtypes.StandardUnitCount, set), d("StalledSets", b2f(m.StalledBy[s.Set]), cwtypes.StandardUnitCount, set))
+		if s.Hibernated > 0 { // a set that keeps no machine hibernated publishes none of these
+			data = append(data, d("HibernatedTarget", float64(s.Hibernated), cwtypes.StandardUnitCount, set),
+				d("HibernatedMachines", float64(s.Asleep), cwtypes.StandardUnitCount, set), d("HibernatingMachines", float64(s.Parking), cwtypes.StandardUnitCount, set),
+				d("HibernatedBooting", float64(s.BackBooting), cwtypes.StandardUnitCount, set), d("ResumingMachines", float64(s.Resuming), cwtypes.StandardUnitCount, set),
+				d("Hibernations", float64(c.Parked), cwtypes.StandardUnitCount, set), d("HibernationFailures", float64(c.ParkFailed), cwtypes.StandardUnitCount, set),
+				d("Resumes", float64(c.Resumed), cwtypes.StandardUnitCount, set), d("ResumeFailures", float64(c.ResumeFailed), cwtypes.StandardUnitCount, set),
+				d("ResumeLate", float64(c.ResumeLate), cwtypes.StandardUnitCount, set),
+				d("ResumeFallbacks", float64(c.ResumeFailed+c.ResumeLate), cwtypes.StandardUnitCount, set))
+			data = append(data, histogram("ResumeLatency", m.ResumeWaits[s.Set], at, []cwtypes.Dimension{set})...)
+		}
 		machines += s.Machines
 		od += s.OnDemand
 		if m.OnDemandFirst[s.Set] {
@@ -158,6 +171,12 @@ func queueWaitData(m Metrics, at *time.Time) []cwtypes.MetricDatum {
 
 // waitDatum is waits as one QueueWait histogram (a value and its count), in as many datums as CloudWatch takes.
 func waitDatum(waits []float64, at *time.Time, dims []cwtypes.Dimension) []cwtypes.MetricDatum {
+	return histogram("QueueWait", waits, at, dims)
+}
+
+// histogram is seconds as one histogram of the metric name (a value, to the second, and its count), in as many datums
+// as CloudWatch takes.
+func histogram(name string, waits []float64, at *time.Time, dims []cwtypes.Dimension) []cwtypes.MetricDatum {
 	if len(waits) == 0 {
 		return nil
 	}
@@ -172,7 +191,7 @@ func waitDatum(waits []float64, at *time.Time, dims []cwtypes.Dimension) []cwtyp
 	var data []cwtypes.MetricDatum
 	for i := 0; i < len(values); i += 150 {
 		j := min(len(values), i+150)
-		data = append(data, cwtypes.MetricDatum{MetricName: aws.String("QueueWait"), Values: values[i:j], Counts: weights[i:j],
+		data = append(data, cwtypes.MetricDatum{MetricName: aws.String(name), Values: values[i:j], Counts: weights[i:j],
 			Unit: cwtypes.StandardUnitSeconds, Timestamp: at, Dimensions: dims})
 	}
 	return data

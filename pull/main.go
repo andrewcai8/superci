@@ -294,6 +294,9 @@ func run(ctx context.Context, f flags) error {
 	}
 	for _, d := range l.dsets {
 		go l.dispatchLauncher(ctx, d)
+		if d.hibernated > 0 {
+			go l.backPool(ctx, d)
+		}
 	}
 	go l.reconciler(ctx, refresh)
 	go l.lister(ctx)
@@ -395,7 +398,8 @@ func bootData(c Config, listener, pin, label string) string {
 // bootDataMode is bootData for a mode: "scaleset" asks for a just-in-time runner as always, "dispatch" runs the agent
 // (agent.py) that takes the one job the dispatcher pairs the machine with.
 func bootDataMode(c Config, listener, pin, label, mode string) string {
-	return strings.NewReplacer("@MODE@", mode, "@LISTENER@", listener, "@PIN@", pin, "@LIFE_SECONDS@", strconv.Itoa(int(c.life().Seconds())), "@LABEL@", label, "@WARM_CAP_SECONDS@", strconv.Itoa(int(warmCap.Seconds())), "@HYDRATE_STOP@", strings.TrimSpace(hydrateStop)).Replace(bootScript)
+	return strings.NewReplacer("@MODE@", mode, "@LISTENER@", listener, "@PIN@", pin, "@LIFE_SECONDS@", strconv.Itoa(int(c.life().Seconds())), "@LABEL@", label, "@WARM_CAP_SECONDS@", strconv.Itoa(int(warmCap.Seconds())), "@HYDRATE_STOP@", strings.TrimSpace(hydrateStop),
+		"@IMAGE_ROOT_BYTES@", "").Replace(bootScript) // a hibernated pool's templates fill it in (hibUserData)
 }
 
 // ensureScaleSet finds or makes the set at GitHub, in the deployment's runner group, with its labels: its name, and
@@ -698,6 +702,9 @@ func (l *Listener) refresher() func(context.Context, string) {
 		}
 		now := time.Now()
 		ms, leaving := live(ms)
+		if ids := untaggedStopped(leaving); len(ids) > 0 {
+			slog.Info("stopped machine without the hib tag, not ours to end", "region", region, "machines", ids)
+		}
 		scaled, dispatched, strays := sortMachines(ms, l.sets, l.dsets)
 		var gone []JobRef
 		for _, s := range l.sets {
@@ -705,7 +712,7 @@ func (l *Listener) refresher() func(context.Context, string) {
 		}
 		_, left, _ := sortMachines(leaving, l.sets, l.dsets)
 		for _, d := range l.dsets {
-			d.Seen(region, dispatched[d], began, now)
+			d.Seen(region, append(dispatched[d], parkedMachines(left[d])...), began, now)
 			d.Leaving(left[d])
 		}
 		for _, j := range gone {
@@ -792,7 +799,11 @@ func (l *Listener) dispatchLauncher(ctx context.Context, d *DispatchSet) {
 			continue
 		}
 		now := time.Now()
-		round, n := d.Deficit(now)
+		// The hibernated pool's machines cover the deficit first: a resume is ready in about 10 s, a cold launch in 47.
+		resume, round, n := d.Plan(now)
+		if len(resume) > 0 {
+			go d.resumeAll(ctx, l.fleet, resume)
+		}
 		if n == 0 {
 			<-slots
 			continue
@@ -809,6 +820,28 @@ func (l *Listener) dispatchLauncher(ctx context.Context, d *DispatchSet) {
 				time.Sleep(5 * time.Second)
 			}
 		}()
+	}
+}
+
+// backPool keeps a dispatch set's hibernated pool (hib.go): every 2 s it hibernates the machines that came to /work for
+// it, and launches its deficit, one launch at a time.
+func (l *Listener) backPool(ctx context.Context, d *DispatchSet) {
+	launching := make(chan struct{}, 1)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(2 * time.Second):
+		}
+		d.parkAll(ctx, l.fleet, time.Now())
+		select {
+		case launching <- struct{}{}:
+			go func() {
+				defer func() { <-launching }()
+				d.refill(ctx)
+			}()
+		default:
+		}
 	}
 }
 
@@ -1371,6 +1404,12 @@ func (l *Listener) metrics() Metrics {
 		m.Waits = append(m.Waits, waits...)
 		m.SetWaits[d.spec.Name] = waits
 		m.DispatchCounts[d.spec.Name] = d.TakeCounts()
+		if d.hibernated > 0 {
+			if m.ResumeWaits == nil {
+				m.ResumeWaits = map[string][]float64{}
+			}
+			m.ResumeWaits[d.spec.Name] = d.TakeResumeWaits()
+		}
 	}
 	for _, d := range st.Dispatch {
 		if d.OldestJobS > (10 * time.Minute).Seconds() {

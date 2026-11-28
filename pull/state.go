@@ -52,6 +52,11 @@ type Machine struct {
 	// (DispatchSet.Leaving). Reclaimed says EC2 gives a spot interruption as the reason it leaves running.
 	State     string
 	Reclaimed bool
+	// Hib says it was launched for a dispatch set's hibernated pool (its superci-pull-hib tag): an encrypted root of
+	// RootGB, which it keeps while hibernated. Parked says it is hibernated: it costs its volume and nothing else.
+	Hib    bool
+	RootGB int
+	Parked bool
 }
 
 // A Runner is one just-in-time registration, which takes one job.

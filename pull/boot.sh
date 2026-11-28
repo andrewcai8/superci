@@ -48,10 +48,20 @@ sysctl -eqp /etc/sysctl.d/99-superci.conf || :
 # ext4 writes a file out at once when it is renamed over another (auto_da_alloc): the worker-boundary tests' facts cache
 # does that 27,000 times, which took 36 s on the volume's 3,000 IOPS and 11 s without it. A one-job machine needs no file
 # to survive a crash.
+# On a machine of a hibernated pool (hib.go) the image's hibinit step (superci-hibinit-prepare) has grown the root before this
+# runs, so its size is no longer the snapshot's part. That pool's template carries the image's root snapshot size
+# (IMAGE_ROOT_BYTES, which the listener reads from DescribeImages): the root's part of it is that less the root partition's
+# start, which growing never moves, so it holds whenever the root grew. Every other machine's is empty.
+IMAGE_ROOT_BYTES='@IMAGE_ROOT_BYTES@'
+part_start() { cat "/sys/class/block/${1##*/}/start"; }
 disk() {
-  local root
+  local root start
   root=$(findmnt -no SOURCE /)
-  ROOT_BYTES=$(lsblk -bndo SIZE "$root")
+  if [[ ${IMAGE_ROOT_BYTES:-} =~ ^[1-9][0-9]*$ ]] && start=$(part_start "$root") && [[ $start =~ ^[0-9]+$ ]]; then
+    ROOT_BYTES=$(( IMAGE_ROOT_BYTES - start * 512 ))
+  else
+    ROOT_BYTES=$(lsblk -bndo SIZE "$root")
+  fi
   export ROOT_BYTES
   mount -o remount,noauto_da_alloc /
   ( growpart "/dev/$(lsblk -no PKNAME "$root")" "${root##*[!0-9]}" && resize2fs "$root" ) > /dev/null 2>&1 &

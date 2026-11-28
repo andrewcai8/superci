@@ -72,9 +72,22 @@ func volumeExtraPerHour(spec SetSpec) float64 {
 	return float64(mbps-125)*gp3PerMBpsHour + float64(max(0, iops-3000))*gp3PerIOPSHour
 }
 
-// price is a machine's cost an hour.
+// hibVolumePerHour is a hibernated pool machine's root an hour: rootGB at hibIOPS and hibMBps (hib.go).
+func hibVolumePerHour(rootGB int) float64 {
+	return float64(rootGB)*gp3PerGBHour + float64(hibMBps-125)*gp3PerMBpsHour + float64(hibIOPS-3000)*gp3PerIOPSHour
+}
+
+// price is a machine's cost an hour. A hibernated pool's machine has its own root, and asleep (Parked) it costs that
+// root and nothing else: no instance and no public address.
 func (s *Spend) price(m Machine) float64 {
 	spec := s.sets[m.Set]
+	if m.Hib {
+		vol := hibVolumePerHour(max(m.RootGB, spec.DiskGB))
+		if m.Parked {
+			return vol
+		}
+		return onDemandPerVCPUHour*float64(max(1, spec.CPU)) + vol + ipv4PerHour
+	}
 	od := onDemandPerVCPUHour * float64(max(1, spec.CPU))
 	p := od
 	if m.Lifecycle == "spot" {

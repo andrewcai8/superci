@@ -99,6 +99,16 @@
       }
     },
     {
+      "Sid": "HibernateAndResumeOnlyAHibernatedPoolsMachines",
+      "Effect": "Allow",
+      "Action": ["ec2:StopInstances", "ec2:StartInstances"],
+      "Resource": "arn:aws:ec2:*:243891825325:instance/*",
+      "Condition": {
+        "StringEquals": { "aws:ResourceTag/purpose": "superci-pull" },
+        "Null": { "aws:ResourceTag/superci-pull-hib": "false" }
+      }
+    },
+    {
       "Sid": "TakeTheListenersAddress",
       "Effect": "Allow",
       "Action": "ec2:AssociateAddress",
