@@ -8,6 +8,10 @@ Runner.Worker as the runner user with those bytes on its pipe. The machine never
 only secret it sees is the job's own token, inside the job message the Worker needs anyway. It frames the Worker's
 output back, renews the job itself so the job outlives the identity host and the dispatcher, and reports the exit code.
 The wire format is D-SPEC.md's: frames are <u8 type><u32 LE length><payload>."""
+# Annotations stay unevaluated: the release build imports this file in its tests on Amazon Linux 2023's python3 (3.9),
+# where `str | None` raises at class creation; the machines run the image's 3.12.
+from __future__ import annotations
+
 import base64
 import dataclasses
 import hashlib
