@@ -1,7 +1,7 @@
 #!/usr/bin/env -S python3 -I
 """The aws CLI as release_test.sh needs it: S3 objects and Lambda code kept under $FAKE_AWS, every call logged to
 $FAKE_AWS/calls.log, and any other call answered as success (an id for a --query, 1 for a length)."""
-import base64, hashlib, os, shutil, sys
+import base64, hashlib, json, os, shutil, sys
 
 root = os.environ["FAKE_AWS"]
 args = sys.argv[1:]
@@ -43,6 +43,11 @@ def keys(bucket, prefix):
     return sorted(out)
 
 
+def world():
+    f = os.path.join(root, "templates-" + opt("--region", "us-east-1") + ".json")
+    return json.load(open(f)) if os.path.isfile(f) else {}
+
+
 svc, cmd = pos[0], pos[1] if len(pos) > 1 else ""
 if svc == "sts":
     print("243891825325")
@@ -82,6 +87,29 @@ elif svc == "lambda":
             sys.exit(254)
         if opt("--query") == "CodeSha256":
             print(open(state).read())
+elif svc == "ec2" and cmd == "describe-launch-templates" and opt("--output") == "json":
+    # templates.sh's world: $FAKE_AWS/templates-<region>.json is {"templates": [{"id", "name", "tags": {k: v}, "default", "latest",
+    # "versions": {"<n>": "<image id>"}}], "asg": {"template": id, "version": "$Default"|"$Latest"|"<n>"}, "images": {id:
+    # {"OwnerId", "State", "DeprecationTime"}}}; with no file, no templates, no group and every image ours and available.
+    w = world()
+    print(json.dumps({"LaunchTemplates": [{"LaunchTemplateId": t["id"], "LaunchTemplateName": t["name"], "DefaultVersionNumber": t["default"],
+                                           "LatestVersionNumber": t["latest"], "Tags": [{"Key": k, "Value": v} for k, v in t["tags"].items()]}
+                                          for t in w.get("templates", [])]}))
+elif svc == "ec2" and cmd == "describe-launch-template-versions" and opt("--output") == "json":
+    w = world()
+    t = next(t for t in w["templates"] if t["id"] == opt("--launch-template-id"))
+    vs = args[args.index("--versions") + 1:]
+    vs = vs[:next((i for i, a in enumerate(vs) if a.startswith("--")), len(vs))]
+    print(json.dumps({"LaunchTemplateVersions": [{"LaunchTemplateId": t["id"], "VersionNumber": int(n), "LaunchTemplateData": {"ImageId": t["versions"][n]}} for n in vs]}))
+elif svc == "autoscaling" and cmd == "describe-auto-scaling-groups" and opt("--output") == "json":
+    g = world().get("asg")
+    print(json.dumps({"AutoScalingGroups": [{"AutoScalingGroupName": "superci-pull-listener", "LaunchTemplate": {"LaunchTemplateId": g["template"], "Version": g["version"]}}] if g else []}))
+elif svc == "ec2" and cmd == "describe-images" and opt("--output") == "json":
+    img = world().get("images", {}).get(opt("--image-ids"), {"OwnerId": "243891825325", "State": "available"})
+    if img is None:
+        sys.stderr.write("An error occurred (InvalidAMIID.NotFound) when calling the DescribeImages operation\n")
+        sys.exit(254)
+    print(json.dumps({"Images": [dict(img, ImageId=opt("--image-ids"))]}))
 elif svc == "ec2" and cmd == "describe-images" and opt("--image-ids") is not None:
     # A pin looked up by id: "<owner>\t<state>\t<image id>\t<superci-pull-image tag>" per region in images-<region>; empty,
     # EC2 does not know the id (the CLI exits 254); with no file, our own available copy of the id asked for, of one RunsOn build.
