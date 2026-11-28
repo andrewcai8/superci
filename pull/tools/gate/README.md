@@ -172,9 +172,27 @@ Blacksmith's earlier hours, which had another mix of PRs (that is how the Nov 28
 - **`split ratio (superci share of runs)`.** Superci's runs over S and B runs against N%, an exact two-sided binomial test at `FALSE_ROLLBACK_RATE`
   (1%): FAIL when the split is further from N% than chance gives. **Report-only**, for the same reason; the failures row cannot see a skewed split.
   With no run in either half it is NOISE.
-- **Unchanged.** `evaluate_job` takes S and B as before: the p50/p90 rows, the failures row with its per-run binomial bound, `MIN_RUNS`, the same-commit
-  excuse and `canary_verdict`. The bound's Blacksmith rate is now the B half's rate in the same window; early ticks have few B runs, so the floor of one
-  failed run and `MIN_RUNS` carry more of the weight.
+- **`wall (per shard)` replaces `wall p50` and `wall p90`.** Pooled percentiles of two halves move with each half's mix of legs: a 4cpu `unit-tests` leg takes
+  about 100 s and an 8cpu leg about 55 s, and two halves finish different shares of each, so equal fleets read as unequal (Nov 28 09:24Z: `unit-tests@50`
+  rolled back on a pooled p50 0.4 s over, while per shard superci was at 1.000x on 4cpu and 0.905x on 8cpu). So the wall is compared shard by shard. A shard is a
+  leg's name with its fleet label left out (`unit-tests (11, superci-8cpu, 8)` and `unit-tests (11, blacksmith-8vcpu-ubuntu-2404, 8)` are `unit-tests (11, 8)`);
+  for each shard with legs on both halves the ratio is superci's median wall over Blacksmith's (wall as `wall p50` counts it: successes, timed-out legs at the
+  ceiling, cancelled-after-start lower bounds). The row prints the geometric mean of the ratios and FAILs only when a **one-sided Wilcoxon signed-rank test** (exact,
+  ties at their average rank; the normal approximation above 150 shards) says the log ratios are above `log(1 + WALL_MARGIN)` (`WALL_MARGIN` = 0.05: a slowdown under 5% is
+  not worth a rollback) at `FALSE_ROLLBACK_RATE` (1%). It is NOISE (`not enough shards paired yet`) until `MIN_PAIRED_SHARDS` (8) shards are paired: an exact one-sided
+  test cannot reach p <= 0.01 from fewer than 7 pairs, and at 8 it can still FAIL with the pair nearest the margin reversed. It is also NOISE until each half has
+  `MIN_SHARD_RUNS` (10) runs: the legs of a run share the run's weight, so the shard ratios are not independent and a few runs let them move together. At the
+  spreads Nov 28 09:24Z measured (run to run 2% on Blacksmith, 6% on superci; leg to leg 7% and 11%) and the mix of 33% against 22% 4cpu runs, the false-rollback rate is under 1%
+  at 10 runs a half and a real +20% is caught by then. The detail lines under the row give the shards paired and the worst 10 ratios. The row's rollback is `canary_verdict`'s from
+  `MIN_SHARD_RUNS` runs. **`wall p90 (ceiling)`** stays as `wall p90` had it: superci's own p90 within the job's ceiling in `ci-limits.tsv` (no row without a ceiling),
+  counted from 20 runs.
+- **Superci's wall is the listener's `wall_ms`**, never GitHub's started to completed: GitHub marks a dispatched job started when its identity accepts it, so that
+  interval holds the wait for a machine (up to 24 s on a size short of identities). With `--superci-source events` (the canary's) the superci jobs are the records,
+  whose start and finish are `wall_ms`; with `github` the window's records are read as well and matched to the GitHub legs (run, name, runner, finish within 2 min), and the output
+  says when none was found and GitHub's wall stays.
+- **Unchanged.** Queue wait stays pooled (it does not depend on the shard), with its p50/p90 rows and the Blacksmith half's size gating; so do the failures row with its per-run
+  Fisher bound, `MIN_RUNS`, the same-commit excuse and `canary_verdict`. The bound's Blacksmith rate is now the B half's rate in the same window; early ticks have few B runs,
+  so the floor of one failed run and `MIN_RUNS` carry more of the weight. Without `--split` nothing changes.
 - **Red on Blacksmith main** (`gather_tests`) is read from the same window's B half: the red main runs are the ordinary main runs of `[--since, now]` that ran on
   Blacksmith (`only_runs`), so a routing fault's Blacksmith leg and a main run that ran on superci are not red-on-Blacksmith-main, and a main run from before
   `--since` is not read. In non-split mode `(baseline start, baseline end)` still bounds it, as before.
@@ -184,7 +202,7 @@ Blacksmith's earlier hours, which had another mix of PRs (that is how the Nov 28
 `gate job <job> --canary` prints the rows, then `canary <job>: KEEP` (exit 0) or `ROLL BACK (reasons)` (exit 3) (`canary <job>@N` with `--split`). A canary rolls
 back on harm to superci's own jobs, judged against Blacksmith over the same window, and on nothing else:
 
-- a FAIL of wall p50, wall p90, queue wait p50, queue wait p90 or failures. A p50 row counts once n passes (5 runs) and a
+- a FAIL of wall p50, wall p90 (a split: wall (per shard) and wall p90 (ceiling)), queue wait p50, queue wait p90 or failures. A p50 row counts once n passes (5 runs; a split's wall (per shard) at 10) and a
   p90 row at 20 runs, since a p90 of six runs is one job; the failures row counts from the first run. NOISE asks for runs
   and a row with no Blacksmith runs to compare has no verdict: neither rolls anything back;
 - `superci-pull-listener-down` or `superci-pull-spend-capped` in ALARM: each stops every set, so it sends back every job listed;
