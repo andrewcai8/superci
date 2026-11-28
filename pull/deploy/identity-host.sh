@@ -228,9 +228,10 @@ UNIT
 # label a runner is routed by, and a parked identity (superci-park) is counted under its size here. A row is printed for every
 # size this host holds, 0 when none of its listeners has a session. It reads sockets and process directories, no file of an
 # identity and no token. It must run as root (ss shows other users' processes only to root) and fails, printing nothing, when
-# ss does not answer: a count of 0 made of that would read as every session lost.
+# ss does not answer, or when it lists established sockets to port 443 and shows the process of none of them (not root): a count
+# of 0 made of either would read as every session lost.
 polling() {
-  local sockets pid name size n d
+  local sockets pids pid name size n d
   local -A seen=() count=()
   sockets=$("$SS" -H -tnp 2> /dev/null) || { echo "superci-id: cannot list sockets ($SS failed)" >&2; return 1; }
   for d in "$ROOT"/superci-id-*/; do
@@ -238,7 +239,21 @@ polling() {
     [ -e "$d/.runner" ] && [[ $name =~ ^superci-id-([0-9]+cpu)-[0-9]+$ ]] && count[superci-${BASH_REMATCH[1]}]=0
   done
   # A line is "ESTAB <recv> <send> <local> <peer> users:((\"Runner.Listener\",pid=<pid>,fd=<fd>))": the peer is the field before users:.
+  # ss shows the users column of a process only to root (and its owner). Established sockets to port 443 where no line has one are not
+  # a host with no sessions but a caller that cannot see them (run as another user): the awk exits 3 then, and polling fails.
+  pids=$(awk '
+    $1 != "ESTAB" { next }
+    { line = $0; sub(/ +users:.*/, "", line); n = split(line, f, " "); peer = f[n] }
+    peer !~ /:443$/ || peer ~ /^(127\.|\[::1\])/ { next }
+    { to443++ }
+    index($0, " users:") == 0 { next }
+    { visible++ }
+    index($0, "\"Runner.Listener\",pid=") == 0 { next }
+    { rest = $0
+      while (match(rest, /"Runner\.Listener",pid=[0-9]+/)) { s = substr(rest, RSTART, RLENGTH); sub(/.*pid=/, "", s); print s; rest = substr(rest, RSTART + RLENGTH) } }
+    END { if (to443 > 0 && visible == 0) exit 3 }' <<< "$sockets") || { echo "superci-id: established sockets to port 443 but no process is shown for any (run as root: ss shows other users' processes only to root)" >&2; return 1; }
   while read -r pid; do
+    [ -n "$pid" ] || continue
     [ -z "${seen[$pid]:-}" ] || continue
     seen[$pid]=1
     name=$(basename "$(readlink "$PROC/$pid/cwd" 2> /dev/null)" 2> /dev/null) || continue
@@ -246,12 +261,7 @@ polling() {
     [[ $name =~ ^superci-id-([0-9]+cpu)-[0-9]+$ ]] || continue
     size=superci-${BASH_REMATCH[1]}
     n=${count[$size]:-0}; count[$size]=$((n + 1))
-  done < <(awk '
-    $1 != "ESTAB" || index($0, "\"Runner.Listener\",pid=") == 0 { next }
-    { line = $0; sub(/ +users:.*/, "", line); n = split(line, f, " "); peer = f[n] }
-    peer !~ /:443$/ || peer ~ /^(127\.|\[::1\])/ { next }
-    { rest = $0
-      while (match(rest, /"Runner\.Listener",pid=[0-9]+/)) { s = substr(rest, RSTART, RLENGTH); sub(/.*pid=/, "", s); print s; rest = substr(rest, RSTART + RLENGTH) } }' <<< "$sockets")
+  done <<< "$pids"
   for size in "${!count[@]}"; do echo "$size ${count[$size]}"; done | sort
 }
 
@@ -476,8 +486,8 @@ status() {
     [ "$kib" -le "$BUDGET_KIB" ] || over=$((over + 1))
   done
   echo "az $(az) identities $total listeners_running $running private_dirty_kib_avg $((seen ? sum / seen : 0)) max $max over_64mib $over listeners_measured $seen"
-  # The sessions with GitHub's broker per size (identity.sh status reads this line); no line when the sockets cannot be listed.
-  if p=$(polling); then echo "polling $(tr '\n' ' ' <<< "$p" | sed 's/ $//')"; fi
+  # The sessions with GitHub's broker per size (identity.sh status reads this line); "polling unknown" when the sockets cannot be counted (never a 0).
+  if p=$(polling); then echo "polling $(tr '\n' ' ' <<< "$p" | sed 's/ $//')"; else echo "polling unknown"; fi
 }
 
 case "${1:-}" in

@@ -27,9 +27,9 @@ func TestIdentitiesAreCountedPerDispatchSizeByTheirLabelAndStatus(t *testing.T) 
 		{Name: "superci-id-8cpu-0001", Status: "online", Busy: true, Labels: []string{"superci-8cpu"}},
 	}
 	got := CountIdentities(runners, map[string]string{"superci-4cpu": "superci-4cpu", "superci-8cpu": "superci-8cpu", "superci-16cpu": "superci-16cpu"})
-	want := []IdentityCount{{"superci-16cpu", 0, 0}, {"superci-4cpu", 2, 1}, {"superci-8cpu", 1, 1}}
+	want := []IdentityCount{{"superci-16cpu", 0, 0, 0}, {"superci-4cpu", 2, 1, 3}, {"superci-8cpu", 1, 1, 1}}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
-		t.Errorf("counted %v, want %v: offline and parked identities serve no size, and a size with none still reports 0", got, want)
+		t.Errorf("counted %v, want %v: online counts what GitHub says is online; labeled counts every identity of the size's label whatever its status, and not a parked one; a size with none still reports 0", got, want)
 	}
 }
 
@@ -85,11 +85,11 @@ func TestAListingThatFailsKeepsTheLastCountAndLogsIt(t *testing.T) {
 }
 
 func TestIdentitiesOnlineAndBusyArePublishedPerSizeUnderTheSetDimension(t *testing.T) {
-	m := Metrics{Identities: []IdentityCount{{"superci-4cpu", 100, 90}, {"superci-8cpu", 0, 0}}, SetWaits: map[string][]float64{}, Denied: map[string]int{}}
+	m := Metrics{Identities: []IdentityCount{{"superci-4cpu", 100, 90, 120}, {"superci-8cpu", 0, 0, 0}}, SetWaits: map[string][]float64{}, Denied: map[string]int{}}
 	got := map[string]float64{}
 	for _, d := range metricData(m, t0) {
 		name := aws.ToString(d.MetricName)
-		if name != "IdentitiesOnline" && name != "IdentitiesBusy" {
+		if name != "IdentitiesOnline" && name != "IdentitiesBusy" && name != "IdentitiesLabeled" {
 			continue
 		}
 		if len(d.Dimensions) != 1 || aws.ToString(d.Dimensions[0].Name) != "Set" {
@@ -97,12 +97,13 @@ func TestIdentitiesOnlineAndBusyArePublishedPerSizeUnderTheSetDimension(t *testi
 		}
 		got[name+" "+aws.ToString(d.Dimensions[0].Value)] = aws.ToFloat64(d.Value)
 	}
-	want := map[string]float64{"IdentitiesOnline superci-4cpu": 100, "IdentitiesBusy superci-4cpu": 90, "IdentitiesOnline superci-8cpu": 0, "IdentitiesBusy superci-8cpu": 0}
+	want := map[string]float64{"IdentitiesOnline superci-4cpu": 100, "IdentitiesBusy superci-4cpu": 90, "IdentitiesLabeled superci-4cpu": 120,
+		"IdentitiesOnline superci-8cpu": 0, "IdentitiesBusy superci-8cpu": 0, "IdentitiesLabeled superci-8cpu": 0}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Errorf("published %v, want %v", got, want)
 	}
 	for _, d := range metricData(Metrics{SetWaits: map[string][]float64{}, Denied: map[string]int{}}, t0) {
-		if n := aws.ToString(d.MetricName); n == "IdentitiesOnline" || n == "IdentitiesBusy" {
+		if n := aws.ToString(d.MetricName); n == "IdentitiesOnline" || n == "IdentitiesBusy" || n == "IdentitiesLabeled" {
 			t.Errorf("no count was read, and %s is published", n)
 		}
 	}
@@ -125,5 +126,32 @@ func TestASizeWhoseIdentitiesAreAllOfflineOrParkedIsPublishedAsZeroOnline(t *tes
 	want := map[string]float64{"IdentitiesOnline superci-4cpu": 0, "IdentitiesBusy superci-4cpu": 0}
 	if fmt.Sprint(published) != fmt.Sprint(want) {
 		t.Errorf("published %v, want %v: a size with no identity online reports 0, so identity-none can fire", published, want)
+	}
+}
+
+// Identities parked under superci-park have listeners with sessions like any other, so the hosts' polling count (by the name's
+// size) cannot see them: the listener's count of the size's label can, and it must publish 0 when every identity is parked (or
+// carries the label but reads offline, which still counts as labeled: REST status is what failed on Nov 28, labels were not).
+func TestIdentitiesLabeledCountsTheSizesLabelWhateverTheStatusAndIsZeroWhenAllAreParked(t *testing.T) {
+	published := func(runners ...map[string]any) map[string]float64 {
+		f := newFakeREST(t)
+		f.groupList = `{"runner_groups":[{"id":9,"name":"dep-identities"}]}`
+		f.runners = append(f.runners, runners...)
+		ids := NewIdentities(f.rest(), spare(), Config{Deployment: "dep", Repositories: []string{"r1"}})
+		l := &Listener{dsets: []*DispatchSet{{spec: SetSpec{Name: "superci-4cpu", Label: "superci-4cpu", Dispatch: true}}}}
+		l.countIdentities(context.Background(), ids)
+		got := map[string]float64{}
+		for _, d := range metricData(Metrics{Identities: l.identityCounts(time.Now()), SetWaits: map[string][]float64{}, Denied: map[string]int{}}, t0) {
+			if n := aws.ToString(d.MetricName); n == "IdentitiesLabeled" {
+				got[n+" "+aws.ToString(d.Dimensions[0].Value)] = aws.ToFloat64(d.Value)
+			}
+		}
+		return got
+	}
+	if got := published(listedIdentity(0, "online", false, "superci-park"), listedIdentity(1, "offline", false, "superci-park"), listedIdentity(2, "online", true, "superci-park")); fmt.Sprint(got) != "map[IdentitiesLabeled superci-4cpu:0]" {
+		t.Errorf("all three identities parked: published %v, want IdentitiesLabeled 0 (so identity-none fires), not left out", got)
+	}
+	if got := published(listedIdentity(0, "online", false, "superci-park"), listedIdentity(1, "offline", false, "superci-4cpu"), listedIdentity(2, "online", true, "superci-4cpu"), listedIdentity(3, "offline", false, "superci-4cpu")); fmt.Sprint(got) != "map[IdentitiesLabeled superci-4cpu:3]" {
+		t.Errorf("a relabel half done: published %v, want the 3 that carry the label, offline at GitHub or not", got)
 	}
 }

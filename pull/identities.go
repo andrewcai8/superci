@@ -301,11 +301,14 @@ func (ids *Identities) list(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"group": group, "runners": runners})
 }
 
-// IdentityCount is how many identities of a dispatch size are online at GitHub and how many of them hold a job. An
-// identity serves the size whose label it carries; a parked one (superci-park) serves none and is counted nowhere.
+// IdentityCount is how many identities of a dispatch size are online at GitHub, how many of them hold a job, and how many
+// carry the size's label at all, whatever GitHub says of their status. An identity serves the size whose label it carries;
+// a parked one (superci-park) serves none and is counted nowhere. Labeled is the count the alarms trust from GitHub: a label
+// is what the REST list holds correctly, where its status read offline for listeners that were taking jobs (Nov 28), and the
+// hosts' IdentitiesPolling cannot see a label (a parked identity's listener holds a session like any other).
 type IdentityCount struct {
-	Set          string
-	Online, Busy int
+	Set                   string
+	Online, Busy, Labeled int
 }
 
 // CountIdentities counts the identities of each dispatch set, given its label by set name. Every set has a count, zero
@@ -321,15 +324,17 @@ func CountIdentities(runners []IdentityRunner, labels map[string]string) []Ident
 		by[out[i].Set] = &out[i]
 	}
 	for _, r := range runners {
-		if r.Status != "online" {
-			continue
-		}
 		for set, label := range labels {
-			if slices.Contains(r.Labels, label) {
-				by[set].Online++
-				if r.Busy {
-					by[set].Busy++
-				}
+			if !slices.Contains(r.Labels, label) {
+				continue
+			}
+			by[set].Labeled++
+			if r.Status != "online" {
+				continue
+			}
+			by[set].Online++
+			if r.Busy {
+				by[set].Busy++
 			}
 		}
 	}

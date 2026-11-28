@@ -460,6 +460,11 @@ grep -q "at GitHub:" <<< "$out" && grep -q "memory they need on 3 hosts" <<< "$o
 
 grep -q "REST online" <<< "$out" && grep -q "label superci-4cpu: REST online [0-9]*, polling 1 (hosts: .*us-east-1a 1" <<< "$out"; check $? "status prints GitHub's online count and the hosts' polling count per label: one of the two listeners on host a holds a broker session"
 grep -q "unreliable for broker sessions" <<< "$out"; check $? "and says GitHub's online status is not to be trusted for a session"
+# A host that cannot count (here: ss lists a socket to port 443 and no process, as it does for a caller that is not root) is "polling unknown", never 0.
+printf 'ESTAB 0 0 10.0.0.5:40000 140.82.112.5:443\n' > "$H/proc/ss"
+ok "status with a host that cannot count its sessions" "$ID" status
+grep -q "^i-0001 .* polling unknown$" <<< "$out"; check $? "prints polling unknown for that host's line"
+grep -q "label superci-4cpu: REST online [0-9]*, polling unknown (hosts: .*us-east-1a unknown" <<< "$out" && ! grep -q "label superci-4cpu: .*polling [0-9]" <<< "$out"; check $? "and for the label it holds, never a count that has a 0 for the host in it"
 rm -f "$H/proc/ss"
 
 # ---- down, and a replacement host restores its share ----
@@ -563,6 +568,17 @@ out=$(env FAKE_METRICS_FAIL=1 "${pollenv[@]}" FAKE=$FAKE HEALTH_UPTIME=$T/uptime
 printf '#!/bin/sh\nexit 1\n' > "$PH/ss-bad"; mkdir -p "$PH/bin"; cp "$PH/ss-bad" "$PH/bin/ss"; chmod 755 "$PH/bin/ss"
 out=$(env "${pollenv[@]}" PATH=$PH/bin:$PATH bash "$HS" polling 2>&1); rc=$?
 [ $rc != 0 ] && grep -q "cannot list sockets" <<< "$out"; check $? "and an ss that fails is no count of 0 (it would read as every session lost)"
+# ss shows another user's process only to root: established sockets to port 443 and no users: column anywhere is a caller that cannot see, not a host with no sessions.
+printf 'ESTAB 0 0 10.0.0.5:40001 140.82.112.5:443\nESTAB 0 0 10.0.0.5:40002 140.82.112.6:443\n' > "$PH/proc/ss"
+out=$(polled 2>&1); rc=$?
+[ $rc = 1 ] && grep -q "no process is shown" <<< "$out" && ! grep -q '^superci-[0-9]*cpu ' <<< "$out"; check $? "established sockets to port 443 with no users: column on any line make polling fail (rc 1, no counts), not count 0"
+rm -f "$FAKE/metrics.log"; out=$(pubhealth 2>&1); rc=$?
+[ $rc = 0 ] && grep -q "IdentitiesPolling was not published" <<< "$out" && [ ! -s "$FAKE/metrics.log" ]; check $? "and the health run publishes nothing"
+[ "$(env "${pollenv[@]}" bash "$HS" status | grep -c '^polling unknown$')" = 1 ]; check $? "and status says polling unknown"
+printf 'ESTAB 0 0 10.0.0.5:22 10.0.0.9:51000\nESTAB 0 0 127.0.0.1:40003 127.0.0.1:443\n' > "$PH/proc/ss"
+out=$(polled 2>&1); [ $? = 0 ] && grep -q '^superci-4cpu 0$' <<< "$out"; check $? "sockets that are not to a remote port 443 need no users: column: a count of 0 stands"
+printf 'ESTAB 0 0 10.0.0.5:40001 140.82.112.5:443 users:(("Runner.Listener",pid=201,fd=21))\nESTAB 0 0 10.0.0.5:40002 140.82.112.6:443\n' > "$PH/proc/ss"
+out=$(polled 2>&1); [ $? = 0 ] && grep -q '^superci-4cpu 1$' <<< "$out"; check $? "and one line with its process among others without counts: it is root that sees them"
 
 # ---- harden: nothing is left writable by others where root runs ----
 # The machines' image as measured Nov 27: /usr/local/bin and /opt mode 777, the runner tree the runner user's, and
