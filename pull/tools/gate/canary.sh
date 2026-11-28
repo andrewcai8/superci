@@ -1,7 +1,8 @@
 #!/bin/bash
 # Watches live canaries and sends a job back to Blacksmith the moment `gate job --canary` says it harms superci's jobs:
-# it removes that job, and only that job, from megpt-mono's SUPERCI_JOBS. One check of every job each EVERY seconds (900;
-# GitHub's read budget is shared, so never under 600), each check only while at least 1,500 reads remain. Stops at UNTIL.
+# it removes that job, and only that job, from megpt-mono's SUPERCI_JOBS. The first check of every job comes at once,
+# right after the start probe, then one each EVERY seconds (900; GitHub's read budget is shared, so never under 600), each check only
+# while at least 1,500 reads remain. Each tick checks and then sleeps; a tick that would start at or after UNTIL does not, and the watch ends.
 #
 #   pull/tools/gate/canary.sh SINCE UNTIL JOB...      # SINCE: when SUPERCI_JOBS listed the jobs; UNTIL: the end of the watch
 #   EVERY=900 WORKFLOW=lint-test-backend.yml LIMITS=ci-limits.tsv LOG=dir pull/tools/gate/canary.sh ...
@@ -228,8 +229,11 @@ if get_vt 1 || [ "$personal_ok" = 1 ]; then
   read_jobs 1; rc=$?
   [ $rc -eq 2 ] && { echo "refusing: SUPERCI_JOBS cannot be read with the variables token (GitHub refused it or did not answer), so this watch could not roll a job back. Is the listener built with the variables scope (an old one answers an actions token for scope=variables)? Check: deploy/ssh.sh \"curl -s -X POST 'localhost:8080/github/token?scope=variables'\"" >&2; exit 2; }
 else echo "no variables token at start ($(vt_why)): each tick skips its check until SUPERCI_JOBS can be read" >&2; fi
-while [ "$(date -u +%s)" -lt "$(date -u -d "$until" +%s)" ]; do
-  sleep "$every"
+until_s=$(date -u -d "$until" +%s) || { echo "refusing: UNTIL is not a date: $until" >&2; exit 2; }
+# Each tick checks and then sleeps, so the first check comes right after the start probe, not EVERY seconds later (Nov 28: the unit-tests
+# canary started 03:08:42Z and a shard failed at 03:13:37Z; the first check was due at 03:18:53Z). The watch never sleeps past UNTIL: when
+# the next tick would start at or after it, the watch ends.
+while [ "$(date -u +%s)" -lt "$until_s" ]; do
   stop=0
   for job in "$@"; do
     get_vt 1 || [ "$personal_ok" = 1 ] || { nocheck "$job" "no GitHub App token, no check (SUPERCI_JOBS, variables: $(vt_why))"; continue; }
@@ -270,5 +274,7 @@ while [ "$(date -u +%s)" -lt "$(date -u -d "$until" +%s)" ]; do
     fi
   done
   [ "$stop" = 1 ] && exit 3
+  [ $(( $(date -u +%s) + every )) -lt "$until_s" ] || break
+  sleep "$every"
 done
 exit 0 # the end of the watch is a clean exit, whatever the last tick's last test returned: 3 means a rollback (STOP_ON_ROLLBACK)
