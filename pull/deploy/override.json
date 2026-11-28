@@ -3,7 +3,7 @@
     "superci-4cpu": {
       "cpu": 4,
       "split": 1,
-      "max": 350,
+      "max": 400,
       "disk_gb": 60,
       "disk_mbps": 1000,
       "disk_iops": 4000,
@@ -18,7 +18,7 @@
     "superci-8cpu": {
       "cpu": 8,
       "split": 1,
-      "max": 560,
+      "max": 600,
       "disk_gb": 80,
       "types": [
         "m8azn.3xlarge",

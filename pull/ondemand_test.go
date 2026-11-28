@@ -58,11 +58,12 @@ func TestAnOnDemandSizeTakesSpotWhenOnDemandIsOutEverywhere(t *testing.T) {
 	}
 }
 
-// The account's on-demand vCPU quota for standard instances (Nov 28): us-east-1 5,000, us-east-2 4,000 (raised from 1,152).
+// The account's on-demand vCPU quota for standard instances (Nov 28): us-east-1 10,000 (raised from 5,000), us-east-2 4,000
+// (raised from 1,152).
 // The sizes that ask on demand first fill it whatever the share, so at their max, with the biggest of their types, they
 // leave room for what the share lets the other sizes ask on demand (on_demand_share of each one's max), and for the
 // listener and the two identity hosts.
-const onDemandQuotaVCPU = 5000 + 4000
+const onDemandQuotaVCPU = 10000 + 4000
 
 var vcpus = map[string]int{"m8azn.xlarge": 4, "m8a.xlarge": 4, "r8a.xlarge": 4, "m8azn.3xlarge": 12, "m8a.2xlarge": 8}
 
