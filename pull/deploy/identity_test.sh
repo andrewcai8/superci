@@ -369,6 +369,36 @@ ok "relabel again" "$ID" relabel 4cpu superci-park superci-4cpu
 flog
 ok "relabel back is the rollback" "$ID" relabel 4cpu superci-4cpu superci-park
 [ "$(count '^labels' "$FAKE/curl.log")" = "$N4" ] && [ "$(count '^token' "$FAKE/curl.log")" = 0 ]; check $? "$N4 relabels and no lease"
+# More than one SSH call's worth (50 a call): ssh takes the stdin of the loop that reads the chunks, so a relabel that does
+# not keep it off ssh moves the first 50 and says "relabelled all" (Nov 28: 50 of 410).
+python3 -I -c 'import json,sys
+p = sys.argv[1] + "/github.json"
+r = json.load(open(p))
+r += [{"id": 7000 + n, "name": "superci-id-8cpu-%d" % n, "status": "online", "busy": False, "labels": ["self-hosted", "superci-park"]} for n in range(1, 121)]
+json.dump(r, open(p, "w"))' "$FAKE"
+flog
+ok "relabel moves every chunk of 50, not the first alone" "$ID" relabel 8cpu superci-park superci-8cpu
+n8=$(count '^labels id=7[01][0-9][0-9] labels=superci-8cpu$' "$FAKE/curl.log"); [ "$n8" = 120 ]; check $? "120 relabels for the 120 parked identities (made $n8)"
+python3 -I -c 'import json,sys
+r = [x for x in json.load(open(sys.argv[1] + "/github.json")) if 7000 < x["id"] <= 7120]
+left = [x["name"] for x in r if "superci-8cpu" not in x["labels"] or "superci-park" in x["labels"]]
+assert len(r) == 120 and not left, (len(r), left[:3])' "$FAKE"
+check $? "and all 120 carry superci-8cpu and not the park label"
+grep -q 'relabelled all 122 of 122' <<< "$out"; check $? "and it says how many it moved of how many (the 120 and the fixture's 2 parked)"
+# GitHub keeps one of them under the old label though the listener answered 204: the relabel says so and fails
+python3 -I -c 'import json,sys
+p = sys.argv[1] + "/github.json"
+r = json.load(open(p))
+for x in r:
+    if 7000 < x["id"] <= 7120:
+        x["labels"] = ["self-hosted", "superci-8cpu"]
+json.dump(r, open(p, "w"))' "$FAKE"
+flog; printf '7005\n' > "$FAKE/labels-sticky"
+refuses "a relabel GitHub did not keep is reported with the real count, never as all" "relabelled 122 of 122, and GitHub still lists 1 of superci-id-8cpu-* under superci-8cpu" "$ID" relabel 8cpu superci-8cpu superci-park
+rm -f "$FAKE/labels-sticky"
+python3 -I -c 'import json,sys
+p = sys.argv[1] + "/github.json"
+json.dump([x for x in json.load(open(p)) if not 7000 < x["id"] <= 7120], open(p, "w"))' "$FAKE"
 flog; printf '429 30 2\n' > "$FAKE/labels-limit"
 refuses "relabel stops at the first 429" "GitHub answered 429" "$ID" relabel 4cpu superci-park superci-4cpu
 [ "$(count '^labels' "$FAKE/curl.log")" = 3 ]; check $? "after 2 relabels and the one refused: no call after it"

@@ -60,7 +60,10 @@ elif method == "POST" and u.path == "/identities/labels":
         if hdr:
             open(hdr, "w").write("HTTP/1.1 %d\r\n%s\r\n" % (code, "" if retry == "0" else "Retry-After: " + retry + "\r\n"))
     else:
-        mine[0]["labels"] = q["labels"].split(",")
+        # labels-sticky: runner ids whose labels GitHub keeps although the call is answered 204
+        sticky = os.path.join(root, "labels-sticky")
+        if not (os.path.exists(sticky) and q["id"] in open(sticky).read().split()):
+            mine[0]["labels"] = q["labels"].split(",")
         json.dump(runners, open(gh, "w"))
         code = 204
 elif method == "GET" and u.path == "/state":
