@@ -21,7 +21,9 @@ PAGE = os.sysconf("SC_PAGE_SIZE")
 SKIP_TOP = {"proc", "sys", "dev", "run", "tmp"}
 # Every boot writes these afresh, so the image's copy is never the one a job reads (readsets_test.go holds the same).
 BOOT_WRITTEN = ("/etc/hosts", "/etc/hostname", "/etc/machine-id")
-BOOT_WRITTEN_UNDER = ("/var/lib/dhcp", "/etc/ssh/ssh_host_")
+# The trees jobs and boot write (readsets_test.go refuses a path under any of them, even one the image holds, such as /home/runner/.bashrc).
+BOOT_WRITTEN_UNDER = ("/var/lib/dhcp", "/etc/ssh/ssh_host_", "/home/runner/_work/", "/home/runner/hydrated/", "/home/runner/.", "/tmp/",
+                      "/run/", "/proc/", "/sys/", "/dev/", "/root/", "/var/lib/cloud/", "/var/log/")
 
 
 def resident_bytes(libc, path, size):
@@ -91,28 +93,33 @@ def image_file(image, path, size=None):
 
 
 def build(image, out, residents):
-    """Keeps a recorded path only when the image has it as a regular file of the size the machine read."""
-    seen, kept, dropped = set(), [], 0
+    """Keeps a recorded path only when the image has it as a regular file of the size a machine read.
+
+    A path is judged once for each size it was recorded at, so a recording of a job's rewritten copy (another size) does not
+    hide the machine that read the image's own."""
+    judged, kept, rejected = set(), set(), set()
     for r in residents:
-        for line in open(r):
-            fields = line.rstrip("\n").split("\t", 2)
-            if len(fields) != 3 or not fields[2].startswith("/") or fields[2] in seen:
-                continue
-            seen.add(fields[2])
-            if fields[2] not in BOOT_WRITTEN and not fields[2].startswith(BOOT_WRITTEN_UNDER) and image_file(image, fields[2], int(fields[1])):
-                kept.append(fields[2])
-            else:
-                dropped += 1
+        with open(r) as f:
+            for line in f:
+                fields = line.rstrip("\n").split("\t", 2)
+                if len(fields) != 3 or not fields[2].startswith("/") or fields[2] in kept or (fields[2], fields[1]) in judged:
+                    continue
+                judged.add((fields[2], fields[1]))
+                if fields[2] not in BOOT_WRITTEN and not fields[2].startswith(BOOT_WRITTEN_UNDER) and image_file(image, fields[2], int(fields[1])):
+                    kept.add(fields[2])
+                else:
+                    rejected.add(fields[2])
     with open(out, "w") as w:
         w.writelines(p + "\n" for p in sorted(kept))
-    print(f"build: {len(kept)} image files kept, {dropped} dropped (not in the image, or not as the image has them)")
+    print(f"build: {len(kept)} image files kept, {len(rejected - kept)} dropped (not in the image, or not as the image has them)")
 
 
 def check(image, listing):
-    bad = [p for p in open(listing).read().split("\n") if p and not image_file(image, p)]
+    paths = [p for p in open(listing).read().split("\n") if p]
+    bad = [p for p in paths if not image_file(image, p)]
     for p in bad[:20]:
         print(f"not an image file: {p}", file=sys.stderr)
-    print(f"check: {len(bad)} of the list's paths are not image files")
+    print(f"check: {len(bad)} of {len(paths)} paths are not image files")
     return 1 if bad else 0
 
 

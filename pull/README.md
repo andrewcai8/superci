@@ -608,6 +608,10 @@ of that time unpacking main's caches, so the job's setup takes them with a renam
   machine posts `readset.start` and `readset.done` (`full`, `full:missing` when some paths are not in the image, or
   `stopped`). A path the image lacks costs one failed open; a file outside the list reads cold, as it would with no
   pre-read. A size without a list, or with an empty one, pre-reads as before; asking for its list costs one S3 GET.
+  superci-4cpu's list is 3,372 paths: 3,108 from the 24 packed 4 vCPU unit-tests legs and 264 more from test-go. On its volume
+  (60 GB, 1,000 MiB/s) the list took 1.0 to 1.5 s and the machine was warm 1.7 to 2.8 s after hydration began, against 30 s and
+  54 s for the pre-read (n=3 each, Nov 28, with the 3,309-path list the previous image gave). test-go's first cgo compile took 10 to 11 ms with the list, 198 to 201 ms after the
+  pre-read and 201 to 255 ms with the unit-tests list alone.
   [tools/readset](tools/readset/README.md) records a list and proves that it holds only the image's files.
 - **Burst.** An entry is read in ranges of 64 MiB, three ahead, and each machine waits a random 0 to 3 s before its first
   read: a thousand machines make about 16 requests per GB each to one prefix, not 64.
