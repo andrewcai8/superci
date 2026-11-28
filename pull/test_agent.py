@@ -12,6 +12,7 @@ import socket
 import ssl
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -20,6 +21,9 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 spec = importlib.util.spec_from_file_location("agent", os.path.join(HERE, "agent.py"))
 agent = importlib.util.module_from_spec(spec)
+# Registered before it runs: agent.py's annotations are strings (from __future__ import annotations), and dataclasses
+# looks a string annotation's module up in sys.modules.
+sys.modules["agent"] = agent
 spec.loader.exec_module(agent)
 
 DOC = "SIGNED-IDENTITY-DOCUMENT"
