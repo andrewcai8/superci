@@ -17,10 +17,18 @@ import (
 // capacity stands in for one region's EC2: how many machines of each (type, spot or on-demand) it will still start. A
 // fleet takes its overrides in priority order, as capacity-optimized-prioritized and prioritized do when capacity allows.
 type capacity struct {
-	mu    sync.Mutex
-	left  map[string]int // "<type>/<spot|on-demand>"
-	n     int
-	asked []string // "<kind> <types...>" of each call
+	mu     sync.Mutex
+	left   map[string]int // "<type>/<spot|on-demand>"
+	n      int
+	asked  []string // "<kind> <types...>" of each call
+	tokens map[string]tokenUse
+}
+
+// tokenUse is what EC2 keeps of a ClientToken: the call it came with and what it answered. A token sent again with the same
+// call gets the same answer; with another call, IdempotentParameterMismatch and nothing started.
+type tokenUse struct {
+	call string
+	out  *ec2.CreateFleetOutput
 }
 
 func (c *capacity) CreateFleet(_ context.Context, in *ec2.CreateFleetInput, _ ...func(*ec2.Options)) (*ec2.CreateFleetOutput, error) {
@@ -36,6 +44,13 @@ func (c *capacity) CreateFleet(_ context.Context, in *ec2.CreateFleetInput, _ ..
 		call += " " + string(p.InstanceType)
 	}
 	c.asked = append(c.asked, call)
+	token := aws.ToString(in.ClientToken)
+	if use, seen := c.tokens[token]; seen && token != "" {
+		if use.call != call {
+			return nil, fmt.Errorf("api error IdempotentParameterMismatch: token %s was sent with %q, now with %q", token, use.call, call)
+		}
+		return use.out, nil
+	}
 	sort.SliceStable(pools, func(i, j int) bool { return aws.ToFloat64(pools[i].Priority) < aws.ToFloat64(pools[j].Priority) })
 	want := int(aws.ToInt32(in.TargetCapacitySpecification.TotalTargetCapacity))
 	out := &ec2.CreateFleetOutput{}
@@ -57,6 +72,10 @@ func (c *capacity) CreateFleet(_ context.Context, in *ec2.CreateFleetInput, _ ..
 	if want > 0 {
 		out.Errors = append(out.Errors, ec2types.CreateFleetError{ErrorCode: aws.String("InsufficientInstanceCapacity")})
 	}
+	if c.tokens == nil {
+		c.tokens = map[string]tokenUse{}
+	}
+	c.tokens[token] = tokenUse{call, out}
 	return out, nil
 }
 

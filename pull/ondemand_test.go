@@ -11,7 +11,8 @@ import (
 // instance-terminated-no-capacity, stamped before the notices reached the listener); the 146 on demand lost none.
 
 // Each type is asked on demand alone, in the size's order and in us-east-1 before us-east-2, before any spot: one on-demand
-// ask over several types would weigh their prices, not the order.
+// ask over several types would weigh their prices, not the order. The fake EC2 refuses a ClientToken sent again with other
+// overrides, as EC2 does (IdempotentParameterMismatch): the asks of one round sharing a token never reached m8a.
 func TestTheUnitTestsSizesAskEachTypeOnDemandBeforeAnySpot(t *testing.T) {
 	for _, c := range []struct{ label, fast, slow string }{{"superci-8cpu", "m8azn.3xlarge", "m8a.2xlarge"}, {"superci-4cpu", "m8azn.xlarge", "m8a.xlarge"}} {
 		east := map[string]int{c.fast + "/on-demand": 2, c.slow + "/on-demand": 2, c.fast + "/spot": 100, c.slow + "/spot": 100}
@@ -79,9 +80,12 @@ func TestTheOnDemandSizesFitTheAccountsOnDemandQuota(t *testing.T) {
 			share += c.OnDemand * float64(s.Max*biggest)
 		}
 	}
-	const planes = 2 + 2*8 // the listener (c7g.large) and two r7i.2xlarge identity hosts
-	if total := float64(first+planes) + share; total > onDemandQuotaVCPU {
-		t.Fatalf("on demand at the sizes' max: %d vCPU first, %.0f by the share, %d the plane's own: %.0f against the quota's %d", first, share, planes, total, onDemandQuotaVCPU)
+	const planes = 2 + 2*16 // the listener (c7g.large) and two r7i.4xlarge identity hosts (identity.sh's default type)
+	// Machines that are ending hold their vCPUs until EC2 has terminated them; while jobs queue behind max, each job's
+	// machine ends as the next launches: room for 30 of the biggest type (m8azn.3xlarge) ending at once.
+	const ending = 30 * 12
+	if total := float64(first+planes+ending) + share; total > onDemandQuotaVCPU {
+		t.Fatalf("on demand at the sizes' max: %d vCPU first, %.0f by the share, %d the plane's own, %d ending: %.0f against the quota's %d", first, share, planes, ending, total, onDemandQuotaVCPU)
 	}
 	if c.Sizes["superci-8cpu"].Max < 285+250 {
 		t.Fatalf("superci-8cpu's max %d holds fewer than the F2 trace's 285 machines at once and the 250 of its pool cap", c.Sizes["superci-8cpu"].Max)

@@ -331,11 +331,13 @@ const chunk = 250
 // odRoom of them. A region's spot shortfall is asked again of the others. It returns what started.
 func (sf *SetFleet) Launch(ctx context.Context, round string, n, odRoom int) []*Machine {
 	if sf.spec.OnDemand {
-		// One type an ask: an on-demand fleet over several types would weigh price, not the order. The steps are fast-*,
-		// which on_demand_share does not bound.
+		// One type an ask: an on-demand fleet over several types would weigh price, not the order. Each type's step names
+		// it, so each ask has its own ClientToken: one token sent again with other overrides is IdempotentParameterMismatch
+		// at EC2, and the next type's on demand would never be asked. The steps are fast-*, which on_demand_share does not
+		// bound.
 		var got []*Machine
 		for _, t := range sf.spec.Types {
-			got = append(got, sf.onDemand(ctx, round, "fast-", n-len(got), n-len(got), []string{t})...)
+			got = append(got, sf.onDemand(ctx, round, "fast-"+t+"-", n-len(got), n-len(got), []string{t})...)
 		}
 		got = append(got, sf.spot(ctx, round, "fast-", n-len(got), sf.spec.Types)...)
 		if left := n - len(got); left > 0 {

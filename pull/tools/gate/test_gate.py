@@ -474,6 +474,15 @@ class Gate2(unittest.TestCase):
         self.assertEqual(row.status, G.PASS, row)
         self.assertEqual(judge_scale(launched=["fast"] * 8 + ["on-demand"] * 2)["on-demand share"].status, G.FAIL)
 
+    def test_the_share_is_of_the_launches_it_bounds(self):
+        # 80 launches of on_demand sizes (fast) do not dilute the others' share: 2 of their 10 is 20%
+        row = judge_scale(launched=["spot"] * 8 + ["fast"] * 80 + ["on-demand"] * 2)["on-demand share"]
+        self.assertEqual(row.status, G.FAIL, row)
+        self.assertIn("2 of 10", row.value)
+        row = judge_scale(launched=["fast"] * 40)["on-demand share"]
+        self.assertEqual(row.status, G.PASS, row)
+        self.assertIn("40 of an on_demand", row.note)
+
     def test_no_alarm_in_alarm_at_the_end(self):
         firing = judge_scale(alarms={"superci-pull-orphans": "ALARM", "superci-pull-jobs-stalled": "OK"})["alarms at the end"]
         self.assertEqual(firing.status, G.FAIL)

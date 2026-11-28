@@ -973,12 +973,15 @@ def evaluate_scale(s):
         rows.append(Row("orphans 10 min after", f"max {peak:.0f}", "0", PASS if peak == 0 else FAIL))
     else:
         rows.append(Row("orphans 10 min after", "-", "0", FAIL, f"no Orphans datapoint at {T.iso(s.orphans_due)}+: run it after then"))
+    # the share is of the launches on_demand_share bounds: a fast-* launch (an on_demand size, or an on_demand_first type)
+    # is outside it, in neither the count nor the whole
     od = sum(1 for l in s.launched if l not in ("spot", "fast"))
     fast = sum(1 for l in s.launched if l == "fast")
-    share = od / len(s.launched) if s.launched else None
-    rows.append(Row("on-demand share", "-" if share is None else f"{100 * share:.1f}% ({od} of {len(s.launched)})", f"<= {100 * ON_DEMAND_SHARE:.0f}%",
+    bounded = len(s.launched) - fast
+    share = od / bounded if bounded else (0.0 if s.launched else None)
+    rows.append(Row("on-demand share", "-" if share is None else f"{100 * share:.1f}% ({od} of {bounded})", f"<= {100 * ON_DEMAND_SHARE:.0f}%",
                     PASS if share is not None and share <= ON_DEMAND_SHARE else FAIL,
-                    "no machine.launched events" if not s.launched else f"{fast} of an on_demand_first type, outside the share" if fast else ""))
+                    "no machine.launched events" if not s.launched else f"{fast} of an on_demand size or on_demand_first type, outside the share" if fast else ""))
     firing = sorted(n for n, st in s.alarms.items() if st == "ALARM")
     rows.append(Row("alarms at the end", f"{len(firing)} in ALARM of {len(s.alarms)}", "0 in ALARM", PASS if not firing and s.alarms else FAIL,
                     f"firing: {firing}" if firing else "" if s.alarms else "no alarms listed"))
