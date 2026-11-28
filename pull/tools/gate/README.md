@@ -186,7 +186,7 @@ Blacksmith's earlier hours, which had another mix of PRs (that is how the Nov 28
   log of superci's median over Blacksmith's. `PERMUTATIONS` (2000) random reassignments of whole runs to the halves, each half keeping its run count, give the null
   distribution, and p = (1 + the assignments at least as slow as the observed) / (1 + draws). The draws are seeded from the window's run ids (and the row and size), so a
   window read again has the same p. Once enough assignments are as slow for p > alpha to be certain the draws stop (the verdict is the one all 2000 give, and the p printed
-  is the estimate from the draws made); a FAIL always has every draw made, and the two rows of 52 shards at 24 runs a half take under a second. It is NOISE (`not enough shards paired yet`)
+  is the estimate from the draws made, which the row's value prints as `p > alpha, stopped at N of 2000 draws`, never as a p); a FAIL always has every draw made and prints its p, and the two rows of 52 shards at 24 runs a half take under a second. It is NOISE (`not enough shards paired yet`)
   until `MIN_PAIRED_SHARDS` (8) shards are paired, so that no verdict hangs on one or two shards. It is also NOISE until each half has `MIN_SHARD_RUNS` (10) runs.
   The detail lines under the row give the shards paired and the worst 10 ratios. The row's rollback is `canary_verdict`'s from `MIN_SHARD_RUNS` runs. **`wall p90 (ceiling)`** stays as `wall p90` had it: superci's own p90 within the job's ceiling in `ci-limits.tsv` (no row without a ceiling),
   counted from 20 runs.
@@ -197,6 +197,11 @@ Blacksmith's earlier hours, which had another mix of PRs (that is how the Nov 28
   back 1.7% of 300 seeds at 10 runs a half (0.10: none of 1800). It is NOISE until a size has `MIN_PAIRED_SHARDS` shards with enough legs and each half has `MIN_SHARD_RUNS`
   runs, and counts toward a rollback from `MIN_SHARD_RUNS` runs. A cold tail of 15% at 1.5x on every shard rolls back in 93% of simulated windows at 24 runs a half, 98% at 30 and 40% at 12 (300 seeds each; the signed-rank rows: 84%, 92%, 40%),
   with the median row passing throughout. The shards of a window of 10 to 15 runs have few legs on one half, so the row is often NOISE early in a canary.
+- **`ramp readiness`** (a split only, **report-only**, in no `ROLLBACK_ROWS`) says whether the job may go from its share to the whole: every machine size with a superci leg
+  in the window is *ready* when `wall (per shard)` judged it (`MIN_PAIRED_SHARDS` shards, `MIN_SHARD_RUNS` runs a half) and did not FAIL it, and `wall tail (per shard)` did the same.
+  PASS when every size is ready; else NOISE, and the note names each size and what it lacks (`not ready: 4cpu tail not judged (3 of 8 shards with 10 legs a half); 8cpu ready`;
+  a size a row FAILs is named too, though the rollback acts on that row). The value is each size's state (`4cpu: median PASS, tail not judged; 8cpu: median PASS, tail PASS`). The
+  canary line ends with `[ramp: ready]` or `[ramp: not ready: ...]`. It reads what the two rows concluded for each size (`Row.sizes`) and tests nothing again.
 - **Superci's wall is the listener's `wall_ms`**, never GitHub's started to completed: GitHub marks a dispatched job started when its identity accepts it, so that
   interval holds the wait for a machine (up to 24 s on a size short of identities). With `--superci-source events` (the canary's) the superci jobs are the records,
   whose start and finish are `wall_ms`; with `github` the window's records are read as well and matched to the GitHub legs (run, name, runner, finish within 2 min), and the output

@@ -91,6 +91,10 @@ SPLIT_ROWS = (ROUTING_ROW, RATIO_ROW)
 WALL_MARGIN = 0.05
 MIN_PAIRED_SHARDS = 8
 SHARD_ROW, CEILING_ROW = "wall (per shard)", "wall p90 (ceiling)"
+# A split is ready to go from its share to the whole job (the ramp rule) when each machine size on superci's half has been judged, by SHARD_ROW and by TAIL_ROW,
+# over MIN_PAIRED_SHARDS shards and MIN_SHARD_RUNS runs a half, and neither row FAILs it. RAMP_ROW says so, and is report-only (in no ROLLBACK_ROWS): the
+# canary line carries it as `[ramp: ready]` or `[ramp: not ready: ...]`.
+RAMP_ROW = "ramp readiness"
 # Every shard's median is over the legs of the runs of its half, and the legs of one run share the run's weight (a big PR is slow in every shard), so the shard
 # ratios are not independent samples: the fewer runs a half has, the more of them move together, and the test's false-rollback rate drifts above
 # FALSE_ROLLBACK_RATE (the run-permutation test keeps them together; MIN_SHARD_RUNS is what its permutations need to have a spread to draw from). The Nov 28
@@ -144,6 +148,7 @@ class Row:
     status: str
     note: str = ""
     detail: tuple = ()  # lines printed under the row, for what a one-line note cannot hold (excluded test names)
+    sizes: tuple = dataclasses.field(default=(), repr=False, compare=False)  # a split wall row's SizeResult of each machine size it judged or left unjudged; ramp_row reads them
 
 
 def run_spread(obs, get):
@@ -266,6 +271,29 @@ def shard_key(name):
     return _LABEL.sub("", _LEADING_LABEL.sub("(", name or ""))
 
 
+class DrawnP(float):
+    """permutation_p's p-value, with the draws it rests on: `draws` of the `of` there were. `stopped` when it stopped early, so that its p is an estimate that
+    only says p > alpha, and the row text must not print it as the p of every draw."""
+    draws: int
+    of: int
+
+    def __new__(cls, p, draws=0, of=0):
+        self = super().__new__(cls, p)
+        self.draws, self.of = draws, of
+        return self
+
+    @property
+    def stopped(self):
+        return self.draws < self.of
+
+
+def p_text(p, alpha):
+    """A size's p for a wall row's value text: the p of every draw, or, for a test that stopped early, only what its stop says (p > alpha) and where it stopped."""
+    if p.stopped:
+        return f"p > {alpha:g}, stopped at {p.draws} of {p.of} draws"
+    return f"p = {p:.3g}"
+
+
 def permutation_p(S, B, ceiling, keys, margin, pct, alpha, row, permutations=PERMUTATIONS, stop_early=True):
     """The one-sided run-permutation p-value that, over the shards `keys`, superci's `pct` wall percentile is above Blacksmith's by more than `margin`, for the
     legs `S` and `B` of one machine size (the two halves' Obs).
@@ -279,8 +307,9 @@ def permutation_p(S, B, ceiling, keys, margin, pct, alpha, row, permutations=PER
     assignment's statistic.
 
     `alpha` is the p-value the caller fails at. Once exceedances make p > alpha certain (1 + k > alpha x (1 + permutations)) the draws stop: the verdict
-    p <= alpha is the same as with all of them, and the p returned is the estimate from the draws made. `stop_early=False` draws all of them. A FAIL, whose
-    p is under alpha, always has every draw made. 1.0 when a side has no run or no shard has legs on both."""
+    p <= alpha is the same as with all of them, and the p returned is the estimate from the draws made (a DrawnP, which says how many: p_text prints it as
+    a bound). `stop_early=False` draws all of them. A FAIL, whose p is under alpha, always has every draw made. 1.0 when a side has no run or no shard has
+    legs on both."""
     keys = set(keys)
     walls = [(half, o.run_id, shard_key(o.name), w[0]) for half, obs in enumerate((S, B)) for o in obs if o.name for w in [wall_sample([o], ceiling)] if w]
     unit_of = {u: i for i, u in enumerate(sorted({(half, run) for half, run, _, _ in walls}))}  # by half and run id, so the draws do not depend on the listing order
@@ -293,7 +322,7 @@ def permutation_p(S, B, ceiling, keys, margin, pct, alpha, row, permutations=PER
     k_s = len(ns)
     shards = [legs[k] for k in sorted(legs)]
     if not 0 < k_s < n or not shards:
-        return 1.0
+        return DrawnP(1.0)
 
     def stat(in_s):
         total = m = 0
@@ -310,7 +339,7 @@ def permutation_p(S, B, ceiling, keys, margin, pct, alpha, row, permutations=PER
     observed = bytearray(1 if u in ns else 0 for u in range(n))
     t_obs = stat(observed)
     if t_obs is None:
-        return 1.0
+        return DrawnP(1.0)
     rng = random.Random(int.from_bytes(hashlib.sha256(json.dumps([row, sorted(r for h, r in unit_of if h == 0), sorted(r for h, r in unit_of if h == 1)]).encode()).digest()[:8], "big"))
     units = range(n)
     over = done = 0
@@ -323,7 +352,7 @@ def permutation_p(S, B, ceiling, keys, margin, pct, alpha, row, permutations=PER
             over += 1
             if stop_early and 1 + over > alpha * (1 + permutations):
                 break
-    return (1 + over) / (1 + done)
+    return DrawnP((1 + over) / (1 + done), done, permutations)
 
 
 def shard_walls(obs, ceiling):
@@ -360,6 +389,24 @@ def size_p(S, B, ceiling, size_of, size, pairs, margin, pct, alpha, row):
     return permutation_p(of_size(S), of_size(B), ceiling, [p[0] for p in pairs], margin, pct, alpha, f"{row}/{size}")
 
 
+@dataclasses.dataclass(frozen=True)
+class SizeResult:
+    """What a split wall row concluded about one machine size, for ramp_row: how many shards it had, whether it judged the size (enough shards, and each half
+    min_runs runs) and, if it did, whether it FAILed it. `short_runs` is (superci runs, Blacksmith runs, min_runs) when the runs, not the shards, were short."""
+    size: str
+    shards: int
+    judged: bool
+    failed: bool
+    short_runs: "tuple | None" = None
+
+
+def size_results(by_size, judged, per, alpha, ns, nb, min_runs):
+    """A SizeResult for each size of `by_size`, from the p-values `per` the row computed (size -> (ratio, shards, p or None)); nothing is tested again."""
+    enough = min(ns, nb) >= min_runs
+    return tuple(SizeResult(size, len(ps), size in judged and enough, size in judged and enough and per[size][2] <= alpha,
+                            (ns, nb, min_runs) if size in judged and not enough else None) for size, ps in sorted(by_size.items()))
+
+
 def shard_wall_row(S, B, ceiling, min_runs=MIN_SHARD_RUNS):
     """The split's wall row (SHARD_ROW): the per-shard superci/Blacksmith ratios, judged size by size (4cpu shards apart from 8cpu ones: superci's sizes are
     separate sets, and a faster 8cpu set must not hide a slower 4cpu one). It FAILs when, for any size with MIN_PAIRED_SHARDS shards paired, a one-sided
@@ -390,16 +437,17 @@ def shard_wall_row(S, B, ceiling, min_runs=MIN_SHARD_RUNS):
         per[size] = (math.exp(sum(math.log(x[1]) for x in ps) / len(ps)), len(ps),
                      size_p(S, B, ceiling, size_of, size, ps, WALL_MARGIN, 50, alpha, SHARD_ROW) if size in judged else None)
     value = f"geometric mean {gm:.3f}x over {n} shards; " + ", ".join(
-        f"{size or 'unsized'} {g:.3f}x over {k}" + (f" (p = {pv:.3g})" if pv is not None else f" (under {MIN_PAIRED_SHARDS}: not judged)") for size, (g, k, pv) in per.items())
+        f"{size or 'unsized'} {g:.3f}x over {k}" + (f" ({p_text(pv, alpha)})" if pv is not None else f" (under {MIN_PAIRED_SHARDS}: not judged)") for size, (g, k, pv) in per.items())
+    sizes = size_results(by_size, judged, per, alpha, ns, nb, min_runs)
     if not judged:
-        return Row(SHARD_ROW, value, th, NOISE, f"not enough shards paired yet: no size has {MIN_PAIRED_SHARDS} (most: {max(len(ps) for ps in by_size.values())})", detail)
+        return Row(SHARD_ROW, value, th, NOISE, f"not enough shards paired yet: no size has {MIN_PAIRED_SHARDS} (most: {max(len(ps) for ps in by_size.values())})", detail, sizes)
     if min(ns, nb) < min_runs:
-        return Row(SHARD_ROW, value, th, NOISE, f"not enough runs yet: the halves have {ns} superci and {nb} Blacksmith runs, under {min_runs} each", detail)
+        return Row(SHARD_ROW, value, th, NOISE, f"not enough runs yet: the halves have {ns} superci and {nb} Blacksmith runs, under {min_runs} each", detail, sizes)
     slow = [size for size in judged if per[size][2] <= alpha]
     if slow:
         return Row(SHARD_ROW, value, th, FAIL, "superci is slower than chance allows on " + ", ".join(f"{size or 'unsized'} ({per[size][0]:.3f}x, p = {per[size][2]:.3g})" for size in slow)
-                   + f": over {1 + WALL_MARGIN:g} at {alpha:g} ({FALSE_ROLLBACK_RATE:g} over {len(judged)} size{'s' if len(judged) != 1 else ''})", detail)
-    return Row(SHARD_ROW, value, th, PASS, "", detail)
+                   + f": over {1 + WALL_MARGIN:g} at {alpha:g} ({FALSE_ROLLBACK_RATE:g} over {len(judged)} size{'s' if len(judged) != 1 else ''})", detail, sizes)
+    return Row(SHARD_ROW, value, th, PASS, "", detail, sizes)
 
 
 def tail_pairs(S, B, ceiling, min_legs=MIN_TAIL_LEGS):
@@ -439,16 +487,49 @@ def tail_row(S, B, ceiling, min_runs=MIN_SHARD_RUNS):
         per[size] = (math.exp(sum(math.log(x[1]) for x in ps) / len(ps)), len(ps),
                      size_p(S, B, ceiling, size_of, size, ps, TAIL_MARGIN, 90, alpha, TAIL_ROW) if size in judged else None)
     value = "p90 ratio " + ", ".join(
-        f"{size or 'unsized'} {g:.3f}x over {k}" + (f" (p = {pv:.3g})" if pv is not None else f" (under {MIN_PAIRED_SHARDS}: not judged)") for size, (g, k, pv) in per.items())
+        f"{size or 'unsized'} {g:.3f}x over {k}" + (f" ({p_text(pv, alpha)})" if pv is not None else f" (under {MIN_PAIRED_SHARDS}: not judged)") for size, (g, k, pv) in per.items())
+    sizes = size_results(by_size, judged, per, alpha, ns, nb, min_runs)
     if not judged:
-        return Row(TAIL_ROW, value, th, NOISE, f"not enough shards yet: no size has {MIN_PAIRED_SHARDS} with {MIN_TAIL_LEGS} legs on both halves (most: {max(len(ps) for ps in by_size.values())})", detail)
+        return Row(TAIL_ROW, value, th, NOISE, f"not enough shards yet: no size has {MIN_PAIRED_SHARDS} with {MIN_TAIL_LEGS} legs on both halves (most: {max(len(ps) for ps in by_size.values())})", detail, sizes)
     if min(ns, nb) < min_runs:
-        return Row(TAIL_ROW, value, th, NOISE, f"not enough runs yet: the halves have {ns} superci and {nb} Blacksmith runs, under {min_runs} each", detail)
+        return Row(TAIL_ROW, value, th, NOISE, f"not enough runs yet: the halves have {ns} superci and {nb} Blacksmith runs, under {min_runs} each", detail, sizes)
     slow = [size for size in judged if per[size][2] <= alpha]
     if slow:
         return Row(TAIL_ROW, value, th, FAIL, "superci's tail is slower than chance allows on " + ", ".join(f"{size or 'unsized'} ({per[size][0]:.3f}x, p = {per[size][2]:.3g})" for size in slow)
-                   + f": p90 over {1 + TAIL_MARGIN:g} at {alpha:g} ({FALSE_ROLLBACK_RATE:g} over {len(judged)} size{'s' if len(judged) != 1 else ''})", detail)
-    return Row(TAIL_ROW, value, th, PASS, "", detail)
+                   + f": p90 over {1 + TAIL_MARGIN:g} at {alpha:g} ({FALSE_ROLLBACK_RATE:g} over {len(judged)} size{'s' if len(judged) != 1 else ''})", detail, sizes)
+    return Row(TAIL_ROW, value, th, PASS, "", detail, sizes)
+
+def ramp_row(S, rows):
+    """The split's ramp readiness row (RAMP_ROW), from the legs of the superci half and the two wall rows' SizeResults (nothing is judged again): every machine
+    size with a superci leg in the window is ready when the wall row judged it and did not FAIL it, and the tail row judged it and did not FAIL it. PASS when
+    every size is ready; else NOISE, and the note names each size and what it lacks. It is in no ROLLBACK_ROWS: the wall rows act on a FAIL, this row only says
+    whether the job may go from its split to full."""
+    by = {r.name: r for r in rows}
+    sizes = sorted({shard_size(o.name) or "unsized" for o in S if o.name}, key=lambda s: (int(s[:-3]) if s[:-3].isdigit() else 10 ** 9, s))
+    th = f"every size on superci's half judged on the median and the tail rows ({MIN_PAIRED_SHARDS} shards, {MIN_SHARD_RUNS} runs a half) and neither FAIL"
+    if not sizes:
+        return Row(RAMP_ROW, "no sizes", th, NOISE, "not ready: no superci leg with a machine size in the window")
+    shard_label = {SHARD_ROW: "shards paired", TAIL_ROW: f"shards with {MIN_TAIL_LEGS} legs a half"}
+    states, lacks, ok = [], [], []
+    for size in sizes:
+        mine = []
+        for name, short in ((SHARD_ROW, "median"), (TAIL_ROW, "tail")):
+            row = by.get(name)
+            res = next((x for x in (row.sizes if row else ()) if (x.size or "unsized") == size), None)
+            if res and res.judged:
+                mine.append((short, "FAIL" if res.failed else "PASS", f"{short} FAIL" if res.failed else ""))
+            elif res and res.short_runs:
+                ns, nb, need = res.short_runs
+                mine.append((short, "not judged", f"{short} not judged (halves have {ns} superci and {nb} Blacksmith runs, under {need})"))
+            else:
+                mine.append((short, "not judged", f"{short} not judged ({res.shards if res else 0} of {MIN_PAIRED_SHARDS} {shard_label[name]})"))
+        states.append(f"{size}: " + ", ".join(f"{short} {state}" for short, state, _ in mine))
+        why = ", ".join(w for _, _, w in mine if w)
+        lacks.append(f"{size} {why}" if why else f"{size} ready")
+        ok.append(not why)
+    ready = all(ok)
+    return Row(RAMP_ROW, "; ".join(states), th, PASS if ready else NOISE, "" if ready else "not ready: " + "; ".join(lacks))
+
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -620,6 +701,8 @@ def evaluate_job(S, B, ceiling, unexplained, min_runs=MIN_RUNS, tests=None, spli
     p50u = T.q(unexplained, 50)
     rows.append(Row("unexplained p50 (timeline)", fmt_s(p50u), f"< {MAX_UNEXPLAINED_S:g} s", PASS if p50u is not None and p50u < MAX_UNEXPLAINED_S else FAIL,
                     "" if unexplained else "no superci timelines"))
+    if split:
+        rows.append(ramp_row(S, rows))
     return rows
 
 
@@ -1759,9 +1842,17 @@ def cmd_job(a):
     paging = sorted(n for n, st in alarms.items() if st == "ALARM" and n not in rollback_alarms(alarms, sets))
     print(f"\njudged on: {judged_on(alarms, sets)}")
     broken = [f"{r.name}: {r.value}" + (f" (run {', '.join(map(str, sorted(faults)[:5]))})" if r.name == ROUTING_ROW else "") for r in rows if r.name in SPLIT_ROWS and r.status == FAIL] if split is not None else []
-    print(f"canary {a.job}{'' if split is None else f'@{split}'}: " + (f"ROLL BACK ({'; '.join(reasons)})" if reasons else "KEEP") + (f"   [paging, no rollback: {paging}]" if paging else "")
-          + (f"   [split, no rollback: {'; '.join(broken)}]" if broken else ""))
+    print(canary_line(a.job, split, reasons, paging, broken, rows))
     return ROLLBACK if reasons else KEEP
+
+
+def canary_line(job, split, reasons, paging, broken, rows):
+    """The line canary.sh logs (its grep is `^canary `): the verdict, then the notes that roll nothing back: the paging alarms, a split's routing faults and, in a split,
+    whether it is ready to ramp (RAMP_ROW). Pure."""
+    ramp = next((r for r in rows if r.name == RAMP_ROW), None)
+    return (f"canary {job}{'' if split is None else f'@{split}'}: " + (f"ROLL BACK ({'; '.join(reasons)})" if reasons else "KEEP") + (f"   [paging, no rollback: {paging}]" if paging else "")
+            + (f"   [split, no rollback: {'; '.join(broken)}]" if broken else "")
+            + (f"   [ramp: {'ready' if ramp.status == PASS else ramp.note}]" if ramp else ""))
 
 
 def collect_scale(a):

@@ -1,6 +1,7 @@
 import atexit
 import collections
 import contextlib
+import dataclasses
 import io
 import json
 import math
@@ -4236,6 +4237,152 @@ class RecordsWallNotGitHubs(unittest.TestCase):
         code, out = self.run_gate(runs, records=None)
         self.assertIn("includes a dispatched job's wait for a machine", out)
         self.assertRegex(self.line(out, "  NOISE wall (per shard)") or self.line(out, "  FAIL  wall (per shard)"), r"geometric mean 1\.5\d\dx", "the wait is in the wall it reads")
+
+
+# Ramp readiness (RAMP_ROW): unit-tests@50 goes to full only when each machine size on superci's half has been judged, on the median and on the tail, and not
+# failed either. The row is report-only: it is in no ROLLBACK_ROWS, and a split's canary line carries it.
+RAMP = "ramp readiness"
+
+
+def slowed(S, cpus, factor):
+    """S with the wall of every leg of the `cpus` size multiplied by `factor`."""
+    return [dataclasses.replace(o, wall=o.wall * factor) if f"superci-{cpus}cpu" in o.name else o for o in S]
+
+
+def thin_tail(B, cpus, keep, runs=5):
+    """B with, for every shard of the `cpus` size not in `keep` (shard numbers), only the legs of its first `runs` runs: the median of those shards is still
+    paired, but their p90 is of too few legs (MIN_TAIL_LEGS) for the tail row to take them."""
+    first = min(o.run_id for o in B)
+    def wanted(o):
+        if f"blacksmith-{cpus}vcpu" not in o.name:
+            return True
+        shard = int(o.name.split("(")[1].split(",")[0])
+        return shard in keep or o.run_id < first + runs
+    return [o for o in B if wanted(o)]
+
+
+class RampReadiness(unittest.TestCase):
+    def rows(self, S, B):
+        return rows_by_name(G.evaluate_job(S, B, 165.0, [0.5] * 10, split=True))
+
+    def test_both_sizes_judged_and_passing_on_both_rows_are_ready(self):
+        rows = self.rows(*simulated_halves(3, 24))
+        self.assertEqual((rows[G.SHARD_ROW].status, rows[G.TAIL_ROW].status), (G.PASS, G.PASS), "the window itself passes both rows")
+        r = want(rows, RAMP)
+        self.assertEqual((r.status, r.note), (G.PASS, ""))
+        self.assertEqual(r.value, "4cpu: median PASS, tail PASS; 8cpu: median PASS, tail PASS")
+
+    def test_the_row_is_report_only(self):
+        self.assertNotIn(RAMP, G.ROLLBACK_ROWS)
+        S, B = simulated_halves(3, 24)
+        rows = G.evaluate_job(S, B, 165.0, [0.5] * 10, split=True)
+        self.assertIn(RAMP, [r.name for r in rows])
+        self.assertEqual(G.canary_verdict([dataclasses.replace(r, status=G.FAIL) if r.name == RAMP else r for r in rows], {}), [], "a FAIL of the row rolls nothing back")
+
+    def test_a_size_with_three_tail_shards_of_eight_is_not_ready_on_its_tail(self):
+        S, B = simulated_halves(3, 24)
+        B = thin_tail(B, 4, keep={1, 2, 3})
+        rows = self.rows(S, B)
+        self.assertEqual(rows[G.TAIL_ROW].status, G.PASS, "the tail row judges 8cpu and does not fail 4cpu: it is not judged")
+        self.assertEqual(rows[G.SHARD_ROW].status, G.PASS)
+        r = want(rows, RAMP)
+        self.assertEqual(r.status, G.NOISE)
+        self.assertEqual(r.note, f"not ready: 4cpu tail not judged (3 of {G.MIN_PAIRED_SHARDS} shards with {G.MIN_TAIL_LEGS} legs a half); 8cpu ready")
+        self.assertEqual(r.value, "4cpu: median PASS, tail not judged; 8cpu: median PASS, tail PASS")
+        self.assertEqual(G.canary_verdict(list(rows.values()), {}), [], "no rollback")
+
+    def test_the_canary_line_says_ready_or_not_ready(self):
+        self.assertTrue(hasattr(G, "canary_line"))
+        S, B = simulated_halves(3, 24)
+        ready = self.rows(S, B)
+        line = G.canary_line("unit-tests", 50, [], [], [], list(ready.values()))
+        self.assertEqual(line, "canary unit-tests@50: KEEP   [ramp: ready]")
+        thin = self.rows(S, thin_tail(B, 4, keep={1, 2, 3}))
+        line = G.canary_line("unit-tests", 50, [], [], [], list(thin.values()))
+        self.assertEqual(line, f"canary unit-tests@50: KEEP   [ramp: not ready: 4cpu tail not judged (3 of {G.MIN_PAIRED_SHARDS} shards with {G.MIN_TAIL_LEGS} legs a half); 8cpu ready]")
+        self.assertRegex(line, r"^canary ", "canary.sh's grep")
+        self.assertEqual(G.canary_line("unit-tests", 50, ["x"], ["a"], ["b"], list(ready.values())),
+                         "canary unit-tests@50: ROLL BACK (x)   [paging, no rollback: ['a']]   [split, no rollback: b]   [ramp: ready]")
+
+    def test_a_size_that_fails_the_median_row_is_named_and_the_canary_still_rolls_back_through_it(self):
+        S, B = simulated_halves(3, 24)
+        rows = self.rows(slowed(S, 4, 1.3), B)
+        self.assertEqual(rows[G.SHARD_ROW].status, G.FAIL)
+        r = want(rows, RAMP)
+        self.assertEqual(r.status, G.NOISE)
+        self.assertRegex(r.note, r"^not ready: 4cpu median FAIL")
+        self.assertIn("8cpu ready", r.note)
+        self.assertRegex(r.value, r"^4cpu: median FAIL, tail \w+.*; 8cpu: median PASS, tail PASS$")
+        reasons = G.canary_verdict(list(rows.values()), {})
+        self.assertTrue(any(x.startswith(G.SHARD_ROW) for x in reasons), reasons)
+        self.assertFalse(any(RAMP in x for x in reasons))
+
+    def test_a_split_without_enough_runs_a_half_is_not_ready_on_either_row(self):
+        rows = self.rows(*simulated_halves(3, 8))
+        r = want(rows, RAMP)
+        self.assertEqual(r.status, G.NOISE)
+        self.assertRegex(r.note, r"4cpu median not judged .*; 8cpu median not judged")
+
+    def test_a_job_that_is_not_split_has_no_ramp_row_and_its_rows_are_as_they_were(self):
+        S = [obs(60.0 + i % 3, run=i, fleet="superci") for i in range(12)]
+        B = [obs(60.0 + i % 3, run=100 + i, fleet="blacksmith") for i in range(30)]
+        rows = G.evaluate_job(S, B, 165.0, [0.5] * 10)
+        self.assertNotIn(RAMP, [r.name for r in rows])
+        self.assertEqual([r.name for r in rows], ["n (superci runs)", "wall p50", "wall p90", "queue wait p50", "queue wait p90", "failures (superci)", "unexplained p50 (timeline)"])
+        self.assertFalse(any("sizes" in repr(r) for r in rows), "a Row prints as it did")
+
+
+class RampOnTheRealWindow(unittest.TestCase):
+    job, workflow = SplitWindow.job, SplitWindow.workflow
+    setUp = SplitWindow.setUp
+    run_gate = SplitWindow.run_gate
+    line = SplitWindow.line
+    leg, run_of, runs = SplitWindow.leg, SplitWindow.run_of, SplitWindow.runs
+
+    def test_the_09_24z_window_is_not_ready_and_names_the_rows_that_were_not_judged(self):
+        rest, records, since, now = load_split_fixture()
+        code, out = self.run_gate(rest, records=records, now=now, extra=["--since", since])
+        self.assertEqual(code, G.KEEP, out)
+        row = self.line(out, "  NOISE ramp readiness")
+        self.assertTrue(row, out)
+        self.assertRegex(row, r"4cpu: median \w+.*8cpu: median", row)
+        self.assertRegex(row, r"not ready: .*(median|tail) not judged", row)
+        canary = self.line(out, "canary ")
+        self.assertTrue(canary.startswith("canary unit-tests@50: KEEP"), canary)
+        self.assertRegex(canary, r"\[ramp: not ready: .*(median|tail) not judged.*\]$")
+
+    def test_a_job_that_is_not_split_prints_no_ramp_row(self):
+        runs = self.runs("superci", 6, 100) + self.runs("blacksmith", 6, 200)
+        code, out = self.run_gate(runs, split=None)
+        self.assertNotIn("ramp", out)
+
+
+# The wall rows print the p of each size. permutation_p stops drawing once p > alpha is certain, so a PASS's p is an estimate from fewer draws: the text says so
+# instead of printing it as the p of every draw. A FAIL has every draw and prints its p.
+class EarlyStoppedPText(unittest.TestCase):
+    def test_a_pass_that_stopped_early_says_so_and_prints_no_bare_p(self):
+        S, B = simulated_halves(3, 24)
+        for row in (G.shard_wall_row(S, B, 165.0), G.tail_row(S, B, 165.0)):
+            self.assertEqual(row.status, G.PASS)
+            self.assertNotRegex(row.value, r"p = ", row.value)
+            self.assertRegex(row.value, rf"p > 0\.005, stopped at \d+ of {G.PERMUTATIONS} draws\)", row.value)
+            self.assertEqual(len(re.findall(r"stopped at", row.value)), 2, "one for each size")
+
+    def test_a_fail_prints_its_full_draw_p_and_a_passing_size_beside_it_prints_the_stop(self):
+        S, B = simulated_halves(3, 24)
+        for build in (G.shard_wall_row, G.tail_row):
+            row = build(slowed(S, 4, 1.3), B, 165.0)
+            self.assertEqual(row.status, G.FAIL, row.value)
+            four, eight = row.value.split("8cpu")[0], row.value.split("8cpu")[1]
+            self.assertRegex(four, r"4cpu .*\(p = [\d.e-]+\)", row.value)
+            self.assertNotIn("stopped", four, "a FAIL has every draw")
+            self.assertRegex(eight, r"stopped at \d+ of 2000 draws", row.value)
+
+    def test_the_p_of_the_draws_is_the_same_number_it_was(self):
+        S, B = run_halves([1.2 + 0.01 * i for i in range(10)], [1.0 + 0.01 * i for i in range(10)])
+        full = G.permutation_p(S, B, 165.0, keys_of(S), G.WALL_MARGIN, 50, 0.005, "x", stop_early=False)
+        self.assertEqual(G.permutation_p(S, B, 165.0, keys_of(S), G.WALL_MARGIN, 50, 0.005, "x"), full, "the verdict side of the test is untouched")
+        self.assertEqual(getattr(full, "draws", None), G.PERMUTATIONS)
 
 
 if __name__ == "__main__":
