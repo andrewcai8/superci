@@ -24,6 +24,21 @@
 # in which case the App is asked once (10 s) and the write goes out on the personal token, announced (`personal-token exception
 # SUPERCI_JOBS write`). A gate that exits 2 (a refusal) is logged as `NO CHECK`, never as a check. pull/README.md lists the exception.
 #
+# The operator hears of it within minutes (Nov 28 00:57:56Z: test-go was rolled back on its queue wait p90 and nobody knew for 59 minutes,
+# because the only record was a line in a log):
+#   ON_ROLLBACK=<command>   run once after every rollback this watch makes, with one more argument: a one-line summary (UTC time, the job,
+#                           the gate's reason line, SUPERCI_JOBS before and after). Also run when the rollback's write fails (the job is
+#                           still on superci, and the line says so), on each failed tick. And once when a job has had no check for 3 ticks
+#                           running (no App token, SUPERCI_JOBS unreadable, under the budget floor, a gate that refused or crashed), with why.
+#                           The command line is run by `bash -c` with the summary appended as its last argument, under `env -i` with only PATH,
+#                           HOME, LANG and the NOTIFY_* variables (never GH_TOKEN, GITHUB_TOKEN or AWS credentials), for NOTIFY_TIMEOUT s (60): TERM
+#                           then, 5 s later, KILL to its whole process group, its output a file read for 250 bytes at most. Its failure is
+#                           logged and never stops the watch or undoes the rollback.
+#   STOP_ON_ROLLBACK=1      exit 3 at the end of the tick that made a rollback, once ON_ROLLBACK has run, so a wrapper that runs the watch as a
+#                           background task is woken. The tick's other jobs are still checked first (and may be rolled back), so the exit
+#                           leaves no job unchecked in that tick; but the watch is over, and a wrapper must restart it for the jobs
+#                           SUPERCI_JOBS still lists. A rollback that could not be written does not stop the watch: the next tick tries again.
+#                           A job already gone from SUPERCI_JOBS when the rollback read it (another watch, a `set`) is not a rollback of this watch.
 # A re-route by hand uses the same token and the same fallback, with no watch, no aws and no actions token:
 #   pull/tools/gate/canary.sh set '["test-go","verify-tools"]'     # SUPERCI_JOBS := that JSON array of job names
 #   pull/tools/gate/canary.sh unset                                # delete SUPERCI_JOBS: every job back to Blacksmith
@@ -84,7 +99,7 @@ vwrite() { # a gh write of SUPERCI_JOBS (gh args): on the variables token; GitHu
   while [ -n "$vt" ]; do
     err=$(mktemp)
     GH_TOKEN=$vt GH_SHIM_KEEP_TOKEN=1 gh "$@" 2> "$err" && { rm -f "$err"; return 0; }
-    wr_err=$(head -c 200 "$err" | tr '\n' ' ' | sed -E 's/ +$//; s/gh[pousr]_[A-Za-z0-9_]+/<token>/g'); rm -f "$err"
+    wr_err=$(head -c 2000 "$err" | tr '\n' ' ' | scrub | head -c 200 | sed -E 's/ +$//'); rm -f "$err"
     echo "writing SUPERCI_JOBS with the variables token failed: $wr_err" >&9
     if [ "$fresh" = 1 ]; then fail_cause="GitHub refused the write with a fresh variables token ($wr_err)"; break; fi
     if [ "$personal_ok" = 1 ] || [[ $wr_err == *"Not Found"* ]]; then fail_cause="GitHub refused the write with the variables token ($wr_err)"; break; fi
@@ -117,11 +132,42 @@ read_jobs() { # [tries]: $jobs_val := SUPERCI_JOBS, with jobs_now's status; a to
   fi
   return $rc
 }
+rb_fail=""
 rollback_failed() { # why: the line the operator reads when SUPERCI_JOBS could not be written
   local line="ROLLBACK FAILED: $1. SUPERCI_JOBS is unchanged. Fix the listener's /github/token (scope variables), or run SUPERCI_PERSONAL_TOKEN=1 $0 unset"
   echo "$line"
   echo "$line" >&2
+  rb_fail=$line
   return 1
+}
+scrub() { sed -E 's/gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|eyJ[A-Za-z0-9_.-]{20,}|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}/<token>/g'; } # a GitHub token, a JWT, an AWS access key id
+notify() { # line: tell the operator (ON_ROLLBACK); a failure is logged and changes nothing else
+  local out rc f pid v nv=()
+  [ -n "${ON_ROLLBACK:-}" ] || return 0
+  # The notifier gets PATH, HOME, LANG and NOTIFY_* and nothing else: the watch's GH_TOKEN, GITHUB_TOKEN and AWS credentials stay out of it.
+  for v in "${!NOTIFY_@}"; do nv+=("$v=${!v}"); done
+  f=$(mktemp) || { echo "$(date -u +%TZ) ON_ROLLBACK not run: no temp file" >&9; return 0; }
+  # A hard bound: TERM at NOTIFY_TIMEOUT, KILL 5 s later, to the whole group (timeout leads its own), whatever the notifier traps or leaves behind.
+  # Its output goes to a file capped at 256 KiB (a notifier that floods is killed by the limit), never a pipe a background child could hold or bash could buffer.
+  ( ulimit -f 256 2> /dev/null; exec timeout -k 5 "${NOTIFY_TIMEOUT:-60}" env -i PATH="$PATH" HOME="${HOME:-/}" LANG="${LANG:-C}" ${nv[@]+"${nv[@]}"} \
+      bash -c "$ON_ROLLBACK"' "$@"' canary-notify "$(tr '\n' ' ' <<<"$1" | scrub)" ) < /dev/null > "$f" 2>&1 &
+  pid=$!
+  wait "$pid"; rc=$?
+  kill -KILL -- "-$pid" 2> /dev/null # what the notifier left running in its group
+  if [ $rc -eq 0 ]; then rm -f "$f"; return 0; fi
+  if [ $rc -eq 124 ] || [ $rc -eq 137 ]; then out="timed out after ${NOTIFY_TIMEOUT:-60} s"; else out=$(head -c 2000 "$f" | tr '\n' ' ' | scrub | head -c 250); fi # scrubbed before it is cut, so no token is cut in two
+  rm -f "$f"
+  out="$(date -u +%TZ) ON_ROLLBACK failed (exit $rc): $out"
+  echo "$out"
+  echo "$out" >&9
+  return 0
+}
+checked() { printf -v "streak_${1//[^A-Za-z0-9_]/_}" %s 0; } # job: a verdict was had, so the run of ticks with no check starts over
+nocheck() { # job why: the tick's log line for a job that was not checked; the 3rd tick running tells the operator, once
+  local var="streak_${1//[^A-Za-z0-9_]/_}" n
+  echo "$(date -u +%TZ) $1: $2"
+  n=$(( ${!var:-0} + 1 )); printf -v "$var" %s "$n"
+  [ "$n" -eq 3 ] && notify "$(date -u +%Y-%m-%dT%H:%M:%SZ) canary: no check of $1 for 3 ticks running (EVERY ${every}s), so a harm to it would not roll it back: $2"
 }
 jobs_write() { # [delete | set JSON]: one write of SUPERCI_JOBS, as the rollback and the re-route make it; 1 (loudly) when it could not be made
   get_vt 3 || [ "$personal_ok" = 1 ] || { rollback_failed "the listener would not give a variables token ($(vt_why))"; return; }
@@ -130,23 +176,29 @@ jobs_write() { # [delete | set JSON]: one write of SUPERCI_JOBS, as the rollback
 }
 remove() { # job: drop it from SUPERCI_JOBS, and delete the variable when it was the last; retried while GitHub does not answer
   local now="" left code try after # now stays empty when no read answers, so the delete below sends every job back
+  rb_state=""; rb_before=""; rb_after="" # for the notice: unset (nothing to roll back), or done with SUPERCI_JOBS before and after
   get_vt 3 || [ "$personal_ok" = 1 ] || { rollback_failed "the listener would not give a variables token to remove $1 with ($(vt_why))"; return 1; }
   for try in 1 2 3 4 5; do
     read_jobs 3 && { now=$jobs_val; break; }
     code=$?
-    [ $code -eq 1 ] && { echo "SUPERCI_JOBS already unset"; return; }
+    [ $code -eq 1 ] && { echo "SUPERCI_JOBS already unset"; rb_state=unset; return; }
     [ $code -eq 3 ] && { rollback_failed "no variables token to read SUPERCI_JOBS with ($(vt_why))"; return 1; }
     echo "GitHub did not answer reading SUPERCI_JOBS (try $try)"; sleep 10
   done
   if [ -z "$now" ]; then
     echo "SUPERCI_JOBS unread after 5 tries: deleting it, which sends every job back to Blacksmith"
-    jobs_write delete
+    jobs_write delete || return 1
+    rb_state=done; rb_before="$listed (the rollback could not re-read it)"; rb_after=unset
     return
+  fi
+  if ! jq -e --arg j "$1" 'index($j) != null' <<<"$now" > /dev/null; then # another watch or a `set` took it out between the tick's read and this one: nothing was rolled back here
+    echo "$1 is no longer in SUPERCI_JOBS ($now): removed by another watch or by hand, nothing to write"; rb_state=gone; return 0
   fi
   left=$(jq -c --arg j "$1" 'map(select(. != $j))' <<<"$now")
   if [ "$left" = "[]" ]; then jobs_write delete; else jobs_write set "$left"; fi || return 1
   read_jobs 1 && after=$jobs_val || after=unset
   echo "SUPERCI_JOBS was $now, now $after"
+  rb_state=done; rb_before=$now; rb_after=$after
 }
 jobs_helper() { # set JSON | unset: the operator's re-route, on the same token and fallback as the rollback
   local usage="usage: $0 set '[\"job\",...]' | $0 unset" now after rc
@@ -178,23 +230,45 @@ if get_vt 1 || [ "$personal_ok" = 1 ]; then
 else echo "no variables token at start ($(vt_why)): each tick skips its check until SUPERCI_JOBS can be read" >&2; fi
 while [ "$(date -u +%s)" -lt "$(date -u -d "$until" +%s)" ]; do
   sleep "$every"
+  stop=0
   for job in "$@"; do
-    get_vt 1 || [ "$personal_ok" = 1 ] || { echo "$(date -u +%TZ) $job: no GitHub App token, no check (SUPERCI_JOBS, variables: $(vt_why))"; continue; }
-    read_jobs 1 || { echo "$(date -u +%TZ) $job: SUPERCI_JOBS unset or unread, no check"; continue; }
+    get_vt 1 || [ "$personal_ok" = 1 ] || { nocheck "$job" "no GitHub App token, no check (SUPERCI_JOBS, variables: $(vt_why))"; continue; }
+    read_jobs 1; jrc=$?
+    case $jrc in
+      0) ;;
+      1) checked "$job"; echo "$(date -u +%TZ) $job: SUPERCI_JOBS unset, nothing to check"; continue ;; # unset is not a failure to check: someone sent every job back (the watch's own rollback, `canary.sh unset`)
+      *) nocheck "$job" "SUPERCI_JOBS unread, no check"; continue ;; # 2: GitHub did not answer, 3: no token
+    esac
     listed=$jobs_val
-    jq -e --arg j "$job" 'index($j) != null' <<<"$listed" >/dev/null || continue
-    refresh_token || { echo "$(date -u +%TZ) $job: no GitHub App token, no check ($(head -c 300 "$apperr" | tr '\n' ' '))"; continue; }
+    jq -e --arg j "$job" 'index($j) != null' <<<"$listed" >/dev/null || { checked "$job"; continue; } # off the list: nothing to check, the run of no-checks ends
+    refresh_token || { nocheck "$job" "no GitHub App token, no check ($(head -c 300 "$apperr" | tr '\n' ' '))"; continue; }
     left=$(ghr api rate_limit --jq .resources.core.remaining) # the budget of the token the check reads with
-    [ "$left" -ge 1500 ] || { echo "$(date -u +%TZ) $job: skipped, $left GitHub reads left"; continue; }
+    [ "$left" -ge 1500 ] || { nocheck "$job" "skipped, $left GitHub reads left"; continue; }
     out="$log/canary-${job//[^A-Za-z0-9._-]/_}-$(date -u +%H%M).txt"
     python3 -B "$here/gate.py" --profile ci-runners ${pt[@]+"${pt[@]}"} job "$job" --workflow "${WORKFLOW:-lint-test-backend.yml}" --branch-glob '*' --since "$since" \
       --baseline-until "$since" --canary ${LIMITS:+--limits "$LIMITS"} >"$out" 2>&1
     code=$?
     if [ $code -eq 2 ]; then # a refusal (a token the gate was refused, say), not a verdict: it keeps no job and says so
-      echo "$(date -u +%TZ) $job: NO CHECK (the gate refused: $( (grep -m1 '^refusing' "$out" || tail -1 "$out") | head -c 250 | sed -E 's/gh[pousr]_[A-Za-z0-9_]+/<token>/g')) (exit 2, $out)"
+      nocheck "$job" "NO CHECK (the gate refused: $( (grep -m1 '^refusing' "$out" || tail -1 "$out") | head -c 250 | scrub)) (exit 2, $out)"
     elif [ $code -ne 0 ] && [ $code -ne 3 ]; then # a crash, a stop or a kill (1, 137, 143): no verdict, so no check, and it says so
-      echo "$(date -u +%TZ) $job: NO CHECK (the gate failed: $(tail -1 "$out" | head -c 250 | sed -E 's/gh[pousr]_[A-Za-z0-9_]+/<token>/g')) (exit $code, $out)"
-    else echo "$(date -u +%TZ) $job: $(grep -E '^canary ' "$out" || tail -1 "$out") (exit $code, $out)"; fi
-    [ $code -eq 3 ] && remove "$job"
+      nocheck "$job" "NO CHECK (the gate failed: $(tail -1 "$out" | head -c 250 | scrub)) (exit $code, $out)"
+    else
+      checked "$job"
+      verdict=$( (grep -E '^canary ' "$out" || tail -1 "$out") | head -c 2000 | scrub) # the log line and the notice carry the gate's words, scrubbed
+      echo "$(date -u +%TZ) $job: $verdict (exit $code, $out)"
+    fi
+    if [ $code -eq 3 ]; then
+      verdict=$(head -c 300 <<<"$verdict" | scrub)
+      if remove "$job"; then
+        if [ "$rb_state" = done ]; then # an unset variable means someone else already sent every job back: nothing was rolled back here
+          notify "$(date -u +%Y-%m-%dT%H:%M:%SZ) canary rolled $job back to Blacksmith: $verdict. SUPERCI_JOBS was $rb_before, now $rb_after"
+          [ "${STOP_ON_ROLLBACK:-0}" = 1 ] && stop=1 # after the rest of this tick's jobs have been checked
+        fi
+      else
+        notify "$(date -u +%Y-%m-%dT%H:%M:%SZ) canary could NOT roll $job back, it is still on superci: $verdict. ${rb_fail:-ROLLBACK FAILED} SUPERCI_JOBS is $listed"
+      fi
+    fi
   done
+  [ "$stop" = 1 ] && exit 3
 done
+exit 0 # the end of the watch is a clean exit, whatever the last tick's last test returned: 3 means a rollback (STOP_ON_ROLLBACK)

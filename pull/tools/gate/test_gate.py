@@ -1630,10 +1630,46 @@ class CanaryTree(Sandbox):
             fh.write(gate)
         return os.path.join(root, "gate", "canary.sh")
 
-    def rollback(self, gate="print('canary FAIL: stub')\nraise SystemExit(3)\n", lasts=2, **extra):
+    def rollback(self, gate="print('canary FAIL: stub')\nraise SystemExit(3)\n", lasts=2, jobs=("verify-tools",), **extra):
         until = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + lasts))
         env = dict(self.env, EVERY="600", LOG=self.tmp, APP_REMAINING="4000", **extra)
-        return subprocess.run(["bash", self.tree(gate), "2026-11-27T00:00:00Z", until, "verify-tools"], env=env, capture_output=True, text=True, timeout=300)
+        return subprocess.run(["bash", self.tree(gate), "2026-11-27T00:00:00Z", until, *jobs], env=env, capture_output=True, text=True, timeout=300)
+
+    def gh_prefix(self, text):
+        """Put shell text in the gh stub ahead of its main case (after the stub's own handling of a variable written)."""
+        gh = os.path.join(self.bin, "gh")
+        with open(gh) as fh:
+            body = fh.read()
+        assert body.count('case "$*" in\n') >= 1
+        with open(gh, "w") as fh:
+            fh.write(body.replace('case "$*" in\n', text + '\ncase "$*" in\n', 1))
+
+    def other_on_reads(self):
+        """Reads of SUPERCI_JOBS number from 1 (the start's probe, then each tick's read, then a rollback's): those from OTHER_FROM to OTHER_TO list another job only, and from FAIL_FROM on answer 502."""
+        self.gh_prefix('''case "$*" in *actions/variables/SUPERCI_JOBS*) n=$(($(cat "$GHLOG.nreads" 2>/dev/null || echo 0)+1)); echo $n > "$GHLOG.nreads"
+  if [ $n -ge ${OTHER_FROM:-99999} ] && [ $n -le ${OTHER_TO:-99999} ]; then echo '["other"]'; exit 0; fi
+  if [ $n -ge ${FAIL_FROM:-99999} ]; then echo "gh: HTTP 502: Bad Gateway" >&2; exit 1; fi ;; esac''')
+
+    def stateful_jobs(self):
+        """SUPERCI_JOBS as a file ($JOBS_FILE; absent = unset): the gh stub reads it, `variable set` writes it and `variable delete` removes it."""
+        self.gh_prefix('''case "$*" in
+  *actions/variables/SUPERCI_JOBS*) if [ -e "$JOBS_FILE" ]; then cat "$JOBS_FILE"; exit 0; else echo "gh: Not Found (HTTP 404)" >&2; exit 1; fi ;;
+  "variable set"*) for a; do last=$a; done; printf %s "$last" > "$JOBS_FILE"; echo ok; exit 0 ;;
+  "variable delete"*) rm -f "$JOBS_FILE"; echo ok; exit 0 ;;
+esac''')
+        self.env["JOBS_FILE"] = os.path.join(self.tmp, "jobs.json")
+
+    def rollback_measured(self, **extra):
+        """rollback() under the largest memory the watch's descendants may take (1 GiB of address space), returning its (returncode, stdout, stderr) with .maxrss in KiB and .t_end."""
+        until = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 60))
+        env = dict(self.env, EVERY="600", LOG=self.tmp, APP_REMAINING="4000", **extra)
+        wrap = ("import json, resource, subprocess, sys, time\nresource.setrlimit(resource.RLIMIT_AS, (1 << 30, 1 << 30))\n"
+                "p = subprocess.run(sys.argv[1:], capture_output=True, text=True)\n"
+                "print(json.dumps([p.returncode, p.stdout, p.stderr, resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss, time.time()]))\n")
+        q = subprocess.run([sys.executable, "-I", "-c", wrap, "bash", self.tree(), "2026-11-27T00:00:00Z", until, "verify-tools"], env=env, capture_output=True, text=True, timeout=120)
+        self.assertEqual(q.returncode, 0, q.stderr)
+        code, out, err, rss, t_end = json.loads(q.stdout)
+        return collections.namedtuple("Run", "returncode stdout stderr maxrss t_end")(code, out, err, rss, t_end)
 
     def writes(self):
         return [(tok, args) for tok, args in self.gh_calls() if args.startswith("variable ")]
@@ -1745,6 +1781,200 @@ class RollbackWhenNoReadAnswers(CanaryTree):
             self.assertEqual(self.writes(), [], "no verdict rolls nothing back")
 
 
+class OperatorHearsOfARollback(CanaryTree):
+    """ON_ROLLBACK and STOP_ON_ROLLBACK: a rollback (Nov 28 00:57:56Z, test-go) reaches the operator in minutes, not after 59 of reading a log."""
+
+    def setUp(self):
+        super().setUp()
+        self.notes = os.path.join(self.tmp, "notes")
+        # One line per call: the number of arguments, then the summary (the first of them).
+        self.notifier = stub("notifier", '''printf '%s\\t%s\\n' "$#" "$1" >> "$NOTIFY_NOTES"\n[ -n "${NOTIFY_SAYS-}" ] && echo "$NOTIFY_SAYS"\nexit ${NOTIFY_EXIT:-0}\n''')
+        self.env.update(NOTIFY_NOTES=self.notes, ON_ROLLBACK=self.notifier)
+
+    def calls(self):
+        if not os.path.exists(self.notes):
+            return []
+        with open(self.notes) as fh:
+            return [tuple(line.rstrip("\n").split("\t", 1)) for line in fh if line.strip()]
+
+    def test_a_rollback_calls_on_rollback_once_with_the_job_the_reason_and_the_variable_before_and_after(self):
+        p = self.rollback()
+        self.assertEqual(p.returncode, 0, (p.stdout, p.stderr))
+        calls = self.calls()
+        self.assertEqual(len(calls), 1, (calls, p.stdout, p.stderr))
+        argc, line = calls[0]
+        self.assertEqual(argc, "1", "one argument: the summary")
+        self.assertRegex(line, r"^20\d\d-\d\d-\d\dT\d\d:\d\d:\d\dZ ", "the UTC time leads")
+        self.assertIn("verify-tools", line)
+        self.assertIn("canary FAIL: stub", line, "the reason line the gate printed")
+        self.assertIn('SUPERCI_JOBS was ["verify-tools"], now unset', line)
+        self.assertEqual([args for _, args in self.writes()], ["variable delete SUPERCI_JOBS -R Authentic-Intelligence/megpt-mono"])
+        self.assertNotIn(VARS_TOKEN, line)
+
+    def test_stop_on_rollback_exits_3_after_the_notice(self):
+        p = self.rollback(lasts=60, STOP_ON_ROLLBACK="1")
+        self.assertEqual(p.returncode, 3, (p.stdout, p.stderr))
+        self.assertEqual(len(self.calls()), 1, "the notice was made before the exit")
+        self.assertIn("SUPERCI_JOBS was", p.stdout, "and so was the rollback")
+        self.assertEqual(len(self.writes()), 1)
+
+    def test_without_stop_on_rollback_the_watch_goes_on_to_its_end(self):
+        p = self.rollback(lasts=3)
+        self.assertEqual(p.returncode, 0, (p.stdout, p.stderr))
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_a_failing_on_rollback_neither_stops_the_watch_nor_undoes_the_rollback(self):
+        p = self.rollback(lasts=6, NOTIFY_EXIT="7", NOTIFY_SAYS="boom ghs_leak_in_text")
+        self.assertEqual(p.returncode, 0, (p.stdout, p.stderr))
+        self.assertEqual(len(self.calls()), 1, "the rollback's notice, and no streak notice after it: the later ticks find SUPERCI_JOBS unset, which is no failure to check")
+        self.assertIn("ON_ROLLBACK failed (exit 7): boom", p.stdout, "the failure is logged")
+        self.assertNotIn("ghs_leak_in_text", p.stdout + p.stderr)
+        self.assertEqual([args for _, args in self.writes()], ["variable delete SUPERCI_JOBS -R Authentic-Intelligence/megpt-mono"], "the rollback stands")
+        self.assertNotIn("ROLLBACK FAILED", p.stdout)
+        after = p.stdout.split("ON_ROLLBACK failed", 1)[1]
+        self.assertIn("SUPERCI_JOBS unset, nothing to check", after, "a later tick still ran")
+
+    def test_a_failing_on_rollback_still_lets_stop_on_rollback_exit_3(self):
+        p = self.rollback(lasts=60, STOP_ON_ROLLBACK="1", NOTIFY_EXIT="7")
+        self.assertEqual(p.returncode, 3, (p.stdout, p.stderr))
+        self.assertIn("ON_ROLLBACK failed (exit 7)", p.stdout)
+
+    def test_a_rollback_whose_write_fails_still_notifies_and_says_the_job_is_still_on_superci(self):
+        p = self.rollback(lasts=3, FAIL_WRITE_FOR=VARS_TOKEN, STOP_ON_ROLLBACK="1")
+        self.assertIn("ROLLBACK FAILED", p.stdout, (p.stdout, p.stderr))
+        calls = self.calls()
+        self.assertTrue(calls, (p.stdout, p.stderr))
+        for argc, line in calls:
+            self.assertEqual(argc, "1")
+            self.assertIn("could NOT roll verify-tools back", line)
+            self.assertIn("still on superci", line)
+            self.assertIn("canary FAIL: stub", line)
+            self.assertIn("ROLLBACK FAILED", line, "the cause the operator reads in the log")
+        self.assertEqual(p.returncode, 0, "nothing was rolled back, so STOP_ON_ROLLBACK does not end the watch: the next tick tries again")
+        self.assertNotIn(VARS_TOKEN, "".join(line for _, line in calls))
+
+    def test_the_notifier_gets_path_home_lang_and_notify_variables_and_no_credential(self):
+        self.env["ON_ROLLBACK"] = stub("env_notifier", 'env > "$NOTIFY_NOTES.env"\n')
+        secrets = {"GH_TOKEN": "ghp_fake_gh_token_for_tests", "GITHUB_TOKEN": "ghp_fake_github_token_for_tests", "AWS_SECRET_ACCESS_KEY": "fake/aws+secret/for/tests",
+                   "AWS_ACCESS_KEY_ID": "AKIA" + "FAKEFAKEFAKEFAKE", "AWS_SESSION_TOKEN": "fake-session-for-tests", "AWS_PROFILE": "ci-runners"}
+        p = self.rollback(lasts=2, LANG="C.UTF-8", NOTIFY_FLAVOUR="kept", **secrets)
+        self.assertEqual(p.returncode, 0, (p.stdout, p.stderr))
+        with open(self.notes + ".env") as fh:
+            seen = dict(line.rstrip("\n").split("=", 1) for line in fh if "=" in line)
+        for name, value in secrets.items():
+            self.assertNotIn(name, seen, f"{name} reached the notifier")
+        self.assertNotIn("SUPERCI_APP_TOKEN_CMD", seen)
+        self.assertEqual({"PATH", "HOME", "LANG", "NOTIFY_FLAVOUR", "NOTIFY_NOTES"} - set(seen), set(), "the allowlist reaches it")
+        self.assertEqual(seen["NOTIFY_FLAVOUR"], "kept")
+        self.assertFalse(set(seen) - {"PATH", "HOME", "LANG", "PWD", "SHLVL", "_", "OLDPWD"} - {n for n in seen if n.startswith("NOTIFY_")}, seen.keys())
+
+    def timed_notifier(self, body):
+        """A notifier that stamps its start (NOTIFY_NOTES.start) and then runs body."""
+        self.env["ON_ROLLBACK"] = stub("timed_notifier", 'date +%s.%N > "$NOTIFY_NOTES.start"\n' + body)
+        return self.env["ON_ROLLBACK"]
+
+    def started_to(self, t_end):
+        with open(self.notes + ".start") as fh:
+            return t_end - float(fh.read())
+
+    def test_a_notifier_that_traps_term_is_killed_within_the_timeout_and_6_s(self):
+        self.timed_notifier("trap '' TERM\n/bin/sleep 20\n")
+        p = self.rollback(lasts=60, STOP_ON_ROLLBACK="1", NOTIFY_TIMEOUT="2")
+        t_end = time.time()
+        self.assertEqual(p.returncode, 3, (p.stdout, p.stderr))
+        self.assertLess(self.started_to(t_end), 2 + 6, "TERM is trapped, so KILL follows 5 s later")
+        self.assertIn("ON_ROLLBACK failed", p.stdout)
+        self.assertIn("timed out after 2 s", p.stdout)
+        self.assertEqual([args for _, args in self.writes()], ["variable delete SUPERCI_JOBS -R Authentic-Intelligence/megpt-mono"], "the rollback stands")
+
+    def test_a_notifier_that_leaves_a_background_child_holding_its_output_does_not_hold_the_watch(self):
+        pidfile = os.path.join(self.tmp, "child.pid")
+        self.timed_notifier(f"/bin/sleep 20 &\necho $! > {pidfile}\nexit 0\n")
+        p = self.rollback(lasts=60, STOP_ON_ROLLBACK="1", NOTIFY_TIMEOUT="2")
+        t_end = time.time()
+        self.assertEqual(p.returncode, 3, (p.stdout, p.stderr))
+        self.assertLess(self.started_to(t_end), 2 + 6, "the child's open output must not make the watch wait for it")
+        self.assertEqual(len(self.writes()), 1, "the rollback stands")
+        with open(pidfile) as fh:
+            pid = int(fh.read())
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            try:
+                with open(f"/proc/{pid}/stat") as fh:
+                    state = fh.read().rsplit(")", 1)[1].split()[0]
+            except OSError:
+                state = "Z"
+            if state == "Z":
+                break
+            time.sleep(0.1)
+        self.assertEqual(state, "Z", "the child the notifier left behind is killed with its group, not left running")
+
+    def test_a_notifier_that_floods_its_output_is_bounded_in_time_and_memory(self):
+        self.timed_notifier("exec yes\n")
+        p = self.rollback_measured(STOP_ON_ROLLBACK="1", NOTIFY_TIMEOUT="2")
+        self.assertEqual(p.returncode, 3, (p.stdout[:300], p.stderr[:300]))
+        self.assertLess(self.started_to(p.t_end), 2 + 6)
+        self.assertLess(p.maxrss, 100_000, f"the watch's biggest process held {p.maxrss} KiB: the notifier's output is not buffered")
+        line = [l for l in p.stdout.splitlines() if "ON_ROLLBACK failed" in l]
+        self.assertEqual(len(line), 1, p.stdout[:500])
+        self.assertLess(len(line[0]), 400, "the log line holds only the first bytes")
+        self.assertEqual(len(self.writes()), 1, "the rollback stands")
+
+    def test_the_log_scrubs_every_kind_of_token_the_gate_or_the_notifier_prints(self):
+        pat = "github_pat_" + "11AAAAAAA0_fakefakefakefake"
+        jwt = "eyJ" + "hbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWtlIn0.fakesignaturefake"
+        akia = "AKIA" + "FAKEFAKEFAKEFAKE"
+        asia = "ASIA" + "FAKEFAKEFAKEFAKE"
+        said = f"{pat} {jwt} {akia} {asia}"
+        p = self.rollback(gate=f"print('canary FAIL: stub {said}')\nraise SystemExit(3)\n", lasts=2, NOTIFY_EXIT="7", NOTIFY_SAYS=said)
+        self.assertEqual(p.returncode, 0, (p.stdout, p.stderr))
+        self.assertIn("ON_ROLLBACK failed (exit 7)", p.stdout, "the notifier's own output is in the log, scrubbed")
+        seen = p.stdout + p.stderr + "".join(line for _, line in self.calls())
+        for secret in (pat, jwt, akia, asia, pat[:20], jwt[:25]):
+            self.assertNotIn(secret, seen)
+        self.assertEqual(len(self.calls()), 1)
+        self.assertIn("<token>", self.calls()[0][1], "the summary the notifier got is scrubbed too")
+
+    def test_stop_on_rollback_checks_the_tick_s_other_jobs_before_it_exits_3(self):
+        self.stateful_jobs()
+        with open(self.env["JOBS_FILE"], "w") as fh:
+            fh.write('["job-a","job-b"]')
+        seen = os.path.join(self.tmp, "gate-jobs")
+        gate = (f"import sys\njob = sys.argv[sys.argv.index('job') + 1]\nopen({seen!r}, 'a').write(job + '\\n')\n"
+                "if job == 'job-a':\n    print('canary FAIL: stub')\n    raise SystemExit(3)\nprint('canary keep')\n")
+        p = self.rollback(gate=gate, lasts=60, jobs=("job-a", "job-b"), STOP_ON_ROLLBACK="1")
+        self.assertEqual(p.returncode, 3, (p.stdout, p.stderr))
+        with open(seen) as fh:
+            self.assertEqual(fh.read().split(), ["job-a", "job-b"], "the second job was checked in the tick that rolled the first back")
+        self.assertEqual(len(self.calls()), 1)
+        self.assertIn("job-a", self.calls()[0][1])
+        self.assertEqual([args for _, args in self.writes()], ['variable set SUPERCI_JOBS -R Authentic-Intelligence/megpt-mono --body ["job-b"]'])
+
+    def test_stop_on_rollback_also_rolls_back_a_second_job_of_the_same_tick(self):
+        self.stateful_jobs()
+        with open(self.env["JOBS_FILE"], "w") as fh:
+            fh.write('["job-a","job-b"]')
+        p = self.rollback(lasts=60, jobs=("job-a", "job-b"), STOP_ON_ROLLBACK="1")
+        self.assertEqual(p.returncode, 3, (p.stdout, p.stderr))
+        self.assertEqual(len(self.calls()), 2, "both rollbacks were told")
+        self.assertFalse(os.path.exists(self.env["JOBS_FILE"]), "both are off superci")
+
+    def test_a_job_another_watch_already_took_out_of_the_variable_is_not_this_watch_s_rollback(self):
+        self.other_on_reads()  # the probe (1) and the tick's read (2) list the job; the rollback's re-read (3) and later reads do not
+        p = self.rollback(lasts=4, STOP_ON_ROLLBACK="1", OTHER_FROM="3")
+        self.assertEqual(p.returncode, 0, "nothing was rolled back here, so STOP_ON_ROLLBACK does not end the watch")
+        self.assertEqual(self.calls(), [], "and nobody is told of a rollback that was not made")
+        self.assertEqual(self.writes(), [], "no write: the variable lists the other job only")
+        self.assertIn("verify-tools is no longer in SUPERCI_JOBS", p.stdout)
+        self.assertNotIn("SUPERCI_JOBS was", p.stdout)
+
+    def test_no_on_rollback_changes_nothing(self):
+        del self.env["ON_ROLLBACK"]
+        p = self.rollback()
+        self.assertEqual((p.returncode, self.calls()), (0, []), (p.stdout, p.stderr))
+        self.assertIn("SUPERCI_JOBS was", p.stdout)
+
+
 class CanaryTokenLifetime(CanaryTree):
     """The variables token as the listener hands it out: it may expire 10 minutes after the ask. A virtual clock (the date and sleep stubs) moves the
     canary through ticks 600 s apart in no real time, and the listener stub numbers its tokens (ghs_vars_N), each valid for 600 s of that clock."""
@@ -1801,7 +2031,7 @@ fi
     def test_a_token_ten_minutes_from_expiry_at_the_ask_is_not_used_past_it(self):
         # Three ticks 600 s apart: a token kept longer than 600 s (the listener's reserve) is expired at the next tick and answers 401.
         p = self.rollback(gate="print('canary keep')\nraise SystemExit(0)\n", lasts=1500)
-        self.assertNotIn("unset or unread", p.stdout, "a tick read SUPERCI_JOBS with an expired token")
+        self.assertNotIn("SUPERCI_JOBS unread", p.stdout, "a tick read SUPERCI_JOBS with an expired token")
         self.assertEqual(p.stdout.count("canary keep"), 3, p.stdout)
         reads = [tok for tok, args in self.gh_calls() if "actions/variables/SUPERCI_JOBS" in args]
         self.assertEqual(len(set(reads)), len(reads), "each tick, 600 s apart, reads with a token asked for since the last: " + str(reads))
@@ -1810,7 +2040,7 @@ fi
     def test_a_401_on_the_read_drops_the_token_asks_again_and_reads_with_the_fresh_one(self):
         self.mark("dead", "ghs_vars_1")
         p = self.rollback(gate="print('canary keep')\nraise SystemExit(0)\n", NO_ADVANCE="1")
-        self.assertNotIn("unset or unread", p.stdout, (p.stdout, p.stderr))
+        self.assertNotIn("SUPERCI_JOBS unread", p.stdout, (p.stdout, p.stderr))
         self.assertIn("canary keep", p.stdout)
         reads = [tok for tok, args in self.gh_calls() if "actions/variables/SUPERCI_JOBS" in args]
         self.assertEqual(reads[:2], ["ghs_vars_1", "ghs_vars_2"], "the refused token is replaced once, and the fresh one is kept")
@@ -1843,6 +2073,84 @@ fi
         p = subprocess.run(["bash", self.tree(), "unset"], env=dict(self.env, REFUSE_AFTER="0"), capture_output=True, text=True, timeout=60)
         self.assertIn("ROLLBACK FAILED: the listener would not give a variables token", p.stdout, (p.stdout, p.stderr))
 
+    def notifier(self, **extra):
+        self.notes = os.path.join(self.tmp, "notes")
+        self.env.update(NOTIFY_NOTES=self.notes, ON_ROLLBACK=stub("notifier", 'printf \'%s\\t%s\\n\' "$#" "$1" >> "$NOTIFY_NOTES"\n'), **extra)
+
+    def calls(self):
+        if not os.path.exists(self.notes):
+            return []
+        with open(self.notes) as fh:
+            return [tuple(line.rstrip("\n").split("\t", 1)) for line in fh if line.strip()]
+
+    def test_a_no_check_streak_of_3_ticks_notifies_once(self):
+        # Four ticks 600 s apart on the virtual clock, the gate crashing on each: the 3rd notifies, the 4th does not repeat it.
+        self.notifier()
+        p = self.rollback(gate="import sys\nprint('Traceback: boom')\nsys.exit(1)\n", lasts=2000)
+        self.assertEqual(p.stdout.count("NO CHECK (the gate failed"), 4, (p.stdout, p.stderr))
+        calls = self.calls()
+        self.assertEqual(len(calls), 1, (calls, p.stdout))
+        argc, line = calls[0]
+        self.assertEqual(argc, "1")
+        self.assertIn("verify-tools", line)
+        self.assertIn("3 ticks", line)
+        self.assertIn("the gate failed: Traceback: boom", line, "why")
+        self.assertEqual(self.writes(), [], "no verdict rolls nothing back")
+
+    def test_a_check_between_no_checks_starts_the_streak_over(self):
+        self.notifier()
+        n = os.path.join(self.tmp, "ticks")
+        gate = f"import sys\nk = int(open({n!r}).read() or 0) + 1 if __import__('os').path.exists({n!r}) else 1\nopen({n!r}, 'w').write(str(k))\nif k == 3:\n    print('canary keep')\n    sys.exit(0)\nsys.exit(1)\n"
+        p = self.rollback(gate=gate, lasts=3000)
+        self.assertEqual(p.stdout.count("NO CHECK (the gate failed"), 4, (p.stdout, p.stderr))
+        self.assertIn("canary keep", p.stdout)
+        self.assertEqual(self.calls(), [], "2 no-checks, a check, 2 no-checks: never 3 running")
+
+    def test_a_rollback_followed_by_four_ticks_gives_exactly_one_notice(self):
+        # The watch's own rollback leaves SUPERCI_JOBS unset: the 4 ticks after it are not 4 failures to check.
+        self.notifier()
+        p = self.rollback(lasts=2500)
+        calls = self.calls()
+        self.assertEqual(len(calls), 1, (calls, p.stdout))
+        self.assertIn("rolled verify-tools back", calls[0][1])
+        self.assertEqual(p.stdout.count("SUPERCI_JOBS unset, nothing to check"), 4, (p.stdout, p.stderr))
+
+    def test_a_deliberate_unset_is_not_a_streak_of_no_checks(self):
+        self.notifier()
+        gh = os.path.join(self.bin, "gh")
+        with open(gh) as fh:
+            body = fh.read()
+        with open(gh, "w") as fh:
+            fh.write(body.replace('case "$*" in\n', 'case "$*" in\n  *actions/variables/SUPERCI_JOBS*) echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;\n', 1))
+        p = self.rollback(gate="raise SystemExit(0)\n", lasts=2500)
+        self.assertEqual(self.calls(), [], "a variable someone deleted on purpose (`canary.sh unset`) is not a watch that cannot check")
+        self.assertEqual(p.stdout.count("SUPERCI_JOBS unset, nothing to check"), 5, (p.stdout, p.stderr))
+
+    def test_an_unreadable_variable_still_counts_as_no_check(self):
+        self.notifier()
+        self.other_on_reads()  # the start's probe answers, every read after it is a 502
+        p = self.rollback(gate="raise SystemExit(0)\n", lasts=2000, FAIL_FROM="2")
+        self.assertEqual(p.stdout.count("SUPERCI_JOBS unread, no check"), 4, (p.stdout, p.stderr))
+        calls = self.calls()
+        self.assertEqual(len(calls), 1, calls)
+        self.assertIn("3 ticks", calls[0][1])
+
+    def test_a_job_that_leaves_the_list_starts_its_streak_over(self):
+        # Ticks 1 and 2: the gate crashes (2 no-checks). Tick 3: the variable lists another job only. Ticks 4 and 5: the gate crashes again.
+        self.notifier()
+        self.other_on_reads()
+        p = self.rollback(gate="import sys\nprint('Traceback: boom')\nsys.exit(1)\n", lasts=2500, OTHER_FROM="4", OTHER_TO="4")
+        self.assertEqual(p.stdout.count("NO CHECK (the gate failed"), 4, (p.stdout, p.stderr))
+        self.assertEqual(self.calls(), [], "2 no-checks, a tick with the job off the list, 2 no-checks: never 3 running")
+
+    def test_a_streak_with_no_variables_token_says_why(self):
+        self.notifier()
+        p = self.rollback(gate="raise SystemExit(0)\n", lasts=1500, REFUSE_AFTER="0", VT_TTL="0")
+        self.assertEqual(p.returncode, 0, (p.stdout, p.stderr))
+        calls = self.calls()
+        self.assertEqual(len(calls), 1, (calls, p.stdout, p.stderr))
+        self.assertIn("no GitHub App token", calls[0][1])
+
     def test_an_exit_2_of_the_gate_is_no_check_and_says_why(self):
         p = self.rollback(gate="import sys\nprint('refusing: no GitHub App token for contents (the listener lacks it). ghs_leak_in_text', file=sys.stderr)\nsys.exit(2)\n")
         self.assertIn("NO CHECK (the gate refused: refusing: no GitHub App token for contents", p.stdout, (p.stdout, p.stderr))
@@ -1870,7 +2178,7 @@ fi
             fh.write(body.replace('case "$*" in\n', 'case "$*" in\n  *actions/variables/SUPERCI_JOBS*) echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;\n', 1))
         p = self.rollback(gate="raise SystemExit(0)\\n", NO_ADVANCE="1")
         self.assertEqual(p.returncode, 0, (p.stdout, p.stderr))
-        self.assertIn("SUPERCI_JOBS unset or unread, no check", p.stdout)
+        self.assertIn("SUPERCI_JOBS unset, nothing to check", p.stdout)
 
     def test_under_the_personal_override_the_rollback_asks_the_app_once_and_does_not_wait_on_it(self):
         flaky = stub("flaky_listener", 'echo variables >> "$TOKS/asks"\nprintf "bad gateway\\n502\\n"\n')
