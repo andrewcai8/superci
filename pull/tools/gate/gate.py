@@ -355,6 +355,8 @@ class Floor:
 WINDOW_FLOORS = {
     "integration": Floor("4e75d940d01c2ec79ef887558b1d050ed2eef4e5", "2026-11-27T20:33:52Z",
                          "megpt-mono #36944 ended the 5-25 minute resets between integration targets"),
+    "unit-tests": Floor("bdfa0fed349ceecee9b2cd1522a0cc5f442a9d9f", "2026-11-28T05:52:41Z",
+                        "megpt-mono #36789, the last of ci-speed's Nov 28 flake fixes (with #36883 0c49174 and #36887 df260e4)"),
 }
 
 
