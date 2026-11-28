@@ -39,7 +39,13 @@ PASS, FAIL, NOISE = "PASS", "FAIL", "NOISE"
 MIN_RUNS = 5
 P90_FACTOR = 1.1
 QUEUE_P90_SLACK_S = 3.0
-EXTRA_FAILURES = 1
+# The failures row counts runs, not legs (one broken PR fails many legs of one run together), and rolls back when the failed runs exceed what
+# Blacksmith's own per-run failure rate would produce by chance in n runs, with FALSE_ROLLBACK_RATE the chance that a healthy superci rolls
+# back anyway: the smallest k with P(X > k) <= FALSE_ROLLBACK_RATE for X ~ Binomial(superci runs, Blacksmith's run failure rate).
+FALSE_ROLLBACK_RATE = 0.01
+# One failed run never rolls a canary back alone, whatever the bound: Blacksmith's rate is an estimate from a finite window, and a rate of 0.0%
+# from 40 clean runs is not a proof that a run cannot fail by chance (a rate of 0 with an exact bound of 0 would roll back on the first red).
+MIN_ALLOWED_FAILED_RUNS = 1
 MAX_UNEXPLAINED_S = 2.0
 BASELINE_HOURS = 24
 # Gate 2.
@@ -210,6 +216,29 @@ def excused(f, everything):
     return any(o.job_id != f.job_id and not o.ok and not o.cancelled and o.sha == f.sha and o.fleet == "blacksmith" for o in everything)
 
 
+def run_failure_allowance(n, p, alpha=FALSE_ROLLBACK_RATE):
+    """The most failed runs out of n a healthy superci shows without rolling back: the smallest k with P(X > k) <= alpha for
+    X ~ Binomial(n, p), p Blacksmith's per-run failure rate, summed exactly with math.comb, never below MIN_ALLOWED_FAILED_RUNS (nor above
+    n). p = 0 gives the floor (the exact bound, 0, would send a job back on one red run against a clean baseline); p = 1 gives n (every
+    run is expected to fail, nothing can exceed it). Each term is taken in log space (lgamma): math.comb(n, i) as a float overflows from
+    n = 1,030, which a long canary's window reaches."""
+    if n <= 0:
+        return 0
+    p = min(max(p, 0.0), 1.0)
+    if p == 0.0:
+        return min(MIN_ALLOWED_FAILED_RUNS, n)
+    if p == 1.0:
+        return n
+    log_p, log_q, log_n = math.log(p), math.log1p(-p), math.lgamma(n + 1)
+    tail = 0.0  # P(X > k), summed from the top so the small terms are not lost
+    for k in range(n, -1, -1):
+        term = math.exp(log_n - math.lgamma(k + 1) - math.lgamma(n - k + 1) + k * log_p + (n - k) * log_q)
+        if tail + term > alpha:
+            return min(max(k, MIN_ALLOWED_FAILED_RUNS), n)
+        tail += term
+    return min(MIN_ALLOWED_FAILED_RUNS, n)
+
+
 def evaluate_job(S, B, ceiling, unexplained, min_runs=MIN_RUNS, tests=None):
     """Gate 1's rows from the superci runs S and Blacksmith's B of one job, the job's ceiling in seconds (None when it has no
     row in ci-limits.tsv), the unexplained seconds of each superci job and `tests` (Tests, or None for a job with no test-name
@@ -248,12 +277,18 @@ def evaluate_job(S, B, ceiling, unexplained, min_runs=MIN_RUNS, tests=None):
         # the tests that excused a superci failure here (so a failure is not counted on both sides). Scattered Blacksmith failures on other tests, one
         # on another branch, one not read, one naming no test and one with a hard reason still count toward the allowance.
         b_counted = [o for o in b_failed if not _cluster_failure(tests.b_reads.get(o.job_id), tests.excused)]
-    b_rate = len(b_counted) / len(B_done) if B_done else 0.0
-    allowed = b_rate * len(S_done) + EXTRA_FAILURES
-    rows.append(Row("failures (superci)", f"{len(counted)} of {len(S_done)}", f"<= B rate {100 * b_rate:.1f}% x {len(S_done)} + {EXTRA_FAILURES} = {allowed:.1f}",
-                    PASS if len(counted) <= allowed else FAIL, "; ".join(notes), tuple(detail) + (
-                        (f"Blacksmith failure rate: {100 * len(b_failed) / len(B_done) if B_done else 0.0:.1f}% ({len(b_failed)} of {len(B_done)}) before, {100 * b_rate:.1f}% ({len(b_counted)} of {len(B_done)}) "
-                         f"after excluding {len(b_failed) - len(b_counted)} failed main job{'' if len(b_failed) - len(b_counted) == 1 else 's'} whose every failing test excused a superci failure; the allowance uses the rate after",) if tests is not None else ())))
+    s_runs, b_runs = {o.run_id for o in S_done}, {o.run_id for o in B_done}
+    failed_runs = collections.Counter(o.run_id for o in counted)  # run -> its counted failed legs
+    b_failed_runs, b_counted_runs = {o.run_id for o in b_failed}, {o.run_id for o in b_counted}
+    b_rate = len(b_counted_runs) / len(b_runs) if b_runs else 0.0
+    allowed = run_failure_allowance(len(s_runs), b_rate)
+    legs_of = ", ".join(f"{r} ({c})" for r, c in failed_runs.most_common(10)) + (" ..." if len(failed_runs) > 10 else "")
+    rows.append(Row("failures (superci)", f"{len(failed_runs)} of {len(s_runs)} ({len(counted)} legs)",
+                    f"<= {allowed} at a {100 * FALSE_ROLLBACK_RATE:g}% false-rollback bound (Blacksmith {len(b_counted_runs)}/{len(b_runs)} runs = {100 * b_rate:.1f}%)",
+                    PASS if len(failed_runs) <= allowed else FAIL, "; ".join(notes), tuple(detail) + (
+                        (f"failed superci runs (counted legs): {legs_of}",) if failed_runs else ()) + (
+                        (f"Blacksmith failure rate: {100 * len(b_failed_runs) / len(b_runs) if b_runs else 0.0:.1f}% ({len(b_failed_runs)} of {len(b_runs)} runs) before, {100 * b_rate:.1f}% ({len(b_counted_runs)} of {len(b_runs)} runs) "
+                         f"after excluding {len(b_failed) - len(b_counted)} failed main job{'' if len(b_failed) - len(b_counted) == 1 else 's'} whose every failing test excused a superci failure; the bound uses the rate after",) if tests is not None else ())))
     p50u = T.q(unexplained, 50)
     rows.append(Row("unexplained p50 (timeline)", fmt_s(p50u), f"< {MAX_UNEXPLAINED_S:g} s", PASS if p50u is not None and p50u < MAX_UNEXPLAINED_S else FAIL,
                     "" if unexplained else "no superci timelines"))

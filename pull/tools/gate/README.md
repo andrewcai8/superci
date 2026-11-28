@@ -81,7 +81,7 @@ lower bound only under-reports, so a row that fails on them fails on the real ti
 | wall p50 | superci p50 of started to completed, over successful runs, timed-out ones at the ceiling and cancelled ones at the time they ran, at or below Blacksmith's |
 | wall p90 | at or below the smaller of Blacksmith's p90 x 1.1 and the job's ceiling in `scripts/verify/ci-limits.tsv` on origin/main |
 | queue wait p50, p90 | created to started (created to completed for a job cancelled in the queue): p50 at or below Blacksmith's, p90 at or below Blacksmith's plus 3 s |
-| failures | at most Blacksmith's failure rate x superci observations + 1; a failure the same commit also has on Blacksmith (main runs there) is not counted. A superci failure never excuses another, main's included. For `unit-tests` and `integration`, a failure whose every failing test is red on Blacksmith's main too is excluded and listed ([below](#failing-tests-and-window-floors)) |
+| failures | failed **runs**, not legs (a run fails when one of its non-cancelled counted legs does, so one broken PR failing 15 legs is one run), at most the smallest k with P(X > k) <= 1% (`FALSE_ROLLBACK_RATE`) for X ~ Binomial(superci runs, Blacksmith's per-run failure rate), summed exactly and never below 1 (a clean baseline does not make one red run evidence; see [the bound](#the-failures-row-counts-runs-against-a-binomial-bound)); a failure the same commit also has on Blacksmith (main runs there) is not counted. A superci failure never excuses another, main's included. For `unit-tests` and `integration`, a failure whose every failing test is red on Blacksmith's main too is excluded and listed ([below](#failing-tests-and-window-floors)) |
 | unexplained p50 | under 2 s per `timeline`'s derivation |
 
 **The noise floor.** Every quantile is interpolated, and above the rows the tool prints each fleet's min, p25, p50, p75, p90,
@@ -125,9 +125,20 @@ output says so: `failing tests: no test-name source for <job>`).
   **Which Blacksmith runs make main red.** Ordinary main runs only: a `workflow_dispatch` run (a census, a hoist record) and an integration
   census leg (`integration (N, v3)`) are left out, as are failed jobs naming no test-level name.
   **The allowance leaves out only the double-counted cluster.** A failed Blacksmith main job leaves the rate's numerator only when every test
-  it failed is among the tests that excused a superci failure in this window; the denominator stays every Blacksmith run. Scattered
+  it failed is among the tests that excused a superci failure in this window; the denominator stays every Blacksmith run (runs, not legs: a Blacksmith run is failed when one of its counted legs is). Scattered
   Blacksmith failures on other tests, one on another branch, one not read, one naming no test and one with a hard reason still count. Both rates are
   printed under the failures row, before and after; the allowance uses the rate after.
+
+### The failures row counts runs against a binomial bound
+
+Nov 28 07:36Z: unit-tests rolled back on 22 failed legs of 491 against `B rate 1.9% x 491 + 1 = 10.2`; 15 of the legs were one PR's single run
+and none was superci's. Legs of one run fail together, so the row counts runs: the value reads `<failed runs> of <runs> (<failed legs> legs)`
+and the threshold `<= k at a 1% false-rollback bound (Blacksmith <failed>/<runs> runs = <rate>%)`, where k is the smallest value with
+P(X > k) <= `FALSE_ROLLBACK_RATE` (1%) for X ~ Binomial(superci runs, Blacksmith's per-run rate), summed exactly (`run_failure_allowance`).
+1% is the chance that a healthy superci rolls back on this row alone. The row fails when the failed runs exceed k, and a canary's `ROLL BACK`
+line carries the value and the threshold, so the bound is in the log. The floor is 1: against a Blacksmith rate of 0 the exact bound is 0,
+which would roll back on one red run, and a clean finite baseline is not proof that a run cannot fail by chance. The distinct runs are those
+with at least one non-cancelled job; the per-leg exclusions (same commit red on Blacksmith, red on Blacksmith main) are unchanged.
 
 **Window floors (`WINDOW_FLOORS`).** A job's parity window may not include runs from before its floor: `--since` and Blacksmith's
 baseline start are clamped to it (the output says so), and a Blacksmith window that ends before it is refused. `integration` starts at
