@@ -1,0 +1,5 @@
+#!/bin/bash
+# ss as the identity host script reads it: the sockets $PROC_ROOT/ss lists, one a line, in `ss -tnpH` form. A host with no
+# such file has no socket.
+cat "${PROC_ROOT:-/proc}/ss" 2> /dev/null
+exit 0

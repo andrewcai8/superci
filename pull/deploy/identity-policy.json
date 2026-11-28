@@ -10,6 +10,8 @@
                      "StringLike": { "kms:EncryptionContext:aws:s3:arn": "arn:aws:s3:::@BUCKET@/@DEPLOYMENT@/*" } } },
     { "Sid": "ReadTheReleasedShim", "Effect": "Allow", "Action": "s3:GetObject",
       "Resource": ["arn:aws:s3:::@RELEASE@/bin/superci-shim", "arn:aws:s3:::@RELEASE@/bin/RELEASE.json"] },
+    { "Sid": "PublishWhoPollsGitHub", "Effect": "Allow", "Action": "cloudwatch:PutMetricData", "Resource": "*",
+      "Condition": { "StringEquals": { "cloudwatch:namespace": "superci-pull" } } },
     { "Sid": "ReadItsOwnGroup", "Effect": "Allow", "Action": "autoscaling:DescribeAutoScalingInstances", "Resource": "*" },
     { "Sid": "MarkItselfUnhealthy", "Effect": "Allow", "Action": "autoscaling:SetInstanceHealth",
       "Resource": "arn:aws:autoscaling:us-east-1:@ACCOUNT@:autoScalingGroup:*:autoScalingGroupName/superci-pull-identity-*" }

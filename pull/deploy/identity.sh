@@ -714,12 +714,15 @@ for g in sorted(rows, key=lambda g: g["AutoScalingGroupName"]):
 if not rows:
     print("  none: every host is plain, and nothing replaces one that is lost (up <az> adopts it into a group)")' "$NAME"
   echo "identity hosts: ${#HOSTS[@]}"
-  local line az id ip
+  local line az id ip st polled=""
   for line in "${HOSTS[@]}"; do
     read -r az id ip <<< "$line"
     case " $(group_info "$az") " in *" $id="*) ;; *) echo "$id is in no group: nothing replaces it if it is lost; up $az adopts it" ;; esac
     hpush "$line"
-    echo "$id $(hssh "$id" "$az" "$ip" 'sudo superci-id status' < /dev/null || echo 'status failed')"
+    st=$(hssh "$id" "$az" "$ip" 'sudo superci-id status' < /dev/null || echo 'status failed')
+    echo "$id $(grep -v '^polling ' <<< "$st")"
+    # "polling <set> <n> ...": the host's listeners holding a session with GitHub's broker, per size label
+    polled="$polled$(sed -n "s/^polling \(.*\)/$az \1/p" <<< "$st")"$'\n'
   done
   echo "stored in s3://$BUCKET:"
   complete_in_s3 | awk '{n[$2]++} END {for (a in n) printf "  %s %d identities\n", a, n[a]}' | sort
@@ -731,6 +734,21 @@ print("  %d identities, %d online, %d busy" % (len(runners), sum(r["status"] == 
 for l, c in sorted(by.items()):
     print("  label %s: %d" % (l, c))
 print("  memory they need on %d hosts: %.1f GiB" % (int(sys.argv[1]), (len(runners) * 64 + 60 * int(sys.argv[1])) / 1024))' "${#HOSTS[@]}"
+  # What GitHub's runner list says is online is not what takes jobs: on Nov 28 it read 620 of 620 identities offline while their
+  # listeners kept taking them. The hosts count the listeners that hold a session with GitHub's broker; the alarms read that.
+  echo "per label, GitHub's online status (REST: unreliable for broker sessions) and the listeners polling (what the hosts count):"
+  at_github | python3 -I -c 'import collections,json,sys
+runners = json.load(sys.stdin)["runners"]
+rest = collections.Counter(l for r in runners if r["status"] == "online" for l in r["labels"] if l.startswith("superci-"))
+polling, hosts = collections.Counter(), collections.defaultdict(list)
+for line in open(sys.argv[1]).read().splitlines():
+    f = line.split()
+    for i in range(1, len(f) - 1, 2):
+        polling[f[i]] += int(f[i + 1])
+        hosts[f[i]].append("%s %s" % (f[0], f[i + 1]))
+labels = set(rest) | set(polling) | {l for r in runners for l in r["labels"] if l.startswith("superci-")}
+for l in sorted(labels):
+    print("  label %s: REST online %d, polling %d%s" % (l, rest[l], polling[l], " (hosts: %s)" % ", ".join(hosts[l]) if hosts[l] else ""))' <(printf '%s' "$polled")
   echo "budget per listener: 64 MiB private (its unit restarts it at MemoryMax 192M) + 60 MiB shared a host; 1,550 identities are about 97 GiB"
 }
 

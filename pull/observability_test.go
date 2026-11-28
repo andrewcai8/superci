@@ -115,6 +115,14 @@ func TestEveryMetricTheDashboardAndAlarmsReadIsPublished(t *testing.T) {
 	for _, d := range metricData(m, at) {
 		published[aws.ToString(d.MetricName)] = true
 	}
+	// The identity hosts publish their own metric, IdentitiesPolling, in this namespace (deploy/identity-host.sh).
+	host, err := os.ReadFile("deploy/identity-host.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, g := range regexp.MustCompile(`\\?"MetricName\\?":\\?"(\w+)\\?"`).FindAllStringSubmatch(string(host), -1) {
+		published[g[1]] = true
+	}
 	raw, err := os.ReadFile("deploy/dashboard.json")
 	if err != nil {
 		t.Fatal(err)
