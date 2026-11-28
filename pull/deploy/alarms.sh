@@ -9,6 +9,19 @@ set -euo pipefail
 A="aws --profile ci-runners --region us-east-1"
 [ "$($A sts get-caller-identity --query Account --output text)" = 243891825325 ] || { echo "refusing: not ci-runners" >&2; exit 1; }
 here=$(cd "$(dirname "$0")" && pwd)
+# The identity alarms read IdentitiesPolling, which only the identity hosts publish, and a host publishes it only once it runs the identity-host.sh that
+# does (identity.sh up, then hpush or status: see the README's rollout order). An alarm created before that reads no data for the metric and stays OK
+# (identity-none would never fire), so nothing is written unless CloudWatch lists a series of it for every AZ the alarms sum over. IDENTITY_AZS lists
+# those AZs (default us-east-1a us-east-1b, as identity.sh reads it). A first install, with no host publishing yet, sets IDENTITY_ALARMS_UNPUBLISHED=1.
+read -ra IDENTITY_AZ_LIST <<< "${IDENTITY_AZS:-us-east-1a us-east-1b}"
+listed=$($A cloudwatch list-metrics --namespace superci-pull --metric-name IdentitiesPolling --query 'Metrics[].Dimensions[?Name==`AZ`].Value[]' --output text) \
+  || { echo "refusing: could not list the IdentitiesPolling series" >&2; exit 1; }
+for az in "${IDENTITY_AZ_LIST[@]}"; do
+  tr '\t' '\n' <<< "$listed" | grep -qx -- "$az" && continue
+  [ "${IDENTITY_ALARMS_UNPUBLISHED:-}" = 1 ] && { echo "warning: no IdentitiesPolling series for $az; IDENTITY_ALARMS_UNPUBLISHED=1 creates the identity alarms anyway" >&2; continue; }
+  echo "refusing: no IdentitiesPolling series for $az in superci-pull, so identity-none and identity-starved would read nothing and stay OK. Roll the identity hosts out first (README: identity.sh up, hpush/status, check polling), or on a first install set IDENTITY_ALARMS_UNPUBLISHED=1" >&2
+  exit 1
+done
 TOPIC=$($A sns create-topic --name superci-pull-alarms --tags Key=purpose,Value=superci-pull --query TopicArn --output text)
 alarm() { # name description metric statistic comparison threshold period evaluations datapoints missing [set]
   local stat=(--statistic "$4") dim=()
@@ -85,25 +98,52 @@ math idle-spend-unrouted "Over 8 USD an hour of estimated spend sat on machines 
     {"Id":"unrouted","Expression":"IF(FILL(started, 0) < 1 AND idle > 8, idle, 0)","Label":"Idle spend an hour with no job started","ReturnData":true}]' \
   GreaterThanThreshold 8 6 6 notBreaching
 # A dispatch size's job waits at GitHub for a free identity before its identity's shim brings it to the dispatcher, where
-# OldestWaitingJobAgeS and the job's queue time start, so a size short of identities waits unseen by every alarm above. The
-# listener lists the identities group every 5 minutes and publishes each dispatch size's IdentitiesOnline and IdentitiesBusy; running
-# and waiting jobs (DispatchRunning, JobsWaiting) over 70% of the identities online for 10 minutes means the size is close to
-# having none free. Jobs only count here once an identity's shim has brought them, so a size with no identity online reads 0 jobs: identity-none
-# below is the alarm for that. A size that is not dispatched publishes none of these, reads no data and stays OK; so does a size whose
-# identities were not listed for 15 minutes.
+# OldestWaitingJobAgeS and the job's queue time start, so a size short of identities waits unseen by every alarm above. The two
+# alarms below read IdentitiesPolling, which each identity host publishes every 30 s (identity-host.sh health): the Runner.Listeners
+# of a size holding a session with GitHub's broker, one series a host (dimensions Set and AZ), summed here over IDENTITY_AZS (the
+# hosts' AZs, as identity.sh reads them; rerun this script after adding a host in another). They do not read GitHub's REST status
+# of a runner, which the listener still publishes as IdentitiesOnline and IdentitiesBusy but which is not to be trusted for a
+# session: from 03:05Z on Nov 28 it read up to 620 of 620 identities offline while their listeners kept taking jobs, and
+# identity-none rolled a canary back on it.
+# A host cannot see a label, though: an identity parked under superci-park has a listener with a session like any other, and the host counts it for the size
+# in its name. So both alarms read the lower of two counts, IdentitiesLabeled (the listener's listing of the identities group: how many identities carry the
+# size's label, whatever their REST status, since the labels are what that list holds correctly) and IdentitiesPolling summed over the hosts. All parked, or a
+# relabel half done, is caught through the labeled count; listeners without a session, or hosts that are down, through the polling count. A listing older than
+# 15 minutes publishes no IdentitiesLabeled, and then both alarms read no data and stay OK, as they did before.
+# Jobs only count in identity-starved once an identity's shim has brought them, so a size with no identity polling reads 0 jobs: identity-none
+# below is the alarm for that. A size that is not dispatched has no DispatchRunning (the listener publishes it for each dispatch set, every
+# minute) and stays OK, its hosts' polling never read; so does a size whose hosts publish nothing while the listener does not either.
+# polling_metrics <size> <stat>: POLL_METRICS holds one metric a host AZ (ids p0, p1, ...), POLL_SUM their sum, a missing host as 0.
+polling_metrics() {
+  local i=0 az
+  POLL_METRICS=""; POLL_SUM=""
+  for az in "${IDENTITY_AZ_LIST[@]}"; do
+    POLL_METRICS="$POLL_METRICS"'{"Id":"p'"$i"'","MetricStat":{"Metric":{"Namespace":"superci-pull","MetricName":"IdentitiesPolling","Dimensions":[{"Name":"Set","Value":"superci-'"$1"'"},{"Name":"AZ","Value":"'"$az"'"}]},"Period":60,"Stat":"'"$2"'"},"ReturnData":false},'
+    POLL_SUM="$POLL_SUM${POLL_SUM:+ + }FILL(p$i, 0)"
+    i=$((i + 1))
+  done
+}
 starved() { # size
-  math "identity-starved-$1" "Superci-$1's running and waiting jobs are over 70% of its identities online for 10 minutes: its jobs will wait at GitHub for a free identity, unseen by oldest-job-wait (register more identities, or relabel parked ones)" \
+  polling_metrics "$1" Minimum
+  math "identity-starved-$1" "Superci-$1's running and waiting jobs are over 70% of the lower of its identities labeled for it (IdentitiesLabeled) and polling GitHub's broker (IdentitiesPolling, over the hosts) for 10 minutes: its jobs will wait at GitHub for a free identity, unseen by oldest-job-wait (register more identities, relabel parked ones, or look at the hosts)" \
     '[{"Id":"running","MetricStat":{"Metric":{"Namespace":"superci-pull","MetricName":"DispatchRunning","Dimensions":[{"Name":"Set","Value":"superci-'"$1"'"}]},"Period":60,"Stat":"Maximum"},"ReturnData":false},
       {"Id":"waiting","MetricStat":{"Metric":{"Namespace":"superci-pull","MetricName":"JobsWaiting","Dimensions":[{"Name":"Set","Value":"superci-'"$1"'"}]},"Period":60,"Stat":"Maximum"},"ReturnData":false},
-      {"Id":"online","MetricStat":{"Metric":{"Namespace":"superci-pull","MetricName":"IdentitiesOnline","Dimensions":[{"Name":"Set","Value":"superci-'"$1"'"}]},"Period":60,"Stat":"Minimum"},"ReturnData":false},
-      {"Id":"share","Expression":"IF(online > 0, 100 * (FILL(running, 0) + FILL(waiting, 0)) / online, IF(FILL(running, 0) + FILL(waiting, 0) > 0, 1000, 0))","Label":"Running and waiting jobs, % of identities online","ReturnData":true}]' \
+      {"Id":"labeled","MetricStat":{"Metric":{"Namespace":"superci-pull","MetricName":"IdentitiesLabeled","Dimensions":[{"Name":"Set","Value":"superci-'"$1"'"}]},"Period":60,"Stat":"Minimum"},"ReturnData":false},
+      '"$POLL_METRICS"'{"Id":"polled","Expression":"'"$POLL_SUM"'","Label":"Identities polling, over the hosts","ReturnData":false},
+      {"Id":"online","Expression":"IF(labeled < polled, labeled, polled)","Label":"Identities that carry the label and poll: the lower of the two","ReturnData":false},
+      {"Id":"share","Expression":"IF(online > 0, 100 * (FILL(running, 0) + FILL(waiting, 0)) / online, IF(FILL(running, 0) + FILL(waiting, 0) > 0, 1000, 0))","Label":"Running and waiting jobs, % of identities labeled and polling","ReturnData":true}]' \
     GreaterThanThreshold 70 10 10 notBreaching
 }
-# A size with no identity online takes no job: its jobs queue at GitHub, where no shim has brought them, so nothing above counts them. IdentitiesOnline
-# alone is read, and a size with every identity offline or parked publishes 0, not nothing.
+# A size with no identity labeled and polling takes no job: its jobs queue at GitHub, where no shim has brought them, so nothing above counts them. The
+# sum is read where the listener publishes the size (running >= 0 is true there and missing elsewhere, where the alarm stays OK; the 1 is
+# only for a CloudWatch that answers the false branch, and is no breach); a host that publishes nothing counts 0, so a size whose hosts are down alarms.
 none() { # size
-  math "identity-none-$1" "Superci-$1 has no identity online for 5 minutes: no job of the size can start, and none is counted by identity-starved or oldest-job-wait (identities offline, parked, or their hosts down)" \
-    '[{"Id":"online","MetricStat":{"Metric":{"Namespace":"superci-pull","MetricName":"IdentitiesOnline","Dimensions":[{"Name":"Set","Value":"superci-'"$1"'"}]},"Period":60,"Stat":"Minimum"},"ReturnData":true}]' \
+  polling_metrics "$1" Minimum
+  math "identity-none-$1" "Superci-$1 has no identity that carries its label and polls GitHub's broker for 5 minutes (the lower of IdentitiesLabeled and IdentitiesPolling over the hosts): no job of the size can start, and none is counted by identity-starved or oldest-job-wait (identities parked or removed at GitHub, listeners without a session, or their hosts down)" \
+    '[{"Id":"running","MetricStat":{"Metric":{"Namespace":"superci-pull","MetricName":"DispatchRunning","Dimensions":[{"Name":"Set","Value":"superci-'"$1"'"}]},"Period":60,"Stat":"Maximum"},"ReturnData":false},
+      {"Id":"labeled","MetricStat":{"Metric":{"Namespace":"superci-pull","MetricName":"IdentitiesLabeled","Dimensions":[{"Name":"Set","Value":"superci-'"$1"'"}]},"Period":60,"Stat":"Minimum"},"ReturnData":false},
+      '"$POLL_METRICS"'{"Id":"polled","Expression":"'"$POLL_SUM"'","Label":"Identities polling, over the hosts","ReturnData":false},
+      {"Id":"usable","Expression":"IF(running >= 0, IF(labeled < polled, labeled, polled), 1)","Label":"Identities that carry the label and poll: the lower of the two","ReturnData":true}]' \
     LessThanThreshold 1 5 5 notBreaching
 }
 # One set's own wait and stall, on the Set dimension, with the listener-wide alarms' threshold, periods and missing-data rule. A canary

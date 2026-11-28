@@ -9,10 +9,13 @@
 #   superci-id boot                                      installs the shim and the unit, restores the share, starts it
 #   superci-id register <label> <url> <group|-> <name>...   registers each name not held yet; token on stdin
 #   superci-id adopt <name>...                           uploads and starts identities already registered here; no token
-#   superci-id status                                    identities, listeners running, private memory per listener against its 64 MiB
+#   superci-id status                                    identities, listeners running, private memory per listener against its 64 MiB, and
+#                                                        the listeners polling per size (a "polling <set> <n> ..." line)
+#   superci-id polling                                   "<set> <n>" for each size this host holds: the listeners holding a session with GitHub's broker
 #   superci-id harden                                    no path is left writable by others (boot runs it first)
-#   superci-id health                                    run by superci-id-health.timer every 30 s: revives listeners that do not
-#                                                        run, then marks this instance Unhealthy so its Auto Scaling group replaces it
+#   superci-id health                                    run by superci-id-health.timer every 30 s: publishes IdentitiesPolling, revives
+#                                                        listeners that do not run, then marks this instance Unhealthy so its Auto Scaling
+#                                                        group replaces it
 #   superci-id install-health                            the timer, on a host that was not booted with it
 #   superci-id check                                     read-only: exit 0 if the host is ready and runs every listener of its share
 set -euo pipefail
@@ -30,6 +33,7 @@ HEALTH_UPTIME=${HEALTH_UPTIME:-/proc/uptime}
 READY_FILE=${READY_FILE:-/run/superci-id-ready}
 BOOTING_FILE=${BOOTING_FILE:-$(dirname "$READY_FILE")/superci-id-booting} # the uptime second a boot started at, while it runs
 PROC=${PROC_ROOT:-/proc}
+SS=${SS_BIN:-ss}
 FSROOT=${FS_ROOT:-/}   # the filesystem harden walks: / on a host, a fake one in identity_test.sh
 FILES=".runner .credentials .credentials_rsaparams"
 BUDGET_KIB=65536 # private memory a listener may hold (64 MiB); its unit's MemoryMax restarts one at 192 MiB
@@ -216,6 +220,66 @@ UNIT
   systemctl enable --now superci-id-health.timer > /dev/null 2>&1 || systemctl start superci-id-health.timer
 }
 
+# polling: which listeners can take a job. A listener takes jobs through the session it holds with GitHub's broker, one
+# long-lived TCP connection to port 443; GitHub's REST status of the runner ("online" or "offline") is a different thing,
+# and on Nov 28 from 03:05Z it read offline for up to 620 of 620 identities whose listeners went on taking jobs. So the host
+# counts what it can see: the Runner.Listeners of the identities held here with an ESTABLISHED socket to a remote port 443
+# (not loopback), per size label. The size is the one the identity is named for (superci-id-<size>-<n>); GitHub keeps the
+# label a runner is routed by, and a parked identity (superci-park) is counted under its size here. A row is printed for every
+# size this host holds, 0 when none of its listeners has a session. It reads sockets and process directories, no file of an
+# identity and no token. It must run as root (ss shows other users' processes only to root) and fails, printing nothing, when
+# ss does not answer, or when it lists established sockets to port 443 and shows the process of none of them (not root): a count
+# of 0 made of either would read as every session lost.
+polling() {
+  local sockets pids pid name size n d
+  local -A seen=() count=()
+  sockets=$("$SS" -H -tnp 2> /dev/null) || { echo "superci-id: cannot list sockets ($SS failed)" >&2; return 1; }
+  for d in "$ROOT"/superci-id-*/; do
+    name=$(basename "$d")
+    [ -e "$d/.runner" ] && [[ $name =~ ^superci-id-([0-9]+cpu)-[0-9]+$ ]] && count[superci-${BASH_REMATCH[1]}]=0
+  done
+  # A line is "ESTAB <recv> <send> <local> <peer> users:((\"Runner.Listener\",pid=<pid>,fd=<fd>))": the peer is the field before users:.
+  # ss shows the users column of a process only to root (and its owner). Established sockets to port 443 where no line has one are not
+  # a host with no sessions but a caller that cannot see them (run as another user): the awk exits 3 then, and polling fails.
+  pids=$(awk '
+    $1 != "ESTAB" { next }
+    { line = $0; sub(/ +users:.*/, "", line); n = split(line, f, " "); peer = f[n] }
+    peer !~ /:443$/ || peer ~ /^(127\.|\[::1\])/ { next }
+    { to443++ }
+    index($0, " users:") == 0 { next }
+    { visible++ }
+    index($0, "\"Runner.Listener\",pid=") == 0 { next }
+    { rest = $0
+      while (match(rest, /"Runner\.Listener",pid=[0-9]+/)) { s = substr(rest, RSTART, RLENGTH); sub(/.*pid=/, "", s); print s; rest = substr(rest, RSTART + RLENGTH) } }
+    END { if (to443 > 0 && visible == 0) exit 3 }' <<< "$sockets") || { echo "superci-id: established sockets to port 443 but no process is shown for any (run as root: ss shows other users' processes only to root)" >&2; return 1; }
+  while read -r pid; do
+    [ -n "$pid" ] || continue
+    [ -z "${seen[$pid]:-}" ] || continue
+    seen[$pid]=1
+    name=$(basename "$(readlink "$PROC/$pid/cwd" 2> /dev/null)" 2> /dev/null) || continue
+    [ -e "$ROOT/$name/.runner" ] || continue
+    [[ $name =~ ^superci-id-([0-9]+cpu)-[0-9]+$ ]] || continue
+    size=superci-${BASH_REMATCH[1]}
+    n=${count[$size]:-0}; count[$size]=$((n + 1))
+  done <<< "$pids"
+  for size in "${!count[@]}"; do echo "$size ${count[$size]}"; done | sort
+}
+
+# publish_polling: polling's counts as IdentitiesPolling (namespace superci-pull, dimensions Set and this host's AZ), which
+# the identity-none and identity-starved alarms sum over the hosts (deploy/alarms.sh). It publishes on the host's instance role
+# (identity-policy.json allows PutMetricData for that namespace only), and publishes nothing, rather than a 0, when it could
+# not count. GitHub's own count, the listener's IdentitiesOnline, stays published as it was: it is not to be trusted for a session.
+publish_polling() {
+  local rows data="" set n
+  valid_az || return 0
+  rows=$(polling) || return 1
+  [ -n "$rows" ] || return 0
+  while read -r set n; do
+    data="$data${data:+,}{\"MetricName\":\"IdentitiesPolling\",\"Dimensions\":[{\"Name\":\"Set\",\"Value\":\"$set\"},{\"Name\":\"AZ\",\"Value\":\"$AZ\"}],\"Value\":$n,\"Unit\":\"Count\"}"
+  done <<< "$rows"
+  timeout "${POLL_PUBLISH_TIMEOUT:-20}" aws cloudwatch put-metric-data --namespace superci-pull --metric-data "[$data]"
+}
+
 # running_listeners / held_identities: the units systemd runs, and the identities whose files are here.
 running_listeners() { systemctl list-units --no-legend --state=running 'superci-id@*' 2> /dev/null | wc -l; }
 held_identities() { find "$ROOT" -maxdepth 2 -name .runner 2> /dev/null | wc -l; }
@@ -276,6 +340,9 @@ stop_listeners() {
 health() {
   local D=$HEALTH_DIR now first since="" why="" id t stuck=0 d booting group
   mkdir -p "$D"
+  # Every run, first and whatever the host's age, so the alarms see the sessions of a host that is still restoring: its failure
+  # to publish is no failure of the host.
+  publish_polling || echo "IdentitiesPolling was not published"
   now=$(cut -d. -f1 "$HEALTH_UPTIME")
   [ "$now" -ge "${HEALTH_GRACE:-900}" ] || exit 0
   exec 9> "$LOCK"
@@ -419,6 +486,8 @@ status() {
     [ "$kib" -le "$BUDGET_KIB" ] || over=$((over + 1))
   done
   echo "az $(az) identities $total listeners_running $running private_dirty_kib_avg $((seen ? sum / seen : 0)) max $max over_64mib $over listeners_measured $seen"
+  # The sessions with GitHub's broker per size (identity.sh status reads this line); "polling unknown" when the sockets cannot be counted (never a 0).
+  if p=$(polling); then echo "polling $(tr '\n' ' ' <<< "$p" | sed 's/ $//')"; else echo "polling unknown"; fi
 }
 
 case "${1:-}" in
@@ -428,9 +497,10 @@ case "${1:-}" in
     locked; register "$@" ;;
   adopt) shift; valid_az || { echo "superci-id: $(no_az): refusing" >&2; exit 1; }; locked; adopt "$@" ;;
   status) status ;;
+  polling) polling ;;
   harden) locked; harden ;;
   health) health ;;
   check) check ;;
   install-health) locked; install_health ;;
-  *) echo "usage: superci-id boot|register|adopt|status|harden|health|install-health|check" >&2; exit 2 ;;
+  *) echo "usage: superci-id boot|register|adopt|status|polling|harden|health|install-health|check" >&2; exit 2 ;;
 esac

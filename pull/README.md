@@ -665,7 +665,8 @@ each job to a fresh machine. Its listener runs on an **identity host**, and no j
   to encrypt and decrypt through S3, and the operator, to administer). The hosts' root volumes are encrypted. A host that
   replaces another in the same AZ restores that share at boot and registers nothing.
 - **Who may read them.** The host's role `superci-pull-identity` may read and write that prefix and read the released
-  shim and `bin/RELEASE.json`, nothing else (`identity-policy.json`; its KMS statement is that one key, for objects of
+  shim and `bin/RELEASE.json`, and put metrics in the `superci-pull` namespace (`cloudwatch:PutMetricData` with that namespace
+  as its condition), nothing else (`identity-policy.json`; its KMS statement is that one key, for objects of
   that prefix only). The bucket policy
   (`identity-bucket-policy.json`) blocks public access, refuses a put that is not SSE-KMS or not the role's, refuses a
   read that is not the role's, and refuses a delete that is not the operator's. The host starts a shim only if its
@@ -741,7 +742,32 @@ both, then `up <az>`). `up` has no way left to make a plain host: a group is how
 **What this does not cover.** A host that is impaired but still running when EC2 replaces it may keep its listeners
 for the seconds before it is gone (terminate before launch holds for the group, not for a hung kernel); its replacement
 then meets GitHub's session conflict on those identities until the old session ends. The health check cannot see a listener that runs and is offline at
-GitHub (that is the `identity-none` and `identity-starved` alarms' to catch).
+GitHub (that is the `identity-none` and `identity-starved` alarms' to catch, from the listeners' sessions the hosts count, below).
+
+**Who can take a job: the hosts count it, GitHub's runner list does not.** A listener takes jobs through the session it holds with
+GitHub's broker, one long-lived TCP connection to port 443. GitHub's REST status of a runner (`online`/`offline` in
+`orgs/<org>/actions/runner-groups/<id>/runners`) is a different thing: from 03:05Z on Nov 28 it read up to 620 of 620 identities offline while
+their listeners kept taking jobs (superci-id-4cpu-0003 at 03:11, 03:13 and 03:20), so the listener's `IdentitiesOnline` read 0 and
+`identity-none` rolled a live canary back. Every 30 s, in the health run, each host counts per size the `Runner.Listener`s of its
+identities (the process of each `/opt/id/<name>`, by its working directory) with an `ESTABLISHED` socket to a remote port 443 (`ss -tnp`; loopback does
+not count, nor does a process that is not the listener), and publishes the count as `IdentitiesPolling` (namespace `superci-pull`,
+dimensions `Set` = `superci-<size>` and `AZ`) on its instance role: a value for every size the host holds, 0 when none has a session,
+nothing when `ss` does not answer. The size is the one in the identity's name (`superci-id-<size>-<n>`); the label GitHub routes by is
+GitHub's, so an identity parked under `superci-park` is counted for its size here: a host cannot see a label. The listener can: it lists the identities
+group every 5 minutes and publishes `IdentitiesLabeled` per size, the identities that carry the size's label whatever their REST status (the labels are
+what that list holds correctly; its status was what failed). Both alarms read the lower of `IdentitiesLabeled` and the polling sum, so all parked
+reads 0 labeled and `identity-none` fires, and a relabel half done leaves `identity-starved` computed on the labeled half. `ss` shows another user's
+process only to root: when it lists established sockets to port 443 and the process of none, `polling` fails (and publishes nothing) instead of
+counting 0. `superci-id polling` prints the counts, `superci-id status` the `polling` line (`polling unknown` when it could not count), and
+`identity.sh status` both the REST online count and the polling count per label (`unknown`, never 0, when a host could not count).
+
+**Rollout order for the polling alarms.** The alarms read a metric only the hosts publish, so they go last: (1) `deploy/identity.sh up <az>` for each AZ
+applies the role policy that allows `cloudwatch:PutMetricData` (without it the hosts' publish is refused and logged); (2) `identity.sh hpush` or `identity.sh status`
+puts the new `identity-host.sh` on each host; (3) check that `identity.sh status` prints a `polling` count for every host (not `polling unknown`) and
+that a health run has published, within a minute; (4) only then `deploy/alarms.sh`. It refuses to run unless `aws cloudwatch list-metrics --namespace
+superci-pull --metric-name IdentitiesPolling` lists a series for every AZ in `IDENTITY_AZS` (default `us-east-1a us-east-1b`): an alarm made earlier would
+read no data and stay OK. A first install, with no host publishing yet, runs `IDENTITY_ALARMS_UNPUBLISHED=1 deploy/alarms.sh`. A host AZ that publishes
+nothing counts 0 in the sum (CloudWatch `FILL(series, 0)` on a series never published reads 0), so a size whose hosts are all down alarms.
 
 **Registering.** Every registration spends the organization's cap, so `register` is bounded four ways:
 
@@ -833,7 +859,10 @@ percentiles, and again per set under the dimension `Set`), `StalledSets` (also p
 waits in progress of any set); `BudgetDenied` (registrations the budget turned away, GitHub never asked; dimension
 `Reason`: `tokens`, `throttled`, `queued`); per set (dimension `Set`): `Machines`, `IdleRunners`,
 `BusyRunners`, `Pool`, `JobsWaiting`, `OldestWaitingJobAgeS`, `OldestUnregisteredMachineAgeS`; per dispatch size (dimension `Set`) `IdentitiesOnline`
-and `IdentitiesBusy`, from one listing of the identities group every 5 minutes (a count older than 15 minutes is not published). A wait is published
+and `IdentitiesBusy`, from one listing of the identities group every 5 minutes (a count older than 15 minutes is not published; they are GitHub's REST
+status, not to be trusted for a broker session, and no alarm reads them), and `IdentitiesLabeled` from the same listing (the identities that carry the size's
+label, whatever their status: the alarms read it, with `IdentitiesPolling`); and `IdentitiesPolling` (dimensions `Set` and `AZ`), published by each identity
+host, not by the listener: the listeners holding a session with GitHub's broker. A wait is published
 while it lasts: `OldestWaitingJobAgeS` is the age of the oldest job that was offered or assigned and has not started,
 and a machine still told to wait writes a `jit.wait` timeline event every 30 s with the reason.
 
@@ -854,8 +883,8 @@ aws --profile ci-runners --region us-east-1 sns subscribe --topic-arn arn:aws:sn
 | superci-pull-oldest-job-wait-`<size>` (2cpu to 32cpu) | the oldest job waiting for a runner of that set (`OldestWaitingJobAgeS`, dimension `Set`) is over 60 s old, two minutes running | yes, a canary whose job ran on the set |
 | superci-pull-queue-wait-p90 | queue wait p90 over 60 s in two 5-minute periods running | no |
 | superci-pull-orphans | orphans above 0 for 10 minutes (a probe runner left registered more than 3 minutes counts, and the lister removes it) | no |
-| superci-pull-identity-starved-`<size>` (2cpu to 32cpu) | a dispatch size's running and waiting jobs (`DispatchRunning` + `JobsWaiting`) are over 70% of its `IdentitiesOnline` for 10 minutes: its jobs wait at GitHub for a free identity, before the dispatcher sees them, which `oldest-job-wait` and the record's queue time cannot show | no |
-| superci-pull-identity-none-`<size>` (2cpu to 32cpu) | a dispatch size has no identity online (`IdentitiesOnline` under 1) for 5 minutes: no job of the size can start, and the starved alarm sees no job, since none has reached the dispatcher | no |
+| superci-pull-identity-starved-`<size>` (2cpu to 32cpu) | a dispatch size's running and waiting jobs (`DispatchRunning` + `JobsWaiting`) are over 70% of the lower of its `IdentitiesLabeled` (identities carrying its label, parked ones not) and its `IdentitiesPolling`, summed over the hosts' AZs (`IDENTITY_AZS`, as `identity.sh` reads it), for 10 minutes: its jobs wait at GitHub for a free identity, before the dispatcher sees them, which `oldest-job-wait` and the record's queue time cannot show | no |
+| superci-pull-identity-none-`<size>` (2cpu to 32cpu) | a dispatch size has no identity that carries its label and polls (the lower of `IdentitiesLabeled` and `IdentitiesPolling` summed over the hosts' AZs, under 1) for 5 minutes, so all of them parked fires it: no job of the size can start, and the starved alarm sees no job, since none has reached the dispatcher. It reads a size only while the listener publishes its `DispatchRunning`, and a host that publishes nothing counts 0 | no |
 | superci-pull-pool-at-floor | a set's pool at the hour's floor for 5 minutes while more of its jobs waited than it had idle runners | no |
 | superci-pull-spend-daily | today's spend past 80% of the daily cap the listener runs with (`SpendDailyCapUSD`) | no |
 | superci-pull-spend-capped | a spend cap is reached: pools empty, held jobs still get machines, a dispatch set stops at 110% | yes, every canary |

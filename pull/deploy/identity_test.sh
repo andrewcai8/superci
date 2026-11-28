@@ -6,6 +6,7 @@ set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 F=$here/testdata/identity
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+chmod +x "$F/ss" 2> /dev/null || true # (a patch does not carry the mode of the stub it adds)
 export FAKE=$T/fake FAKE_RUNNER=$T/runner PATH=$F:$PATH SSH=$F/listener-ssh AWS_ACCESS_KEY_ID= AWS_SECRET_ACCESS_KEY= AWS_SESSION_TOKEN=
 # harden walks FS_ROOT: never this machine's own /, whichever way a test reaches the host script (the fake ssh points it
 # at the fake host's tree), and HARDEN_OWNER is whoever runs the test, so no chown needs root.
@@ -117,10 +118,14 @@ allowed = {"arn:aws:s3:::superci-pull-identities-243891825325/superci-pull/*", "
            "arn:aws:s3:::superci-pull-243891825325/bin/superci-shim", "arn:aws:s3:::superci-pull-243891825325/bin/RELEASE.json", "arn:aws:kms:us-east-1:243891825325:key/1234abcd-12ab-34cd-56ef-1234567890ab",
            "arn:aws:autoscaling:us-east-1:243891825325:autoScalingGroup:*:autoScalingGroupName/superci-pull-identity-*"}
 res = set()
+assert "PublishWhoPollsGitHub" in {st["Sid"] for st in role["Statement"]}, "the host may not publish IdentitiesPolling"
 for st in role["Statement"]:
     assert st["Effect"] == "Allow"
     if st["Sid"] == "ReadItsOwnGroup":  # a Describe call takes no resource: it is the one statement on "*"
         assert st["Action"] == "autoscaling:DescribeAutoScalingInstances" and st["Resource"] == "*", st
+        continue
+    if st["Sid"] == "PublishWhoPollsGitHub":  # a metric has no ARN: the namespace is the condition
+        assert st["Action"] == "cloudwatch:PutMetricData" and st["Resource"] == "*" and st["Condition"] == {"StringEquals": {"cloudwatch:namespace": "superci-pull"}}, st
         continue
     acts = st["Action"] if isinstance(st["Action"], list) else [st["Action"]]
     assert all(a.startswith(("s3:Get", "s3:Put", "s3:List", "kms:")) and "*" not in a or a == "autoscaling:SetInstanceHealth" for a in acts), acts
@@ -132,7 +137,7 @@ for need in ["TlsOnly", "NoPutWithoutKms", "NoPutWithoutAnEncryptionHeader", "On
 assert sids["OnlyTheOperatorDeletes"]["Condition"]["ArnNotLike"]["aws:PrincipalArn"] == ["arn:aws:iam::243891825325:role/ops", "arn:aws:iam::243891825325:role/*/ops"]
 assert sids["OnlyTheIdentityHostsRead"]["Condition"]["ArnNotEquals"]["aws:PrincipalArn"] == "arn:aws:iam::243891825325:role/superci-pull-identity"
 EOF
-check $? "the role may only use its prefix, the shim, the one key and mark an identity host's own group unhealthy; the bucket denies unencrypted puts and others' reads, writes and deletes"
+check $? "the role may only use its prefix, the shim, the one key, put metrics in the superci-pull namespace and mark an identity host's own group unhealthy; the bucket denies unencrypted puts and others' reads, writes and deletes"
 python3 -I - "$FAKE/state/role-policy.json" "$FAKE/state/bucket-policy.json" "$FAKE/state/key-policy.json" "$FAKE/state/bucket-encryption.json" << 'PY'
 import json, sys
 role, bucket, key, enc = (json.load(open(f)) for f in sys.argv[1:5])
@@ -445,11 +450,22 @@ refuses "relabel refuses a well-formed label that is neither the park label nor 
 H=$FAKE/hosts/$ip_a; mkdir -p "$H/proc/101" "$H/proc/102"; printf '101\n102\n' > "$H/proc/pids"
 ln -sf "$H/opt/id/superci-id-4cpu-0002" "$H/proc/101/cwd"; printf 'Rss: 9 kB\nPrivate_Dirty:     36864 kB\n' > "$H/proc/101/smaps_rollup"
 ln -sf "$H/opt/id/superci-id-4cpu-0004" "$H/proc/102/cwd"; printf 'Rss: 9 kB\nPrivate_Dirty:     70000 kB\n' > "$H/proc/102/smaps_rollup"
+# Only the listener of 0002 holds a session with GitHub's broker (an ESTABLISHED socket to port 443): 0004's listener runs without one.
+printf 'ESTAB 0 0 10.0.0.5:40000 140.82.112.5:443 users:(("Runner.Listener",pid=101,fd=21))\n' > "$H/proc/ss"
 ok "status" "$ID" status
 grep -q "identity groups:" <<< "$out" && grep -q "superci-pull-identity-us-east-1a: min 1 max 1 desired 1: i-0001 InService Healthy" <<< "$out" && grep -q "superci-pull-identity-us-east-1b: min 1 max 1 desired 1: i-0002 InService Healthy" <<< "$out"; check $? "status shows each group, its size and its host's state"
 ! grep -q "is in no group" <<< "$out"; check $? "and no host outside a group"
 grep -q "identity hosts: 3" <<< "$out" && grep -q "az us-east-1a identities [0-9]* listeners_running [0-9]* private_dirty_kib_avg 53432 max 70000 over_64mib 1" <<< "$out"; check $? "counts hosts, measures each listener's private memory and counts those over 64 MiB"
 grep -q "at GitHub:" <<< "$out" && grep -q "memory they need on 3 hosts" <<< "$out" && grep -q "64 MiB private (its unit restarts it at MemoryMax 192M) + 60 MiB shared a host; 1,550 identities are about 97 GiB" <<< "$out"; check $? "and shows what GitHub holds and the memory budget"
+
+grep -q "REST online" <<< "$out" && grep -q "label superci-4cpu: REST online [0-9]*, polling 1 (hosts: .*us-east-1a 1" <<< "$out"; check $? "status prints GitHub's online count and the hosts' polling count per label: one of the two listeners on host a holds a broker session"
+grep -q "unreliable for broker sessions" <<< "$out"; check $? "and says GitHub's online status is not to be trusted for a session"
+# A host that cannot count (here: ss lists a socket to port 443 and no process, as it does for a caller that is not root) is "polling unknown", never 0.
+printf 'ESTAB 0 0 10.0.0.5:40000 140.82.112.5:443\n' > "$H/proc/ss"
+ok "status with a host that cannot count its sessions" "$ID" status
+grep -q "^i-0001 .* polling unknown$" <<< "$out"; check $? "prints polling unknown for that host's line"
+grep -q "label superci-4cpu: REST online [0-9]*, polling unknown (hosts: .*us-east-1a unknown" <<< "$out" && ! grep -q "label superci-4cpu: .*polling [0-9]" <<< "$out"; check $? "and for the label it holds, never a count that has a 0 for the host in it"
+rm -f "$H/proc/ss"
 
 # ---- down, and a replacement host restores its share ----
 ok "down terminates a host by its name" "$ID" down us-east-1b
@@ -489,6 +505,80 @@ grep -q 'systemctl enable --now superci-id-health.timer' "$FAKE/systemctl.log"; 
 printf 'tampered\n' >> "$REL/bin/superci-shim"; rm -rf "$N/id" "$N/enabled" "$N/ready" "$N/shim"
 refuses "a replacement host refuses a shim that is not the release's" "refusing s3://superci-pull-$ACCOUNT/bin/superci-shim" newhost boot
 { [ ! -e "$N/id" ] || [ -z "$(ls "$N/id")" ]; } && [ ! -e "$N/enabled" ]; check $? "and starts nothing"
+
+# ---- polling: which listeners hold a session with GitHub's broker ----
+# A listener takes a job only through the session it holds with GitHub's broker, an ESTABLISHED socket to port 443; GitHub's
+# REST status of a runner said "offline" for hundreds of listeners that held one (Nov 28). The host counts the sessions per size.
+PH=$T/pollhost; mkdir -p "$PH/id" "$PH/proc" "$PH/log"
+for n in superci-id-4cpu-0002 superci-id-4cpu-0004 superci-id-4cpu-0006 superci-id-4cpu-0008 superci-id-4cpu-0010 superci-id-8cpu-0001 superci-id-8cpu-0003 superci-id-16cpu-0001; do
+  mkdir -p "$PH/id/$n"; : > "$PH/id/$n/.runner"
+done
+mkdir -p "$PH/id/not-an-identity" "$PH/id/superci-id-2cpu-0001"; : > "$PH/id/not-an-identity/.runner" # (no .runner at all for 2cpu-0001: not held)
+lst() { # <pid> <identity dir>: a Runner.Listener of that identity
+  mkdir -p "$PH/proc/$1"; ln -sfn "$PH/id/$2" "$PH/proc/$1/cwd"
+}
+lst 201 superci-id-4cpu-0002; lst 202 superci-id-4cpu-0004; lst 203 superci-id-4cpu-0006; lst 204 superci-id-4cpu-0010
+lst 205 superci-id-8cpu-0001; lst 206 superci-id-8cpu-0003; lst 207 superci-id-2cpu-0001; lst 208 not-an-identity
+lst 209 superci-id-4cpu-0008 # the process that holds the socket of 0008 is not a listener (aws, run from its directory)
+cat > "$PH/proc/ss" <<'SS'
+ESTAB 0 0 10.0.0.5:40001 140.82.112.5:443 users:(("Runner.Listener",pid=201,fd=21))
+SYN-SENT 0 1 10.0.0.5:40002 140.82.112.5:443 users:(("Runner.Listener",pid=202,fd=21))
+TIME-WAIT 0 0 10.0.0.5:40003 140.82.112.5:443
+ESTAB 0 0 10.0.0.5:40004 169.254.169.254:80 users:(("Runner.Listener",pid=203,fd=21))
+ESTAB 0 0 10.0.0.5:40005 140.82.112.6:443 users:(("Runner.Listener",pid=204,fd=21))
+ESTAB 0 0 10.0.0.5:40006 140.82.112.7:443 users:(("Runner.Listener",pid=204,fd=22))
+ESTAB 0 0 10.0.0.5:40007 140.82.112.8:443 users:(("Runner.Listener",pid=205,fd=21),("dotnet",pid=205,fd=21))
+CLOSE-WAIT 0 0 10.0.0.5:40008 140.82.112.9:443 users:(("Runner.Listener",pid=206,fd=21))
+ESTAB 0 0 10.0.0.5:40009 140.82.112.9:443 users:(("Runner.Listener",pid=207,fd=21))
+ESTAB 0 0 10.0.0.5:40010 140.82.112.9:443 users:(("Runner.Listener",pid=208,fd=21))
+ESTAB 0 0 10.0.0.5:40011 140.82.112.9:443 users:(("aws",pid=209,fd=5))
+ESTAB 0 0 10.0.0.5:40012 140.82.112.9:443 users:(("Runner.Listener",pid=299,fd=21))
+ESTAB 0 0 127.0.0.1:40013 127.0.0.1:443 users:(("Runner.Listener",pid=206,fd=22))
+SS
+pollenv=(ID_ROOT=$PH/id PROC_ROOT=$PH/proc ID_CONF=$N/conf ID_LOG=$PH/log ID_LOCK=$PH/lock ID_AZ=us-east-1a PATH=$F:$PATH)
+polled() { env "${pollenv[@]}" bash "$HS" polling; }
+ok "polling counts" polled
+want=$(printf 'superci-16cpu 0\nsuperci-4cpu 2\nsuperci-8cpu 1\n')
+[ "$out" = "$want" ]; check $? "the listeners that hold an established socket to port 443, per size label: 2 of the 5 of 4cpu, 1 of the 2 of 8cpu, 0 of 16cpu (not a connecting or closing socket, a socket to another port or to loopback, another process, a listener of no held identity, or the same listener twice)"
+[ "$(env "${pollenv[@]}" bash "$HS" status | grep -c '^polling superci-16cpu 0 superci-4cpu 2 superci-8cpu 1$')" = 1 ]; check $? "and status says so, for identity.sh status to read"
+rm -f "$FAKE/metrics.log"
+printf '10.00 0.00\n' > "$T/uptime"
+pubhealth() { env "${pollenv[@]}" FAKE=$FAKE HEALTH_UPTIME=$T/uptime HEALTH_DIR=$PH/hd bash "$HS" health; }
+ok "a health run publishes them" pubhealth
+python3 -I - "$FAKE/metrics.log" << 'PY'
+import json, sys
+calls = [json.loads(l) for l in open(sys.argv[1])]
+assert [c["namespace"] for c in calls] == ["superci-pull"], calls
+rows = calls[0]["data"]
+got = {}
+for r in rows:
+    assert r["MetricName"] == "IdentitiesPolling" and r["Unit"] == "Count", r
+    assert [d["Name"] for d in r["Dimensions"]] == ["Set", "AZ"], r
+    got[r["Dimensions"][0]["Value"]] = (r["Dimensions"][1]["Value"], r["Value"])
+assert got == {"superci-4cpu": ("us-east-1a", 2), "superci-8cpu": ("us-east-1a", 1), "superci-16cpu": ("us-east-1a", 0)}, got
+PY
+check $? "as IdentitiesPolling of namespace superci-pull, one value for each size the host holds (0 too, so a host that lost its sessions says so), with the Set and its AZ"
+hasnt TOKEN "$FAKE/metrics.log" "and nothing secret is in them"
+: > "$PH/proc/ss"; rm -f "$FAKE/metrics.log"; pubhealth > /dev/null
+python3 -I -c 'import json,sys; c = [json.loads(l) for l in open(sys.argv[1])]; assert sorted(r["Value"] for r in c[0]["data"]) == [0, 0, 0], c' "$FAKE/metrics.log"
+check $? "a host none of whose listeners has a session publishes 0 for each size, not nothing"
+rm -f "$FAKE/metrics.log"; printf 'ESTAB 0 0 10.0.0.5:40001 140.82.112.5:443 users:(("Runner.Listener",pid=201,fd=21))\n' > "$PH/proc/ss"
+out=$(env FAKE_METRICS_FAIL=1 "${pollenv[@]}" FAKE=$FAKE HEALTH_UPTIME=$T/uptime HEALTH_DIR=$PH/hd bash "$HS" health 2>&1); rc=$?
+[ $rc = 0 ] && grep -q "IdentitiesPolling was not published" <<< "$out"; check $? "a refused publish does not fail the health run, which says so"
+printf '#!/bin/sh\nexit 1\n' > "$PH/ss-bad"; mkdir -p "$PH/bin"; cp "$PH/ss-bad" "$PH/bin/ss"; chmod 755 "$PH/bin/ss"
+out=$(env "${pollenv[@]}" PATH=$PH/bin:$PATH bash "$HS" polling 2>&1); rc=$?
+[ $rc != 0 ] && grep -q "cannot list sockets" <<< "$out"; check $? "and an ss that fails is no count of 0 (it would read as every session lost)"
+# ss shows another user's process only to root: established sockets to port 443 and no users: column anywhere is a caller that cannot see, not a host with no sessions.
+printf 'ESTAB 0 0 10.0.0.5:40001 140.82.112.5:443\nESTAB 0 0 10.0.0.5:40002 140.82.112.6:443\n' > "$PH/proc/ss"
+out=$(polled 2>&1); rc=$?
+[ $rc = 1 ] && grep -q "no process is shown" <<< "$out" && ! grep -q '^superci-[0-9]*cpu ' <<< "$out"; check $? "established sockets to port 443 with no users: column on any line make polling fail (rc 1, no counts), not count 0"
+rm -f "$FAKE/metrics.log"; out=$(pubhealth 2>&1); rc=$?
+[ $rc = 0 ] && grep -q "IdentitiesPolling was not published" <<< "$out" && [ ! -s "$FAKE/metrics.log" ]; check $? "and the health run publishes nothing"
+[ "$(env "${pollenv[@]}" bash "$HS" status | grep -c '^polling unknown$')" = 1 ]; check $? "and status says polling unknown"
+printf 'ESTAB 0 0 10.0.0.5:22 10.0.0.9:51000\nESTAB 0 0 127.0.0.1:40003 127.0.0.1:443\n' > "$PH/proc/ss"
+out=$(polled 2>&1); [ $? = 0 ] && grep -q '^superci-4cpu 0$' <<< "$out"; check $? "sockets that are not to a remote port 443 need no users: column: a count of 0 stands"
+printf 'ESTAB 0 0 10.0.0.5:40001 140.82.112.5:443 users:(("Runner.Listener",pid=201,fd=21))\nESTAB 0 0 10.0.0.5:40002 140.82.112.6:443\n' > "$PH/proc/ss"
+out=$(polled 2>&1); [ $? = 0 ] && grep -q '^superci-4cpu 1$' <<< "$out"; check $? "and one line with its process among others without counts: it is root that sees them"
 
 # ---- harden: nothing is left writable by others where root runs ----
 # The machines' image as measured Nov 27: /usr/local/bin and /opt mode 777, the runner tree the runner user's, and

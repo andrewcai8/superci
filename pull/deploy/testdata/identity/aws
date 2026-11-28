@@ -225,6 +225,13 @@ elif svc == "iam" and cmd in ("get-role", "get-instance-profile"):
     sys.exit(0 if os.path.exists(os.path.join(state, "iam-" + (opt("--role-name") or opt("--instance-profile-name")) + cmd)) else 254)
 elif svc == "iam" and cmd in ("create-role", "create-instance-profile"):
     open(os.path.join(state, "iam-" + (opt("--role-name") or opt("--instance-profile-name")) + cmd.replace("create", "get")), "w").write("")
+elif svc == "cloudwatch" and cmd == "put-metric-data":
+    # FAKE_METRICS_FAIL: CloudWatch refuses (a throttle, a policy that does not allow the namespace)
+    if os.environ.get("FAKE_METRICS_FAIL"):
+        sys.stderr.write("An error occurred (AccessDenied) when calling the PutMetricData operation\n")
+        sys.exit(254)
+    with open(os.path.join(root, "metrics.log"), "a") as m:
+        m.write(json.dumps({"namespace": opt("--namespace"), "data": json.loads(opt("--metric-data"))}) + "\n")
 elif svc == "iam" and cmd == "put-role-policy":
     open(os.path.join(state, "role-policy.json"), "w").write(opt("--policy-document"))
 elif svc == "kms" and cmd == "describe-key":

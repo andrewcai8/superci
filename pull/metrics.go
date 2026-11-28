@@ -36,7 +36,7 @@ type Metrics struct {
 	// Dispatch is the sets the identity plane serves, and DispatchCounts what each did this minute.
 	Dispatch       []DispatchSnapshot
 	DispatchCounts map[string]DispatchCounts
-	// Identities is the identities online and busy at GitHub per dispatch size, from the listener's last listing of the
+	// Identities is the identities online, busy and labeled at GitHub per dispatch size, from the listener's last listing of the
 	// identities group; empty when that listing is older than identityCountFresh or has not yet been made.
 	Identities []IdentityCount
 }
@@ -120,7 +120,8 @@ func metricData(m Metrics, now time.Time) []cwtypes.MetricDatum {
 	// JobsWaiting count from the dispatcher's side only), so the identities are the size's capacity the alarm reads.
 	for _, c := range m.Identities {
 		set := cwtypes.Dimension{Name: aws.String("Set"), Value: aws.String(c.Set)}
-		data = append(data, d("IdentitiesOnline", float64(c.Online), cwtypes.StandardUnitCount, set), d("IdentitiesBusy", float64(c.Busy), cwtypes.StandardUnitCount, set))
+		data = append(data, d("IdentitiesOnline", float64(c.Online), cwtypes.StandardUnitCount, set), d("IdentitiesBusy", float64(c.Busy), cwtypes.StandardUnitCount, set),
+			d("IdentitiesLabeled", float64(c.Labeled), cwtypes.StandardUnitCount, set))
 	}
 	// The listener-wide alarms read these without a dimension: the longest waits of any set (the per-set alarms read each set's own, above).
 	data = append(data, d("OldestWaitingJobAgeS", oldestJob, cwtypes.StandardUnitSeconds),
