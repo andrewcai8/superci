@@ -1687,6 +1687,53 @@ exec {TOKEN_SCOPED}
 
 
 
+class CanaryChecksAtOnce(CanaryTree):
+    """The first check comes right after the start probe, not after a first EVERY sleep (Nov 28: the unit-tests canary started 03:08:42Z, a shard failed
+    03:13:37Z, and the first check was due 03:18:53Z). A trace file gets a line for each gate call and each sleep, in order."""
+
+    def setUp(self):
+        super().setUp()
+        self.trace = os.path.join(self.tmp, "trace")
+        self.clock = os.path.join(self.tmp, "clock")
+        for name, body in {
+            "sleep": 'echo "sleep $1" >> "$TRACE"\necho $(( $(cat "$VCLOCK" 2>/dev/null || echo 0) + ${1%%[!0-9]*} )) > "$VCLOCK"\n',
+            "date": 'off=$(cat "$VCLOCK" 2>/dev/null || echo 0)\n[ "$1 $2" = "-u +%s" ] && { echo $(( $(/bin/date +%s) + off )); exit 0; }\nexec /bin/date "$@"\n',
+        }.items():
+            path = os.path.join(self.bin, name)
+            with open(path, "w") as fh:
+                fh.write("#!/bin/sh\n" + body)
+            os.chmod(path, 0o755)
+        self.env.update(TRACE=self.trace, VCLOCK=self.clock)
+
+    GATE = "import os\nopen(os.environ['TRACE'], 'a').write('gate\\n')\nprint('canary keep')\nraise SystemExit(0)\n"
+
+    def seen(self):
+        with open(self.trace) as fh:
+            return fh.read().split("\n")[:-1]
+
+    def test_the_gate_is_called_once_before_any_sleep_and_the_watch_ends(self):
+        p = self.rollback(gate=self.GATE, lasts=5)
+        self.assertEqual(p.returncode, 0, (p.stdout, p.stderr))
+        self.assertEqual(self.seen(), ["gate"], "one check at the start, and no sleep: the next tick (EVERY 600 s) would start past UNTIL")
+        self.assertEqual(p.stdout.count("canary keep"), 1, p.stdout)
+
+    def test_each_tick_checks_and_then_sleeps_and_no_sleep_goes_past_until(self):
+        p = self.rollback(gate=self.GATE, lasts=1000)
+        self.assertEqual(p.returncode, 0, (p.stdout, p.stderr))
+        self.assertEqual(self.seen(), ["gate", "sleep 600", "gate"], "ticks at 0 and 600 s; the one at 1200 s is past UNTIL (1000 s), so the watch ends without sleeping to it")
+
+    def test_a_rollback_in_the_first_check_exits_3_with_no_sleep(self):
+        p = self.rollback(gate="import os\nopen(os.environ['TRACE'], 'a').write('gate\\n')\nprint('canary FAIL: stub')\nraise SystemExit(3)\n", lasts=1000, STOP_ON_ROLLBACK="1")
+        self.assertEqual(p.returncode, 3, (p.stdout, p.stderr))
+        self.assertEqual(self.seen(), ["gate"])
+
+    def test_every_keeps_its_floor_of_600(self):
+        until = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 60))
+        p = subprocess.run(["bash", self.tree(self.GATE), "2026-11-27T00:00:00Z", until, "verify-tools"], env=dict(self.env, EVERY="599", LOG=self.tmp), capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 2, (p.stdout, p.stderr))
+        self.assertFalse(os.path.exists(self.trace), "the gate was not called")
+
+
 class RollbackWritesOnTheVariablesToken(CanaryTree):
     """canary.sh beside a gate.py that is a stub answering ROLL BACK (exit 3), so only the rollback's own writes are run."""
 
@@ -1824,7 +1871,16 @@ class OperatorHearsOfARollback(CanaryTree):
         self.assertEqual(len(self.calls()), 1)
 
     def test_a_failing_on_rollback_neither_stops_the_watch_nor_undoes_the_rollback(self):
-        p = self.rollback(lasts=6, NOTIFY_EXIT="7", NOTIFY_SAYS="boom ghs_leak_in_text")
+        # The first tick rolls back at once, so a later tick needs a next tick that starts before UNTIL: a virtual clock (date and sleep stubs) moves it 600 s.
+        for name, body in {
+            "date": 'off=$(cat "$VCLOCK" 2>/dev/null || echo 0)\n[ "$1 $2" = "-u +%s" ] && { echo $(( $(/bin/date +%s) + off )); exit 0; }\nexec /bin/date "$@"\n',
+            "sleep": 'echo $(( $(cat "$VCLOCK" 2>/dev/null || echo 0) + ${1%%[!0-9]*} )) > "$VCLOCK"\n',
+        }.items():
+            path = os.path.join(self.bin, name)
+            with open(path, "w") as fh:
+                fh.write("#!/bin/sh\n" + body)
+            os.chmod(path, 0o755)
+        p = self.rollback(lasts=1000, VCLOCK=os.path.join(self.tmp, "clock"), NOTIFY_EXIT="7", NOTIFY_SAYS="boom ghs_leak_in_text")
         self.assertEqual(p.returncode, 0, (p.stdout, p.stderr))
         self.assertEqual(len(self.calls()), 1, "the rollback's notice, and no streak notice after it: the later ticks find SUPERCI_JOBS unset, which is no failure to check")
         self.assertIn("ON_ROLLBACK failed (exit 7): boom", p.stdout, "the failure is logged")
@@ -2029,12 +2085,15 @@ fi
             return fh.read().split().count(scope)
 
     def test_a_token_ten_minutes_from_expiry_at_the_ask_is_not_used_past_it(self):
-        # Three ticks 600 s apart: a token kept longer than 600 s (the listener's reserve) is expired at the next tick and answers 401.
+        # Three ticks (at once, then 600 s apart): a token kept longer than 600 s (the listener's reserve) is expired at the next tick and answers 401.
         p = self.rollback(gate="print('canary keep')\nraise SystemExit(0)\n", lasts=1500)
         self.assertNotIn("SUPERCI_JOBS unread", p.stdout, "a tick read SUPERCI_JOBS with an expired token")
         self.assertEqual(p.stdout.count("canary keep"), 3, p.stdout)
         reads = [tok for tok, args in self.gh_calls() if "actions/variables/SUPERCI_JOBS" in args]
-        self.assertEqual(len(set(reads)), len(reads), "each tick, 600 s apart, reads with a token asked for since the last: " + str(reads))
+        # The first read is the start's probe; the first tick follows at once and may share its token (asked 0 s before). Each later tick is 600 s on.
+        ticks = reads[1:]
+        self.assertEqual(len(ticks), 3, reads)
+        self.assertEqual(len(set(ticks)), len(ticks), "each tick, 600 s apart, reads with a token asked for since the last: " + str(reads))
         self.assertNotIn("ghs_vars_", p.stdout + p.stderr)
 
     def test_a_401_on_the_read_drops_the_token_asks_again_and_reads_with_the_fresh_one(self):

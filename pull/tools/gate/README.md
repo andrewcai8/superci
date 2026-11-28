@@ -162,7 +162,7 @@ is at the cap, not that superci harmed a job. It pages and is counted. If the re
 queue-wait rows and the per-set `superci-pull-oldest-job-wait-<size>` see it. In canary 4b's minutes over the cap (Nov 26 16:11-16:20Z, the
 organization at 5.03-5.30/s) superci's test-go waited 1-2 s and Blacksmith's 4 vCPU jobs p50 7 s, p90 19 s.
 
-`canary.sh SINCE UNTIL JOB...` runs the check for each job SUPERCI_JOBS still lists, every 15 minutes, until UNTIL, with
+`canary.sh SINCE UNTIL JOB...` runs the check for each job SUPERCI_JOBS still lists, the first at once (right after the start probe, so a harm in the first minutes is seen then, not after a first EVERY sleep), then every 15 minutes, until UNTIL (it never sleeps past UNTIL: when the next tick would start at or after it, the watch ends), with
 Blacksmith's side the 24 h before SINCE (`--baseline-until`), so a job that left Blacksmith still has a baseline. It
 removes a job that gets ROLL BACK from SUPERCI_JOBS, and leaves the other jobs listed. SUPERCI_JOBS is read and written on the App's
 `variables` token, and a rollback that cannot get it prints `ROLLBACK FAILED` (or, with `SUPERCI_PERSONAL_TOKEN=1`, writes on the personal
